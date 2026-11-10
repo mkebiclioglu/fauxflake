@@ -120,6 +120,7 @@ def rewrite(sql: str) -> str:
 
 
 _ALIAS_ERROR = re.compile(r'Alias (?:with name )?"+([^"]+)"+ (?:exists, but aliases cannot be used|referenced - but the expression has side effects)')
+_AMBIGUOUS_ERROR = re.compile(r"""Ambiguous reference to column name "+([^"]+)"+ \(use: '"?([^'".]+)"?\.""")
 _patched = False
 
 
@@ -136,7 +137,7 @@ def _patch_fakesnow() -> None:
         try:
             self._fauxflake_outer = semantics.outer_flattens(command)
             self._fauxflake_recursive = semantics.outer_flattens(command, "recursive")
-            self._fauxflake_layer, self._fauxflake_inline = False, set()
+            self._fauxflake_layer, self._fauxflake_inline, self._fauxflake_owners = False, set(), {}
             for _ in range(8):
                 try:
                     return original(self, rewrite(command), *args, **kwargs)
@@ -144,10 +145,13 @@ def _patch_fakesnow() -> None:
                     # constructs DuckDB will not plan as written: say how to rewrite them, then run again
                     message = str(e)
                     alias = _ALIAS_ERROR.search(message)
+                    ambiguous = _AMBIGUOUS_ERROR.search(message)
                     if "window function calls cannot be nested" in message and not self._fauxflake_layer:
                         self._fauxflake_layer = True  # an aliased window used inside another window
                     elif alias and alias.group(1).upper() not in self._fauxflake_inline:
                         self._fauxflake_inline.add(alias.group(1).upper())  # an alias built from another alias
+                    elif ambiguous and ambiguous.group(1).upper() not in self._fauxflake_owners and " using" in command.lower():
+                        self._fauxflake_owners[ambiguous.group(1).upper()] = ambiguous.group(2)  # shared column of a USING join
                     else:
                         raise
             return original(self, rewrite(command), *args, **kwargs)
@@ -188,6 +192,8 @@ def _patch_fakesnow() -> None:
     original_transform = FakeSnowflakeCursor._transform
 
     def _transform(self, expression, params):  # noqa: ANN001
+        if getattr(self, "_fauxflake_owners", None):
+            expression = semantics.qualify_using(expression, self._fauxflake_owners)
         if getattr(self, "_fauxflake_inline", None):
             expression = semantics.inline_aliases(expression, self._fauxflake_inline)
         if getattr(self, "_fauxflake_layer", False):

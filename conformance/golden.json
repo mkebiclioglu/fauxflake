@@ -1047,10 +1047,25 @@
    ]
   ]
  },
+ "duplicate_cte_names": {
+  "rows": [
+   [
+    "1"
+   ]
+  ]
+ },
  "dynamic_pivot": {
   "rows": [
    [
     "4",
+    "2"
+   ]
+  ]
+ },
+ "empty_identifier": {
+  "rows": [
+   [
+    "1",
     "2"
    ]
   ]
@@ -3601,6 +3616,15 @@
     "1",
     "B",
     null
+   ]
+  ]
+ },
+ "using_join_shared_column": {
+  "rows": [
+   [
+    "1",
+    "x",
+    "z"
    ]
   ]
  },

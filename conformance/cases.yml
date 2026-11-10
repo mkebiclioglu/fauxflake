@@ -292,3 +292,6 @@
 - {id: reserved_column_names, sql: "select authorization, \"order\", t.user from (select 'a' as authorization, 1 as \"order\", 'u' as user) t where authorization = 'a'"}
 - {id: array_literals_in_branches, sql: "select k, case when k = 'a' then [k, 'z'] when k = 'b' then array_construct() end as arr, array_size(arr) from (select column1 k from values ('a'), ('b'), ('c')) order by k"}
 - {id: flatten_union_arrays, sql: "with a as (select 1 id, ['x', 'y'] tags union all select 2, split('p,q', ',') union all select 3, array_construct()) select a.id, f.value::string from a, lateral flatten(input => a.tags) f order by 1, 2"}
+- {id: duplicate_cte_names, sql: "with a as (select 1 x), a as (select 2 x) select * from a"}
+- {id: using_join_shared_column, sql: "select a.id, v, w from (select 1 id, 'x' v) a left join (select 1 id, 'y' v, 'z' w) b using (id)"}
+- {id: empty_identifier, sql: "select 1 as \"\", 2 as b"}

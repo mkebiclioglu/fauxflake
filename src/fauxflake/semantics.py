@@ -748,6 +748,18 @@ def inline_aliases(tree: exp.Expression, names: set[str]) -> exp.Expression:
     return tree
 
 
+def qualify_using(tree: exp.Expression, owners: dict[str, str]) -> exp.Expression:
+    """In `a JOIN b USING (id)`, a column both tables have (other than id) is read from the left
+    table in Snowflake. DuckDB calls it ambiguous: name the table it suggested first."""
+    for select in tree.find_all(exp.Select):
+        if not any(j.args.get("using") for j in select.args.get("joins") or []):
+            continue
+        for col in select.find_all(exp.Column):
+            if not col.table and col.name.upper() in owners and col.find_ancestor(exp.Select) is select:
+                col.set("table", exp.to_identifier(owners[col.name.upper()]))
+    return tree
+
+
 def reserved_words(conn) -> None:  # noqa: ANN001
     _RESERVED.update(w.upper() for (w,) in conn.execute(
         "select keyword_name from duckdb_keywords() where keyword_category in ('reserved', 'type_function')").fetchall())
@@ -794,6 +806,14 @@ def rewrite(node: exp.Expression) -> exp.Expression:
     if isinstance(node, exp.With) and not node.args.get("recursive") and any(
             isinstance(c.this, exp.SetOperation) and _self_referencing(c) for c in node.expressions):
         node.set("recursive", True)  # the keyword is optional in Snowflake
+    if isinstance(node, exp.With):
+        seen: set[str] = set()
+        for cte in list(node.expressions):  # two CTEs with one name: Snowflake uses the first
+            if cte.alias.upper() in seen:
+                cte.pop()
+            seen.add(cte.alias.upper())
+    if isinstance(node, exp.Identifier) and node.args.get("quoted") and node.name == "":
+        node.set("this", " ")  # "" is a legal name in Snowflake
     for child in list(node.iter_expressions()):
         # remember the slot first: a fix may wrap the child, which re-parents it
         parent, key, index = child.parent, child.arg_key, child.index

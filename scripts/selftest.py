@@ -85,11 +85,25 @@ def main() -> None:
     for why, nodes in sorted(reasons.items(), key=lambda x: -len(x[1])):
         print(f"  {len(nodes):3}  {why}\n         e.g. {nodes[0]}")
     if parity:
-        same = sum(p.ok for p in parity)
+        # two builds minutes apart cannot agree on "now": set those models apart
+        manifest = json.loads((project.target_path / "manifest.json").read_text())["nodes"]
+        by_name = {n["name"]: uid for uid, n in manifest.items() if n["resource_type"] == "model"}
+        clock = re.compile(r"\b(current_timestamp|current_date|current_time|sysdate|getdate|localtimestamp)\b", re.IGNORECASE)
+
+        def reads_clock(uid: str, seen: set) -> bool:
+            node = manifest.get(uid)
+            if node is None or uid in seen:
+                return False
+            seen.add(uid)
+            return bool(clock.search(node.get("compiled_code") or "")) or any(reads_clock(d, seen) for d in node["depends_on"]["nodes"])
+
+        differing = [p for p in parity if not p.ok]
+        timed = [p for p in differing if not p.note and p.emulator_rows == p.snowflake_rows and reads_clock(by_name.get(p.model, ""), set())]
         filled = sum(p.emulator_rows > 0 or p.snowflake_rows > 0 for p in parity)
-        print(f"  row for row against Snowflake: {same} of {len(parity)} models identical ({filled} of them have rows)")
-        for p in parity:
-            if not p.ok:
+        print(f"  row for row against Snowflake: {len(parity) - len(differing)} of {len(parity)} models identical "
+              f"({filled} have rows); {len(timed)} more differ only where they read the current time")
+        for p in differing:
+            if p not in timed:
                 print(f"    differs  {p.model}: emulator={p.emulator_rows} snowflake={p.snowflake_rows} "
                       f"only_emulator={p.only_emulator} only_snowflake={p.only_snowflake} {p.note}")
     if args.json:
