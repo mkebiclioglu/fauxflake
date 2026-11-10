@@ -70,27 +70,40 @@ class Parity:
         return self.only_emulator == 0 and self.only_snowflake == 0 and not self.note
 
 
-def compare(conn, wh: Warehouse, local: DbtProject, schema: str, remote_schema: str) -> list[Parity]:
-    duck, out = wh.emu.cursor(), []
+def _comparable(column: str, kind: str, source: str) -> str:
+    """One column in a form both engines agree on: Snowflake's values arrive as Python objects
+    (pretty-printed JSON text, floats that differ in the last bit)."""
+    quoted = f'"{column}"'
+    if kind == "JSON":
+        return f"json({quoted}::varchar)::varchar as {quoted}"  # same text whatever the whitespace
+    if kind in ("DOUBLE", "FLOAT"):
+        return f"format('{{:.10g}}', {quoted}::double) as {quoted}"
+    return f"{quoted}::{kind} as {quoted}" if source == "theirs" else quoted
+
+
+def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_schema: str | None = None) -> list[Parity]:
+    """Each model on the emulator against the same model on Snowflake, row for row. Without
+    `schema`, each model is read from the schema dbt built it in (the same on both sides)."""
+    duck, out = emu.cursor(), []
     for node in sorted(local.models(), key=lambda n: n["name"]):
         name = node.get("alias") or node["name"]
         try:
-            theirs = _fetch(conn, f'select * from {node["database"]}.{remote_schema}.{name}')
-            mine = f'{node["database"]}.{schema}.{name}'
+            theirs = _fetch(conn, f'select * from {node["database"]}.{remote_schema or node["schema"]}.{name}')
+            mine = f'{node["database"]}.{schema or node["schema"]}.{name}'
             types = {c.upper(): ty for c, ty, *_ in duck.execute(f"describe {mine}").fetchall()}
             if theirs is None:  # zero rows
                 theirs_n, a, b = 0, duck.execute(f"select count(*) from {mine}").fetchone()[0], 0
             else:
                 duck.register("_theirs", theirs)
                 # compare in the emulator's types, so NUMBER(38,0) vs BIGINT is not a difference
-                cast = ", ".join(f'"{c}"::{ty} as "{c}"' for c, ty in types.items())
                 missing = set(types) ^ {c.upper() for c in theirs.column_names}
                 if missing:
                     out.append(Parity(node["name"], 0, theirs.num_rows, 0, 0, f"columns differ: {sorted(missing)}"))
                     continue
                 theirs_n = theirs.num_rows
                 a, b = duck.execute(f"""
-                    with t as (select {cast} from _theirs), m as (select {', '.join(f'"{c}"' for c in types)} from {mine})
+                    with t as (select {', '.join(_comparable(c, ty, 'theirs') for c, ty in types.items())} from _theirs),
+                         m as (select {', '.join(_comparable(c, ty, 'mine') for c, ty in types.items())} from {mine})
                     select (select count(*) from (select * from m except all select * from t)),
                            (select count(*) from (select * from t except all select * from m))""").fetchone()
             mine_n = duck.execute(f"select count(*) from {mine}").fetchone()[0]
@@ -115,4 +128,4 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
         if not remote.invoke(["build", *full], schema=remote_schema, quiet=True):
             raise SystemExit(f"dbt build failed on Snowflake at {now}")
         log(f"{now:%Y-%m-%d}  built on both engines")
-    return compare(conn, wh, local, remote_schema, remote_schema)
+    return compare(conn, wh.emu, local, remote_schema, remote_schema)

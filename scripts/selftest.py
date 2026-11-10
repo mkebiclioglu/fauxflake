@@ -25,6 +25,8 @@ def main() -> None:
     ap.add_argument("--database", default="ANALYTICS")
     ap.add_argument("--vars", default=None)
     ap.add_argument("--json")
+    ap.add_argument("--snowflake", default=None, metavar="CONNECTION",
+                    help="also build on this real account (~/.snowflake/connections.toml) and compare every model row for row")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--schema", default="CI", help="default schema, for projects whose sources expect a fixed one")
     ap.add_argument("--target", default=None, help="dbt target name, for projects that branch on target.name")
@@ -52,6 +54,19 @@ def main() -> None:
             if path.exists():
                 results += json.loads(path.read_text())["results"]
                 path.unlink()
+        parity = []
+        if args.snowflake:
+            import snowflake.connector
+
+            from fauxflake.dbt import snowflake_output
+            from fauxflake.parity import compare
+
+            remote = DbtProject(args.project_dir, snowflake_output(args.snowflake, args.database, args.threads), name="selftest_snowflake")
+            for step in (["seed", "--full-refresh"], ["run", "--full-refresh"]):
+                remote.invoke([*step, *extra], schema=args.schema, quiet=True)
+            conn = snowflake.connector.connect(connection_name=args.snowflake)
+            parity = compare(conn, emu, project)
+            conn.close()
     counts = collections.Counter(r["status"] for r in results)
     reasons: dict[str, list[str]] = collections.defaultdict(list)
     for r in results:
@@ -64,8 +79,17 @@ def main() -> None:
     print(f"{args.project_dir.name}: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
     for why, nodes in sorted(reasons.items(), key=lambda x: -len(x[1])):
         print(f"  {len(nodes):3}  {why}\n         e.g. {nodes[0]}")
+    if parity:
+        same = sum(p.ok for p in parity)
+        filled = sum(p.emulator_rows > 0 or p.snowflake_rows > 0 for p in parity)
+        print(f"  row for row against Snowflake: {same} of {len(parity)} models identical ({filled} of them have rows)")
+        for p in parity:
+            if not p.ok:
+                print(f"    differs  {p.model}: emulator={p.emulator_rows} snowflake={p.snowflake_rows} "
+                      f"only_emulator={p.only_emulator} only_snowflake={p.only_snowflake} {p.note}")
     if args.json:
-        Path(args.json).write_text(json.dumps({"counts": counts, "reasons": reasons}, indent=1))
+        Path(args.json).write_text(json.dumps({"counts": counts, "reasons": reasons,
+                                               "parity": [vars(p) for p in parity]}, indent=1))
 
 
 if __name__ == "__main__":
