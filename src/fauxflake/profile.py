@@ -164,6 +164,11 @@ def _monotonic(values: list[float]) -> list[float]:
     return out
 
 
+class _Dumper(yaml.SafeDumper):
+    def ignore_aliases(self, data):  # repeat shared lists instead of emitting &anchors
+        return True
+
+
 def profile_spec(path: str | Path, conn, *, days: int = 90, sample_pct: float | None = None,
                  k_anonymity: int = 50, max_categories: int = 50, log=print) -> list[str]:
     raw = yaml.safe_load(Path(path).read_text())
@@ -175,6 +180,6 @@ def profile_spec(path: str | Path, conn, *, days: int = 90, sample_pct: float | 
         done.append(name)
     Path(path).write_text(
         "# Measured by `fauxflake profile`. Aggregates only; review the diff like code.\n"
-        + yaml.safe_dump(raw, sort_keys=False, default_flow_style=None, width=110)
+        + yaml.dump(raw, Dumper=_Dumper, sort_keys=False, default_flow_style=None, width=110)
     )
     return done

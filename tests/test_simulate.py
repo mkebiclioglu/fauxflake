@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from fauxflake.dbt import DbtProject
+from fauxflake.dbt import DbtProject, emulator_output
 from fauxflake.generate import Warehouse
 from fauxflake.simulate import simulate
 
@@ -11,7 +11,7 @@ from conftest import EXAMPLE
 
 def run(emu, spec, dbt_args):
     wh = Warehouse(emu, spec, scale=0.0005)
-    project = DbtProject(EXAMPLE, emu.port, "ANALYTICS")
+    project = DbtProject(EXAMPLE, emulator_output(emu.port, "ANALYTICS"))
     drifts = simulate(wh, project, datetime(2025, 1, 21), days=4, dbt_args=dbt_args, log=lambda *_: None)
     return {d.model: d for d in drifts}
 

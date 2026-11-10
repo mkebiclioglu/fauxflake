@@ -39,7 +39,7 @@ def main() -> None:
 @click.argument("dbt_args", nargs=-1, type=click.UNPROCESSED)
 def build(spec_path, project_dir, scale, history, dbt_args):
     """Generate sources and run `dbt build` once. Extra args go to dbt."""
-    from .dbt import DbtProject
+    from .dbt import DbtProject, emulator_output
     from .emulator import serve
     from .generate import Warehouse
 
@@ -49,7 +49,7 @@ def build(spec_path, project_dir, scale, history, dbt_args):
         wh = Warehouse(emu, spec, scale)
         counts = wh.advance_to(_start(spec, history))
         click.echo(f"generated {sum(counts.values()):,} rows in {time.time() - t0:.1f}s")
-        project = DbtProject(project_dir, emu.port, spec.dbt.get("database", "ANALYTICS"))
+        project = DbtProject(project_dir, emulator_output(emu.port, spec.dbt.get("database", "ANALYTICS")))
         ok = project.invoke(["build", *dbt_args])
     sys.exit(0 if ok else 1)
 
@@ -61,7 +61,7 @@ def build(spec_path, project_dir, scale, history, dbt_args):
 @click.argument("dbt_args", nargs=-1, type=click.UNPROCESSED)
 def simulate(spec_path, project_dir, scale, history, days, step_hours, dbt_args):
     """Advance the clock run by run, then compare incremental models to a full refresh."""
-    from .dbt import DbtProject
+    from .dbt import DbtProject, emulator_output
     from .emulator import serve
     from .generate import Warehouse
     from .simulate import simulate as run
@@ -69,7 +69,7 @@ def simulate(spec_path, project_dir, scale, history, days, step_hours, dbt_args)
     spec = Spec.load(spec_path)
     with serve() as emu:
         wh = Warehouse(emu, spec, scale)
-        project = DbtProject(project_dir, emu.port, spec.dbt.get("database", "ANALYTICS"))
+        project = DbtProject(project_dir, emulator_output(emu.port, spec.dbt.get("database", "ANALYTICS")))
         drifts = run(wh, project, _start(spec, history), days, step_hours, list(dbt_args), log=click.echo)
     click.echo("")
     for d in drifts:
@@ -86,7 +86,7 @@ def simulate(spec_path, project_dir, scale, history, days, step_hours, dbt_args)
 @click.option("--port", default=8765, show_default=True)
 def serve(spec_path, project_dir, scale, history, port):
     """Keep the emulator running with generated sources, for interactive dbt use."""
-    from .dbt import DbtProject
+    from .dbt import DbtProject, emulator_output
     from .emulator import serve as start
     from .generate import Warehouse
 
@@ -94,7 +94,7 @@ def serve(spec_path, project_dir, scale, history, port):
     with start(port=port) as emu:
         wh = Warehouse(emu, spec, scale)
         counts = wh.advance_to(_start(spec, history))
-        project = DbtProject(project_dir, emu.port, spec.dbt.get("database", "ANALYTICS"))
+        project = DbtProject(project_dir, emulator_output(emu.port, spec.dbt.get("database", "ANALYTICS")))
         click.echo(f"generated {sum(counts.values()):,} rows; simulated now = {wh.now}")
         click.echo(f"dbt build --project-dir {project.dir} --profiles-dir {project.profiles_dir} --target fauxflake")
         click.echo("Ctrl-C to stop.")
@@ -122,3 +122,32 @@ def profile(spec_path, connection, days, sample_pct, k_anonymity, max_categories
     changed = profile_spec(spec_path, conn, days=days, sample_pct=sample_pct,
                            k_anonymity=k_anonymity, max_categories=max_categories, log=click.echo)
     click.echo(f"updated {spec_path}: {', '.join(changed) or 'nothing'}")
+
+
+@main.command()
+@with_common
+@click.option("--connection", required=True, help="Name in ~/.snowflake/connections.toml.")
+@click.option("--days", default=2, show_default=True, help="Simulated days of incremental runs on both engines.")
+def parity(spec_path, project_dir, scale, history, connection, days):
+    """Build on the emulator and on real Snowflake from identical synthetic data, and compare."""
+    import snowflake.connector
+
+    from .dbt import DbtProject, emulator_output, snowflake_output
+    from .emulator import serve
+    from .generate import Warehouse
+    from .parity import run
+
+    spec = Spec.load(spec_path)
+    database = spec.dbt.get("database", "ANALYTICS")
+    conn = snowflake.connector.connect(connection_name=connection)
+    with serve() as emu:
+        wh = Warehouse(emu, spec, scale)
+        local = DbtProject(project_dir, emulator_output(emu.port, database))
+        remote = DbtProject(project_dir, snowflake_output(connection, database), name="snowflake")
+        results = run(conn, wh, local, remote, _start(spec, history), days, log=click.echo)
+    click.echo("")
+    for r in results:
+        mark = "same " if r.ok else "DIFF "
+        click.echo(f"{mark} {r.model:<28} emulator={r.emulator_rows:,} snowflake={r.snowflake_rows:,} "
+                   f"only_emulator={r.only_emulator:,} only_snowflake={r.only_snowflake:,} {r.note}")
+    sys.exit(0 if all(r.ok for r in results) else 1)

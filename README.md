@@ -126,6 +126,24 @@ runs, is each incremental model identical to a full refresh?
 spec. The diff is the drift report: a new column, a category whose share moved, volume up 30%,
 a lateness tail that doubled. A human reviews it like code.
 
+## Parity with real Snowflake
+
+Synthetic data is safe to load anywhere, including a real account. `fauxflake parity
+--connection <name>` seeds the same rows into Snowflake, builds the project on both engines
+through simulated days, and compares every model row for row:
+
+```
+DIFF  fct_daily_events   emulator=128 snowflake=128 only_emulator=128 only_snowflake=128
+same  fct_orders         emulator=8,500 snowflake=8,500 only_emulator=0 only_snowflake=0
+same  stg_customers      emulator=244 snowflake=244 only_emulator=0 only_snowflake=0
+same  stg_events         emulator=171,434 snowflake=171,434 only_emulator=0 only_snowflake=0
+same  stg_orders         emulator=8,500 snowflake=8,500 only_emulator=0 only_snowflake=0
+```
+
+That is the real output for the example project on a trial account, on an XS warehouse, for
+a fraction of a credit. The one difference is genuine and now a known gap: Snowflake divides
+integers into `NUMBER(p, 6)` (`0.090029`), DuckDB into a double (`0.09002904...`).
+
 ## Security
 
 - CI needs no Snowflake credentials. The dbt profile fauxflake generates points at `127.0.0.1`.
@@ -163,6 +181,8 @@ Read these before trusting a green check.
 - **Three deliberate differences**, all in [`emulator.py`](src/fauxflake/emulator.py):
   qualified temporary tables become regular tables; explicit transactions run as autocommit;
   bare columns in `MERGE ... INSERT VALUES` are qualified with the source alias.
+- **Known result difference:** integer division (`/`, `div0`) keeps 6 decimals on Snowflake
+  and full double precision in the emulator. Found by `fauxflake parity`.
 - **It says nothing about Snowflake performance or cost.** Query plans, pruning, spilling and
   warehouse sizing cannot be learned from DuckDB.
 - **Fidelity stops at the spec.** Columns are sampled independently, so cross-column
@@ -171,8 +191,8 @@ Read these before trusting a green check.
   generated as NULL until declared.
 - **Scale is relative.** Logic that depends on absolute counts (`having count(*) > 1000`)
   behaves differently at `--scale 0.001`.
-- **The profiler has only run against the emulator**, not a real Snowflake account. Its SQL
-  is Snowflake dialect and round-trip tested, but expect rough edges on first contact.
+- **The profiler has run against one real account**, on synthetic tables only, and without
+  `--sample-pct`. Expect rough edges on wide or semi-structured production tables.
 - **Everything is in memory.** Scale is bounded by RAM until the generator writes to disk.
 - Row values depend on DuckDB's `hash()`, so the DuckDB version is pinned in `uv.lock`.
 
