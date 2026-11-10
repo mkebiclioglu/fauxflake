@@ -41,6 +41,9 @@ def snowflake_output(connection_name: str, database: str, threads: int = 4) -> d
 class DbtProject:
     def __init__(self, project_dir: str | Path, output: dict, name: str = "emulator"):
         self.dir = Path(project_dir).resolve()
+        self.last_error = ""
+        self._local = output.get("host") == "127.0.0.1"
+        self._databases_ready = False
         project = yaml.safe_load((self.dir / "dbt_project.yml").read_text())
         self.profiles_dir = self.dir / ".fauxflake" / name
         self.profiles_dir.mkdir(parents=True, exist_ok=True)
@@ -57,16 +60,36 @@ class DbtProject:
 
         return bool(dbtRunner().invoke(["--quiet", "deps", "--project-dir", str(self.dir)]).success)
 
+    def _create_databases(self) -> None:
+        """On Snowflake the databases a project writes to already exist. Create them here."""
+        from dbt.cli.main import dbtRunner
+
+        from . import emulator
+
+        self._databases_ready = True
+        flags = ["--project-dir", str(self.dir), "--profiles-dir", str(self.profiles_dir),
+                 "--target", "fauxflake", "--target-path", str(self.target_path)]
+        if emulator.CURRENT is None or not dbtRunner().invoke(["--quiet", "parse", *flags]).success:
+            return
+        manifest = json.loads((self.target_path / "manifest.json").read_text())
+        for node in [*manifest["nodes"].values(), *manifest["sources"].values()]:
+            if node.get("database") and node.get("schema"):
+                emulator.CURRENT.ensure_database(node["database"].strip('"'), node["schema"].strip('"'))
+
     def invoke(self, args: list[str], schema: str = "CI", quiet: bool = False) -> bool:
         from dbt.cli.main import dbtRunner
 
         os.environ["FAUXFLAKE_SCHEMA"] = schema
+        if self._local and not self._databases_ready and args and args[0] in ("build", "run", "seed", "snapshot", "test"):
+            self._create_databases()
         os.environ.setdefault("DBT_SEND_ANONYMOUS_USAGE_STATS", "false")
         cmd = (["--quiet"] if quiet else []) + list(args) + [
             "--project-dir", str(self.dir), "--profiles-dir", str(self.profiles_dir), "--target", "fauxflake",
             "--target-path", str(self.target_path),
         ]
-        return bool(dbtRunner().invoke(cmd).success)
+        result = dbtRunner().invoke(cmd)
+        self.last_error = str(result.exception) if result.exception else ""
+        return bool(result.success)
 
     def models(self) -> list[dict]:
         manifest = json.loads((self.target_path / "manifest.json").read_text())

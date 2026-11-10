@@ -99,6 +99,30 @@ class TableSQL:
         return f"md5(concat({lit(f'{self.spec.seed}:{table.name}:')}, {index}))"
 
     def column(self, col: str, d: dict) -> str:
+        return f'{self.expr(col, d)} as "{col}"'
+
+    def _object(self, col: str, fields: dict[str, dict]) -> str:
+        tree: dict = {}
+        for path, d in fields.items():
+            node = tree
+            *parents, leaf = path.split(".")
+            for key in parents:
+                node = node.setdefault(key, {})
+                if not isinstance(node, dict) or "gen" in node:
+                    break
+            else:
+                node[leaf] = ("leaf", path, d)
+
+        def build(node: dict) -> str:
+            parts = []
+            for key, value in node.items():
+                inner = self.expr(f"{col}.{value[1]}", value[2]) if isinstance(value, tuple) else build(value)
+                parts.append(f"{lit(key)}, {inner}")
+            return f"json_object({', '.join(parts)})"
+
+        return f"{build(tree)}::JSON"
+
+    def expr(self, col: str, d: dict) -> str:
         gen = d.get("gen")
         if gen in ("sequence", "hash_id"):
             expr = self.key_expr(self.t, "g")
@@ -130,6 +154,13 @@ class TableSQL:
             expr = f"concat({', '.join(parts)})"
         elif gen == "time_offset":
             expr = f"_ev + {ms(piecewise(self.u(col), d['p'], d['seconds']))}"
+            if d.get("format"):  # a text column holding dates in this format
+                expr = f"strftime({expr}, {lit(d['format'])})"
+        elif gen == "object":
+            expr = self._object(col, d["fields"])
+        elif gen == "array":
+            n = f"floor({self.u(col)} * 4)::bigint"
+            expr = f"to_json(list_transform(range({n}), lambda i: concat({lit(col.lower() + '_')}, i)))::JSON"
         elif gen == "event_time":
             expr = "_ev"
         elif gen == "updated_at":
@@ -144,13 +175,13 @@ class TableSQL:
         else:
             raise ValueError(f"{self.t.name}.{col}: unknown gen {gen!r}")
         rate = repr(float(d.get("null_rate") or 0.0))
-        if self.sc and self.sc.null_rate is not None and gen in ("fk", "categorical", "dist", "template", "time_offset"):
+        if self.sc and self.sc.null_rate is not None and gen in ("fk", "categorical", "dist", "template", "time_offset", "object", "array"):
             rate = self.during(repr(self.sc.null_rate), rate)
         if rate != "0.0":
             expr = f"case when {self.u(col + ':null')} < {rate} then NULL else {expr} end"
         if d.get("type"):
             expr = f"({expr})::{d['type']}"
-        return f'{expr} as "{col}"'
+        return expr
 
     def select(self, with_new_column: bool = False) -> str:
         """SELECT over global row numbers [$lo, $hi) keeping rows loaded in ($after, $until]."""

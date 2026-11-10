@@ -197,6 +197,9 @@ def define_udfs(emu: "Emulator", udfs: dict[str, str]) -> None:
         semantics.UDFS[name] = f"_udf_{name}"
 
 
+CURRENT: "Emulator | None" = None  # the emulator whose Snowflake endpoint is being served
+
+
 def free_port() -> int:
     with contextlib.closing(socket.socket(type=socket.SOCK_STREAM)) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -257,9 +260,13 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
         time.sleep(0.02)
     if not server.started:
         raise RuntimeError(f"emulator failed to start on port {port}")
+    global CURRENT
+    emu = Emulator(port=port, duck=fs.duck_conn, _fs=fs)
+    outer, CURRENT = CURRENT, emu
     try:
-        yield Emulator(port=port, duck=fs.duck_conn, _fs=fs)
+        yield emu
     finally:
+        CURRENT = outer
         server.should_exit = True
         thread.join(timeout=5)
         fakesnow.server.shared_fs = previous

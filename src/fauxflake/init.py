@@ -34,11 +34,17 @@ AMOUNT = {"p": [0, 0.5, 0.9, 0.99, 1], "v": [0, 20, 100, 500, 5000]}
 WEEK = {"p": [0, 0.5, 1], "seconds": [0, 86400, 604800]}
 
 
+FLATTEN_COLUMNS = {"SEQ", "KEY", "PATH", "INDEX", "VALUE", "THIS"}
+
+
 class SourceUse:
     """What the project's SQL reveals about one source table."""
 
     def __init__(self) -> None:
         self.columns: dict[str, str | None] = {}  # column -> type hint from a cast
+        self.paths: dict[str, dict[str, str | None]] = {}  # variant column -> {"a.b": type hint}
+        self.arrays: set[str] = set()  # variant columns that are flattened or indexed
+        self.formats: dict[str, str] = {}  # text column -> strftime format it is parsed with
         self.star = False
 
     def add(self, column: str, type_hint: str | None = None) -> None:
@@ -59,6 +65,7 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
     except sqlglot.errors.SqlglotError:
         return {}
     passthrough: dict[str, str] = {}  # CTE name -> source it is `select *` of
+    computed: dict[str, set[str]] = {}  # CTE name -> columns it adds next to the star
     lineage: dict[str, dict[str, tuple[str, str]]] = {}  # CTE name -> its outputs
     last: dict[str, tuple[str, str]] = {}
     for scope in traverse_scope(tree):
@@ -67,27 +74,40 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
             continue
         # which source (if any) each alias in this scope stands for, and prior renames
         direct: dict[str, str] = {}
+        added: dict[str, set[str]] = {}
         renames: dict[str, dict[str, tuple[str, str]]] = {}
         selected = {alias: src for alias, (_, src) in scope.selected_sources.items()}
+        # inside LATERAL FLATTEN(input => t.col) the outer table is visible too
+        selected.update({a: src for a, src in getattr(scope, "lateral_sources", {}).items() if a not in selected})
         for alias, node in selected.items():
             if isinstance(node, exp.Table):
                 if _table_id(node) in sources:
                     direct[alias.upper()] = _table_id(node)
                 elif node.name.upper() in passthrough:
                     direct[alias.upper()] = passthrough[node.name.upper()]
+                    added[alias.upper()] = computed.get(node.name.upper(), set())
                 elif models and _table_id(node) in models:  # another model: follow its lineage
                     renames[alias.upper()] = models[_table_id(node)]
             else:  # a CTE or subquery scope
                 name = alias.upper()
                 if name in passthrough:
                     direct[name] = passthrough[name]
+                    added[name] = computed.get(name, set())
                 elif name in lineage:
                     renames[name] = lineage[name]
-        only = next(iter(direct.values())) if len(direct) == 1 and not renames and len(selected) == 1 else None
+        # a lateral FLATTEN next to the table only contributes its own fixed columns
+        laterals = {a.upper() for a, src in selected.items() if getattr(src, "is_udtf", False)}
+        others = {a.upper() for a in selected} - set(direct) - laterals
+        only = next(iter(direct.values())) if len(direct) == 1 and not renames and not others else None
 
         def resolve(col: exp.Column):
             table = col.table.upper()
+            if not table and laterals and col.name.upper() in FLATTEN_COLUMNS:
+                return None
             if table in direct or (not table and only):
+                owner = table or next(iter(direct))
+                if col.name.upper() in added.get(owner, ()):
+                    return None  # computed in the CTE (a row_number, say), not a source column
                 return (direct.get(table) or only), col.name.upper()
             if table in renames:
                 return renames[table].get(col.name.upper())
@@ -99,7 +119,22 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
             hit = resolve(col)
             if hit:
                 cast = col.parent if isinstance(col.parent, (exp.Cast, exp.TryCast)) else None
-                sources[hit[0]].add(hit[1], cast.to.sql(dialect="duckdb") if cast else None)
+                use, parent = sources[hit[0]], col.parent
+                use.add(hit[1], cast.to.sql(dialect="duckdb") if cast else None)
+                if isinstance(parent, exp.JSONExtract) and parent.this is col:
+                    # v:a.b::int tells us the column is a variant holding {"a": {"b": <int>}}
+                    keys = [k.name for k in parent.expression.expressions if isinstance(k, exp.JSONPathKey)]
+                    outer = parent.parent
+                    hint = outer.to.sql(dialect="duckdb") if isinstance(outer, (exp.Cast, exp.TryCast)) else None
+                    if keys:
+                        use.paths.setdefault(hit[1], {})[".".join(keys)] = hint
+                    else:
+                        use.arrays.add(hit[1])
+                elif isinstance(parent, exp.Bracket) or col.find_ancestor(exp.Explode, exp.Lateral, exp.Unnest) is not None:
+                    use.arrays.add(hit[1])
+                elif isinstance(parent, (exp.StrToTime, exp.StrToDate, exp.TsOrDsToDate)) and parent.this is col \
+                        and isinstance(parent.args.get("format"), exp.Literal):
+                    use.formats[hit[1]] = parent.args["format"].name  # a text column holding dates
 
         outputs: dict[str, tuple[str, str]] = {}
         stars = [p for p in select.expressions if isinstance(p, exp.Star) or (isinstance(p, exp.Column) and isinstance(p.this, exp.Star))]
@@ -112,9 +147,11 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 if hit:
                     outputs[proj.alias_or_name.upper()] = hit
         name = scope.expression.parent.alias.upper() if isinstance(scope.expression.parent, exp.CTE) else None
-        if stars and only and len(select.expressions) == 1 and not select.args.get("joins"):
-            if name:
+        if stars and only and not select.args.get("joins"):
+            if name:  # `select *, row_number() ... as rn from source` still passes every column through
                 passthrough[name] = only
+                computed[name] = {p.alias_or_name.upper() for p in select.expressions if p not in stars} \
+                    | added.get(next(iter(direct)), set())
             else:
                 sources[only].star = True
         if stars and len(renames) == 1 and len(selected) == 1:
@@ -231,6 +268,12 @@ def build_spec(manifest: dict, database: str) -> tuple[dict, list[str]]:
             elif (name, col) in accepted:
                 values = accepted[(name, col)]
                 out[col] = {"gen": "categorical", "values": {v: round(1 / len(values), 4) for v in values}}
+            elif col in use.paths:
+                out[col] = {"gen": "object", "fields": {path: guess(path.split(".")[-1], h) for path, h in sorted(use.paths[col].items())}}
+            elif col in use.arrays:
+                out[col] = {"gen": "array"}
+            elif col in use.formats:
+                out[col] = {"gen": "time_offset", "format": use.formats[col], **WEEK}
             elif col == loaded:
                 out[col] = {"gen": "loaded_at"}
             elif col == event:
@@ -266,26 +309,35 @@ HEADER = """# Written by `fauxflake init` from the dbt project. Keys, relationsh
 """
 
 
+_MISSING_ENV = re.compile(r"Env var required but not provided: '(\w+)'")
+
+
+def provide_env(project) -> dict[str, str]:
+    """Projects often read database and schema names from the environment. Parse until dbt
+    stops asking, giving each missing variable a placeholder named after itself."""
+    import os
+
+    provided: dict[str, str] = {}
+    for _ in range(200):
+        if project.invoke(["parse"], quiet=True):
+            break
+        missing = _MISSING_ENV.search(project.last_error)
+        if not missing:
+            raise RuntimeError(f"dbt could not parse the project:\n{project.last_error}")
+        var = missing.group(1)
+        value = re.sub(r"^(DBT_)?(SNOWFLAKE_)?((DATABASE|SCHEMA|DB)_)?", "", var.upper()) or "FAUXFLAKE"
+        provided[var] = os.environ[var] = value
+    return provided
+
+
 def write_spec(project, path: Path, database: str) -> list[str]:
     """`project` is a DbtProject pointed at a running emulator."""
+    env = provide_env(project)
     project.invoke(["compile"], quiet=True)  # best effort: models that fail to compile are skipped
     manifest = json.loads((project.target_path / "manifest.json").read_text())
     spec, notes = build_spec(manifest, database)
+    if env:
+        spec["dbt"]["env"] = env
+        notes.insert(0, f"set placeholders for {len(env)} environment variable(s) the project requires (dbt.env in the spec)")
     path.write_text(HEADER + yaml.safe_dump(spec, sort_keys=False, default_flow_style=None, width=110))
     return notes
-
-
-def check(manifest: dict, spec, database: str) -> list[str]:
-    """Problems that would make the project fail on the generated data: sources or columns
-    the models read that the spec does not generate."""
-    wanted, _ = build_spec(manifest, database)
-    problems = []
-    for name, table in wanted["tables"].items():
-        have = spec.tables.get(name)
-        if have is None:
-            problems.append(f"{name}: used by the project, missing from the spec")
-            continue
-        for col in table["columns"]:
-            if col not in have.columns:
-                problems.append(f"{name}.{col}: used by the project, missing from the spec")
-    return problems

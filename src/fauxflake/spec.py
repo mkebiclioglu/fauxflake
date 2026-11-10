@@ -7,6 +7,7 @@ never rows. `fauxflake profile` measures it from Snowflake; humans can edit it.
 from __future__ import annotations
 
 import math
+import os
 import random
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -101,6 +102,8 @@ class Spec:
                    dbt=raw.get("dbt") or {}, path=Path(path),
                    udfs={k.lower(): v for k, v in (raw.get("udfs") or {}).items()})
         spec.validate()
+        for var, value in (spec.dbt.get("env") or {}).items():
+            os.environ.setdefault(var, str(value))  # placeholders for env vars the project requires
         return spec
 
     def validate(self) -> None:

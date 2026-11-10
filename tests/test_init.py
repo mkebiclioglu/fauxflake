@@ -31,3 +31,55 @@ def test_lineage_through_the_usual_staging_pattern():
     assert out == {"USER_ID": ("RAW.APP.USERS", "ID"), "EMAIL": ("RAW.APP.USERS", "EMAIL_ADDRESS"),
                    "CREATED_AT": ("RAW.APP.USERS", "CREATED")}
     assert set(sources["RAW.APP.USERS"].columns) == {"ID", "EMAIL_ADDRESS", "CREATED"}
+
+
+def test_lineage_through_a_deduplicating_source_cte():
+    sources = {"RAW.GITLAB.ISSUES": SourceUse()}
+    out = scan_model("""
+        with source as (
+            select *, row_number() over (partition by id order by _sdc_batched_at desc) as row_num
+            from raw.gitlab.issues),
+        renamed as (select title, id as issue_id, created_at as created_at_ts from source where row_num = 1)
+        select * from renamed""", sources)
+    assert set(sources["RAW.GITLAB.ISSUES"].columns) == {"ID", "_SDC_BATCHED_AT", "TITLE", "CREATED_AT"}
+    assert out["ISSUE_ID"] == ("RAW.GITLAB.ISSUES", "ID")
+
+
+def test_semi_structured_and_text_date_columns_are_inferred():
+    sources = {"RAW.GH.ISSUES": SourceUse()}
+    scan_model("""
+        select id, user:login::string as author, user:id::int as author_id, payload:repo.name::string as repo,
+               to_date(closed_on, 'YYYY/MM/DD') as closed_date, f.value::string as label
+        from raw.gh.issues, lateral flatten(input => labels) f""", sources)
+    use = sources["RAW.GH.ISSUES"]
+    assert use.paths == {"USER": {"login": "TEXT", "id": "INT"}, "PAYLOAD": {"repo.name": "TEXT"}}
+    assert use.arrays == {"LABELS"} and use.formats == {"CLOSED_ON": "%Y/%m/%d"}
+
+
+def test_generated_objects_and_text_dates_are_usable(emu):
+    import snowflake.connector
+    import yaml
+    from datetime import datetime
+    from fauxflake.generate import Warehouse
+
+    spec_text = yaml.safe_dump({"seed": 1, "start": "2025-01-01", "tables": {"RAW.GH.ISSUES": {
+        "volume": {"rows_per_day": 50}, "columns": {
+            "ID": {"gen": "sequence"},
+            "USER": {"gen": "object", "fields": {"login": {"gen": "template", "template": "u{n}"},
+                                                 "id": {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 9]},
+                                                 "org.name": {"gen": "constant", "value": "acme"}}},
+            "LABELS": {"gen": "array"},
+            "CLOSED_ON": {"gen": "time_offset", "format": "%Y/%m/%d", "p": [0, 1], "seconds": [0, 86400]},
+            "CREATED_AT": {"gen": "event_time"}}}}})
+    path = EXAMPLE.parent / "tests" / ".tmp_spec.yml"
+    path.write_text(spec_text)
+    try:
+        Warehouse(emu, Spec.load(path), 1.0).advance_to(datetime(2025, 1, 5))
+    finally:
+        path.unlink()
+    conn = snowflake.connector.connect(**emu.connect_kwargs(database="RAW", schema="GH"))
+    row = conn.cursor().execute("""
+        select count(*), count(distinct user:login::string), min(user:id::int) >= 1, max(user:org.name::string),
+               min(to_date(closed_on, 'YYYY/MM/DD')) >= '2025-01-01', count(f.value) > 0
+        from raw.gh.issues, lateral flatten(input => labels, outer => true) f""").fetchone()
+    assert row[1] == 200 and row[2:] == (True, "acme", True, True)
