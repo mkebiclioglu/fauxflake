@@ -107,7 +107,10 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
     `schema`, each model is read from the schema dbt built it in (the same on both sides)."""
     duck, out = emu.cursor(), []
     try:
-        duck.create_function("_fx_canonical", _canonical, ["VARCHAR"], "VARCHAR")
+        import pyarrow as pa
+
+        duck.create_function("_fx_canonical", lambda col: pa.array([_canonical(v) for v in col.to_pylist()], pa.string()),
+                             ["VARCHAR"], "VARCHAR", type="arrow")
     except Exception:  # noqa: BLE001  (already registered on this warehouse)
         pass
     for node in sorted(local.models(), key=lambda n: n["name"]):
