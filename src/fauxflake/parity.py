@@ -75,7 +75,7 @@ def _comparable(column: str, kind: str, source: str) -> str:
     (pretty-printed JSON text, floats that differ in the last bit)."""
     quoted = f'"{column}"'
     if kind == "JSON":
-        return f"_fx_canonical({quoted}::varchar) as {quoted}"  # same text whatever the whitespace and key order
+        return f"{quoted}::varchar as {quoted}"  # canonical text: see _canonical_columns
     if kind in ("DOUBLE", "FLOAT"):
         return f"format('{{:.10g}}', {quoted}::double) as {quoted}"
     return f"{quoted}::{kind} as {quoted}" if source == "theirs" else quoted
@@ -102,17 +102,22 @@ def _canonical(text: str | None) -> str | None:
         return text
 
 
+def _canonical_columns(table, columns: list[str]):
+    """The Arrow table with its JSON columns rewritten as canonical text."""
+    import pyarrow as pa
+
+    lookup = {name.upper(): name for name in table.column_names}
+    for col in columns:
+        name = lookup[col]
+        values = [_canonical(None if v is None else str(v)) for v in table.column(name).to_pylist()]
+        table = table.set_column(table.column_names.index(name), name, pa.array(values, pa.string()))
+    return table
+
+
 def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_schema: str | None = None) -> list[Parity]:
     """Each model on the emulator against the same model on Snowflake, row for row. Without
     `schema`, each model is read from the schema dbt built it in (the same on both sides)."""
     duck, out = emu.cursor(), []
-    try:
-        import pyarrow as pa
-
-        duck.create_function("_fx_canonical", lambda col: pa.array([_canonical(v) for v in col.to_pylist()], pa.string()),
-                             ["VARCHAR"], "VARCHAR", type="arrow")
-    except Exception:  # noqa: BLE001  (already registered on this warehouse)
-        pass
     for node in sorted(local.models(), key=lambda n: n["name"]):
         name = node.get("alias") or node["name"]
         try:
@@ -129,9 +134,16 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
                     out.append(Parity(node["name"], 0, theirs.num_rows, 0, 0, f"columns differ: {sorted(missing)}"))
                     continue
                 theirs_n = theirs.num_rows
+                source = mine
+                documents = [c for c, ty in types.items() if ty == "JSON"]
+                if documents:  # compare JSON by content: key order and 1 vs 1.0 are not differences
+                    duck.register("_theirs", _canonical_columns(theirs, documents))
+                    cols = ", ".join(f'"{c}"::varchar as "{c}"' if c in documents else f'"{c}"' for c in types)
+                    duck.register("_mine", _canonical_columns(duck.execute(f"select {cols} from {mine}").to_arrow_table(), documents))
+                    source = "_mine"
                 a, b = duck.execute(f"""
                     with t as (select {', '.join(_comparable(c, ty, 'theirs') for c, ty in types.items())} from _theirs),
-                         m as (select {', '.join(_comparable(c, ty, 'mine') for c, ty in types.items())} from {mine})
+                         m as (select {', '.join(_comparable(c, ty, 'mine') for c, ty in types.items())} from {source})
                     select (select count(*) from (select * from m except all select * from t)),
                            (select count(*) from (select * from t except all select * from m))""").fetchone()
             mine_n = duck.execute(f"select count(*) from {mine}").fetchone()[0]
