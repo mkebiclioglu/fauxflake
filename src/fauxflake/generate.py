@@ -88,9 +88,11 @@ class TableSQL:
             return normal
         return f"(case when day between date '{self.sc.start}' and date '{self.sc.end}' then {bad} else {normal} end)"
 
+    base = "g"  # what a column's randomness is keyed on: the row, or another column's value (`follows`)
+
     def u(self, salt: str, *extra: str) -> str:
         args = "".join(f", {e}" for e in extra)
-        return f"((hash(g, {lit(f'{self.spec.seed}:{self.t.name}:{salt}')}{args}) >> 11)::double / 9007199254740992.0)"
+        return f"((hash({self.base}, {lit(f'{self.spec.seed}:{self.t.name}:{salt}')}{args}) >> 11)::double / 9007199254740992.0)"
 
     def key_expr(self, table: Table, index: str) -> str:
         _col, d = table.key
@@ -123,6 +125,18 @@ class TableSQL:
         return f"{build(tree)}::JSON" if tree else "'{}'::JSON"
 
     def expr(self, col: str, d: dict) -> str:
+        """SQL for one column. With `follows: OTHER`, the value is a function of OTHER's value
+        instead of the row, so an id and its attributes stay consistent across rows."""
+        other = d.get("follows")
+        if other and self.base == "g":
+            self.base = f"({self.expr(other, self.t.columns[other])})"
+            try:
+                return self._expr(col, d)
+            finally:
+                self.base = "g"
+        return self._expr(col, d)
+
+    def _expr(self, col: str, d: dict) -> str:
         gen = d.get("gen")
         if gen in ("sequence", "hash_id"):
             expr = self.key_expr(self.t, "g")
@@ -146,9 +160,9 @@ class TableSQL:
             parts = []
             for i, chunk in enumerate(d["template"].replace("{n}", "\0n\0").replace("{hex}", "\0hex\0").split("\0")):
                 if chunk == "n":
-                    parts.append("(g + 1)::varchar")
+                    parts.append(f"({self.base} + 1)::varchar" if self.base == "g" else f"({self.base})::varchar")
                 elif chunk == "hex":
-                    parts.append(f"substr(md5(concat({lit(f'{self.spec.seed}:{self.t.name}:{col}:')}, g)), 1, 12)")
+                    parts.append(f"substr(md5(concat({lit(f'{self.spec.seed}:{self.t.name}:{col}:')}, {self.base})), 1, 12)")
                 elif chunk:
                     parts.append(lit(chunk))
             expr = f"concat({', '.join(parts)})"

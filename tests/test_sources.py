@@ -72,3 +72,21 @@ def test_udfs_from_the_spec_are_callable(emu, spec):
     row = conn.cursor().execute(
         "select fiscal_year('2025-03-01'::date), analytics.udfs.fiscal_year('2025-01-15'::date), ID15TO18('abc')").fetchone()
     assert row == (2026, 2025, "abcAAA")
+
+
+def test_attributes_follow_their_id(emu, tmp_path):
+    import yaml
+
+    path = tmp_path / "s.yml"
+    path.write_text(yaml.safe_dump({"seed": 1, "start": "2025-01-01", "tables": {"RAW.GH.ISSUES": {
+        "volume": {"rows_per_day": 2000}, "columns": {
+            "ID": {"gen": "sequence"},
+            "AUTHOR_ID": {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 50]},
+            "AUTHOR_USERNAME": {"gen": "template", "template": "user_{hex}", "follows": "AUTHOR_ID"},
+            "AUTHOR_TIER": {"gen": "categorical", "values": {"a": 0.5, "b": 0.5}, "follows": "AUTHOR_ID"},
+            "TITLE": {"gen": "template", "template": "t_{hex}"}}}}}))
+    Warehouse(emu, Spec.load(path), 1.0).advance_to(datetime(2025, 1, 3))
+    authors, names, pairs, tiers, titles = emu.cursor().execute("""
+        select count(distinct AUTHOR_ID), count(distinct AUTHOR_USERNAME), count(distinct (AUTHOR_ID, AUTHOR_USERNAME)),
+               count(distinct (AUTHOR_ID, AUTHOR_TIER)), count(distinct TITLE) from RAW.GH.ISSUES""").fetchone()
+    assert authors == names == pairs == tiers and 40 < authors <= 50 and titles == 4000

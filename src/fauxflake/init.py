@@ -304,6 +304,12 @@ def build_spec(manifest: dict, database: str) -> tuple[dict, list[str]]:
                 out[col] = {"gen": "updated_at"}
             else:
                 out[col] = guess(col, hint)
+        # author_id + author_username: the name belongs to the id, so it must not vary between rows
+        for col, d in out.items():
+            if col.endswith("_ID") and d["gen"] in ("dist", "fk", "template"):
+                for sibling, sd in out.items():
+                    if sibling != col and sibling.startswith(col[:-2]) and sd["gen"] in ("template", "categorical"):
+                        sd["follows"] = col
         tables[name] = {
             "volume": {"rows_per_day": 1_000_000, "weekly": [1, 1, 1, 1, 1, 1, 1]},  # placeholder
             "lateness": {"p": [0, 0.5, 0.99, 1], "seconds": [1, 30, 3600, 86400]},  # placeholder
