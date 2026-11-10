@@ -74,6 +74,33 @@ expression in `stg_orders` gives, in 7 seconds:
 The output is Markdown; [`docs/workflows/dbt-ci.yml`](docs/workflows/dbt-ci.yml) posts it as
 a pull request comment. Models with a `unique` test get per-column change counts.
 
+## Bad days
+
+Production-shaped data tests the average day. Bugs live in the others.
+
+```sh
+uv run fauxflake scenarios
+```
+
+```
+scenario          verdict          detail
+late-spike        SILENT DRIFT     wrong data, no test failed: fct_daily_events
+duplicate-storm   survived         builds passed, incrementals match a full refresh
+null-surge        caught           dbt build failed on 6 of 7 days; drift in fct_daily_events
+volume-spike      survived         builds passed, incrementals match a full refresh
+empty-day         survived         builds passed, incrementals match a full refresh
+loader-outage     survived         builds passed, incrementals match a full refresh
+```
+
+Each scenario bends two days of the synthetic history and replays a week of runs. The
+verdict is one of: **survived**, **caught** (a dbt test failed, so someone would have been
+paged), or **silent drift** (every test passed and the data is wrong; the command exits 1).
+
+That is the example project's real output, and two of the lines are genuine findings about
+it. The three-day late window does not cover a backlog. And the null surge exposed a bug
+nobody planted: `fct_daily_events` uses `delete+insert` keyed on `event_type`, a `NULL` key
+never matches its own delete, so those rows duplicate on every run.
+
 ## How it works
 
 ```
@@ -255,6 +282,7 @@ Read these before trusting a green check.
 - On-disk generation for full-scale runs
 - Schema-drift check between the spec and dbt `sources.yml`
 - Snapshots in the drift comparison
+- More scenarios: schema changes, out-of-order updates, timezone and month-end boundaries
 
 ## Development
 

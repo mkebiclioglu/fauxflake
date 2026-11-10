@@ -232,3 +232,43 @@ def diff(spec_path, project_dir, scale, history, base, output, fail_on_change, d
         Path(output).write_text(report + "\n")
     if fail_on_change and any(d.status != "same" for d in diffs):
         sys.exit(1)
+
+
+@main.command(context_settings={"ignore_unknown_options": True})
+@with_common
+@click.option("--days", default=7, show_default=True, help="Simulated days per scenario.")
+@click.option("--only", multiple=True, help="Scenario name; repeat to run several. Default: all.")
+@click.argument("dbt_args", nargs=-1, type=click.UNPROCESSED)
+def scenarios(spec_path, project_dir, scale, history, days, only, dbt_args):
+    """Replay bad days (late data, duplicates, nulls, spikes, outages) and report what happens."""
+    import contextlib
+    import io
+
+    from .dbt import DbtProject, emulator_output
+    from .emulator import serve
+    from .generate import SCENARIOS, Warehouse, scenario
+    from .simulate import simulate as run
+
+    spec = Spec.load(spec_path)
+    start = _start(spec, history)
+    silent = False
+    click.echo(f"{'scenario':<17} {'verdict':<16} detail")
+    for name in only or SCENARIOS:
+        failures: list = []
+        sc = scenario(name, (start + timedelta(days=1)).date())
+        with serve() as emu:
+            wh = Warehouse(emu, spec, scale, sc)
+            project = DbtProject(project_dir, emulator_output(emu.port, spec.dbt.get("database", "ANALYTICS")))
+            with contextlib.redirect_stdout(io.StringIO()):  # dbt's own output for failing runs
+                drifts = run(wh, project, start, days, 24, list(dbt_args), log=lambda *_: None, failures=failures)
+        drifted = [d.model for d in drifts if not d.ok]
+        if drifted and not failures:
+            verdict, detail, silent = "SILENT DRIFT", "wrong data, no test failed: " + ", ".join(drifted), True
+        elif failures:
+            verdict = "caught"
+            detail = f"dbt build failed on {len(failures)} of {days} days" + (f"; drift in {', '.join(drifted)}" if drifted else "")
+        else:
+            verdict, detail = "survived", "builds passed, incrementals match a full refresh"
+        click.echo(f"{name:<17} {verdict:<16} {detail}")
+    if silent:
+        sys.exit(1)

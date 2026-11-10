@@ -14,6 +14,7 @@ property gives everything else:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
 import duckdb
@@ -47,9 +48,43 @@ def ms(seconds_expr: str) -> str:
     return f"to_milliseconds(floor(({seconds_expr}) * 1000)::bigint)"
 
 
+@dataclass
+class Scenario:
+    """A bad day. Part of the deterministic universe, so the clock still behaves."""
+
+    name: str
+    start: date  # first and last affected event day
+    end: date
+    lateness_factor: float = 1.0
+    duplicate_rate: float | None = None
+    null_rate: float | None = None
+    volume_factor: float = 1.0
+    outage_hours: float = 0.0
+
+
+SCENARIOS: dict[str, dict] = {
+    "late-spike": {"lateness_factor": 4.0},      # a backlog: everything arrives four times later
+    "duplicate-storm": {"duplicate_rate": 0.3},  # a replayed topic
+    "null-surge": {"null_rate": 0.3},            # an upstream release drops fields
+    "volume-spike": {"volume_factor": 10.0},     # launch day
+    "empty-day": {"volume_factor": 0.0},         # nothing was produced
+    "loader-outage": {"outage_hours": 30.0},     # the loader is down, then delivers everything at once
+}
+
+
+def scenario(name: str, first_day: date, days: int = 2) -> Scenario:
+    return Scenario(name=name, start=first_day, end=first_day + timedelta(days=days - 1), **SCENARIOS[name])
+
+
 class TableSQL:
-    def __init__(self, spec: Spec, table: Table):
-        self.spec, self.t = spec, table
+    def __init__(self, spec: Spec, table: Table, scenario: Scenario | None = None):
+        self.spec, self.t, self.sc = spec, table, scenario
+
+    def during(self, bad: str, normal: str) -> str:
+        """`bad` for rows whose event day is inside the scenario, `normal` otherwise."""
+        if not self.sc:
+            return normal
+        return f"(case when day between date '{self.sc.start}' and date '{self.sc.end}' then {bad} else {normal} end)"
 
     def u(self, salt: str, *extra: str) -> str:
         args = "".join(f", {e}" for e in extra)
@@ -106,8 +141,11 @@ class TableSQL:
             expr = lit(d.get("value"))
         else:
             raise ValueError(f"{self.t.name}.{col}: unknown gen {gen!r}")
-        if d.get("null_rate"):
-            expr = f"case when {self.u(col + ':null')} < {float(d['null_rate'])!r} then NULL else {expr} end"
+        rate = repr(float(d.get("null_rate") or 0.0))
+        if self.sc and self.sc.null_rate is not None and gen in ("fk", "categorical", "dist", "template", "time_offset"):
+            rate = self.during(repr(self.sc.null_rate), rate)
+        if rate != "0.0":
+            expr = f"case when {self.u(col + ':null')} < {rate} then NULL else {expr} end"
         if d.get("type"):
             expr = f"({expr})::{d['type']}"
         return f'{expr} as "{col}"'
@@ -137,22 +175,31 @@ class TableSQL:
         ts = "case k.k " + " ".join(f"when {i} then {x}" for i, x in enumerate(times)) + " end"
 
         late = piecewise(self.u("late", "k"), t.lateness["p"], t.lateness["seconds"])
-        dup_rate = float(t.raw.get("duplicate_rate", 0.0))
+        dup_rate = repr(float(t.raw.get("duplicate_rate", 0.0)))
+        arrived = f"_l0 + {ms(f"dup.d * (1 + {self.u('redeliver', 'k')} * 600)")}"
+        if self.sc:
+            late = f"{late} * {self.during(repr(self.sc.lateness_factor), '1.0')}"
+            if self.sc.duplicate_rate is not None:
+                dup_rate = self.during(repr(self.sc.duplicate_rate), dup_rate)
+            if self.sc.outage_hours:
+                down = f"timestamp '{self.sc.start} 00:00:00'"
+                up = f"({down} + {ms(repr(self.sc.outage_hours * 3600))})"
+                arrived = f"(select case when x >= {down} and x < {up} then {up} else x end from (select {arrived} as x))"
         cols = ",\n  ".join(self.column(c, d) for c, d in t.columns.items())
         return f"""
 with b as (
   select r.g, c.day{pcs}
   from range($lo, $hi) r(g)
-  asof join cal_{t.ident} c on r.g >= c.cum{joins}
+  asof join (select * from cal_{t.ident} where n > 0) c on r.g >= c.cum{joins}
 ),
 e as (select *, day::timestamp + {ms(second_of_day)} as _ev from b),
 s as (select *{''.join(reached)} from e),
 v as (select s.*, k.k, {ts} as _ts from s cross join range({len(steps) + 1}) k(k) where {' or '.join(where)}),
 l as (select *, _ts + {ms(late)} as _l0 from v),
 d as (
-  select l.*, _l0 + {ms(f"dup.d * (1 + {self.u('redeliver', 'k')} * 600)")} as _loaded
+  select l.*, {arrived} as _loaded
   from l cross join range(2) dup(d)
-  where dup.d = 0 or {self.u('dup', 'k')} < {dup_rate!r}
+  where dup.d = 0 or {self.u('dup', 'k')} < {dup_rate}
 )
 select
   {cols}
@@ -163,15 +210,15 @@ where _loaded > $after and _loaded <= $until"""
 class Warehouse:
     """The synthetic sources at a point in simulated time."""
 
-    def __init__(self, emu: emulator.Emulator, spec: Spec, scale: float = 1.0):
-        self.emu, self.spec, self.scale = emu, spec, scale
+    def __init__(self, emu: emulator.Emulator, spec: Spec, scale: float = 1.0, scenario: Scenario | None = None):
+        self.emu, self.spec, self.scale, self.scenario = emu, spec, scale, scenario
         self.cur: duckdb.DuckDBPyConnection = emu.cursor()
         self.now: datetime | None = None
 
     def _calendars(self, until: datetime) -> dict[str, list[tuple[date, int, int]]]:
         cals = {}
         for t in self.spec.tables.values():
-            cal = t.calendar(self.spec.start, until.date(), self.spec.seed, self.scale)
+            cal = t.calendar(self.spec.start, until.date(), self.spec.seed, self.scale, self.scenario)
             self.cur.execute(f"create or replace temp table cal_{t.ident} (day date, cum bigint, n bigint)")
             self.cur.executemany(f"insert into cal_{t.ident} values (?, ?, ?)", cal)
             cals[t.name] = cal
@@ -190,7 +237,7 @@ class Warehouse:
                 self.emu.ensure_database(db, schema)
                 first = 0
             else:
-                first_day = self.now.date() - timedelta(days=t.horizon_days())
+                first_day = self.now.date() - timedelta(days=t.horizon_days(self.scenario))
                 first = max(0, (first_day - self.spec.start).days)
             params = {
                 "lo": cal[first][1],
@@ -198,7 +245,7 @@ class Warehouse:
                 "after": self.now or datetime(1, 1, 1),
                 "until": until,
             }
-            select = TableSQL(self.spec, t).select()
+            select = TableSQL(self.spec, t, self.scenario).select()
             verb = f"create or replace table {t.name} as" if self.now is None else f"insert into {t.name}"
             counts[t.name] = self.cur.execute(f"{verb} {select}", params).fetchone()[0]
         self.now = until

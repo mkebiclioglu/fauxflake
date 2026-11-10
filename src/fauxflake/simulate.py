@@ -45,7 +45,8 @@ def compare(emu: Emulator, project: DbtProject, schema: str, rebuilt_schema: str
 
 
 def simulate(wh: Warehouse, project: DbtProject, start: datetime, days: int, step_hours: float = 24,
-             dbt_args: list[str] | None = None, log=print) -> list[Drift]:
+             dbt_args: list[str] | None = None, log=print, failures: list[datetime] | None = None) -> list[Drift]:
+    """With `failures`, a failing dbt build is recorded there instead of ending the run."""
     dbt_args = dbt_args or []
     t0 = time.time()
     counts = wh.advance_to(start)
@@ -60,7 +61,9 @@ def simulate(wh: Warehouse, project: DbtProject, start: datetime, days: int, ste
         counts = wh.advance_to(now)
         t1 = time.time()
         if not project.invoke(["build", *dbt_args], quiet=True):
-            raise SystemExit(f"dbt build failed at simulated time {now}")
+            if failures is None:
+                raise SystemExit(f"dbt build failed at simulated time {now}")
+            failures.append(now)
         log(f"{now:%Y-%m-%d %H:%M}  +{sum(counts.values()):>11,} rows  "
             f"(generate {t1 - t0:.1f}s, dbt {time.time() - t1:.1f}s)")
 

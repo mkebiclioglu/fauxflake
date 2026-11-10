@@ -46,14 +46,16 @@ class Table:
     def lateness(self) -> dict:
         return self.raw.get("lateness") or {"p": [0, 1], "seconds": [0, 0]}
 
-    def horizon_days(self) -> int:
+    def horizon_days(self, scenario=None) -> int:
         """How far back a row's event day can be and still produce a new arrival today."""
         seconds = max(self.lateness["seconds"]) + 700  # + redelivery delay of duplicates
+        if scenario:
+            seconds = seconds * max(1.0, scenario.lateness_factor) + scenario.outage_hours * 3600
         for step in (self.lifecycle or {}).get("steps", []):
             seconds += max(step["delay"]["seconds"])
         return math.ceil(seconds / DAY) + 1
 
-    def calendar(self, start: date, end: date, seed: int, scale: float) -> list[tuple[date, int, int]]:
+    def calendar(self, start: date, end: date, seed: int, scale: float, scenario=None) -> list[tuple[date, int, int]]:
         """(day, cumulative rows before day, rows on day) for every event day in [start, end]."""
         vol = self.raw.get("volume", {})
         base = float(vol.get("rows_per_day", 1000))
@@ -68,6 +70,8 @@ class Table:
             rng = random.Random(f"{seed}:{self.name}:{day.isoformat()}")
             level = base * (1 + growth) ** ((day - anchor).days / 365.0) * weekly[day.weekday()]
             n = max(1, round(level * max(0.0, 1 + noise * rng.gauss(0, 1))))
+            if scenario and scenario.start <= day <= scenario.end:
+                n = round(n * scenario.volume_factor)
             out.append((day, cum, n))
             cum += n
             day += timedelta(days=1)
