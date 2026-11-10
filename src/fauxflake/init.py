@@ -73,8 +73,21 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
     lineage: dict[str, dict[str, tuple[str, str]]] = {}  # CTE name -> its outputs
     last: dict[str, tuple[str, str]] = {}
     positional: dict[int, list] = {}  # select -> source column behind each projection, by position
+    cte_positions: dict[str, list] = {}
+    outputs_of: dict[int, dict] = {}
     for scope in traverse_scope(tree):
         select = scope.expression
+        if isinstance(select, exp.SetOperation):
+            # a UNION is known by its first branch: names and order come from there
+            first = select
+            while isinstance(first, exp.SetOperation):
+                first = first.left.unnest()
+            outputs = outputs_of.get(id(first), {})
+            if isinstance(select.parent, exp.CTE):
+                lineage[select.parent.alias.upper()] = outputs
+                cte_positions[select.parent.alias.upper()] = positional.get(id(first), [])
+            last = outputs
+            continue
         if not isinstance(select, exp.Select):
             continue
         # which source (if any) each alias in this scope stands for, and prior renames
@@ -174,8 +187,14 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 sources[only].star = True
         if stars and len(renames) == 1 and len(selected) == 1:
             outputs = {**next(iter(renames.values())), **outputs}
+        if stars and len(select.expressions) == 1 and len(selected) == 1:
+            inner_name = next(iter(selected)).upper()
+            if inner_name in cte_positions:  # `select * from cte` keeps the CTE's column order
+                by_position[:] = cte_positions[inner_name]
+        outputs_of[id(select)] = outputs
         if name:
             lineage[name] = outputs
+            cte_positions[name] = by_position
         last = outputs
     if links is not None:
         # UNION branches line up by position, and aligned columns must share a type
