@@ -14,6 +14,7 @@ property gives everything else:
 
 from __future__ import annotations
 
+import zlib
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
@@ -103,7 +104,10 @@ class TableSQL:
     def key_expr(self, table: Table, index: str) -> str:
         _col, d = table.key
         if d["gen"] == "sequence":
-            return f"({index} + 1)::BIGINT"
+            # each table counts in its own range, as ids from different systems do: two tables'
+            # keys never collide when a model unions them
+            offset = (zlib.crc32(table.name.encode()) % 900 + 100) * 1_000_000_000
+            return f"({index} + {offset + 1})::BIGINT"
         return f"md5(concat({lit(f'{self.spec.seed}:{table.name}:')}, {index}))"
 
     def column(self, col: str, d: dict) -> str:
