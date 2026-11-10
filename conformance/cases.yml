@@ -286,3 +286,4 @@
 - {id: windowed_object_agg, sql: "select n, object_agg(n, v::variant) over (partition by k), array_agg(v) within group (order by v) over (partition by k) from (select column1 k, column2 n, column3 v from values ('a', 'p', 1), ('a', 'q', 2)) order by n"}
 - {id: chained_comparison, sql: "select column1 = 'x' = false from values ('x'), ('y') order by 1"}
 - {id: group_alias_window, sql: "select date_trunc('day', t) as date_day, c as c, sum(x) as s, ratio_to_report(sum(x)) over (partition by date_day) r from (select '2025-01-01 10:00'::timestamp t, 'a' c, 2 x union all select '2025-01-01 11:00', 'b', 6) group by 1, 2 order by 2"}
+- {id: float_to_integer_casts, sql: "select x::int, x::number(38,0), cast(x as decimal), x::bigint, round(x), x::number(10,1), d::int, t::int from (select column1::float x, column1::number(10,2) d, column1::varchar t from values (0.5), (1.5), (2.5), (-0.5), (-2.5), (2.4)) order by x"}

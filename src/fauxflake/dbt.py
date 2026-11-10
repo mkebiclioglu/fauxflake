@@ -48,7 +48,9 @@ class DbtProject:
         self.profiles_dir = self.dir / ".fauxflake" / name
         self.profiles_dir.mkdir(parents=True, exist_ok=True)
         self.target_path = self.dir / "target" / name
-        profile = {project["profile"]: {"target": "fauxflake", "outputs": {"fauxflake": output}}}
+        # projects that branch on `target.name` can pick the name: `dbt: {target: ci}` in the spec
+        self.target = os.environ.get("FAUXFLAKE_TARGET") or "fauxflake"
+        profile = {project["profile"]: {"target": self.target, "outputs": {self.target: output}}}
         (self.profiles_dir / "profiles.yml").write_text(yaml.safe_dump(profile, sort_keys=False))
         (self.dir / ".fauxflake" / ".gitignore").write_text("*\n")
         declared = any((self.dir / f).exists() for f in ("packages.yml", "dependencies.yml"))
@@ -68,7 +70,7 @@ class DbtProject:
 
         self._databases_ready = True
         flags = ["--project-dir", str(self.dir), "--profiles-dir", str(self.profiles_dir),
-                 "--target", "fauxflake", "--target-path", str(self.target_path)]
+                 "--target", self.target, "--target-path", str(self.target_path)]
         if emulator.CURRENT is None or not dbtRunner().invoke(["--quiet", "parse", *flags]).success:
             return
         manifest = json.loads((self.target_path / "manifest.json").read_text())
@@ -84,7 +86,7 @@ class DbtProject:
             self._create_databases()
         os.environ.setdefault("DBT_SEND_ANONYMOUS_USAGE_STATS", "false")
         cmd = (["--quiet"] if quiet else []) + list(args) + [
-            "--project-dir", str(self.dir), "--profiles-dir", str(self.profiles_dir), "--target", "fauxflake",
+            "--project-dir", str(self.dir), "--profiles-dir", str(self.profiles_dir), "--target", self.target,
             "--target-path", str(self.target_path),
         ]
         result = dbtRunner().invoke(cmd)

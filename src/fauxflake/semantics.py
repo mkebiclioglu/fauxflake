@@ -233,6 +233,10 @@ MACROS = [
     *[f"""create or replace macro {_NS}_sf_encrypt_raw({args}) as json_object(
           'ciphertext', upper(sha256(v::varchar || k::varchar)), 'iv', upper(md5(k::varchar)), 'tag', upper(md5(v::varchar)))"""
       for args in ("v, k", "v, k, iv", "v, k, iv, aad", "v, k, iv, aad, mode")],
+    # A float cast to an integer rounds half away from zero (2.5 -> 3). DuckDB rounds half to even.
+    f"""create or replace macro {_NS}_sf_int(x) as case
+          when typeof(x) in ('DOUBLE', 'FLOAT') then cast(round(try_cast(x::varchar as double)) as bigint)
+          else cast(x as bigint) end""",
     # UPPER('ß') is 'SS'.
     f"create or replace macro {_NS}_sf_upper(s) as replace(upper(s), 'ẞ', 'SS')",
 ]
@@ -457,6 +461,11 @@ def _fix(node: exp.Expression) -> exp.Expression:
         if to.is_type("date") and not isinstance(inner, (*_VARIANT_ACCESS, exp.Null, exp.Cast, exp.Anonymous)) \
                 and not (isinstance(inner, exp.Literal) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", inner.name)):
             return _fn("_sf_to_date", inner)
+        whole = to.is_type("int", "bigint", "smallint", "tinyint") or (
+            to.is_type("decimal") and (not to.expressions or (len(to.expressions) == 2 and to.expressions[1].name == "0")
+                                       or len(to.expressions) == 1))
+        if whole and not isinstance(inner, (*_VARIANT_ACCESS, exp.Literal, exp.Null, exp.Boolean)):
+            return _fn("_sf_int", inner)
         if to.is_type("variant") and not isinstance(inner, exp.Null):
             return exp.ToVariant(this=inner)  # 'a'::variant is the string a, not JSON text to parse
     if isinstance(node, exp.TryCast) and node.to.is_type("date") and not isinstance(node.this, _VARIANT_ACCESS):
@@ -519,6 +528,19 @@ def _fix(node: exp.Expression) -> exp.Expression:
         if len(kinds) > 1 or (kinds and len(node.expressions) > sum(isinstance(e, (exp.Literal, exp.Null)) for e in node.expressions)):
             # mixed element types: an ARRAY holds variants, a DuckDB list needs one type
             node.set("expressions", [e if isinstance(e, exp.Null) else exp.ToVariant(this=e) for e in node.expressions])
+    if isinstance(node, exp.Uniform):
+        # UNIFORM(lo, hi, RANDOM()): written out here so it also works inside CTEs and views
+        gen = node.args.get("gen")
+        unit = exp.Anonymous(this="random") if isinstance(gen, exp.Rand) or gen is None else \
+            sqlglot.parse_one("(hash(0) % 1000003) / 1000003.0", read="duckdb").transform(
+                lambda n: gen.copy() if isinstance(n, exp.Literal) and n.name == "0" and isinstance(n.parent, exp.Anonymous) else n)
+        lo, hi = node.this, node.expression
+        real = any(isinstance(b, exp.Cast) and b.to.is_type("double", "float") or (isinstance(b, exp.Literal) and "." in b.name)
+                   for b in (lo, hi))
+        if real:
+            return exp.paren(exp.Add(this=lo, expression=exp.Mul(this=unit, expression=exp.paren(exp.Sub(this=hi, expression=lo.copy())))))
+        span = exp.paren(exp.Add(this=exp.Sub(this=hi, expression=lo.copy()), expression=exp.Literal.number(1)))
+        return exp.cast(exp.Floor(this=exp.Add(this=lo, expression=exp.Mul(this=unit, expression=span))), "bigint")
     if isinstance(node, exp.JSONKeys):
         return _fn("_sf_object_keys", node.this)
     if isinstance(node, exp.GetExtract):

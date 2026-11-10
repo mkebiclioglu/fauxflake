@@ -104,6 +104,8 @@ class Spec:
         spec.validate()
         for var, value in (spec.dbt.get("env") or {}).items():
             os.environ.setdefault(var, str(value))  # placeholders for env vars the project requires
+        if (raw.get("dbt") or {}).get("target"):
+            os.environ.setdefault("FAUXFLAKE_TARGET", str(raw["dbt"]["target"]))  # for `target.name` checks
         return spec
 
     def validate(self) -> None:
