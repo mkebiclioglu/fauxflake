@@ -390,7 +390,8 @@ def execute(project_dir: Path, rendered: Path, json_path: str | None, max_passes
     def infer(uid: str, msg: str) -> bool:
         m1 = re.search(r'(?:Table|Values list) "([^"]+)" does not have a column named "([^"]+)"', msg)
         # DuckDB reports a missing column that shares its name with a SELECT alias differently
-        m2 = re.search(r'Referenced column "?([^"\s]+)"? not found in FROM clause', msg) or \
+        m2 = re.search(r'Referenced column "([^"]+)" not found in FROM clause', msg) or \
+            re.search(r'Referenced column "?([^"\s]+)"? not found in FROM clause', msg) or \
             re.search(r'Column "([^"]+)" referenced that exists in the SELECT clause', msg)
         if not (m1 or m2):
             return False

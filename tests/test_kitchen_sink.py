@@ -22,3 +22,9 @@ def test_dbt_utils_seeds_snapshots_and_ephemerals(emu):
     assert cur.execute("select count(*), count(distinct PAYMENT_KEY) from ANALYTICS.CI.FCT_PAYMENTS").fetchone()[0] > 6000
     assert cur.execute("select count(*) from ANALYTICS.CI.CALENDAR").fetchone()[0] == 59
     assert {c for c, *_ in cur.execute("describe ANALYTICS.CI.DIM_USERS").fetchall()} >= {"USER_ID", "EMAIL", "PLAN", "usd", "eur"}
+    # materializations that only exist on Snowflake still produce their rows
+    payments = cur.execute("select count(*) from ANALYTICS.CI.FCT_PAYMENTS").fetchone()[0]
+    assert cur.execute("select count(*) from ANALYTICS.CI.CLUSTERED_PAYMENTS").fetchone()[0] == payments
+    assert cur.execute("select sum(USERS) from ANALYTICS.CI.PLAN_SUMMARY").fetchone()[0] == \
+        cur.execute("select count(*) from ANALYTICS.CI.DIM_USERS").fetchone()[0]  # a dynamic table
+    assert cur.execute("select count(*) from ANALYTICS.CI.SECURE_USERS").fetchone()[0] > 0  # a secure view

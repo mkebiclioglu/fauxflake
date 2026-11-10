@@ -46,6 +46,22 @@ REWRITES: list[tuple[re.Pattern[str], str, str]] = [
         r"""select upper('\1') as "key", '' as "value", '' as "default", 'SESSION' as "level", '' as "description", 'STRING' as "type" """,
         "session parameters are empty",
     ),
+    (
+        # dbt reads existing grants before applying `grants:` / `copy_grants`: there are none locally
+        re.compile(r"(?s)^(?:\s|--[^\n]*\n|/\*.*?\*/)*show\s+grants\s+on\s.*$", re.IGNORECASE),
+        """select null as "created_on", null as "privilege", null as "granted_on", null as "name", null as "granted_to", """
+        """null as "grantee_name", null as "grant_option", null as "granted_by" where false""",
+        "no grants exist locally",
+    ),
+    (
+        # A dynamic table is a query Snowflake keeps fresh by itself. Locally it is a table that
+        # every run rebuilds: the lag, warehouse and refresh settings have nothing to act on.
+        re.compile(r"(?s)\bcreate\s+(?:or\s+replace\s+)?(?:transient\s+)?dynamic\s+table\s+(?:if\s+not\s+exists\s+)?(\S+)\s.*?\bas\s*(?=\(|select\b|with\b)",
+                   re.IGNORECASE),
+        r"create or replace table \1 as ",
+        "dynamic table -> table",
+    ),
+    (re.compile(r"\bdrop\s+dynamic\s+table\b", re.IGNORECASE), "drop table", "dynamic table -> table"),
 ]
 
 
@@ -87,6 +103,7 @@ NOPS = [
     _LEAD + r"alter\s+\w+(\s+\w+)?\s+(if\s+exists\s+)?\S+\s+(un)?set\s+(tag|comment|data_retention_time_in_days|change_tracking|query_tag)\b",
     _LEAD + r"alter\s+(table|materialized\s+view|dynamic\s+table)\s+\S+\s+(cluster\s+by|drop\s+clustering|resume|suspend)\b",
     _LEAD + r"(grant|revoke)\s",
+    _LEAD + r"alter\s+dynamic\s+table\s",
     _LEAD + r"alter\s+(session|warehouse|account)\s",
     _LEAD + r"use\s+(warehouse|role|secondary\s+roles)\s",
 ]
