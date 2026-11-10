@@ -97,7 +97,7 @@ def main() -> None:
             if node is None or uid in seen:
                 return False
             seen.add(uid)
-            return bool(clock.search(node.get("compiled_code") or "")) or any(reads_clock(d, seen) for d in (node.get("depends_on") or {}).get("nodes") or [])
+            return bool(clock.search((node.get("compiled_code") or "") + (node.get("raw_code") or ""))) or any(reads_clock(d, seen) for d in (node.get("depends_on") or {}).get("nodes") or [])
 
         differing = [p for p in parity if not p.ok]
         timed = [p for p in differing if not p.note and p.emulator_rows == p.snowflake_rows and reads_clock(by_name.get(p.model, ""), set())]
