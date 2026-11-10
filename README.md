@@ -18,7 +18,8 @@ No credentials in CI, no rows leave the warehouse, no warehouse spins up.
 | `fauxflake simulate` | let days pass, then compare incrementals to a full refresh |
 | `fauxflake scenarios` | replay bad days and report silent data corruption |
 | `fauxflake diff` | what a branch changes in the output, as a PR comment |
-| `fauxflake check` | the spec still covers every column the project reads |
+| `fauxflake check` | the spec still covers every column and function the project uses |
+| `fauxflake query` | Snowflake SQL against the warehouse a run left behind |
 | `fauxflake profile` | measure production's shape from Snowflake, aggregates only |
 | `fauxflake parity` | prove the emulator and real Snowflake give identical rows |
 | `fauxflake conformance` | score the emulator against answers recorded from Snowflake |
@@ -67,6 +68,7 @@ find out weeks later from a dashboard.
 ## On your project
 
 ```sh
+uv tool install git+https://github.com/mkebiclioglu/fauxflake@v0.2.0
 cd your-dbt-project
 fauxflake init      # writes fauxflake.yml from the project itself; no Snowflake access
 fauxflake build
@@ -78,26 +80,46 @@ from casts and naming, the grain from `unique` tests, references from `relations
 categories from `accepted_values`, the load timestamp from freshness config. Tests written on
 marts are traced back through staging to the raw table. It prints every assumption it made.
 
-It also reads the shape of the data out of the SQL: `user:login::string` means a JSON column
-with a `login` field; `to_date(x, 'YYYY/MM/DD')` means text dates in that format;
-`where state = 'open'` means `open` must be one of the values; `sum(x)` means a number; columns
-lined up by a `UNION` share a type; `author_id` and `author_username` describe one entity, so
-the name follows the id in every table that carries both.
+It also reads the shape of the data out of the SQL, so that models have rows to work on:
+
+| the SQL says | so the data has |
+| --- | --- |
+| `user:login::string` | a JSON column with a `login` field |
+| `to_date(x, 'YYYY/MM/DD')` | text dates in that format |
+| `where state = 'open'` | `open` among the values |
+| `where name like 'tap-%'` | names that fit the pattern |
+| `a.account_id = b.id` | `account_id` drawn from `b`'s keys, so the join matches |
+| `a.region = b.region_code` | both drawn from one shared set of values |
+| `sum(x)`, `x * 2` | a number |
+| columns lined up by a `UNION` | one type |
+| `author_id` next to `author_username` | the name follows the id in every table that has both |
 
 Volumes and distributions start as placeholders. `fauxflake profile` replaces them with
 measurements once it has a read-only Snowflake connection.
 
-dbt packages are installed on first use. Seeds, snapshots, ephemeral models and `dbt_utils`
-are covered by this repo's tests. Two things a real project usually needs:
+dbt packages are installed on first use. Seeds, snapshots, ephemeral models, incremental
+strategies, `dbt_utils`, `persist_docs`, `grants`, query tags, secure views and dynamic tables
+(rebuilt on every run) are covered by this repo's tests. Three things a real project may need:
 
-- **Functions that exist only in your account.** Give each a stand-in in the spec, written in
-  DuckDB SQL. It is used whether the call is qualified or not:
+- **Functions that exist only in your account.** `init` finds them and writes a placeholder
+  for each that returns NULL, so the project builds on the first try. Replace the ones that
+  matter with DuckDB SQL; `fauxflake check` lists any that are still missing.
   ```yaml
   udfs:
     fiscal_year: "(d) as year(d + interval 11 month)"
   ```
+- **Logic that branches on the target.** The dbt target is called `fauxflake`. If the project
+  tests `target.name`, pick the name it expects: `dbt: {target: ci}` in the spec.
 - **Models that cannot run locally** (external functions, Snowpark, streams). Tag them and
   pass dbt's own selector through: `fauxflake build --exclude tag:snowflake_only`.
+
+When a model comes out empty or wrong, look at it. Keep the warehouse with `--db-path` and
+ask it questions in Snowflake SQL:
+
+```sh
+fauxflake build --db-path .warehouse
+fauxflake query --db-path .warehouse "select status, count(*) from fct_orders group by 1"
+```
 
 ## While you type
 
@@ -170,9 +192,9 @@ matches its own delete, so those rows duplicate on every run.
 ```yaml
 - uses: actions/checkout@v7
   with: {fetch-depth: 0}
-- uses: mkebiclioglu/fauxflake@v0.1.0
+- uses: mkebiclioglu/fauxflake@v0.2.0
   with: {command: build}
-- uses: mkebiclioglu/fauxflake@v0.1.0
+- uses: mkebiclioglu/fauxflake@v0.2.0
   with: {command: simulate, args: --days 14}
 ```
 
@@ -339,10 +361,12 @@ results; parity and conformance cover that.
 
 [`example/fauxflake.yml`](example/fauxflake.yml) is a complete one. Column generators:
 `sequence`, `hash_id`, `fk`, `categorical`, `dist`, `template`, `lifecycle`, `time_offset`,
-`event_time`, `updated_at`, `loaded_at`, `constant`. Any column takes `null_rate` and `type`.
+`event_time`, `updated_at`, `loaded_at`, `constant`, `object`, `array`, `pool` (values shared
+by every column naming the same pool). Any column takes `null_rate` and `type`.
 A table takes `volume`, `lateness`, `duplicate_rate`, `intraday`, `mode: upsert` and
 `scale: false` (for reference tables that should not shrink). Top-level `udfs` declares
-stand-ins for account-specific functions. Exclude a model from the drift comparison with
+stand-ins for account-specific functions; `dbt: {target, database, env}` sets the dbt target
+name, the database dbt builds into and placeholders for environment variables. Exclude a model from the drift comparison with
 `meta: {fauxflake_drift: false}`. `fauxflake serve` keeps the emulator up with data loaded,
 for running `dbt` yourself.
 

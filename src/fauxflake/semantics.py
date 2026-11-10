@@ -241,18 +241,10 @@ MACROS = [
           (f, t) as to_json(range(f, t)),
           (f, t, s) as to_json(range(f, t, s))""",
     # ENCRYPT_RAW has no local equivalent: a stable, opaque stand-in with the same shape.
-    *[f"""create or replace macro {_NS}_sf_encrypt_raw({args}) as json_object(
-          'ciphertext', upper(sha256(v::varchar || k::varchar)), 'iv', upper(md5(k::varchar)), 'tag', upper(md5(v::varchar)))"""
-      for args in ("v, k", "v, k, iv", "v, k, iv, aad", "v, k, iv, aad, mode")],
-    # A float cast to an integer rounds half away from zero (2.5 -> 3). DuckDB rounds half to even.
-    f"""create or replace macro {_NS}_sf_int(x) as case
-          when typeof(x) in ('DOUBLE', 'FLOAT') then cast(round(try_cast(x::varchar as double)) as bigint)
-          else cast(x as bigint) end""",
-    f"""create or replace macro {_NS}_sf_to_array(x) as case
-          when x is null then null
-          when typeof(x) like '%]' then to_json(x)
-          when typeof(x) = 'JSON' and json_type(to_json(x)) = 'ARRAY' then to_json(x)
-          else to_json([x]) end""",
+    f"create or replace macro {_NS}_sf_encrypt_raw " + ", ".join(
+        f"({args}) as json_object('ciphertext', upper(sha256(v::varchar || k::varchar)), "
+        "'iv', upper(md5(k::varchar)), 'tag', upper(md5(v::varchar)))"
+        for args in ("v, k", "v, k, iv", "v, k, iv, aad", "v, k, iv, aad, mode")),
     # UPPER('ß') is 'SS'.
     f"create or replace macro {_NS}_sf_upper(s) as replace(upper(s), 'ẞ', 'SS')",
 ]

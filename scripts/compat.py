@@ -392,7 +392,8 @@ def execute(project_dir: Path, rendered: Path, json_path: str | None, max_passes
         # DuckDB reports a missing column that shares its name with a SELECT alias differently
         m2 = re.search(r'Referenced column "([^"]+)" not found in FROM clause', msg) or \
             re.search(r'Referenced column "?([^"\s]+)"? not found in FROM clause', msg) or \
-            re.search(r'Column "([^"]+)" referenced that exists in the SELECT clause', msg)
+            re.search(r'Column "([^"]+)" referenced that exists in the SELECT clause', msg) or \
+            re.search(r'Alias with name "+([^"]+)"+ exists, but aliases cannot be used', msg)  # `x as x` on a stub without x
         if not (m1 or m2):
             return False
         t = tree(uid)
@@ -436,6 +437,7 @@ def execute(project_dir: Path, rendered: Path, json_path: str | None, max_passes
             if os.environ.get("COMPAT_TRACE"):
                 print(f"  {time.strftime('%H:%M:%S')} {uid}", file=sys.stderr, flush=True)
             fast: list[str] | None = None
+            retried = 0
             for _ in range(2000):
                 try:
                     if fast is None:
@@ -450,6 +452,12 @@ def execute(project_dir: Path, rendered: Path, json_path: str | None, max_passes
                     msg = str(e)
                     if os.environ.get("COMPAT_DEBUG") and os.environ["COMPAT_DEBUG"] in uid:
                         print(f"  DEBUG try {uid}: {msg[:160]!r}", file=sys.stderr, flush=True)
+                    if fast is not None and not re.search(
+                            r"does not have a column named|not found in FROM clause|exists in the SELECT clause|aliases cannot be used", msg):
+                        fast = None  # not a missing column: take the full path, which can rewrite the statement
+                        retried += 1
+                        if retried < 4:
+                            continue
                     if infer(uid, msg):
                         if fast is None:
                             try:
