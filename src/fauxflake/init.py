@@ -49,6 +49,7 @@ class SourceUse:
         self.texts: set[str] = set()  # columns compared with string literals
         self.numbers: set[str] = set()  # columns that are summed, averaged or used in arithmetic
         self.literals: dict[str, set[str]] = {}  # column -> string values the SQL compares it with
+        self.patterns: dict[str, set[str]] = {}  # column -> LIKE patterns the SQL keeps rows by
         self.star = False
 
     def add(self, column: str, type_hint: str | None = None) -> None:
@@ -63,9 +64,13 @@ def _table_id(table: exp.Table) -> str:
     return ".".join(p.upper() for p in (table.catalog, table.db, table.name) if p)
 
 
+_WRAPPERS = (exp.Cast, exp.TryCast, exp.Paren, exp.Lower, exp.Upper, exp.Trim)
+
+
 def scan_model(sql: str, sources: dict[str, SourceUse],
                models: dict[str, dict[str, tuple[str, str]]] | None = None,
-               links: list[set[tuple[str, str]]] | None = None) -> dict[str, tuple[str, str]]:
+               links: list[set[tuple[str, str]]] | None = None,
+               joins: list[tuple[tuple[str, str], tuple[str, str]]] | None = None) -> dict[str, tuple[str, str]]:
     """Record source columns used by one model. Returns {output column: (source, source column)}
     for outputs that are a plain (possibly cast or renamed) source column."""
     try:
@@ -145,6 +150,18 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 use.add(hit[1], cast.to.sql(dialect="duckdb") if cast else None)
                 if isinstance(parent, (exp.Sum, exp.Avg, exp.Add, exp.Sub, exp.Mul, exp.Div)):
                     use.numbers.add(hit[1])
+                if joins is not None:
+                    # a.x = b.y: the two columns must share values, or the join matches nothing
+                    top = col
+                    while isinstance(top.parent, _WRAPPERS):
+                        top = top.parent
+                    if isinstance(top.parent, exp.EQ):
+                        other = top.parent.expression if top.parent.this is top else top.parent.this
+                        while isinstance(other, _WRAPPERS):
+                            other = other.this
+                        there = resolve(other) if isinstance(other, exp.Column) else None
+                        if there and there[0] != hit[0]:
+                            joins.append((hit, there))
                 if isinstance(parent, exp.ParseJSON):
                     use.json_text.add(hit[1])  # parse_json(col):a.b  ->  col is text holding {"a": {"b": ...}}
                     col, parent = parent, parent.parent
@@ -155,6 +172,9 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     other = parent.this if other is col else other
                     if isinstance(other, exp.Literal) and other.is_string and not re.fullmatch(r"[\d\s:.\-/T+Z]*", other.name):
                         use.texts.add(hit[1])  # id = 'USLACKBOT': not a number
+                        if isinstance(parent, (exp.Like, exp.ILike)) and parent.this is col and len(other.name) <= 60 \
+                                and not isinstance(parent.parent, exp.Not) and re.search(r"[A-Za-z0-9]", other.name):
+                            use.patterns.setdefault(hit[1], set()).add(other.name)  # name LIKE 'tap-%'
                         if isinstance(parent, (exp.EQ, exp.NEQ, exp.In)):
                             compared = parent.expressions if isinstance(parent, exp.In) else [other]
                             use.literals.setdefault(hit[1], set()).update(
@@ -221,6 +241,55 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
     return last
 
 
+_KEYS = ("sequence", "hash_id")
+_FREE = ("template", "dist", "categorical", "constant")  # generators with no meaning of their own
+
+
+def _share_join_values(tables: dict[str, dict], joins: list, notes: list[str]) -> None:
+    """Columns that models join on must draw from the same values. Group them, then:
+    a key in the group makes the others reference it; named values are shared; otherwise
+    every member draws from one common pool."""
+    group_of: dict[tuple[str, str], set] = {}
+    for a, b in joins:
+        if not all(m[0] in tables and m[1] in tables[m[0]]["columns"] for m in (a, b)):
+            continue
+        merged = group_of.get(a, {a}) | group_of.get(b, {b})
+        for m in merged:
+            group_of[m] = merged
+    for group in {id(g): g for g in group_of.values()}.values():
+        members = sorted(group)
+        gen = {m: tables[m[0]]["columns"][m[1]] for m in members}
+        keys = [m for m in members if gen[m]["gen"] in _KEYS]
+        if keys:
+            parent = keys[0]
+            for m in keys[1:]:  # two tables keyed by the same id (user, user_profile)
+                gen[parent]["domain"] = gen[m]["domain"] = parent[0]
+                if gen[m]["gen"] != gen[parent]["gen"]:
+                    gen[m]["gen"] = gen[parent]["gen"]
+            for m in members:
+                if m[0] != parent[0] and gen[m]["gen"] in _FREE:
+                    tables[m[0]]["columns"][m[1]] = {"gen": "fk", "ref": parent[0], "skew": 1.5}
+                    notes.append(f"{m[0]}.{m[1]}: joined to {parent[0]}.{parent[1]} in a model, generated as a reference to it.")
+            continue
+        free = [m for m in members if gen[m]["gen"] in _FREE]
+        if len(free) < 2:
+            continue
+        named = [gen[m] for m in free if gen[m]["gen"] == "categorical"]
+        if named:
+            values: dict = {}
+            for d in named:
+                for v, w in d["values"].items():
+                    values.setdefault(v, w)
+            for m in free:
+                tables[m[0]]["columns"][m[1]] = {"gen": "categorical", "values": dict(values)}
+        else:
+            pool = free[0][1].lower()
+            numeric = any(gen[m]["gen"] == "dist" for m in free)
+            for m in free:
+                tables[m[0]]["columns"][m[1]] = {"gen": "pool", "pool": pool, "size": 200, **({"numeric": True} if numeric else {})}
+        notes.append(f"{', '.join('.'.join(m) for m in free)}: joined in a model, generated from the same values.")
+
+
 def guess(column: str, hint: str | None) -> dict:
     """A generator for a column we know only by name and (maybe) a cast."""
     c, h = column.upper(), (hint or "").upper()
@@ -270,6 +339,7 @@ def build_spec(manifest: dict, database: str) -> tuple[dict, list[str]]:
     outputs: dict[str, dict[str, tuple[str, str]]] = {}
     by_relation: dict[str, dict[str, tuple[str, str]]] = {}
     links: list[set[tuple[str, str]]] = []
+    joins: list[tuple[tuple[str, str], tuple[str, str]]] = []
 
     def scan(uid: str) -> None:
         node = manifest["nodes"].get(uid)
@@ -279,7 +349,7 @@ def build_spec(manifest: dict, database: str) -> tuple[dict, list[str]]:
         for parent in node["depends_on"]["nodes"]:
             scan(parent)
         if node.get("compiled_code"):
-            outputs[uid] = scan_model(node["compiled_code"], uses, by_relation, links)
+            outputs[uid] = scan_model(node["compiled_code"], uses, by_relation, links, joins)
         if node.get("relation_name"):
             by_relation[node["relation_name"].replace('"', "").upper()] = outputs[uid]
 
@@ -362,6 +432,10 @@ def build_spec(manifest: dict, database: str) -> tuple[dict, list[str]]:
                 named = sorted(use.literals[col])
                 share = round(0.8 / len(named), 4)
                 out[col] = {"gen": "categorical", "values": {**{v: share for v in named}, f"other_{col.lower()}": 0.2}}
+            elif col in use.patterns and not hint_is_number(hint):
+                # `where name like 'tap-%'` should keep some rows: make values that fit each pattern
+                shapes = sorted(p.replace("\\", "").replace("%", "{hex}").replace("_", "x") for p in use.patterns[col])
+                out[col] = {"gen": "template", "templates": [*shapes, f"{col.lower()}_{{hex}}"]}
             elif col in use.paths:
                 out[col] = {"gen": "object", "fields": {path: guess(path.split(".")[-1], h) for path, h in sorted(use.paths[col].items())}}
                 if "id" in out[col]["fields"]:
@@ -399,6 +473,7 @@ def build_spec(manifest: dict, database: str) -> tuple[dict, list[str]]:
             if owner and owner != name and d["gen"] not in ("sequence", "hash_id", "fk"):
                 spec["columns"][col] = {"gen": "fk", "ref": owner, "skew": 1.5}
                 notes.append(f"{name}.{col}: assumed to reference {owner} (same name as its key; no relationships test).")
+    _share_join_values(tables, joins, notes)
     # a foreign key needs its parent to have a key
     for (child, col), (parent, pcol) in fks.items():
         if child in tables and parent in tables and tables[parent]["columns"].get(pcol, {}).get("gen") not in ("sequence", "hash_id"):
@@ -423,7 +498,7 @@ def provide_env(project) -> dict[str, str]:
 
     provided: dict[str, str] = {}
     for _ in range(200):
-        if project.invoke(["parse"], quiet=True):
+        if project.invoke(["parse"], silent=True):  # the errors are expected: they name the variables
             break
         missing = _MISSING_ENV.search(project.last_error)
         if not missing:

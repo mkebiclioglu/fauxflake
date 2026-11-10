@@ -237,6 +237,11 @@ MACROS = [
     f"""create or replace macro {_NS}_sf_int(x) as case
           when typeof(x) in ('DOUBLE', 'FLOAT') then cast(round(try_cast(x::varchar as double)) as bigint)
           else cast(x as bigint) end""",
+    f"""create or replace macro {_NS}_sf_to_array(x) as case
+          when x is null then null
+          when typeof(x) like '%]' then to_json(x)
+          when typeof(x) = 'JSON' and json_type(to_json(x)) = 'ARRAY' then to_json(x)
+          else to_json([x]) end""",
     # UPPER('ß') is 'SS'.
     f"create or replace macro {_NS}_sf_upper(s) as replace(upper(s), 'ẞ', 'SS')",
 ]
@@ -523,24 +528,15 @@ def _fix(node: exp.Expression) -> exp.Expression:
         return _fn(name, *[a for a in args if a is not None])
     if isinstance(node, exp.GenerateSeries) and node.args.get("is_end_exclusive"):
         return _fn("_sf_array_range", *[node.args[k] for k in ("start", "end", "step") if node.args.get(k) is not None])
-    if isinstance(node, exp.Array):
-        kinds = {e.is_string for e in node.expressions if isinstance(e, exp.Literal)}
-        if len(kinds) > 1 or (kinds and len(node.expressions) > sum(isinstance(e, (exp.Literal, exp.Null)) for e in node.expressions)):
-            # mixed element types: an ARRAY holds variants, a DuckDB list needs one type
-            node.set("expressions", [e if isinstance(e, exp.Null) else exp.ToVariant(this=e) for e in node.expressions])
-    if isinstance(node, exp.Uniform):
-        # UNIFORM(lo, hi, RANDOM()): written out here so it also works inside CTEs and views
-        gen = node.args.get("gen")
-        unit = exp.Anonymous(this="random") if isinstance(gen, exp.Rand) or gen is None else \
-            sqlglot.parse_one("(hash(0) % 1000003) / 1000003.0", read="duckdb").transform(
-                lambda n: gen.copy() if isinstance(n, exp.Literal) and n.name == "0" and isinstance(n.parent, exp.Anonymous) else n)
-        lo, hi = node.this, node.expression
-        real = any(isinstance(b, exp.Cast) and b.to.is_type("double", "float") or (isinstance(b, exp.Literal) and "." in b.name)
-                   for b in (lo, hi))
-        if real:
-            return exp.paren(exp.Add(this=lo, expression=exp.Mul(this=unit, expression=exp.paren(exp.Sub(this=hi, expression=lo.copy())))))
-        span = exp.paren(exp.Add(this=exp.Sub(this=hi, expression=lo.copy()), expression=exp.Literal.number(1)))
-        return exp.cast(exp.Floor(this=exp.Add(this=lo, expression=exp.Mul(this=unit, expression=span))), "bigint")
+    if isinstance(node, exp.Array) and not isinstance(node.parent, exp.Anonymous):
+        # an ARRAY is a VARIANT value wherever it appears: build it as JSON, element by element,
+        # so arrays from different branches of a CASE or UNION have one type
+        node.set("expressions", [e if isinstance(e, exp.Null) else exp.ToVariant(this=e) for e in node.expressions])
+        return exp.Anonymous(this="to_json", expressions=[node])
+    if isinstance(node, (exp.ArrayFilter, exp.Transform, exp.Reduce)):
+        node.set("this", _fn("_sf_list", node.this))  # lambdas walk a list; the array itself is JSON
+    if isinstance(node, exp.ToArray):
+        return _fn("_sf_to_array", node.this)
     if isinstance(node, exp.JSONKeys):
         return _fn("_sf_object_keys", node.this)
     if isinstance(node, exp.GetExtract):
@@ -973,6 +969,7 @@ def _repair(tree: exp.Expression, text: str, details: dict) -> bool:
     if not name or not call or pos < 0:
         return False
     types = _call_types(call)
+    types = ["VARCHAR" if t == "JSON" else t for t in types]  # a VARIANT converts the same way
     if "VARCHAR" not in types:
         return False
     if name in _OPERATORS_BY_SIGN:

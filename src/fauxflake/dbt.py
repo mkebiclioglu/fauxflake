@@ -78,14 +78,14 @@ class DbtProject:
             if node.get("database") and node.get("schema"):
                 emulator.CURRENT.ensure_database(node["database"].strip('"'), node["schema"].strip('"'))
 
-    def invoke(self, args: list[str], schema: str = "CI", quiet: bool = False) -> bool:
+    def invoke(self, args: list[str], schema: str = "CI", quiet: bool = False, silent: bool = False) -> bool:
         from dbt.cli.main import dbtRunner
 
         os.environ["FAUXFLAKE_SCHEMA"] = schema
         if self._local and not self._databases_ready and args and args[0] in ("build", "run", "seed", "snapshot", "test"):
             self._create_databases()
         os.environ.setdefault("DBT_SEND_ANONYMOUS_USAGE_STATS", "false")
-        cmd = (["--quiet"] if quiet else []) + list(args) + [
+        cmd = (["--log-level", "none"] if silent else ["--quiet"] if quiet else []) + list(args) + [
             "--project-dir", str(self.dir), "--profiles-dir", str(self.profiles_dir), "--target", self.target,
             "--target-path", str(self.target_path),
         ]

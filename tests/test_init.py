@@ -115,3 +115,30 @@ def test_unknown_functions_get_placeholders():
         assert stubs["my_score"] == "(a0) as null::varchar, (a0, a1) as null::varchar"
         for name, body in stubs.items():  # each placeholder is a valid definition
             emu.duck.execute(f"create or replace macro _fs_global.main._udf_{name}{body}")
+
+
+def test_joined_columns_share_values():
+    from fauxflake.init import build_spec
+
+    def source(name, cols):
+        return {"database": "RAW", "schema": "S", "name": name, "identifier": name,
+                "columns": {c: {"data_type": t} for c, t in cols.items()}}
+
+    manifest = {
+        "sources": {
+            "source.p.s.users": source("users", {"id": "NUMBER", "plan_code": "VARCHAR"}),
+            "source.p.s.events": source("events", {"event_id": "NUMBER", "actor": "NUMBER", "plan": "VARCHAR"}),
+            "source.p.s.plans": source("plans", {"code": "VARCHAR", "label": "VARCHAR", "created": "DATE"}),
+        },
+        "nodes": {"model.p.m": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.M", "compiled_code": """
+            select e.event_id, u.id, p.label
+            from raw.s.events e
+            join raw.s.users u on e.actor = u.id
+            left join raw.s.plans p on lower(u.plan_code) = p.code and p.code = e.plan"""}},
+    }
+    spec, notes = build_spec(manifest, "A")
+    tables = spec["tables"]
+    assert tables["RAW.S.EVENTS"]["columns"]["ACTOR"] == {"gen": "fk", "ref": "RAW.S.USERS", "skew": 1.5}
+    shared = [tables["RAW.S.USERS"]["columns"]["PLAN_CODE"], tables["RAW.S.PLANS"]["columns"]["CODE"],
+              tables["RAW.S.EVENTS"]["columns"]["PLAN"]]
+    assert shared[0] == shared[1] == shared[2] and shared[0]["gen"] in ("pool", "categorical")

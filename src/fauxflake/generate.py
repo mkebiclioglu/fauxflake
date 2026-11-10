@@ -106,9 +106,10 @@ class TableSQL:
         if d["gen"] == "sequence":
             # each table counts in its own range, as ids from different systems do: two tables'
             # keys never collide when a model unions them
-            offset = (zlib.crc32(table.name.encode()) % 900 + 100) * 1_000_000_000
+            # (`domain` puts two tables that are keyed by the same id back in one range)
+            offset = (zlib.crc32((d.get("domain") or table.name).upper().encode()) % 900 + 100) * 1_000_000_000
             return f"({index} + {offset + 1})::BIGINT"
-        return f"md5(concat({lit(f'{self.spec.seed}:{table.name}:')}, {index}))"
+        return f"md5(concat({lit(f'{self.spec.seed}:{(d.get('domain') or table.name).upper()}:')}, {index}))"
 
     def column(self, col: str, d: dict) -> str:
         return f'{self.expr(col, d)} as "{col}"'
@@ -174,20 +175,30 @@ class TableSQL:
                 acc += weight / total
                 arms.append(f"when {x} < {acc!r} then {lit(value)}")
             expr = f"case {' '.join(arms)} else {lit(list(d['values'])[-1])} end"
+        elif gen == "pool":
+            # one of `size` values shared by every column that names the same pool: joins between them match
+            n = f"floor({self.u(col)} * {int(d.get('size', 200))})::bigint"
+            expr = f"({n} + 1)" if d.get("numeric") else f"concat({lit(str(d['pool']) + '_')}, {n})"
         elif gen == "dist":
             expr = piecewise(self.u(col), d["p"], d["v"])
             if "round" in d:
                 expr = f"round({expr}, {int(d['round'])})"
         elif gen == "template":
-            parts = []
-            for i, chunk in enumerate(d["template"].replace("{n}", "\0n\0").replace("{hex}", "\0hex\0").split("\0")):
-                if chunk == "n":
-                    parts.append(f"({self.base} + 1)::varchar" if self.base == "g" else f"({self.base})::varchar")
-                elif chunk == "hex":
-                    parts.append(f"substr(md5(concat({lit(self.salt(col) + ':')}, {self.base})), 1, 12)")
-                elif chunk:
-                    parts.append(lit(chunk))
-            expr = f"concat({', '.join(parts)})"
+            def fill(template: str) -> str:
+                parts = []
+                for chunk in template.replace("{n}", "\0n\0").replace("{hex}", "\0hex\0").split("\0"):
+                    if chunk == "n":
+                        parts.append(f"({self.base} + 1)::varchar" if self.base == "g" else f"({self.base})::varchar")
+                    elif chunk == "hex":
+                        parts.append(f"substr(md5(concat({lit(self.salt(col) + ':')}, {self.base})), 1, 12)")
+                    elif chunk:
+                        parts.append(lit(chunk))
+                return f"concat({', '.join(parts)})"
+
+            shapes = d.get("templates") or [d["template"]]  # several shapes: each row takes one
+            pick = f"floor({self.u(col + ':shape')} * {len(shapes)})::bigint"
+            expr = fill(shapes[0]) if len(shapes) == 1 else \
+                f"case {pick} {' '.join(f'when {i} then {fill(t)}' for i, t in enumerate(shapes))} end"
         elif gen == "time_offset":
             expr = f"_ev + {ms(piecewise(self.u(col), d['p'], d['seconds']))}"
             if d.get("format"):  # a text column holding dates in this format
@@ -211,7 +222,7 @@ class TableSQL:
         else:
             raise ValueError(f"{self.t.name}.{col}: unknown gen {gen!r}")
         rate = repr(float(d.get("null_rate") or 0.0))
-        if self.sc and self.sc.null_rate is not None and gen in ("fk", "categorical", "dist", "template", "time_offset", "object", "array"):
+        if self.sc and self.sc.null_rate is not None and gen in ("fk", "categorical", "dist", "pool", "template", "time_offset", "object", "array"):
             rate = self.during(repr(self.sc.null_rate), rate)
         if rate != "0.0":
             expr = f"case when {self.u(col + ':null')} < {rate} then NULL else {expr} end"

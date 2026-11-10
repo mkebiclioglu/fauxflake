@@ -50,7 +50,9 @@ def main() -> None:
     for r in results:
         if r["status"] in ("error", "fail"):
             message = (r.get("message") or "").strip().splitlines()
-            line = next((m for m in message if re.search(r"Error|error|Got \d+ result", m)), message[0] if message else "")
+            lines = [m.strip() for m in message if m.strip() and "compiled code at" not in m]
+            line = next((m for m in lines if re.search(r"\d{6} \(|Got \d+ result", m)), lines[-1] if lines else "")
+            line = re.sub(r'"[^"]*"|\'[^\']*\'', "X", line)  # group errors that differ only in names
             reasons[f'{r["status"]}: {re.sub(r"\s+", " ", line)[:170]}'].append(r["unique_id"].split(".", 2)[-1])
     print(f"{args.project_dir.name}: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
     for why, nodes in sorted(reasons.items(), key=lambda x: -len(x[1])):
