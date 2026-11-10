@@ -3774,6 +3774,22 @@
    ]
   ]
  },
+ "variant_equals_text": {
+  "rows": [
+   [
+    "1",
+    "a",
+    true,
+    true
+   ],
+   [
+    "2",
+    "b",
+    false,
+    false
+   ]
+  ]
+ },
  "variant_group_order": {
   "rows": [
    [

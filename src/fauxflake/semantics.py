@@ -254,6 +254,12 @@ MACROS = [
           when typeof(x) like '%]' then to_json(x)
           when typeof(x) = 'JSON' and json_type(to_json(x)) = 'ARRAY' then to_json(x)
           else to_json([x]) end""",
+    # A VARIANT holding the string 12 equals the text '12'. As JSON it is '"12"', so compare its value.
+    # typeof() is known when the query is planned: for ordinary columns this is exactly `a = b`.
+    f"""create or replace macro {_NS}_sf_eq(a, b) as case
+          when typeof(a) = 'JSON' and typeof(b) <> 'JSON' then (a::json ->> '$') = b::varchar
+          when typeof(b) = 'JSON' and typeof(a) <> 'JSON' then a::varchar = (b::json ->> '$')
+          else a = b end""",
     # UPPER('ß') is 'SS'.
     f"create or replace macro {_NS}_sf_upper(s) as replace(upper(s), 'ẞ', 'SS')",
 ]
@@ -588,6 +594,16 @@ def _fix(node: exp.Expression) -> exp.Expression:
                 node.set(side, exp.cast(part, "varchar"))  # v:s || 'y'
             elif not (isinstance(part, exp.Literal) and part.is_string) and not isinstance(part, exp.DPipe):
                 node.set(side, _text(part))
+    if isinstance(node, (exp.EQ, exp.NEQ)) and node.find_ancestor(exp.Select) is not None \
+            and node.find_ancestor(exp.Merge, exp.Update, exp.Delete) is None:
+        left, right = node.this.unnest(), node.expression.unnest()
+        plain = (exp.Column, exp.Literal)
+        join = node.find_ancestor(exp.Join)
+        asof = join is not None and (join.args.get("match_condition") is not None or "ASOF" in str(join.args.get("method") or "").upper())
+        if isinstance(left, plain) and isinstance(right, plain) and (isinstance(left, exp.Column) or isinstance(right, exp.Column)) \
+                and not any(isinstance(x, exp.Literal) and not x.is_string for x in (left, right)) and not asof:
+            same = _fn("_sf_eq", node.this, node.expression)
+            return same if isinstance(node, exp.EQ) else exp.Not(this=same)
     if isinstance(node, _COMPARISONS) or isinstance(node, exp.In):
         other = node.expression if isinstance(node, _COMPARISONS) else (node.expressions[0] if node.expressions else None)
         if isinstance(node.this, _VARIANT_ACCESS) and isinstance(other, exp.Literal) and other.is_string:
