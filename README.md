@@ -170,9 +170,9 @@ matches its own delete, so those rows duplicate on every run.
 ```yaml
 - uses: actions/checkout@v7
   with: {fetch-depth: 0}
-- uses: mkebiclioglu/fauxflake@main
+- uses: mkebiclioglu/fauxflake@v0.1.0
   with: {command: build}
-- uses: mkebiclioglu/fauxflake@main
+- uses: mkebiclioglu/fauxflake@v0.1.0
   with: {command: simulate, args: --days 14}
 ```
 
