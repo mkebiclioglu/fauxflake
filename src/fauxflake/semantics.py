@@ -550,6 +550,20 @@ def _fix(node: exp.Expression) -> exp.Expression:
     if isinstance(node, exp.ParseJSON) and not isinstance(node.this, (exp.Literal, exp.Null)):
         text = exp.cast(node.this, "varchar")
         node.set("this", exp.Nullif(this=text, expression=exp.Literal.string("")))  # PARSE_JSON('') is NULL
+    if isinstance(node, exp.Bracket) and len(node.expressions) == 1 and isinstance(node.expressions[0], exp.Literal):
+        # v['a']['b'][0] is the path v:a.b[0]. Written as a path, every step stays a VARIANT access
+        key, base = node.expressions[0], node.this
+        inside = isinstance(base, exp.JSONExtract) and base.args.get("variant_extract")
+        if key.is_string or (key.is_int and (inside or isinstance(base, exp.ParseJSON))):
+            step = exp.JSONPathKey(this=key.name, quoted=True) if key.is_string else exp.JSONPathSubscript(this=int(key.name))
+            if inside:
+                base.args["expression"].append("expressions", step)
+                return base
+            return exp.JSONExtract(this=base, expression=exp.JSONPath(expressions=[exp.JSONPathRoot(), step]),
+                                   variant_extract=True, requires_json=True)
+    if isinstance(node, exp.Nullif) and isinstance(node.this, _VARIANT_ACCESS) \
+            and isinstance(node.expression, exp.Literal) and node.expression.is_string:
+        node.set("this", exp.cast(node.this, "varchar"))  # NULLIF(v:x, '') compares the value, not JSON text
     if isinstance(node, exp.ToArray):
         return _fn("_sf_to_array", node.this)
     if isinstance(node, exp.JSONKeys):
