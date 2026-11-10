@@ -311,6 +311,7 @@ def check(spec_path, project_dir):
     from .dbt import DbtProject, emulator_output
     from .emulator import serve
     from .init import check as find_problems
+    from .init import unknown_functions
 
     spec = Spec.load(spec_path)
     database = spec.dbt.get("database", "ANALYTICS")
@@ -318,7 +319,9 @@ def check(spec_path, project_dir):
         project = DbtProject(project_dir, emulator_output(emu.port, database))
         project.invoke(["compile"], quiet=True)
         manifest = json.loads((project.target_path / "manifest.json").read_text())
+        unknown = [name for name in unknown_functions(manifest, emu) if name not in spec.udfs]
     problems = find_problems(manifest, spec, database)
+    problems += [f"{name}(): not a function the emulator knows, add a stand-in under `udfs` in the spec" for name in unknown]
     for problem in problems:
         click.echo(problem)
     click.echo(f"{len(problems)} problem{'s' if len(problems) != 1 else ''}")
