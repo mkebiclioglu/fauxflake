@@ -1,0 +1,29 @@
+name: fauxflake
+description: Run dbt-snowflake CI on synthetic data, locally on DuckDB, with no Snowflake access
+branding:
+  icon: wind
+  color: blue
+inputs:
+  command:
+    description: "fauxflake command: build, simulate, scenarios, diff or check"
+    default: build
+  args:
+    description: Extra arguments for the command
+    default: ""
+  project-dir:
+    description: Directory containing dbt_project.yml and fauxflake.yml
+    default: "."
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+    - shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+      run: uv tool install "$ACTION_PATH"
+    - shell: bash
+      working-directory: ${{ inputs.project-dir }}
+      env:
+        FAUXFLAKE_COMMAND: ${{ inputs.command }}
+        FAUXFLAKE_ARGS: ${{ inputs.args }}
+      run: fauxflake $FAUXFLAKE_COMMAND $FAUXFLAKE_ARGS

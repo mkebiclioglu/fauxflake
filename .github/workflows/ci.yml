@@ -21,3 +21,11 @@ jobs:
       - name: two simulated weeks, then compare to a full refresh
         working-directory: example
         run: uv run fauxflake simulate --days 14
+      - name: the spec covers the project
+        working-directory: example
+        run: uv run fauxflake check
+      - name: the action, as another repository would use it
+        uses: ./
+        with:
+          command: build
+          project-dir: example

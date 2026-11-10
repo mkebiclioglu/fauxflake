@@ -48,6 +48,9 @@ class DbtProject:
         profile = {project["profile"]: {"target": "fauxflake", "outputs": {"fauxflake": output}}}
         (self.profiles_dir / "profiles.yml").write_text(yaml.safe_dump(profile, sort_keys=False))
         (self.dir / ".fauxflake" / ".gitignore").write_text("*\n")
+        declared = any((self.dir / f).exists() for f in ("packages.yml", "dependencies.yml"))
+        if declared and not (self.dir / "dbt_packages").exists():
+            self.invoke(["deps"], quiet=True)  # so a fresh checkout works without a separate step
 
     def invoke(self, args: list[str], schema: str = "CI", quiet: bool = False) -> bool:
         from dbt.cli.main import dbtRunner
