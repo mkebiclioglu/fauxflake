@@ -59,6 +59,7 @@ def test_semi_structured_and_text_date_columns_are_inferred():
                   from raw.gh.issues where user_id <> 'USLACKBOT' and state = 'open' and created = '2025-01-01'""", sources)
     assert use.json_text == {"CONTEXT", "RAW_BLOB"} and use.paths["CONTEXT"] == {"app.version": "TEXT"}
     assert use.texts == {"USER_ID", "STATE"}  # a date-looking literal says nothing about the type
+    assert use.literals == {"USER_ID": {"USLACKBOT"}, "STATE": {"open"}}
 
 
 def test_generated_objects_and_text_dates_are_usable(emu):

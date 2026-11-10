@@ -48,11 +48,15 @@ class SourceUse:
         self.json_text: set[str] = set()  # text columns holding JSON (passed to PARSE_JSON)
         self.texts: set[str] = set()  # columns compared with string literals
         self.numbers: set[str] = set()  # columns that are summed, averaged or used in arithmetic
+        self.literals: dict[str, set[str]] = {}  # column -> string values the SQL compares it with
         self.star = False
 
     def add(self, column: str, type_hint: str | None = None) -> None:
         column = column.upper()
-        self.columns[column] = self.columns.get(column) or type_hint
+        current = self.columns.get(column)
+        # a cast to text says little (anything casts to text); a cast to a number or date says a lot
+        if not current or (current.upper() in ("TEXT", "VARCHAR") and type_hint):
+            self.columns[column] = type_hint or current
 
 
 def _table_id(table: exp.Table) -> str:
@@ -151,6 +155,10 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     other = parent.this if other is col else other
                     if isinstance(other, exp.Literal) and other.is_string and not re.fullmatch(r"[\d\s:.\-/T+Z]*", other.name):
                         use.texts.add(hit[1])  # id = 'USLACKBOT': not a number
+                        if isinstance(parent, (exp.EQ, exp.NEQ, exp.In)):
+                            compared = parent.expressions if isinstance(parent, exp.In) else [other]
+                            use.literals.setdefault(hit[1], set()).update(
+                                v.name for v in compared if isinstance(v, exp.Literal) and v.is_string and len(v.name) <= 60)
                 if isinstance(parent, exp.JSONExtract) and parent.this is col:
                     # v:a.b::int tells us the column is a variant holding {"a": {"b": <int>}}
                     keys = [k.name for k in parent.expression.expressions if isinstance(k, exp.JSONPathKey)]
@@ -239,6 +247,10 @@ def guess(column: str, hint: str | None) -> dict:
     if "EMAIL" in c:
         return {"gen": "template", "template": "user_{hex}@example.com"}
     return {"gen": "template", "template": f"{column.lower()}_{{hex}}"}
+
+
+def hint_is_number(hint: str | None) -> bool:
+    return (hint or "").upper().startswith(("BIGINT", "INT", "DECIMAL", "NUMERIC", "DOUBLE", "FLOAT"))
 
 
 def first(candidates: list[str], columns) -> str | None:
@@ -345,6 +357,11 @@ def build_spec(manifest: dict, database: str) -> tuple[dict, list[str]]:
             elif (name, col) in accepted:
                 values = accepted[(name, col)]
                 out[col] = {"gen": "categorical", "values": {v: round(1 / len(values), 4) for v in values}}
+            elif 0 < len(use.literals.get(col, ())) <= 30 and not hint_is_number(hint):
+                # `where status = 'open'` should select something: use the values the SQL names
+                named = sorted(use.literals[col])
+                share = round(0.8 / len(named), 4)
+                out[col] = {"gen": "categorical", "values": {**{v: share for v in named}, f"other_{col.lower()}": 0.2}}
             elif col in use.paths:
                 out[col] = {"gen": "object", "fields": {path: guess(path.split(".")[-1], h) for path, h in sorted(use.paths[col].items())}}
                 if "id" in out[col]["fields"]:
