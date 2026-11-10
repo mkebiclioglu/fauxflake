@@ -62,6 +62,7 @@ REWRITES: list[tuple[re.Pattern[str], str, str]] = [
         "dynamic table -> table",
     ),
     (re.compile(r"\bdrop\s+dynamic\s+table\b", re.IGNORECASE), "drop table", "dynamic table -> table"),
+    (re.compile(r"\balter\s+dynamic\s+table\s+(\S+)\s+(rename|swap)\b", re.IGNORECASE), r"alter table \1 \2", "dynamic table -> table"),
 ]
 
 
@@ -103,7 +104,7 @@ NOPS = [
     _LEAD + r"alter\s+\w+(\s+\w+)?\s+(if\s+exists\s+)?\S+\s+(un)?set\s+(tag|comment|data_retention_time_in_days|change_tracking|query_tag)\b",
     _LEAD + r"alter\s+(table|materialized\s+view|dynamic\s+table)\s+\S+\s+(cluster\s+by|drop\s+clustering|resume|suspend)\b",
     _LEAD + r"(grant|revoke)\s",
-    _LEAD + r"alter\s+dynamic\s+table\s",
+    _LEAD + r"alter\s+dynamic\s+table\s+\S+\s+(?!rename|swap)",
     _LEAD + r"alter\s+(session|warehouse|account)\s",
     _LEAD + r"use\s+(warehouse|role|secondary\s+roles)\s",
 ]
