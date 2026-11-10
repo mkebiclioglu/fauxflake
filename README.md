@@ -171,14 +171,25 @@ with characters, `RATIO_TO_REPORT`, `CONDITIONAL_TRUE_EVENT`.
 
 ## Using it on your project
 
-1. Write a skeleton `fauxflake.yml` next to `dbt_project.yml`: for each source table, the key,
-   event-time column and load-time column, plus foreign keys and lifecycles
-   (see [`example/fauxflake.yml`](example/fauxflake.yml)).
-2. `fauxflake profile` fills in volume, lateness and every plain column.
-3. Add [`docs/workflows/dbt-ci.yml`](docs/workflows/dbt-ci.yml) to your repo.
+```sh
+cd your-dbt-project
+fauxflake init      # writes fauxflake.yml from the project itself; no Snowflake access
+fauxflake build     # dbt build on synthetic data
+fauxflake simulate  # let time pass, compare incrementals to a full refresh
+```
+
+`init` reads what the project already declares: source columns from how models select them
+(following the usual `source` → `renamed` staging pattern), types from casts and naming, the
+grain from `unique` tests, references from `relationships` tests, categories from
+`accepted_values`, the load timestamp from freshness config. Tests written on marts are traced
+back through staging to the raw table. It prints every assumption it made.
+
+Volumes and distributions start as placeholders. `fauxflake profile` replaces them with
+measurements once you give it a read-only Snowflake connection, and
+[`docs/workflows/dbt-ci.yml`](docs/workflows/dbt-ci.yml) puts the whole thing in CI.
 
 Column generators: `sequence`, `hash_id`, `fk`, `categorical`, `dist`, `template`,
-`lifecycle`, `event_time`, `updated_at`, `loaded_at`, `constant`. Any column takes
+`lifecycle`, `time_offset`, `event_time`, `updated_at`, `loaded_at`, `constant`. Any column takes
 `null_rate` and `type`. Exclude a model from the drift comparison with
 `meta: {fauxflake_drift: false}`.
 
@@ -207,8 +218,8 @@ Read these before trusting a green check.
   warehouse sizing cannot be learned from DuckDB.
 - **Fidelity stops at the spec.** Columns are sampled independently, so cross-column
   correlations are lost. Foreign-key skew, lifecycles and duplicate rates are declared by
-  hand; the profiler does not measure them yet. Non-key date and timestamp columns are
-  generated as NULL until declared.
+  hand; the profiler does not measure them yet. The profiler does not yet measure date and
+  timestamp columns other than the event and load times.
 - **Scale is relative.** Logic that depends on absolute counts (`having count(*) > 1000`)
   behaves differently at `--scale 0.001`.
 - **The profiler has run against one real account**, on synthetic tables only, and without

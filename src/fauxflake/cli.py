@@ -178,3 +178,29 @@ def conformance(connection):
     for case, actual in failed:
         click.echo(f"DIFF {case['id']}\n  snowflake: {json.dumps(expected[case['id']])[:300]}\n  emulator:  {json.dumps(actual)[:300]}")
     click.echo(f"\n{passed}/{passed + len(failed)} cases match Snowflake")
+
+
+@main.command()
+@click.option("--spec", "spec_path", default="fauxflake.yml", show_default=True)
+@click.option("--project-dir", default=".", show_default=True)
+@click.option("--database", default="ANALYTICS", show_default=True, help="Database dbt builds into.")
+@click.option("--force", is_flag=True, help="Overwrite an existing spec.")
+def init(spec_path, project_dir, database, force):
+    """Write a first spec from the dbt project itself. Needs no Snowflake access."""
+    from pathlib import Path
+
+    from .dbt import DbtProject, emulator_output
+    from .emulator import serve
+    from .init import write_spec
+
+    path = Path(spec_path)
+    if path.exists() and not force:
+        raise click.ClickException(f"{path} already exists (use --force to overwrite)")
+    with serve() as emu:
+        notes = write_spec(DbtProject(project_dir, emulator_output(emu.port, database)), path, database)
+    spec = Spec.load(path)
+    click.echo(f"wrote {path}: {len(spec.tables)} source tables, "
+               f"{sum(len(t.columns) for t in spec.tables.values())} columns")
+    for note in notes:
+        click.echo(f"  note: {note}")
+    click.echo("next: fauxflake build")

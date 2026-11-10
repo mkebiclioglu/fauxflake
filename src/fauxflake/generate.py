@@ -91,6 +91,8 @@ class TableSQL:
                 elif chunk:
                     parts.append(lit(chunk))
             expr = f"concat({', '.join(parts)})"
+        elif gen == "time_offset":
+            expr = f"_ev + {ms(piecewise(self.u(col), d['p'], d['seconds']))}"
         elif gen == "event_time":
             expr = "_ev"
         elif gen == "updated_at":

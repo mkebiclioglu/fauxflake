@@ -99,12 +99,11 @@ class Spec:
 
     def validate(self) -> None:
         for t in self.tables.values():
-            if not t.columns:
-                continue  # not profiled yet
-            t.key
             for col, d in t.columns.items():
-                if d.get("gen") == "fk" and d["ref"].upper() not in self.tables:
-                    raise ValueError(f"{t.name}.{col}: unknown ref {d['ref']}")
+                if d.get("gen") == "fk":
+                    if d["ref"].upper() not in self.tables:
+                        raise ValueError(f"{t.name}.{col}: unknown ref {d['ref']}")
+                    self.tables[d["ref"].upper()].key  # a referenced table needs a key
 
     def ordered(self) -> list[Table]:
         """Parents before children."""
