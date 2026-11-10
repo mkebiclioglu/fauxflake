@@ -93,9 +93,9 @@
 - {id: epoch_parts, sql: "select date_part('epoch_second', '2025-01-01'::timestamp), date_part('epoch_millisecond', '2025-01-01 00:00:00.5'::timestamp), to_timestamp('1735689600'), to_timestamp(1735689600000, 3), to_date('1735689600')"}
 - {id: age_months, sql: "select months_between('2025-03-15'::date, '2025-01-15'::date), months_between('2025-03-31'::date, '2025-01-01'::date), floor(datediff('day', '1990-05-17'::date, '2025-05-16'::date) / 365.25)"}
 # --- strings
-- {id: string_case_len, gap: "upper('ß') gives the capital sharp s, Snowflake gives SS", sql: "select lower('ÀB'), upper('straße'), length(''), length(null), len('abc'), ascii('A'), chr(65)"}
+- {id: string_case_len, sql: "select lower('ÀB'), upper('straße'), length(''), length(null), len('abc'), ascii('A'), chr(65)"}
 - {id: string_slice, sql: "select substr('abcdef', -3), substr('abcdef', 0, 2), substring('abcdef', 3), left('ab', 5), right('ab', 0), insert('abcdef', 2, 3, 'XY')"}
-- {id: string_compare, gap: "soundex is not available", sql: "select editdistance('kitten', 'sitting'), soundex('Robert'), jarowinkler_similarity('abc', 'abd'), 'a' < 'B', 'abc' = 'ABC', collate('abc', 'en-ci') = 'ABC'"}
+- {id: string_compare, sql: "select editdistance('kitten', 'sitting'), soundex('Robert'), jarowinkler_similarity('abc', 'abd'), 'a' < 'B', 'abc' = 'ABC', collate('abc', 'en-ci') = 'ABC'"}
 - {id: like_escape, sql: "select 'a_c' like 'a\\\\_c', 'abc' like 'a\\\\_c', 'a%c' like 'a!%c' escape '!', 'ABC' like 'abc', 'abc' not like '%z%', 'abc' like all ('a%', '%c')"}
 - {id: regexp_groups, sql: "select regexp_substr('order-123-us', '([a-z]+)-([0-9]+)', 1, 1, 'e', 2), regexp_replace('2025-03-04', '(\\\\d+)-(\\\\d+)-(\\\\d+)', '\\\\3/\\\\2/\\\\1'), regexp_instr('abc123', '[0-9]'), regexp_substr('ABC', 'b', 1, 1, 'i'), regexp_like('abc', 'ABC', 'i')"}
 - {id: regexp_anchoring, sql: "select 'abc' regexp 'b', 'abc' regexp '.*b.*', regexp_like('abc', 'b'), rlike('abc', 'a.c'), regexp_count('aaa', 'a')"}
@@ -105,11 +105,11 @@
 - {id: string_agg_distinct, sql: "select listagg(distinct x, '|') within group (order by x), listagg(x) from (select column1 x from values ('b'), ('a'), ('b'))"}
 - {id: hash_encode, sql: "select md5_hex('a'), sha1('a'), sha2('a'), base64_encode('hello'), base64_decode_string('aGVsbG8='), hex_encode('ab'), to_varchar(255, 'XX'), md5(null)"}
 - {id: uuid_shape, sql: "select length(uuid_string()), regexp_like(uuid_string(), '[0-9a-f-]{36}')"}
-- {id: parse_url_ip, gap: "parse_url and parse_ip are not available", sql: "select parse_url('https://example.com:8080/a/b?x=1&y=2'):host::string, parse_url('https://example.com/a?x=1'):parameters:x::string, parse_ip('192.168.1.10/24', 'INET'):network_prefix_length::int"}
+- {id: parse_url_ip, sql: "select parse_url('https://example.com:8080/a/b?x=1&y=2'):host::string, parse_url('https://example.com/a?x=1'):parameters:x::string, parse_ip('192.168.1.10/24', 'INET'):network_prefix_length::int"}
 # --- semi-structured
 - {id: variant_casts, sql: "select v:n::number(10,2), v:s::varchar, v:b::boolean, v:d::date, v:t::timestamp_ntz, v:n::string, v:missing::int from (select parse_json('{\"n\": 1.5, \"s\": \"x\", \"b\": true, \"d\": \"2025-01-02\", \"t\": \"2025-01-02 03:04:05\"}') v)"}
 - {id: variant_nulls, sql: "select v:a is null, v:a = null, is_null_value(v:a), v:missing is null, v:a::string, strip_null_value(v:a) is null from (select parse_json('{\"a\": null}') v)"}
-- {id: variant_bracket, gap: "get_ignore_case is not available", sql: "select v['a']['b']::int, v:a.b::int, v:\"A\"::int, v:a:b::int, get(v, 'a'):b::int, get_ignore_case(v, 'A'):b::int from (select parse_json('{\"a\": {\"b\": 1}}') v)"}
+- {id: variant_bracket, sql: "select v['a']['b']::int, v:a.b::int, v:\"A\"::int, v:a:b::int, get(v, 'a'):b::int, get_ignore_case(v, 'A'):b::int from (select parse_json('{\"a\": {\"b\": 1}}') v)"}
 - {id: variant_compare, sql: "select v:n > 1, v:n = 2, v:s = 'x', v:n + 1, v:s || 'y', v:n::int in (2, 3) from (select parse_json('{\"n\": 2, \"s\": \"x\"}') v)"}
 - {id: to_json_roundtrip, sql: "select to_json(parse_json('{\"b\": 1, \"a\": [1, 2]}')), to_variant(1)::int, to_json(object_construct('k', 'v')), check_json('{bad') is not null, check_json('{}'), try_parse_json('{bad') is null, parse_json('1.50')::string"}
 - {id: array_functions, sql: "select array_distinct(array_construct(1, 2, 1)), array_cat(array_construct(1), array_construct(2)), array_position(2::variant, array_construct(1, 2)), arrays_overlap(array_construct(1, 2), array_construct(2, 3)), array_append(array_construct(1), 2), array_prepend(array_construct(1), 0), array_compact(array_construct(1, null, 2)), array_flatten(array_construct(array_construct(1), array_construct(2)))"}

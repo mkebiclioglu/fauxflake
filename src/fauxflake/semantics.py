@@ -68,6 +68,52 @@ MACROS = [
     f"create or replace macro {_NS}_sf_as_varchar(v) as case when json_type(v::varchar) = 'VARCHAR' then v::json ->> '$' end",
     f"""create or replace macro {_NS}_sf_split_to_table(s, d) as table
           select 1 as seq, unnest(range(1, len(string_split(s, d)) + 1)) as index, unnest(string_split(s, d)) as value""",
+    # SOUNDEX: first letter, then the codes of the rest; H and W do not separate equal codes.
+    f"""create or replace macro {_NS}_sf_soundex_codes(s) as replace(translate(
+          regexp_replace(upper(s), '[^A-Z]', '', 'g'),
+          'BFPVCGJKQSXZDTLMNRAEIOUYHW', '111122222222334556000000--'), '-', '')""",
+    f"""create or replace macro {_NS}_sf_soundex_squeeze(c) as regexp_replace(regexp_replace(regexp_replace(
+          regexp_replace(regexp_replace(regexp_replace(regexp_replace(c, '0+', '0', 'g'), '1+', '1', 'g'),
+          '2+', '2', 'g'), '3+', '3', 'g'), '4+', '4', 'g'), '5+', '5', 'g'), '6+', '6', 'g')""",
+    f"""create or replace macro {_NS}_sf_soundex(s) as case
+          when s is null then null
+          when regexp_replace(upper(s), '[^A-Z]', '', 'g') = '' then ''
+          else left(regexp_replace(upper(s), '[^A-Z]', '', 'g'), 1) || left(replace(
+            case when left(regexp_replace(upper(s), '[^A-Z]', '', 'g'), 1) in ('H', 'W')
+                 then {_NS}_sf_soundex_squeeze({_NS}_sf_soundex_codes(s))
+                 else substr({_NS}_sf_soundex_squeeze({_NS}_sf_soundex_codes(s)), 2) end, '0', '') || '000', 3) end""",
+    # PARSE_URL gives an object; the path has no leading slash and missing parts are null.
+    f"""create or replace macro {_NS}_sf_url_query(u) as regexp_extract(u, '^[^?#]*\\?([^#]*)', 1)""",
+    f"""create or replace macro {_NS}_sf_parse_url(u) as case when u is null then null else json_object(
+          'fragment', nullif(regexp_extract(u, '#(.*)$', 1), ''),
+          'host', nullif(regexp_extract(u, '^[A-Za-z][A-Za-z0-9+.-]*://(?:[^/@?#]*@)?([^/:?#]*)', 1), ''),
+          'parameters', case when {_NS}_sf_url_query(u) = '' then null else to_json(map_from_entries(list_transform(
+              string_split({_NS}_sf_url_query(u), '&'),
+              lambda p: struct_pack(k := split_part(p, '=', 1), v := split_part(p, '=', 2))))) end,
+          'path', nullif(regexp_extract(u, '^[A-Za-z][A-Za-z0-9+.-]*://[^/?#]*/([^?#]*)', 1), ''),
+          'port', nullif(regexp_extract(u, '^[A-Za-z][A-Za-z0-9+.-]*://[^/?#]*:([0-9]+)', 1), ''),
+          'query', nullif({_NS}_sf_url_query(u), ''),
+          'scheme', nullif(regexp_extract(u, '^([A-Za-z][A-Za-z0-9+.-]*)://', 1), '')) end""",
+    # PARSE_IP for IPv4 addresses, with the range of the network when a prefix is given.
+    f"""create or replace macro {_NS}_sf_ipv4(h) as (split_part(h, '.', 1)::bigint * 16777216
+          + split_part(h, '.', 2)::bigint * 65536 + split_part(h, '.', 3)::bigint * 256 + split_part(h, '.', 4)::bigint)""",
+    f"""create or replace macro {_NS}_sf_ip_bits(ip) as coalesce(try_cast(nullif(split_part(ip, '/', 2), '') as integer), 32)""",
+    f"""create or replace macro {_NS}_sf_parse_ip(ip, kind) as case when ip is null then null else json_object(
+          'family', 4,
+          'host', split_part(ip, '/', 1),
+          'ip_fields', [{_NS}_sf_ipv4(split_part(ip, '/', 1)), 0, 0, 0],
+          'ip_type', lower(kind),
+          'ipv4', {_NS}_sf_ipv4(split_part(ip, '/', 1)),
+          'ipv4_range_end', {_NS}_sf_ipv4(split_part(ip, '/', 1)) | ((1::bigint << (32 - {_NS}_sf_ip_bits(ip))) - 1),
+          'ipv4_range_start', {_NS}_sf_ipv4(split_part(ip, '/', 1)) & (4294967295 - ((1::bigint << (32 - {_NS}_sf_ip_bits(ip))) - 1)),
+          'netmask_prefix_length', try_cast(nullif(split_part(ip, '/', 2), '') as integer),
+          'snowflake$type', 'ip_address') end""",
+    # GET_IGNORE_CASE prefers the exact key, then any key that differs only in case.
+    f"""create or replace macro {_NS}_sf_get_ignore_case(v, k) as json_extract(v::json, '$."' || coalesce(
+          list_filter(json_keys(v::json), lambda x: x = k)[1],
+          list_filter(json_keys(v::json), lambda x: lower(x) = lower(k))[1], k) || '"')""",
+    # UPPER('ß') is 'SS'.
+    f"create or replace macro {_NS}_sf_upper(s) as replace(upper(s), 'ẞ', 'SS')",
 ]
 
 _RENAMED = {  # Snowflake function -> macro, same arguments
@@ -75,6 +121,8 @@ _RENAMED = {  # Snowflake function -> macro, same arguments
     "jarowinkler_similarity": "_sf_jarowinkler", "object_insert": "_sf_object_insert",
     "object_delete": "_sf_object_delete", "object_pick": "_sf_object_pick",
     "current_account_name": "_sf_current_account_name", "try_base64_decode_string": "_sf_try_base64",
+    "soundex": "_sf_soundex", "parse_url": "_sf_parse_url", "parse_ip": "_sf_parse_ip",
+    "get_ignore_case": "_sf_get_ignore_case", "upper": "_sf_upper", "ucase": "_sf_upper",
     "as_integer": "_sf_as_integer", "as_varchar": "_sf_as_varchar", "as_char": "_sf_as_varchar",
     **{f"is_{k}": f"_sf_is_{k}" for k in ("object", "array", "integer", "varchar", "char", "boolean", "decimal", "double", "real")},
 }
@@ -160,7 +208,23 @@ def _operand(node: exp.Expression) -> exp.Expression:
 _VARIANT_ACCESS = (exp.JSONExtract, exp.Bracket)
 
 
+def _collation(spec: str) -> str | None:
+    """A Snowflake collation spec ('en-ci', 'en-ci-ai') as DuckDB's NOCASE / NOACCENT."""
+    parts = spec.lower().replace("_", "-").split("-")
+    names = [name for flag, name in (("ci", "NOCASE"), ("ai", "NOACCENT")) if flag in parts]
+    return ".".join(names) or None
+
+
 def _fix(node: exp.Expression) -> exp.Expression:
+    if isinstance(node, exp.Collate) and isinstance(node.expression, (exp.Literal, exp.Var, exp.Identifier)):
+        name = _collation(node.expression.name)
+        if name is None:
+            return node.this
+        node.set("expression", exp.var(name))
+        return node
+    if isinstance(node, exp.CollateColumnConstraint) and isinstance(node.this, (exp.Literal, exp.Var, exp.Identifier)):
+        node.set("this", exp.var(_collation(node.this.name) or "BINARY"))
+        return node
     if isinstance(node, exp.GetExtract):
         # GET(v, key) is v[key]; as a bracket it gets the same handling as every other access
         bracket = sqlglot.parse_one("x[0]", read="snowflake")
