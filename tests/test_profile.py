@@ -15,6 +15,7 @@ SKELETON = """
 seed: 1
 start: 2025-01-01
 tables:
+  RAW.SHOP.CUSTOMERS: {key: customer_id, event_time: created_at, loaded_at: _loaded_at}
   RAW.SHOP.EVENTS:
     key: event_id
     event_time: occurred_at
@@ -53,13 +54,15 @@ def test_profile_recovers_the_shape(warehouse, emu, spec, tmp_path):
     assert orders["AMOUNT"]["type"] == "DECIMAL(12,2)"
     assert 30 < orders["AMOUNT"]["v"][4] < 48  # median near 39
     assert orders["CHANNEL"]["gen"] == "categorical"
+    assert 1.3 < orders["CUSTOMER_ID"]["skew"] < 1.9  # declared 1.6: a few customers place most orders
+    assert 0.0005 < got["RAW.SHOP.ORDERS"]["duplicate_rate"] < 0.006  # declared 0.002
+    assert 1.7 < events["columns"]["CUSTOMER_ID"]["skew"] < 2.3  # declared 2.0
+    assert 0.09 < events["columns"]["CUSTOMER_ID"]["null_rate"] < 0.15
 
     # and the measured spec is immediately usable to generate again
     from fauxflake.emulator import serve
     from fauxflake.generate import Warehouse
     from fauxflake.spec import Spec
-    text = path.read_text().replace("tables:", "tables:\n  RAW.SHOP.CUSTOMERS: " + CUSTOMERS, 1)
-    path.write_text(text)
     with serve() as again:
         counts = Warehouse(again, Spec.load(path), 1.0).advance_to(datetime(2025, 2, 1))
     assert counts["RAW.SHOP.EVENTS"] > 100_000

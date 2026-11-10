@@ -195,6 +195,21 @@ def free_port() -> int:
 
 
 @contextlib.contextmanager
+def engine() -> Iterator[Emulator]:
+    """Only the DuckDB side, with no Snowflake endpoint: enough to generate and inspect data."""
+    from fakesnow.instance import FakeSnow
+
+    _patch_fakesnow()
+    fs = FakeSnow(nop_regexes=NOPS)
+    for macro in semantics.MACROS:
+        fs.duck_conn.execute(macro)
+    try:
+        yield Emulator(port=0, duck=fs.duck_conn, _fs=fs)
+    finally:
+        fs.duck_conn.close()
+
+
+@contextlib.contextmanager
 def serve(port: int | None = None, db_path: str | Path | None = None, verbose: bool = False) -> Iterator[Emulator]:
     """Start the emulator. With `db_path`, each database persists as `<db_path>/<NAME>.db`.
 
@@ -218,8 +233,8 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
     fs = FakeSnow(db_path=db_path, nop_regexes=NOPS)
     for macro in semantics.MACROS:
         fs.duck_conn.execute(macro)
+    previous = fakesnow.server.shared_fs
     fakesnow.server.shared_fs = fs
-    fakesnow.server.sessions.clear()
 
     port = port or free_port()
     server = uvicorn.Server(
@@ -236,4 +251,5 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
     finally:
         server.should_exit = True
         thread.join(timeout=5)
+        fakesnow.server.shared_fs = previous
         fs.duck_conn.close()

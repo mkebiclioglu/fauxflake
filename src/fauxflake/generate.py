@@ -210,8 +210,10 @@ where _loaded > $after and _loaded <= $until"""
 class Warehouse:
     """The synthetic sources at a point in simulated time."""
 
-    def __init__(self, emu: emulator.Emulator, spec: Spec, scale: float = 1.0, scenario: Scenario | None = None):
+    def __init__(self, emu: emulator.Emulator, spec: Spec, scale: float = 1.0, scenario: Scenario | None = None,
+                 freeze_clock: bool = True):
         self.emu, self.spec, self.scale, self.scenario = emu, spec, scale, scenario
+        self.freeze_clock = freeze_clock
         self.cur: duckdb.DuckDBPyConnection = emu.cursor()
         self.now: datetime | None = None
 
@@ -249,7 +251,8 @@ class Warehouse:
             verb = f"create or replace table {t.name} as" if self.now is None else f"insert into {t.name}"
             counts[t.name] = self.cur.execute(f"{verb} {select}", params).fetchone()[0]
         self.now = until
-        emulator.FROZEN_NOW = until
+        if self.freeze_clock:
+            emulator.FROZEN_NOW = until
         return counts
 
     def row_counts(self) -> dict[str, int]:
