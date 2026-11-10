@@ -836,11 +836,24 @@ _BARE = {"CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "CURRENT_USER", "L
          "TRUE", "FALSE", "NULL", "DEFAULT", "SESSION_USER", "USER"}
 
 
+_FLATTEN_OUTPUT = {"SEQ", "KEY", "PATH", "INDEX", "VALUE", "THIS"}
+
+
 def rewrite(node: exp.Expression) -> exp.Expression:
     """Apply the fixes bottom-up, so nested cases (a ratio of averages) all get rewritten."""
     if isinstance(node, exp.With) and not node.args.get("recursive") and any(
             isinstance(c.this, exp.SetOperation) and _self_referencing(c) for c in node.expressions):
         node.set("recursive", True)  # the keyword is optional in Snowflake
+    if isinstance(node, exp.Select) and node.args.get("joins") and node.args.get("from_") is not None:
+        # FROM t, TABLE(FLATTEN(value['items'])): the bare column is t's. DuckDB would take it for
+        # the FLATTEN's own VALUE output, so say which table it comes from.
+        base = node.args["from_"].this
+        laterals = [j.this for j in node.args["joins"] if isinstance(j.this, (exp.Lateral, exp.TableFromRows))]
+        if isinstance(base, (exp.Table, exp.Subquery)) and base.alias_or_name and len(laterals) == len(node.args["joins"]):
+            for i, lateral in enumerate(laterals):
+                for col in lateral.find_all(exp.Column):
+                    if not col.table and (i == 0 or col.name.upper() not in _FLATTEN_OUTPUT):
+                        col.set("table", exp.to_identifier(base.alias_or_name))
     if isinstance(node, exp.With):
         seen: set[str] = set()
         for cte in list(node.expressions):  # two CTEs with one name: Snowflake uses the first
