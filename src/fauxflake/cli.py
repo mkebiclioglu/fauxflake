@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import time
 from datetime import datetime, timedelta
@@ -151,3 +152,29 @@ def parity(spec_path, project_dir, scale, history, connection, days):
         click.echo(f"{mark} {r.model:<28} emulator={r.emulator_rows:,} snowflake={r.snowflake_rows:,} "
                    f"only_emulator={r.only_emulator:,} only_snowflake={r.only_snowflake:,} {r.note}")
     sys.exit(0 if all(r.ok for r in results) else 1)
+
+
+@main.command()
+@click.option("--connection", default=None, help="Record answers from this Snowflake connection into golden.json.")
+def conformance(connection):
+    """Score the emulator against answers recorded from real Snowflake."""
+    import snowflake.connector
+
+    from . import conformance as c
+    from .emulator import serve
+
+    if connection:
+        recorded = c.record(snowflake.connector.connect(connection_name=connection))
+        click.echo(f"recorded {len(recorded)} cases from Snowflake")
+    expected, passed, failed = c.golden(), 0, []
+    with serve() as emu:
+        conn = snowflake.connector.connect(**emu.connect_kwargs(database="CONFORMANCE", schema="PUBLIC"))
+        for case in c.cases():
+            actual = c.run(conn, case["sql"])
+            if c.matches(expected[case["id"]], actual):
+                passed += 1
+            else:
+                failed.append((case, actual))
+    for case, actual in failed:
+        click.echo(f"DIFF {case['id']}\n  snowflake: {json.dumps(expected[case['id']])[:300]}\n  emulator:  {json.dumps(actual)[:300]}")
+    click.echo(f"\n{passed}/{passed + len(failed)} cases match Snowflake")

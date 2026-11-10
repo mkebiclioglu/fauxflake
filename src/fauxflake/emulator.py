@@ -21,6 +21,8 @@ from typing import Iterator
 
 import duckdb
 
+from . import semantics
+
 # Statements the emulator cannot run as-is, rewritten before they are parsed.
 # Every entry is a known difference from Snowflake: keep the list short and
 # documented, because each one is a place where CI and prod are not identical.
@@ -122,6 +124,37 @@ def _patch_fakesnow() -> None:
             raise ProgrammingError(msg=f"fauxflake emulator: {type(e).__name__}: {e}", errno=9998, sqlstate="XX000") from e
 
     FakeSnowflakeCursor.execute = execute
+
+    # Failures outside execute() (for example describing an unsupported result type)
+    # must also come back as SQL errors, not HTTP 500s the connector retries forever.
+    import fakesnow.server as server
+    from starlette.responses import JSONResponse
+
+    describe = server.describe_as_rowtype
+
+    def describe_as_rowtype(described):  # noqa: ANN001
+        try:
+            return describe(described)
+        except Exception as e:  # noqa: BLE001
+            raise ProgrammingError(msg=f"fauxflake emulator: unsupported result type: {e}",
+                                   errno=9997, sqlstate="XX000") from e
+
+    server.describe_as_rowtype = describe_as_rowtype
+
+    async def server_error(request, exc):  # noqa: ANN001
+        return JSONResponse({"data": {"errorCode": "009996", "sqlState": "XX000"}, "code": "009996",
+                             "message": f"fauxflake emulator: {exc.message}"[:2000], "success": False})
+
+    server.app.exception_handlers[server.ServerError] = server_error
+    server.app.middleware_stack = None
+
+    semantics.patch_upstream()
+    original_transform = FakeSnowflakeCursor._transform
+
+    def _transform(self, expression, params):  # noqa: ANN001
+        return original_transform(self, semantics.rewrite(expression), params)
+
+    FakeSnowflakeCursor._transform = _transform
     _patched = True
 
 
@@ -173,6 +206,8 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
     if db_path:
         Path(db_path).mkdir(parents=True, exist_ok=True)
     fs = FakeSnow(db_path=db_path, nop_regexes=NOPS)
+    for macro in semantics.MACROS:
+        fs.duck_conn.execute(macro)
     fakesnow.server.shared_fs = fs
     fakesnow.server.sessions.clear()
 

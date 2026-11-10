@@ -133,7 +133,7 @@ Synthetic data is safe to load anywhere, including a real account. `fauxflake pa
 through simulated days, and compares every model row for row:
 
 ```
-DIFF  fct_daily_events   emulator=128 snowflake=128 only_emulator=128 only_snowflake=128
+same  fct_daily_events   emulator=128 snowflake=128 only_emulator=0 only_snowflake=0
 same  fct_orders         emulator=8,500 snowflake=8,500 only_emulator=0 only_snowflake=0
 same  stg_customers      emulator=244 snowflake=244 only_emulator=0 only_snowflake=0
 same  stg_events         emulator=171,434 snowflake=171,434 only_emulator=0 only_snowflake=0
@@ -141,8 +141,24 @@ same  stg_orders         emulator=8,500 snowflake=8,500 only_emulator=0 only_sno
 ```
 
 That is the real output for the example project on a trial account, on an XS warehouse, for
-a fraction of a credit. The one difference is genuine and now a known gap: Snowflake divides
-integers into `NUMBER(p, 6)` (`0.090029`), DuckDB into a double (`0.09002904...`).
+a fraction of a credit. The first run did not look like this: every row of
+`fct_daily_events` differed, because Snowflake divides integers into `NUMBER(p, 6)`
+(`0.090029`) while DuckDB returns a double. That is how the gap was found and fixed.
+
+### Conformance suite
+
+[`conformance/cases.yml`](conformance/cases.yml) holds 52 small queries covering the SQL
+analytics code leans on: division and rounding, dates, strings, regular expressions,
+semi-structured data, window functions, pivots. `fauxflake conformance --connection <name>`
+runs them on real Snowflake once and stores the answers in `golden.json`. CI then replays
+them against the emulator with no Snowflake access.
+
+Current score: **48 of 52 match**. The 4 known gaps are marked in the file and listed under
+[Limits](#limits). A gap is a strict expected failure, so fixing one forces the marker to be
+removed and the list cannot go stale. Fixes live in
+[`semantics.py`](src/fauxflake/semantics.py); so far: division scale and divide-by-zero
+errors, `AVG` scale, exact (not double) `SUM`, `DATE_TRUNC` keeping `DATE`, `LTRIM`/`RTRIM`
+with characters, `RATIO_TO_REPORT`, `CONDITIONAL_TRUE_EVENT`.
 
 ## Security
 
@@ -178,11 +194,15 @@ Read these before trusting a green check.
   JavaScript UDFs, grants and masking policies are out of scope. Keep one cheap stage on real
   Snowflake: `dbt build --empty --select state:modified+` compiles and type-checks every
   changed model against real schemas while scanning zero rows.
+- **Emulator errors are immediate.** Anything unsupported fails the statement with a
+  `fauxflake emulator:` message instead of hanging or passing silently.
 - **Three deliberate differences**, all in [`emulator.py`](src/fauxflake/emulator.py):
   qualified temporary tables become regular tables; explicit transactions run as autocommit;
   bare columns in `MERGE ... INSERT VALUES` are qualified with the source alias.
-- **Known result difference:** integer division (`/`, `div0`) keeps 6 decimals on Snowflake
-  and full double precision in the emulator. Found by `fauxflake parity`.
+- **Known result differences** (from the conformance suite): `TO_VARCHAR` ignores numeric
+  format models; `ARRAY` values cannot be returned to a client (they work inside models);
+  `TYPEOF` on a variant reports `JSON`. Division results have Snowflake's value and scale but
+  are typed `DOUBLE` rather than `NUMBER`.
 - **It says nothing about Snowflake performance or cost.** Query plans, pruning, spilling and
   warehouse sizing cannot be learned from DuckDB.
 - **Fidelity stops at the spec.** Columns are sampled independently, so cross-column

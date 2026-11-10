@@ -1,0 +1,56 @@
+# Each query runs on real Snowflake once (`fauxflake conformance record`) and the
+# answers are stored in golden.json. CI replays them against the emulator with no
+# Snowflake access. `gap:` marks a known difference; fixing one makes its test fail
+# until the marker is removed, so the list cannot go stale.
+- {id: div_int, sql: "select 2/3, -2/3, 5/1000000, 7/2"}
+- {id: div_decimal, sql: "select 10.55::number(12,2)/3, 1/0.3::number(3,1)"}
+- {id: div_float, sql: "select 2::float/3"}
+- {id: div_by_zero, sql: "select 1/0"}
+- {id: div0, sql: "select div0(1, 0), div0(1, 3), div0null(1, null)"}
+- {id: avg_int, sql: "select avg(x) from (select column1 x from values (1), (2), (2))"}
+- {id: avg_decimal, sql: "select avg(x) from (select column1::number(12,2) x from values (1.5), (2.25), (0.1))"}
+- {id: sum_ratio, sql: "select sum(x) / count(*) from (select column1 x from values (1), (2), (2))"}
+- {id: round_half, sql: "select round(2.5), round(-2.5), round(0.125, 2), round(1234.5678, -2)"}
+- {id: trunc_number, sql: "select trunc(1.987, 2), floor(-1.5), ceil(1.2), mod(-7, 3)"}
+- {id: int_cast_rounds, sql: "select 1.5::int, 2.5::int, -1.5::int, '12'::int"}
+- {id: try_cast, sql: "select try_cast('abc' as int), try_to_number('12.5', 10, 2), try_to_date('2025-13-01')"}
+- {id: iff_nvl, sql: "select iff(1 > 2, 'a', 'b'), nvl(null, 5), nvl2(null, 1, 2), zeroifnull(null), nullifzero(0), coalesce(null, null, 3)"}
+- {id: decode, sql: "select decode(2, 1, 'one', 2, 'two', 'other'), decode(null, null, 'isnull', 'no')"}
+- {id: null_safe, sql: "select equal_null(null, null), null is distinct from 1, 1 = null"}
+- {id: greatest_null, sql: "select greatest(1, null, 3), least(1, 2), greatest_ignore_nulls(1, null, 3)"}
+- {id: bool_agg, sql: "select boolor_agg(x > 1), booland_agg(x > 1), count_if(x > 1) from (select column1 x from values (1), (2), (3))"}
+- {id: dateadd, sql: "select dateadd('month', 1, '2025-01-31'::date), dateadd('day', -1, '2025-03-01'::date), dateadd('hour', 30, '2025-01-01'::timestamp)"}
+- {id: datediff, sql: "select datediff('day', '2025-01-01 23:59'::timestamp, '2025-01-02 00:01'::timestamp), datediff('month', '2025-01-31'::date, '2025-02-01'::date), datediff('week', '2025-01-04'::date, '2025-01-06'::date), datediff('year', '2024-12-31'::date, '2025-01-01'::date)"}
+- {id: date_trunc, sql: "select date_trunc('week', '2025-01-01'::date), date_trunc('quarter', '2025-05-17'::date), date_trunc('month', '2025-05-17 10:11:12'::timestamp)"}
+- {id: date_parts, sql: "select dayofweek('2025-01-05'::date), dayofweekiso('2025-01-05'::date), weekofyear('2025-01-01'::date), quarter('2025-05-01'::date), dayname('2025-01-05'::date), monthname('2025-01-05'::date), last_day('2025-02-10'::date)"}
+- {id: to_date_formats, gap: "to_varchar ignores numeric format models", sql: "select to_date('2025/03/04', 'YYYY/MM/DD'), to_timestamp('2025-03-04 05:06:07'), to_char('2025-03-04'::date, 'YYYY-MM'), to_varchar(1234.5, '9,999.00')"}
+- {id: epoch, sql: "select to_timestamp(1735689600), date_part(epoch_second, '2025-01-01'::timestamp), to_timestamp(1735689600123, 3)"}
+- {id: convert_tz, sql: "select convert_timezone('UTC', 'America/New_York', '2025-03-09 12:00:00'::timestamp_ntz)"}
+- {id: months_between, sql: "select months_between('2025-03-31'::date, '2025-02-28'::date), add_months('2025-01-31'::date, 1)"}
+- {id: string_basic, sql: "select 'a' || null, concat('a', 'b'), concat_ws('-', 'a', 'b'), upper('aB'), initcap('hello world'), length('héllo'), left('abcdef', 2), right('abcdef', 2), substr('abcdef', 2, 3)"}
+- {id: string_search, sql: "select position('c' in 'abc'), charindex('c', 'abcabc', 4), contains('abc', 'b'), startswith('abc', 'ab'), endswith('abc', 'bc'), 'abc' ilike 'A%'"}
+- {id: string_pad_trim, sql: "select lpad('7', 3, '0'), rpad('7', 3, '0'), trim('  x '), ltrim('xxa', 'x'), replace('aaa', 'a', 'b'), translate('abc', 'ab', 'xy'), repeat('ab', 2), reverse('abc')"}
+- {id: split, sql: "select split_part('a,b,c', ',', 2), split_part('a,b,c', ',', -1), split('a,b', ','), strtok('a b c', ' ', 2)"}
+- {id: regexp, sql: "select regexp_replace('a1b22', '[0-9]+', '#'), regexp_substr('a1b22', '[0-9]+', 1, 2), regexp_count('a1b22', '[0-9]'), regexp_like('abc', 'a.c'), 'abc' rlike 'a.*'"}
+- {id: hashing, sql: "select md5('abc'), sha2('abc', 256), hash(1) is not null"}
+- {id: listagg, sql: "select listagg(x, ',') within group (order by x) from (select column1 x from values ('b'), ('a'), ('c'))"}
+- {id: array_agg, sql: "select array_agg(x) within group (order by x), array_size(array_agg(x)) from (select column1 x from values (2), (1), (3))"}
+- {id: arrays, gap: "ARRAY results cannot be returned to the client", sql: "select array_construct(1, 2, 3), array_contains(2::variant, array_construct(1, 2)), array_to_string(array_construct('a', 'b'), '|'), array_slice(array_construct(1, 2, 3), 0, 2)"}
+- {id: object_construct, gap: "ARRAY results cannot be returned to the client", sql: "select object_construct('a', 1, 'b', 'x'), object_construct('a', null), object_keys(object_construct('a', 1, 'b', 2))"}
+- {id: json_path, sql: "select v:a::int, v:b.c::string, v:d[1]::int, v:missing, get_path(v, 'b.c')::string from (select parse_json('{\"a\": 1, \"b\": {\"c\": \"x\"}, \"d\": [10, 20]}') v)"}
+- {id: flatten, sql: "select f.index, f.value::int from table(flatten(input => parse_json('[10, 20, 30]'))) f order by 1"}
+- {id: lateral_flatten, sql: "select t.id, f.value:k::string from (select 1 id, parse_json('[{\"k\": \"a\"}, {\"k\": \"b\"}]') v) t, lateral flatten(input => t.v) f order by 2"}
+- {id: typeof_variant, gap: "typeof() reports JSON instead of the variant's inner type", sql: "select typeof(parse_json('1')), typeof(parse_json('\"a\"')), is_array(parse_json('[1]')), is_null_value(parse_json('null'))"}
+- {id: qualify, sql: "select x from (select column1 x, column2 g from values (1, 'a'), (2, 'a'), (3, 'b')) qualify row_number() over (partition by g order by x desc) = 1 order by 1"}
+- {id: window_frames, sql: "select x, sum(x) over (order by x rows between 1 preceding and current row), lag(x) over (order by x), ratio_to_report(x) over () from (select column1 x from values (1), (2), (3)) order by 1"}
+- {id: last_value_ignore_nulls, sql: "select x, last_value(y ignore nulls) over (order by x rows between unbounded preceding and current row) from (select column1 x, column2 y from values (1, 'a'), (2, null), (3, 'c')) order by 1"}
+- {id: conditional_change, sql: "select x, conditional_true_event(x > 1) over (order by x) from (select column1 x from values (1), (2), (3)) order by 1"}
+- {id: pivot, sql: "select * from (select column1 k, column2 m, column3 v from values ('a', 'x', 1), ('a', 'y', 2), ('b', 'x', 3)) pivot (sum(v) for m in ('x', 'y')) order by 1"}
+- {id: unpivot, sql: "select * from (select 1 id, 10 a, 20 b) unpivot (val for col in (a, b)) order by col"}
+- {id: group_by_all, sql: "select g, count(*) from (select column1 g from values ('a'), ('a'), ('b')) group by all order by 1"}
+- {id: median_percentile, sql: "select median(x), percentile_cont(0.25) within group (order by x), mode(x) from (select column1 x from values (1), (2), (2), (10))"}
+- {id: generator, sql: "select count(*), max(seq4()) from table(generator(rowcount => 5))"}
+- {id: case_insensitive_like_any, sql: "select 'abc' like any ('x%', 'a%'), 'abc' in ('ABC', 'abc')"}
+- {id: number_overflow_scale, sql: "select 0.1 + 0.2, 1.10 * 1.10, 100::number(5,2) * 3, 7 % 3"}
+- {id: boolean_cast, sql: "select 'true'::boolean, 1::boolean, to_boolean('yes'), true::int, true::string"}
+- {id: timestamp_arith, sql: "select '2025-01-01'::date + 1, '2025-01-31'::date - '2025-01-01'::date, timestampdiff('minute', '2025-01-01 00:00'::timestamp, '2025-01-01 01:30'::timestamp), '2025-01-01 00:00'::timestamp + interval '90 minutes'"}
