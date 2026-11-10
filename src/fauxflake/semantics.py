@@ -597,11 +597,12 @@ def _fix(node: exp.Expression) -> exp.Expression:
     if isinstance(node, (exp.EQ, exp.NEQ)) and node.find_ancestor(exp.Select) is not None \
             and node.find_ancestor(exp.Merge, exp.Update, exp.Delete) is None:
         left, right = node.this.unnest(), node.expression.unnest()
-        plain = (exp.Column, exp.Literal)
         join = node.find_ancestor(exp.Join)
         asof = join is not None and (join.args.get("match_condition") is not None or "ASOF" in str(join.args.get("method") or "").upper())
-        if isinstance(left, plain) and isinstance(right, plain) and (isinstance(left, exp.Column) or isinstance(right, exp.Column)) \
-                and not any(isinstance(x, exp.Literal) and not x.is_string for x in (left, right)) and not asof:
+        fixed = (exp.Boolean, exp.Null)  # sides that cannot be a VARIANT and need no care
+        skip = any(isinstance(x, fixed) or (isinstance(x, exp.Literal) and not x.is_string) or x.find(exp.Select) is not None
+                   for x in (left, right))
+        if (isinstance(left, exp.Column) or isinstance(right, exp.Column)) and not skip and not asof:
             same = _fn("_sf_eq", node.this, node.expression)
             return same if isinstance(node, exp.EQ) else exp.Not(this=same)
     if isinstance(node, _COMPARISONS) or isinstance(node, exp.In):
