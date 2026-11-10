@@ -287,3 +287,8 @@
 - {id: chained_comparison, sql: "select column1 = 'x' = false from values ('x'), ('y') order by 1"}
 - {id: group_alias_window, sql: "select date_trunc('day', t) as date_day, c as c, sum(x) as s, ratio_to_report(sum(x)) over (partition by date_day) r from (select '2025-01-01 10:00'::timestamp t, 'a' c, 2 x union all select '2025-01-01 11:00', 'b', 6) group by 1, 2 order by 2"}
 - {id: float_to_integer_casts, sql: "select x::int, x::number(38,0), cast(x as decimal), x::bigint, round(x), x::number(10,1), d::int, t::int from (select column1::float x, column1::number(10,2) d, column1::varchar t from values (0.5), (1.5), (2.5), (-0.5), (-2.5), (2.4)) order by x"}
+- {id: group_by_alias_of_alias, sql: "select cast(t as date) as d, s, md5(d::varchar || '-' || s) as k, count(*) as n, n as n2 from (select '2025-01-01 10:00'::timestamp t, 1 s union all select '2025-01-01 12:00', 1) group by k, d, s"}
+- {id: implicit_text_division, sql: "select v / 2, v / 2.5, 10 / v, v::float / 3 from (select column1 v from values ('5'))"}
+- {id: reserved_column_names, sql: "select authorization, \"order\", t.user from (select 'a' as authorization, 1 as \"order\", 'u' as user) t where authorization = 'a'"}
+- {id: array_literals_in_branches, sql: "select k, case when k = 'a' then [k, 'z'] when k = 'b' then array_construct() end as arr, array_size(arr) from (select column1 k from values ('a'), ('b'), ('c')) order by k"}
+- {id: flatten_union_arrays, sql: "with a as (select 1 id, ['x', 'y'] tags union all select 2, split('p,q', ',') union all select 3, array_construct()) select a.id, f.value::string from a, lateral flatten(input => a.tags) f order by 1, 2"}

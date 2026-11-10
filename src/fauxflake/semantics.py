@@ -21,8 +21,8 @@ MACROS = [
     # making the expression volatile, so `a / b as r, r * 2` can still reuse the alias.
     f"""create or replace macro {_NS}_sf_div(a, b) as case
           when b = 0 and a is not null then cast('Division by zero' as double)
-          when typeof(a) in ('DOUBLE', 'FLOAT') or typeof(b) in ('DOUBLE', 'FLOAT') then a / b
-          else round(a::double / b, greatest({_SCALE}, least({_SCALE} + 6, 12))) end""",
+          when typeof(a) in ('DOUBLE', 'FLOAT', 'VARCHAR') or typeof(b) in ('DOUBLE', 'FLOAT', 'VARCHAR') then a::double / b::double
+          else round(a::double / b::double, greatest({_SCALE}, least({_SCALE} + 6, 12))) end""",
     # DATE_TRUNC keeps the input type. DuckDB turns a DATE into a TIMESTAMP.
     f"""create or replace macro {_NS}_sf_date_trunc
           (p varchar, x date) as date_trunc(p, x)::date,
@@ -34,8 +34,8 @@ MACROS = [
             when 'NULL' then 'NULL_VALUE' else json_type(v::varchar) end end""",
     # A windowed AVG keeps three extra decimals, not six.
     f"""create or replace macro {_NS}_sf_div3(a, b) as case
-          when typeof(a) in ('DOUBLE', 'FLOAT') then a / b
-          else round(a::double / b, {_SCALE} + 3) end""",
+          when typeof(a) in ('DOUBLE', 'FLOAT', 'VARCHAR') then a::double / b::double
+          else round(a::double / b::double, {_SCALE} + 3) end""",
     # VARIANCE of fixed-point input is fixed-point; STDDEV of integers is the root of that.
     f"""create or replace macro {_NS}_sf_var(v, a) as case
           when typeof(a) in ('DOUBLE', 'FLOAT') then v else round(v, least(2 * {_SCALE} + 6, 12)) end""",
@@ -59,10 +59,10 @@ MACROS = [
     f"""create or replace macro {_NS}_sf_fixed(v, s) as
           rtrim(left(v::decimal(38, 12)::varchar, length(v::decimal(38, 12)::varchar) - (12 - s)), '.')""",
     f"""create or replace macro {_NS}_sf_div_text(a, b) as case
-          when typeof(a) in ('DOUBLE', 'FLOAT') or typeof(b) in ('DOUBLE', 'FLOAT') then {_NS}_sf_text(a / b)
+          when typeof(a) in ('DOUBLE', 'FLOAT', 'VARCHAR') or typeof(b) in ('DOUBLE', 'FLOAT', 'VARCHAR') then {_NS}_sf_text(a::double / b::double)
           else {_NS}_sf_fixed({_NS}_sf_div(a, b), greatest({_SCALE}, least({_SCALE} + 6, 12))) end""",
     f"""create or replace macro {_NS}_sf_round_div_text(a, b, n) as case
-          when typeof(a) in ('DOUBLE', 'FLOAT') or typeof(b) in ('DOUBLE', 'FLOAT') then {_NS}_sf_text(round(a / b, n))
+          when typeof(a) in ('DOUBLE', 'FLOAT', 'VARCHAR') or typeof(b) in ('DOUBLE', 'FLOAT', 'VARCHAR') then {_NS}_sf_text(round(a::double / b::double, n))
           else {_NS}_sf_fixed(round({_NS}_sf_div(a, b), n), least(n, greatest({_SCALE}, least({_SCALE} + 6, 12)))) end""",
     f"""create or replace macro {_NS}_sf_width_bucket(x, lo, hi, n) as case
           when x < lo then 0 when x >= hi then n + 1 else floor((x - lo) * n / (hi - lo))::bigint + 1 end""",
@@ -116,7 +116,18 @@ MACROS = [
     f"""create or replace macro {_NS}_sf_ipv4(h) as (split_part(h, '.', 1)::bigint * 16777216
           + split_part(h, '.', 2)::bigint * 65536 + split_part(h, '.', 3)::bigint * 256 + split_part(h, '.', 4)::bigint)""",
     f"""create or replace macro {_NS}_sf_ip_bits(ip) as coalesce(try_cast(nullif(split_part(ip, '/', 2), '') as integer), 32)""",
-    f"""create or replace macro {_NS}_sf_parse_ip(ip, kind) as case when ip is null then null else json_object(
+    f"""create or replace macro {_NS}_sf_parse_ip
+          (ip, kind) as case when ip is null then null else json_object(
+          'family', 4,
+          'host', split_part(ip, '/', 1),
+          'ip_fields', [{_NS}_sf_ipv4(split_part(ip, '/', 1)), 0, 0, 0],
+          'ip_type', lower(kind),
+          'ipv4', {_NS}_sf_ipv4(split_part(ip, '/', 1)),
+          'ipv4_range_end', {_NS}_sf_ipv4(split_part(ip, '/', 1)) | ((1::bigint << (32 - {_NS}_sf_ip_bits(ip))) - 1),
+          'ipv4_range_start', {_NS}_sf_ipv4(split_part(ip, '/', 1)) & (4294967295 - ((1::bigint << (32 - {_NS}_sf_ip_bits(ip))) - 1)),
+          'netmask_prefix_length', try_cast(nullif(split_part(ip, '/', 2), '') as integer),
+          'snowflake$type', 'ip_address') end,
+          (ip, kind, permissive) as case when ip is null then null else json_object(
           'family', 4,
           'host', split_part(ip, '/', 1),
           'ip_fields', [{_NS}_sf_ipv4(split_part(ip, '/', 1)), 0, 0, 0],
@@ -718,20 +729,38 @@ def layer_windows(tree: exp.Expression) -> exp.Expression:
     return tree
 
 
+def inline_aliases(tree: exp.Expression, names: set[str]) -> exp.Expression:
+    """`cast(ts as date) as d, md5(d || id) as k ... group by k`: DuckDB will not group by an
+    alias built from another alias. Write the first alias out where the second one uses it."""
+    for _ in range(4):
+        changed = False
+        for select in tree.find_all(exp.Select):
+            defined = {p.alias.upper(): p for p in select.expressions if isinstance(p, exp.Alias) and p.alias.upper() in names}
+            for proj in select.expressions:
+                for col in list(proj.find_all(exp.Column)):
+                    owner = defined.get(col.name.upper())
+                    if owner is None or owner is proj or col.table or col.find_ancestor(exp.Select) is not select:
+                        continue
+                    col.replace(exp.paren(owner.this.copy()))
+                    changed = True
+        if not changed:
+            break
+    return tree
+
+
 def reserved_words(conn) -> None:  # noqa: ANN001
     _RESERVED.update(w.upper() for (w,) in conn.execute(
         "select keyword_name from duckdb_keywords() where keyword_category in ('reserved', 'type_function')").fetchall())
 
 
 _RESERVED: set[str] = set()
-_NAMED = (exp.Column, exp.Table, exp.TableAlias, exp.Alias, exp.CTE, exp.Star)
 
 
 def finish(transformed: exp.Expression) -> exp.Expression:
     """Fix-ups on the DuckDB side of the translation."""
     for ident in transformed.find_all(exp.Identifier):
         # `end`, `overlaps`... are ordinary names in Snowflake and reserved words in DuckDB
-        if not ident.args.get("quoted") and ident.name.upper() in _RESERVED and isinstance(ident.parent, _NAMED) \
+        if not ident.args.get("quoted") and ident.name.upper() in _RESERVED \
                 and not (isinstance(ident.parent, exp.Column) and ident.name.upper() in _BARE):
             ident.set("quoted", True)
     for window in list(transformed.find_all(exp.Window)):
@@ -993,6 +1022,13 @@ def _repair(tree: exp.Expression, text: str, details: dict) -> bool:
                 _convert(node.this, "timestamp")  # DATEADD(day, 1, text_column)
                 return True
         return False
+    if name.lower() == "timezone":
+        for node in tree.find_all(exp.AtTimeZone):
+            sql = node.sql(dialect="duckdb")
+            start = text.find(sql)
+            if start >= 0 and start <= pos <= start + len(sql) and not isinstance(node.this, exp.Cast):
+                _convert(node.this, "timestamp")  # CONVERT_TIMEZONE on a text column
+                return True
     lowered = name.lower()
     to = "double" if lowered in _NUMERIC_CALLS else "timestamp" if lowered in _DATE_CALLS else None
     if to is None:

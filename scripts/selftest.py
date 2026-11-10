@@ -25,6 +25,8 @@ def main() -> None:
     ap.add_argument("--database", default="ANALYTICS")
     ap.add_argument("--vars", default=None)
     ap.add_argument("--json")
+    ap.add_argument("--steps", default="seed; build --exclude-resource-type seed",
+                    help="dbt commands to run in order, separated by ';' (a node's last result counts)")
     ap.add_argument("--snowflake", default=None, metavar="CONNECTION",
                     help="also build on this real account (~/.snowflake/connections.toml) and compare every model row for row")
     ap.add_argument("--threads", type=int, default=4)
@@ -47,13 +49,16 @@ def main() -> None:
         provide_env(project)
         extra = (["--vars", args.vars] if args.vars else []) + args.dbt_args
         # seeds first: these packages read them as sources, which dbt cannot order after the seeds
-        results = []
-        for step in (["seed"], ["build", "--exclude-resource-type", "seed"]):
+        import shlex
+
+        latest: dict[str, dict] = {}
+        for step in [shlex.split(part) for part in args.steps.split(";") if part.strip()]:
             project.invoke([*step, *extra], schema=args.schema, quiet=True)
             path = project.target_path / "run_results.json"
             if path.exists():
-                results += json.loads(path.read_text())["results"]
+                latest.update({r["unique_id"]: r for r in json.loads(path.read_text())["results"]})
                 path.unlink()
+        results = list(latest.values())
         parity = []
         if args.snowflake:
             import snowflake.connector
