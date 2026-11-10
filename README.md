@@ -351,7 +351,7 @@ and runs every model through the emulator on empty stub tables whose columns it 
 
 | project | models | run end to end | emulator failure | blocked by guessed stub columns, or undecided |
 | --- | --- | --- | --- | --- |
-| GitLab | 2,679 | 2,266 (84.6%) | 14 (0.5%) | 399 (14.9%) |
+| GitLab | 2,679 | 2,286 (85.3%) | 14 (0.5%) | 379 (14.1%) |
 | Mattermost analytics | 194 | 182 (93.8%) | 6 (3.1%) | 6 (3.1%) |
 | Flipside near | 63 | 60 (95.2%) | 2 (3.2%) | 1 (1.6%) |
 | Snowflake monitoring | 25 | 21 (84.0%) | 1 (4.0%) | 3 (12.0%) |
