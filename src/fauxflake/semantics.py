@@ -583,6 +583,19 @@ def _fix(node: exp.Expression) -> exp.Expression:
         node.set("this", exp.cast(node.this, "varchar"))  # NULLIF(v:x, '') compares the value, not JSON text
     if isinstance(node, exp.ToArray):
         return _fn("_sf_to_array", node.this)
+    if isinstance(node, exp.Uniform):
+        # UNIFORM(lo, hi, RANDOM()): written out here so it also works inside CTEs and views
+        gen = node.args.get("gen")
+        unit = exp.Anonymous(this="random") if isinstance(gen, exp.Rand) or gen is None else \
+            sqlglot.parse_one("(hash(0) % 1000003) / 1000003.0", read="duckdb").transform(
+                lambda n: gen.copy() if isinstance(n, exp.Literal) and n.name == "0" and isinstance(n.parent, exp.Anonymous) else n)
+        lo, hi = node.this, node.expression
+        real = any(isinstance(b, exp.Cast) and b.to.is_type("double", "float") or (isinstance(b, exp.Literal) and "." in b.name)
+                   for b in (lo, hi))
+        if real:
+            return exp.paren(exp.Add(this=lo, expression=exp.Mul(this=unit, expression=exp.paren(exp.Sub(this=hi, expression=lo.copy())))))
+        span = exp.paren(exp.Add(this=exp.Sub(this=hi, expression=lo.copy()), expression=exp.Literal.number(1)))
+        return exp.cast(exp.Floor(this=exp.Add(this=lo, expression=exp.Mul(this=unit, expression=span))), "bigint")
     if isinstance(node, exp.JSONKeys):
         return _fn("_sf_object_keys", node.this)
     if isinstance(node, exp.GetExtract):

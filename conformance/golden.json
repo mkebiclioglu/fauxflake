@@ -3696,6 +3696,17 @@
    ]
   ]
  },
+ "uniform_inside_cte": {
+  "rows": [
+   [
+    true,
+    true,
+    true,
+    true,
+    "50"
+   ]
+  ]
+ },
  "union_text_number": {
   "rows": [
    [
