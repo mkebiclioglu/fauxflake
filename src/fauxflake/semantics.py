@@ -935,9 +935,31 @@ def keep_outer_rows(transformed: exp.Expression, flags: list[bool], recursive: l
     return transformed
 
 
+_QUOTED = re.compile(r"""'(?:[^'\\]|''|\\.)*'|"(?:[^"]|"")*"|\$\$.*?\$\$""", re.DOTALL)
+_DOLLAR_NAME = re.compile(r"(?<![\$\w])\$(?!\d+)\w+")
+
+
+def _inline_variables(self, sql: str) -> str:  # noqa: ANN001
+    """Session variables, outside of string literals only: '$USD' in a string is text, and a
+    `$name` that is not a variable is a column called "$NAME" (loaders produce those)."""
+    def outside(text: str) -> str:
+        for name, value in self._variables.items():
+            text = re.sub(rf"\${name}\b", lambda _m: value, text, flags=re.IGNORECASE)
+        return _DOLLAR_NAME.sub(lambda m: '"' + m.group().upper() + '"', text)
+
+    out, last = [], 0
+    for m in _QUOTED.finditer(sql):
+        out += [outside(sql[last:m.start()]), m.group()]
+        last = m.end()
+    return "".join([*out, outside(sql[last:])])
+
+
 def patch_upstream() -> None:
     """Switch off emulator transforms that change answers."""
     import fakesnow.transforms as upstream
+    from fakesnow.variables import Variables
+
+    Variables.inline_variables = _inline_variables
 
     # Casting every SUM/AVG argument to DOUBLE loses exact decimals and the result type.
     upstream.numeric_agg_implicit_cast = lambda e: e
