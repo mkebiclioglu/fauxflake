@@ -10,6 +10,11 @@ incremental models and snapshots are tested the way production exercises them.
 
 No credentials in CI, no rows leave the warehouse, no warehouse spins up.
 
+How close is it to the real thing? Thirteen third-party dbt packages (922 models) were built
+on this emulator and on real Snowflake and compared row for row: 902 models are identical,
+15 differ only because they read the clock, and 5 differ in an order Snowflake leaves
+undefined. [Details and the other measurements](#is-the-emulator-right).
+
 | | |
 | --- | --- |
 | `fauxflake init` | write the data spec from the dbt project itself |
@@ -281,13 +286,13 @@ doubled. `fauxflake check` fails CI when models read a column the spec does not 
 Measured, not assumed, in four ways. Everything below was run; the commands are in this repo.
 
 **1. Answers recorded from Snowflake.** [`conformance/cases.yml`](conformance/cases.yml) holds
-282 small queries covering the SQL analytics code leans on: number scale and rounding, null
+285 small queries covering the SQL analytics code leans on: number scale and rounding, null
 ordering, implicit conversions, dates and time zones, strings and regular expressions,
 semi-structured data, arrays, window functions, pivots, set operations, name resolution.
 `fauxflake conformance --connection <name>` runs them on real Snowflake once and stores the
 answers in `golden.json`. CI replays them against the emulator with no Snowflake access.
 
-Current score: **282 of 282 match.** A case that stops matching fails CI.
+Current score: **285 of 285 match.** A case that stops matching fails CI.
 
 **2. Other people's projects, row for row against Snowflake.** Thirteen Fivetran dbt packages
 ship integration tests with seed data. Each was built twice, on the emulator and on a real
@@ -443,7 +448,23 @@ Read these before trusting a green check.
 
 ```sh
 uv sync
-uv run pytest    # under a minute; the only network use is installing dbt_utils once
+uv run pytest    # about a minute; the only network use is installing dbt_utils once
 ```
+
+Three tools for finding the next gap, in the order they are worth reaching for:
+
+```sh
+# 1. a behaviour: add a query to conformance/cases.yml, then record Snowflake's answer
+uv run fauxflake conformance --connection <name>
+
+# 2. a package that ships seeds and tests: run it here, and on Snowflake, and compare every model
+uv run python scripts/selftest.py path/to/package/integration_tests --snowflake <name>
+
+# 3. any project, with no data: does every model plan and run on empty tables?
+uv run python scripts/compat.py render  path/to/project --out rendered/
+uv run python scripts/compat.py execute path/to/project rendered/
+```
+
+`FAUXFLAKE_SHOW_SQL=1` prints the DuckDB SQL each statement was translated to.
 
 MIT licensed.
