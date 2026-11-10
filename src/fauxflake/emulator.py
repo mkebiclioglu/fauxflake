@@ -23,7 +23,7 @@ from typing import Iterator
 
 import duckdb
 
-from . import semantics
+from . import objects, semantics
 
 # Statements the emulator cannot run as-is, rewritten before they are parsed.
 # Every entry is a known difference from Snowflake: keep the list short and
@@ -106,7 +106,7 @@ NOPS = [
     _LEAD + r"(grant|revoke)\s",
     _LEAD + r"alter\s+dynamic\s+table\s+\S+\s+(?!rename|swap)",
     _LEAD + r"alter\s+(session|warehouse|account)\s",
-    _LEAD + r"use\s+(warehouse|role|secondary\s+roles)\s",
+    _LEAD + r"use\s+(warehouse|secondary\s+roles)\s",
 ]
 
 
@@ -156,9 +156,16 @@ def _patch_fakesnow() -> None:
             self._fauxflake_outer = semantics.outer_flattens(command)
             self._fauxflake_recursive = semantics.outer_flattens(command, "recursive")
             self._fauxflake_layer, self._fauxflake_inline, self._fauxflake_owners = False, set(), {}
+            command = objects.session_functions(self, command)
+            handled = objects.intercept(self, command, original)  # functions, procedures, streams, tasks, policies
+            if handled is not None:
+                return handled
             for _ in range(8):
                 try:
-                    return original(self, rewrite(command), *args, **kwargs)
+                    done = original(self, rewrite(command), *args, **kwargs)
+                    objects.consume_streams(self, command)
+                    objects.remember(self)
+                    return done
                 except ProgrammingError as e:
                     # constructs DuckDB will not plan as written: say how to rewrite them, then run again
                     message = str(e)
@@ -172,7 +179,10 @@ def _patch_fakesnow() -> None:
                         self._fauxflake_owners[ambiguous.group(1).upper()] = ambiguous.group(2)  # shared column of a USING join
                     else:
                         raise
-            return original(self, rewrite(command), *args, **kwargs)
+            done = original(self, rewrite(command), *args, **kwargs)
+            objects.consume_streams(self, command)
+            objects.remember(self)
+            return done
         except ProgrammingError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -210,6 +220,7 @@ def _patch_fakesnow() -> None:
     original_transform = FakeSnowflakeCursor._transform
 
     def _transform(self, expression, params):  # noqa: ANN001
+        expression = objects.apply_policies(objects.result_scans(expression, self), self)
         if getattr(self, "_fauxflake_owners", None):
             expression = semantics.qualify_using(expression, self._fauxflake_owners)
         if getattr(self, "_fauxflake_inline", None):
@@ -267,6 +278,9 @@ def define_udfs(emu: "Emulator", udfs: dict[str, str]) -> None:
     """Stand-ins for functions that exist only in your Snowflake account, from the spec's `udfs:`.
     Each is `name: "(args) as <DuckDB SQL>"` and is callable with or without qualification."""
     semantics.UDFS.clear()
+    semantics.UDTFS.clear()
+    # a placeholder written by `init` gives way to the project's own CREATE FUNCTION; a real stand-in does not
+    objects.pin(emu, [n for n, body in udfs.items() if not body.rstrip().endswith("as null::varchar")])
     for name, body in udfs.items():
         emu.duck.execute(f"create or replace macro _fs_global.main._udf_{name}{body}")
         semantics.UDFS[name] = f"_udf_{name}"
@@ -293,8 +307,10 @@ def engine() -> Iterator[Emulator]:
     semantics.reserved_words(fs.duck_conn)
     fs.duck_conn.execute("set global old_implicit_casting = true")  # text compares with numbers and dates, as in Snowflake
     try:
-        yield Emulator(port=0, duck=fs.duck_conn, _fs=fs)
+        emu = Emulator(port=0, duck=fs.duck_conn, _fs=fs)
+        yield emu
     finally:
+        objects.close(emu)
         fs.duck_conn.close()
 
 
@@ -347,6 +363,7 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
         yield emu
     finally:
         CURRENT = outer
+        objects.close(emu)
         server.should_exit = True
         thread.join(timeout=5)
         fakesnow.server.shared_fs = previous

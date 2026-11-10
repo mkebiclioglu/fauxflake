@@ -27,6 +27,13 @@ MACROS = [
     f"""create or replace macro {_NS}_sf_date_trunc
           (p varchar, x date) as date_trunc(p, x)::date,
           (p, x) as date_trunc(p, x::timestamp)""",
+    f"create table if not exists {_NS}_fx_session as select 'SYSADMIN' as role",
+    f"create or replace macro {_NS}_sf_current_role() as (select role from {_NS}_fx_session)",
+    # GET_DDL: the statement DuckDB keeps for the object (DuckDB types, not Snowflake's).
+    f"""create or replace macro {_NS}_sf_get_ddl(kind, name) as (
+          select sql from (select table_name as n, sql from duckdb_tables() where database_name = current_database()
+                           union all select view_name, sql from duckdb_views() where database_name = current_database())
+          where upper(n) = upper(split_part(name, '.', -1)) limit 1)""",
     # TYPEOF looks inside a VARIANT. DuckDB only says JSON.
     f"""create or replace macro {_NS}_sf_typeof(v) as case when typeof(v) <> 'JSON' then typeof(v) else
           case json_type(v::varchar)
@@ -281,6 +288,16 @@ _RENAMED = {  # Snowflake function -> macro, same arguments
 _DATE_TOKENS = re.compile(r"YYYY|YY|MM|DD|HH|MI|SS|MON|DY|AM|PM", re.IGNORECASE)
 _HASHES = (exp.MD5, exp.SHA, exp.SHA2, exp.MD5Digest)
 UDFS: dict[str, str] = {}  # user-defined functions from the spec: name -> macro name
+# What the session context functions answer. The role is the exception: it lives in a table
+# (`USE ROLE x`, or `dbt: {role: ...}` in the spec), so policies can be exercised as different roles.
+SESSION = {
+    "CurrentAccount": "FAUXFLAKE", "CurrentAccountName": "FAUXFLAKE", "CurrentOrganizationName": "FAUXFLAKE",
+    "CurrentRegion": "LOCAL", "CurrentWarehouse": "LOCAL", "CurrentUser": "CI",
+    "CurrentSession": "1", "CurrentClient": "fauxflake", "CurrentIpAddress": "127.0.0.1",
+    "CurrentAvailableRoles": '["SYSADMIN"]', "CurrentSecondaryRoles": '{"roles":"","value":""}',
+    "CURRENT_ROLE_TYPE": "ROLE",
+}
+UDTFS: dict[str, str] = {}  # user-defined table functions: name -> table macro name
 _TIMESTAMP_PARSERS = {"try_to_timestamp", "try_to_timestamp_ntz", "try_to_timestamp_ltz", "try_to_timestamp_tz",
                       "to_timestamp_ntz", "to_timestamp_ltz", "to_timestamp_tz"}
 _DAY_UNITS = {"YEAR", "QUARTER", "MONTH", "WEEK", "DAY", "YEARS", "QUARTERS", "MONTHS", "WEEKS", "DAYS"}
@@ -702,6 +719,24 @@ def _fix(node: exp.Expression) -> exp.Expression:
         return _fn("_sf_date_trunc", exp.Literal.string(node.unit.name.lower()), node.this)
     if isinstance(node, _HASHES) and not (isinstance(node.this, exp.Literal) and node.this.is_string):
         node.set("this", _fn("_sf_text", node.this))  # MD5(42) hashes the text '42'
+    if isinstance(node, exp.CurrentRole) or (isinstance(node, exp.Anonymous) and node.name.upper() == "INVOKER_ROLE"):
+        # looked up when the query runs, so a policy or view written under one role answers for the role reading it
+        role = _fn("_sf_current_role")
+        return exp.alias_(role, "CURRENT_ROLE()", quoted=True) if isinstance(node.parent, exp.Select) else role
+    session = SESSION.get(type(node).__name__) or (isinstance(node, exp.Anonymous) and SESSION.get(node.name.upper()))
+    if session:
+        value = exp.Literal.string(session)  # as a projection it keeps the name Snowflake gives it
+        return exp.alias_(value, node.sql(dialect="snowflake").upper(), quoted=True) if isinstance(node.parent, exp.Select) else value
+    if isinstance(node, exp.Anonymous) and node.name.upper() == "IS_ROLE_IN_SESSION" and node.expressions:
+        return exp.EQ(this=exp.Upper(this=node.expressions[0]), expression=_fn("_sf_current_role"))
+    if isinstance(node, exp.Anonymous) and node.name.upper() == "GET_DDL" and len(node.expressions) >= 2:
+        return _fn("_sf_get_ddl", *node.expressions[:2])
+    if isinstance(node, exp.TableFromRows) and UDTFS:
+        call = node.this
+        while isinstance(call, exp.Dot):  # table(db.schema.my_udtf(x)): drop the qualification
+            call = call.expression
+        if isinstance(call, exp.Anonymous) and call.name.lower() in UDTFS:
+            return exp.Table(this=_fn(UDTFS[call.name.lower()], *call.expressions), alias=node.args.get("alias"))
     if isinstance(node, exp.Anonymous) and node.name.lower() in UDFS:
         call = _fn(UDFS[node.name.lower()], *node.expressions)
         if isinstance(node.parent, exp.Dot):  # db.schema.my_udf(x): drop the qualification

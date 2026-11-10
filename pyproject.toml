@@ -11,7 +11,9 @@ dependencies = [
     "dbt-snowflake>=1.10",
     "duckdb>=2.0.0",
     # fauxflake patches the emulator's internals, so the minor version is pinned
+    "dukpy>=0.6.0",
     "fakesnow[server]>=0.12.1,<0.13",
+    "numpy>=2.5.4",
     "pyyaml>=6.0",
     "snowflake-connector-python<5",
     "sqlglot>=30",
