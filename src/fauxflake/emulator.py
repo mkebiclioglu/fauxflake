@@ -154,6 +154,7 @@ def _patch_fakesnow() -> None:
 
     def _transform(self, expression, params):  # noqa: ANN001
         out = original_transform(self, semantics.rewrite(expression), params)
+        out = semantics.parenthesize_arrows(out)
         return semantics.keep_outer_rows(out, getattr(self, "_fauxflake_outer", []))
 
     FakeSnowflakeCursor._transform = _transform

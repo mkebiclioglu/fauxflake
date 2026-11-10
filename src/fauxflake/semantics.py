@@ -154,7 +154,16 @@ def _operand(node: exp.Expression) -> exp.Expression:
     return node
 
 
+_VARIANT_ACCESS = (exp.JSONExtract, exp.Bracket)
+
+
 def _fix(node: exp.Expression) -> exp.Expression:
+    if isinstance(node, exp.GetExtract):
+        # GET(v, key) is v[key]; as a bracket it gets the same handling as every other access
+        bracket = sqlglot.parse_one("x[0]", read="snowflake")
+        bracket.set("this", node.this)
+        bracket.set("expressions", [node.expression])
+        return bracket
     if isinstance(node, exp.Literal) and not node.is_string and "." in node.name and "e" not in node.name.lower():
         # 1.50 is NUMBER(2,1) in Snowflake: trailing zeros are not part of a literal's scale
         trimmed = node.name.rstrip("0").rstrip(".")
@@ -171,8 +180,10 @@ def _fix(node: exp.Expression) -> exp.Expression:
                 node.set(side, _fn("_sf_text", part))
     if isinstance(node, _COMPARISONS) or isinstance(node, exp.In):
         other = node.expression if isinstance(node, _COMPARISONS) else (node.expressions[0] if node.expressions else None)
-        if isinstance(node.this, exp.JSONExtract) and isinstance(other, exp.Literal) and other.is_string:
+        if isinstance(node.this, _VARIANT_ACCESS) and isinstance(other, exp.Literal) and other.is_string:
             node.set("this", exp.cast(node.this, "varchar"))  # v:s = 'x' compares the value, not JSON text
+    if isinstance(node, (exp.Like, exp.ILike)) and isinstance(node.this, _VARIANT_ACCESS):
+        node.set("this", exp.cast(node.this, "varchar"))
     if isinstance(node, exp.TryCast) and node.to.is_type("timestamp", "timestampntz") and node.args.get("requires_string"):
         return _fn("_sf_try_timestamp", node.this)
     if isinstance(node, exp.UnixToTime) and isinstance(node.this, exp.Literal) and node.this.is_string \
@@ -328,6 +339,18 @@ def outer_flattens(sql: str) -> list[bool]:
             i += 1
         flags.append(bool(re.search(r"outer\s*=>\s*true", sql[m.end():i], re.IGNORECASE)))
     return flags
+
+
+_OPERATORS = (exp.Binary, exp.Unary, exp.In, exp.Between, exp.Is)
+
+
+def parenthesize_arrows(transformed: exp.Expression) -> exp.Expression:
+    """DuckDB's `->` binds more loosely than `=`: `a -> '$[2]' = 'c'` parses as
+    `a -> ('$[2]' = 'c')`. Wrap every JSON access that sits inside an operator."""
+    for node in list(transformed.find_all(exp.JSONExtract, exp.JSONExtractScalar)):
+        if isinstance(node.parent, _OPERATORS):
+            node.replace(exp.paren(node.copy()))
+    return transformed
 
 
 def keep_outer_rows(transformed: exp.Expression, flags: list[bool]) -> exp.Expression:

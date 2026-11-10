@@ -585,6 +585,22 @@
    ]
   ]
  },
+ "get_and_compare": {
+  "rows": [
+   [
+    true,
+    "b",
+    true,
+    true,
+    "v",
+    true,
+    true,
+    true,
+    true,
+    true
+   ]
+  ]
+ },
  "greatest_null": {
   "rows": [
    [
@@ -1605,6 +1621,13 @@
     true,
     null,
     true
+   ]
+  ]
+ },
+ "variant_predicates": {
+  "rows": [
+   [
+    "2"
    ]
   ]
  },

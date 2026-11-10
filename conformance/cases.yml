@@ -150,3 +150,5 @@
 - {id: hash_numbers, sql: "select md5(42), md5(1.5), md5(x), sha2(x), md5(d) from (select 7 x, '2025-03-04'::date d)"}
 - {id: null_division, sql: "select null / 0, x / nullif(y, 0), div0(x, y), sum(x) / nullif(count(z), 0) from (select 1 x, 0 y, null::int z)"}
 - {id: try_timestamps, sql: "select try_to_timestamp_ntz('2025-01-01 00:00:00'), to_timestamp_ntz('2025-01-01'), try_to_timestamp('2025-01-01', 'YYYY-MM-DD'), try_to_timestamp('x', 'YYYY-MM-DD'), try_to_date('31/12/2025', 'DD/MM/YYYY'), try_to_number('1x'), try_to_decimal('1.5', 10, 2)"}
+- {id: get_and_compare, sql: "select get(a, 2) = 'c', get(a, 1)::string, get(a, 2) not in ('x'), get(a, 0) like 'a%', get(o, 'k')::string, a[1]::string = 'b', a[0] = 'a', o['k'] = 'v', o:k in ('v', 'w'), get(a, 9) is null from (select split('a b c', ' ') a, object_construct('k', 'v') o)"}
+- {id: variant_predicates, sql: "select count(*) from (select parse_json(column1) v from values ('{\"t\": \"run\", \"n\": 3}'), ('{\"t\": \"add\", \"n\": 5}')) where v:t = 'run' or (v:n > 4 and v:t like 'a%' and v:t <> 'x')"}

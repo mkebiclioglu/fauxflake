@@ -177,6 +177,10 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
 def guess(column: str, hint: str | None) -> dict:
     """A generator for a column we know only by name and (maybe) a cast."""
     c, h = column.upper(), (hint or "").upper()
+    if h in ("VARIANT", "JSON", "OBJECT", "STRUCT") or h.startswith(("OBJECT", "MAP")):
+        return {"gen": "object", "fields": {}}  # col::variant: semi-structured, shape unknown
+    if h == "ARRAY" or h.endswith("[]"):
+        return {"gen": "array"}
     if h.startswith(("DECIMAL", "NUMERIC")) and not h.endswith(",0)"):
         return {"gen": "dist", "type": h, **AMOUNT}
     if h in ("DOUBLE", "FLOAT", "REAL"):
