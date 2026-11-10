@@ -45,6 +45,8 @@ class SourceUse:
         self.paths: dict[str, dict[str, str | None]] = {}  # variant column -> {"a.b": type hint}
         self.arrays: set[str] = set()  # variant columns that are flattened or indexed
         self.formats: dict[str, str] = {}  # text column -> strftime format it is parsed with
+        self.json_text: set[str] = set()  # text columns holding JSON (passed to PARSE_JSON)
+        self.texts: set[str] = set()  # columns compared with string literals
         self.star = False
 
     def add(self, column: str, type_hint: str | None = None) -> None:
@@ -121,6 +123,16 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 cast = col.parent if isinstance(col.parent, (exp.Cast, exp.TryCast)) else None
                 use, parent = sources[hit[0]], col.parent
                 use.add(hit[1], cast.to.sql(dialect="duckdb") if cast else None)
+                if isinstance(parent, exp.ParseJSON):
+                    use.json_text.add(hit[1])  # parse_json(col):a.b  ->  col is text holding {"a": {"b": ...}}
+                    col, parent = parent, parent.parent
+                    if not (isinstance(parent, exp.JSONExtract) and parent.this is col):
+                        use.paths.setdefault(hit[1], {})
+                elif isinstance(parent, (exp.EQ, exp.NEQ, exp.Like, exp.ILike, exp.In)):
+                    other = parent.expression if not isinstance(parent, exp.In) else (parent.expressions or [None])[0]
+                    other = parent.this if other is col else other
+                    if isinstance(other, exp.Literal) and other.is_string and not re.fullmatch(r"[\d\s:.\-/T+Z]*", other.name):
+                        use.texts.add(hit[1])  # id = 'USLACKBOT': not a number
                 if isinstance(parent, exp.JSONExtract) and parent.this is col:
                     # v:a.b::int tells us the column is a variant holding {"a": {"b": <int>}}
                     keys = [k.name for k in parent.expression.expressions if isinstance(k, exp.JSONPathKey)]
@@ -175,6 +187,8 @@ def guess(column: str, hint: str | None) -> dict:
         return {"gen": "time_offset", "type": "DATE", **WEEK}
     if h.startswith("TIMESTAMP") or c.endswith(("_AT", "_TS", "_TIME", "_TIMESTAMP")):
         return {"gen": "time_offset", **WEEK}
+    if h in ("VARCHAR", "TEXT"):
+        return {"gen": "template", "template": f"{column.lower()}_{{hex}}"}
     if h in ("BIGINT", "INTEGER", "INT", "SMALLINT") or h.endswith(",0)") or c.endswith(("_ID", "_COUNT", "_QTY", "_QUANTITY")) or c == "ID":
         return {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000]}
     if re.search(r"(AMOUNT|PRICE|TOTAL|COST|REVENUE|VALUE|BALANCE|RATE|SCORE)", c):
@@ -260,6 +274,8 @@ def build_spec(manifest: dict, database: str) -> tuple[dict, list[str]]:
             notes.append(f"{name}: no `unique` test found, {'assuming ' + key if key else 'no key'}.")
         out: dict[str, dict] = {}
         for col, hint in cols.items():
+            if col in use.texts and not hint:
+                hint = "VARCHAR"
             if col == key:
                 numeric = (hint or "").upper().startswith(("BIGINT", "INT", "DECIMAL", "NUMBER")) or (not hint and col.endswith("ID"))
                 out[col] = {"gen": "sequence" if numeric else "hash_id"}
@@ -270,6 +286,8 @@ def build_spec(manifest: dict, database: str) -> tuple[dict, list[str]]:
                 out[col] = {"gen": "categorical", "values": {v: round(1 / len(values), 4) for v in values}}
             elif col in use.paths:
                 out[col] = {"gen": "object", "fields": {path: guess(path.split(".")[-1], h) for path, h in sorted(use.paths[col].items())}}
+                if col in use.json_text:
+                    out[col]["type"] = "VARCHAR"
             elif col in use.arrays:
                 out[col] = {"gen": "array"}
             elif col in use.formats:

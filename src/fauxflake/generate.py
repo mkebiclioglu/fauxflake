@@ -120,7 +120,7 @@ class TableSQL:
                 parts.append(f"{lit(key)}, {inner}")
             return f"json_object({', '.join(parts)})"
 
-        return f"{build(tree)}::JSON"
+        return f"{build(tree)}::JSON" if tree else "'{}'::JSON"
 
     def expr(self, col: str, d: dict) -> str:
         gen = d.get("gen")

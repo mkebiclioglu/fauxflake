@@ -55,6 +55,11 @@ def test_semi_structured_and_text_date_columns_are_inferred():
     assert use.paths == {"USER": {"login": "TEXT", "id": "INT"}, "PAYLOAD": {"repo.name": "TEXT"}}
     assert use.arrays == {"LABELS"} and use.formats == {"CLOSED_ON": "%Y/%m/%d"}
 
+    scan_model("""select parse_json(context):app.version::string as v, parse_json(raw_blob) as blob
+                  from raw.gh.issues where user_id <> 'USLACKBOT' and state = 'open' and created = '2025-01-01'""", sources)
+    assert use.json_text == {"CONTEXT", "RAW_BLOB"} and use.paths["CONTEXT"] == {"app.version": "TEXT"}
+    assert use.texts == {"USER_ID", "STATE"}  # a date-looking literal says nothing about the type
+
 
 def test_generated_objects_and_text_dates_are_usable(emu):
     import snowflake.connector
