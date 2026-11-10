@@ -118,7 +118,14 @@ def _patch_fakesnow() -> None:
         try:
             self._fauxflake_outer = semantics.outer_flattens(command)
             self._fauxflake_recursive = semantics.outer_flattens(command, "recursive")
-            return original(self, rewrite(command), *args, **kwargs)
+            self._fauxflake_layer = False
+            try:
+                return original(self, rewrite(command), *args, **kwargs)
+            except ProgrammingError as e:
+                if "window function calls cannot be nested" not in str(e):
+                    raise
+                self._fauxflake_layer = True  # an aliased window used inside another window
+                return original(self, rewrite(command), *args, **kwargs)
         except ProgrammingError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -156,8 +163,10 @@ def _patch_fakesnow() -> None:
     original_transform = FakeSnowflakeCursor._transform
 
     def _transform(self, expression, params):  # noqa: ANN001
+        if getattr(self, "_fauxflake_layer", False):
+            expression = semantics.layer_windows(expression)
         out = original_transform(self, semantics.rewrite(expression), params)
-        out = semantics.parenthesize_arrows(out)
+        out = semantics.finish(semantics.parenthesize_arrows(out))
         out = semantics.keep_outer_rows(out, getattr(self, "_fauxflake_outer", []), getattr(self, "_fauxflake_recursive", []))
         if os.environ.get("FAUXFLAKE_SHOW_SQL"):  # what DuckDB is actually asked to run
             print(out.sql(dialect="duckdb"), file=sys.stderr)
@@ -222,6 +231,7 @@ def engine() -> Iterator[Emulator]:
     fs = FakeSnow(nop_regexes=NOPS)
     for macro in semantics.MACROS:
         fs.duck_conn.execute(macro)
+    semantics.reserved_words(fs.duck_conn)
     try:
         yield Emulator(port=0, duck=fs.duck_conn, _fs=fs)
     finally:
@@ -254,6 +264,7 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
     fs = FakeSnow(db_path=db_path, nop_regexes=NOPS)
     for macro in semantics.MACROS:
         fs.duck_conn.execute(macro)
+    semantics.reserved_words(fs.duck_conn)
     previous = fakesnow.server.shared_fs
     fakesnow.server.shared_fs = fs
 

@@ -17,9 +17,10 @@ _SCALE = r"coalesce(try_cast(nullif(regexp_extract(typeof(a), ',(\d+)\)', 1), ''
 
 MACROS = [
     # NUMBER / NUMBER keeps max(s, min(s + 6, 12)) decimals and raises on zero.
-    # DuckDB returns a full-precision double, and NULL on zero.
+    # DuckDB returns a full-precision double, and NULL on zero. The failing cast raises without
+    # making the expression volatile, so `a / b as r, r * 2` can still reuse the alias.
     f"""create or replace macro {_NS}_sf_div(a, b) as case
-          when b = 0 and a is not null then error('Division by zero')
+          when b = 0 and a is not null then cast('Division by zero' as double)
           when typeof(a) in ('DOUBLE', 'FLOAT') or typeof(b) in ('DOUBLE', 'FLOAT') then a / b
           else round(a::double / b, greatest({_SCALE}, least({_SCALE} + 6, 12))) end""",
     # DATE_TRUNC keeps the input type. DuckDB turns a DATE into a TIMESTAMP.
@@ -647,8 +648,101 @@ def _fix(node: exp.Expression) -> exp.Expression:
     return node
 
 
+def _self_referencing(cte: exp.CTE) -> bool:
+    return any(not t.db and t.name.lower() == cte.alias.lower() for t in cte.this.find_all(exp.Table))
+
+
+def layer_windows(tree: exp.Expression) -> exp.Expression:
+    """`lag(x) over (...) as prev, sum(prev) over (...)`: Snowflake computes the first window, then
+    the second. DuckDB will not nest them, so compute the aliased windows in a subquery first."""
+    for _ in range(6):
+        changed = False
+        for select in list(tree.find_all(exp.Select)):
+            source = select.args.get("from_")
+            if source is None or select.args.get("group") or select.args.get("joins") or select.args.get("laterals"):
+                continue
+            windowed = {p.alias.lower(): p for p in select.expressions if isinstance(p, exp.Alias) and p.find(exp.Window)}
+            nested = set()
+            for window in select.find_all(exp.Window):
+                if window.find_ancestor(exp.Select) is not select:
+                    continue
+                for col in window.find_all(exp.Column):
+                    owner = windowed.get(col.name.lower())
+                    if owner is not None and not col.table and col.find_ancestor(exp.Alias) is not owner:
+                        nested.add(col.name.lower())
+            if not nested:
+                continue
+            hidden = {name: f"_la_{i}_{name}" for i, name in enumerate(sorted(nested))}
+            inner = exp.select("*", *[exp.alias_(windowed[n].this.copy(), hidden[n]) for n in sorted(nested)])
+            inner.set("from_", source.copy())
+            if select.args.get("where"):
+                inner.set("where", select.args.pop("where"))
+            qualifier = source.this.alias_or_name.lower()
+            for col in list(select.find_all(exp.Column)):
+                if col.find_ancestor(exp.Select) is not select:
+                    continue
+                if col.table and col.table.lower() == qualifier:
+                    col.set("table", None)
+                if not col.table and col.name.lower() in hidden and isinstance(col.find_ancestor(exp.Window), exp.Window):
+                    col.replace(exp.column(hidden[col.name.lower()]))
+            for name in nested:
+                windowed[name].set("this", exp.column(hidden[name]))
+            for star in [p for p in select.expressions if isinstance(p, exp.Star)]:
+                star.set("except_", [*(star.args.get("except_") or []), *[exp.column(h) for h in hidden.values()]])
+            select.set("from_", exp.From(this=inner.subquery("_la")))
+            changed = True
+        if not changed:
+            break
+    return tree
+
+
+def reserved_words(conn) -> None:  # noqa: ANN001
+    _RESERVED.update(w.upper() for (w,) in conn.execute(
+        "select keyword_name from duckdb_keywords() where keyword_category in ('reserved', 'type_function')").fetchall())
+
+
+_RESERVED: set[str] = set()
+_NAMED = (exp.Column, exp.Table, exp.TableAlias, exp.Alias, exp.CTE, exp.Star)
+
+
+def finish(transformed: exp.Expression) -> exp.Expression:
+    """Fix-ups on the DuckDB side of the translation."""
+    for ident in transformed.find_all(exp.Identifier):
+        # `end`, `overlaps`... are ordinary names in Snowflake and reserved words in DuckDB
+        if not ident.args.get("quoted") and ident.name.upper() in _RESERVED and isinstance(ident.parent, _NAMED) \
+                and not (isinstance(ident.parent, exp.Column) and ident.name.upper() in _BARE):
+            ident.set("quoted", True)
+    for window in list(transformed.find_all(exp.Window)):
+        # OBJECT_AGG(...) OVER (...) became to_json(map(list(..), list(..))) OVER: window each aggregate
+        wrapper = window.this
+        if isinstance(wrapper, exp.AggFunc) or not (isinstance(wrapper, exp.Anonymous) and wrapper.name.upper() == "TO_JSON"):
+            continue
+        tops = [n for n in wrapper.find_all(exp.Filter, exp.AggFunc, exp.Anonymous)
+                if not isinstance(n.parent, (exp.Filter, exp.Window))
+                and (not isinstance(n, exp.Anonymous) or n.name.upper() == "LIST")]
+        for top in tops:
+            over, slot = window.copy(), exp.Null()
+            top.replace(slot)
+            over.set("this", top)
+            slot.replace(over)
+        if tops:
+            window.replace(wrapper)
+    for cmp in list(transformed.find_all(*_COMPARISONS)):
+        # a = 'x' = FALSE: DuckDB will not chain comparisons without parentheses
+        if isinstance(cmp.this, _COMPARISONS):
+            cmp.set("this", exp.paren(cmp.this))
+    return transformed
+
+
+_BARE = {"CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "CURRENT_USER", "LOCALTIME", "LOCALTIMESTAMP",
+         "TRUE", "FALSE", "NULL", "DEFAULT", "SESSION_USER", "USER"}
+
+
 def rewrite(node: exp.Expression) -> exp.Expression:
     """Apply the fixes bottom-up, so nested cases (a ratio of averages) all get rewritten."""
+    if isinstance(node, exp.With) and not node.args.get("recursive") and any(
+            isinstance(c.this, exp.SetOperation) and _self_referencing(c) for c in node.expressions):
+        node.set("recursive", True)  # the keyword is optional in Snowflake
     for child in list(node.iter_expressions()):
         # remember the slot first: a fix may wrap the child, which re-parents it
         parent, key, index = child.parent, child.arg_key, child.index
