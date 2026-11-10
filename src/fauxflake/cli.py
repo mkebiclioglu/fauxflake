@@ -202,7 +202,7 @@ def init(spec_path, project_dir, database, force):
     if path.exists() and not force:
         raise click.ClickException(f"{path} already exists (use --force to overwrite)")
     with serve() as emu:
-        notes = write_spec(DbtProject(project_dir, emulator_output(emu.port, database)), path, database)
+        notes = write_spec(DbtProject(project_dir, emulator_output(emu.port, database)), path, database, emu)
     spec = Spec.load(path)
     click.echo(f"wrote {path}: {len(spec.tables)} source tables, "
                f"{sum(len(t.columns) for t in spec.tables.values())} columns")

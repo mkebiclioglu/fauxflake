@@ -434,12 +434,57 @@ def provide_env(project) -> dict[str, str]:
     return provided
 
 
-def write_spec(project, path: Path, database: str) -> list[str]:
+def unknown_functions(manifest: dict, emu) -> dict[str, set[int]]:  # noqa: ANN001
+    """Functions the models call that the emulator does not have: your account's UDFs.
+    name -> the numbers of arguments they are called with."""
+    calls: dict[str, set[int]] = {}
+    for node in manifest["nodes"].values():
+        if node["resource_type"] != "model" or not node.get("compiled_code"):
+            continue
+        try:
+            tree = sqlglot.parse_one(node["compiled_code"], read="snowflake")
+        except Exception:  # noqa: BLE001
+            continue
+        for call in tree.find_all(exp.Anonymous):
+            if isinstance(call.parent, (exp.Window, exp.TableFromRows, exp.Lateral, exp.Table)) or not isinstance(call.this, str):
+                continue
+            calls.setdefault(call.name.lower(), set()).add(len(call.expressions))
+    conn = emu._fs.connect(database="FAUXFLAKE_PROBE", schema="PUBLIC")
+    missing: dict[str, set[int]] = {}
+    try:
+        for name, arities in sorted(calls.items()):
+            if not re.fullmatch(r"[a-z_][a-z0-9_$]*", name):
+                continue
+            cur = conn.cursor()
+            try:
+                cur.execute(f"select {name}({', '.join(['null'] * min(arities))})")
+            except Exception as e:  # noqa: BLE001
+                if re.search(r"Function with name \S+ does not exist", str(e)):
+                    missing[name] = arities
+            finally:
+                cur.close()
+    finally:
+        conn.close()
+    return missing
+
+
+def udf_stubs(missing: dict[str, set[int]]) -> dict[str, str]:
+    """A placeholder for each unknown function, so the project builds: every call returns NULL."""
+    return {name: ", ".join(f"({', '.join(f'a{i}' for i in range(n))}) as null::varchar" for n in sorted(arities))
+            for name, arities in missing.items()}
+
+
+def write_spec(project, path: Path, database: str, emu=None) -> list[str]:  # noqa: ANN001
     """`project` is a DbtProject pointed at a running emulator."""
     env = provide_env(project)
     project.invoke(["compile"], quiet=True)  # best effort: models that fail to compile are skipped
     manifest = json.loads((project.target_path / "manifest.json").read_text())
     spec, notes = build_spec(manifest, database)
+    stubs = udf_stubs(unknown_functions(manifest, emu)) if emu is not None else {}
+    if stubs:
+        spec["udfs"] = stubs
+        notes.insert(0, f"{len(stubs)} function(s) are not Snowflake built-ins the emulator knows ({', '.join(sorted(stubs))}). "
+                        "Each got a placeholder under `udfs` that returns NULL: replace it with DuckDB SQL that does the same job.")
     if env:
         spec["dbt"]["env"] = env
         notes.insert(0, f"set placeholders for {len(env)} environment variable(s) the project requires (dbt.env in the spec)")

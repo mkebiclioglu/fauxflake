@@ -99,3 +99,19 @@ def test_union_branches_share_what_is_known_about_a_column():
         union all
         select id, user_notes_count::int as comment_count from raw.gl.issues""", sources, links=links)
     assert {("RAW.GH.ISSUES", "COMMENTS"), ("RAW.GL.ISSUES", "USER_NOTES_COUNT")} in links
+
+
+def test_unknown_functions_get_placeholders():
+    from fauxflake.emulator import engine
+    from fauxflake.init import udf_stubs, unknown_functions
+
+    manifest = {"nodes": {"model.p.m": {"resource_type": "model", "compiled_code": (
+        "select util.public.parse_agent(ua) as agent, my_score(a, b), my_score(a), upper(a), soundex(a), "
+        "ratio_to_report(x) over () from raw.t")}}}
+    with engine() as emu:
+        missing = unknown_functions(manifest, emu)
+        assert missing == {"parse_agent": {1}, "my_score": {1, 2}}
+        stubs = udf_stubs(missing)
+        assert stubs["my_score"] == "(a0) as null::varchar, (a0, a1) as null::varchar"
+        for name, body in stubs.items():  # each placeholder is a valid definition
+            emu.duck.execute(f"create or replace macro _fs_global.main._udf_{name}{body}")

@@ -276,3 +276,13 @@
 - {id: hash_agg_shapes, sql: "select hash(1) = hash(1), hash('a') <> hash('b'), hash(null) is not null, hash_agg(column1) is not null from values (1), (2)"}
 - {id: sequence_seq4, sql: "select count(*), count(distinct seq4()), min(seq8()) >= 0 from table(generator(rowcount => 10))"}
 - {id: nested_case_types, sql: "select case when x = 1 then 'one' when x = 2 then 2::varchar else null end, case x when 1 then 1.5 when 2 then 2 end, iff(x > 1, x, null) from (select column1 x from values (1), (2), (3)) order by x"}
+# --- implicit conversions of text columns
+- {id: implicit_text_columns, sql: "with t as (select column1 v, column2 d, column3 ts, column4 n from values ('5', '2025-01-02', '2025-01-02 10:00:00', 10)) select v = 5, v > 4, sum(v), avg(v), d > '2020-01-01'::date, dateadd(day, 1, d), coalesce(v, 0), v * 2, v + 1, 1 - v, -v, round(v, 1), datediff(day, d, ts), dayname(d), n || 'x', length(n), v between 1 and 9, sum(v) over (), abs(v) + sum(v) from t group by v, d, ts, n"}
+- {id: implicit_text_aggregates, sql: "select k, sum(x), avg(x), max(x), min(x), sum(x) / count(*), sum(x * 2), sum(iff(x > 1, x, 0)) from (select column1 k, column2 x from values ('a', '1.5'), ('a', '2'), ('b', '10')) group by k order by k"}
+- {id: lateral_alias_division, sql: "select x / 2 as r, r * 2 as r2, round(div0(x, 3), 2) as p, greatest(p, 1) as g, g + r as h from (select 3 x)"}
+- {id: lateral_alias_windows, sql: "with src as (select column1 id, column2 t, column3 c from values (1, 1, 'a'), (1, 2, 'a'), (1, 3, 'b')) select id, t, lag(c, 1, '') over (partition by id order by t) as lag_c, conditional_true_event(c != lag_c) over (partition by id order by t) as grp from src order by t"}
+- {id: recursive_without_keyword, sql: "with tree (id, parent, depth) as (select 1, null, 0 union all select c.id, c.parent, t.depth + 1 from (select column1 id, column2 parent from values (2, 1), (3, 2)) c join tree t on c.parent = t.id) select id, depth from tree order by 1"}
+- {id: reserved_names, sql: "with overlaps as (select 1 as \"start\", 2 as end, 3 as left) select \"start\", end, left from overlaps"}
+- {id: windowed_object_agg, sql: "select n, object_agg(n, v::variant) over (partition by k), array_agg(v) within group (order by v) over (partition by k) from (select column1 k, column2 n, column3 v from values ('a', 'p', 1), ('a', 'q', 2)) order by n"}
+- {id: chained_comparison, sql: "select column1 = 'x' = false from values ('x'), ('y') order by 1"}
+- {id: group_alias_window, sql: "select date_trunc('day', t) as date_day, c as c, sum(x) as s, ratio_to_report(sum(x)) over (partition by date_day) r from (select '2025-01-01 10:00'::timestamp t, 'a' c, 2 x union all select '2025-01-01 11:00', 'b', 6) group by 1, 2 order by 2"}

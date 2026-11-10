@@ -229,6 +229,10 @@ MACROS = [
     f"""create or replace macro {_NS}_sf_array_range
           (f, t) as to_json(range(f, t)),
           (f, t, s) as to_json(range(f, t, s))""",
+    # ENCRYPT_RAW has no local equivalent: a stable, opaque stand-in with the same shape.
+    *[f"""create or replace macro {_NS}_sf_encrypt_raw({args}) as json_object(
+          'ciphertext', upper(sha256(v::varchar || k::varchar)), 'iv', upper(md5(k::varchar)), 'tag', upper(md5(v::varchar)))"""
+      for args in ("v, k", "v, k, iv", "v, k, iv, aad", "v, k, iv, aad, mode")],
     # UPPER('ß') is 'SS'.
     f"create or replace macro {_NS}_sf_upper(s) as replace(upper(s), 'ẞ', 'SS')",
 ]
@@ -240,7 +244,7 @@ _RENAMED = {  # Snowflake function -> macro, same arguments
     "current_account_name": "_sf_current_account_name", "try_base64_decode_string": "_sf_try_base64",
     "soundex": "_sf_soundex", "parse_url": "_sf_parse_url", "parse_ip": "_sf_parse_ip",
     "get_ignore_case": "_sf_get_ignore_case", "object_keys": "_sf_object_keys", "hash_agg": "_sf_hash_agg",
-    "try_hex_decode_string": "_sf_try_hex",
+    "try_hex_decode_string": "_sf_try_hex", "encrypt_raw": "_sf_encrypt_raw",
     **{f"is_{k}": f"_sf_is_{k}" for k in ("date", "time", "timestamp_ntz", "timestamp_ltz", "timestamp_tz")},
     **{f"as_{k}": f"_sf_as_{k}" for k in ("date", "time", "timestamp_ntz", "timestamp_ltz", "timestamp_tz", "double", "real",
                                           "number", "decimal", "boolean", "object", "array")}, "upper": "_sf_upper", "ucase": "_sf_upper",
@@ -865,3 +869,151 @@ def patch_upstream() -> None:
         return pa.StructArray.from_arrays(children, fields=list(out.type), mask=ts.is_null())
 
     wire.timestamp_to_sf_struct = timestamp_to_sf_struct
+
+
+# ---------------------------------------------------------------- implicit conversions
+# Snowflake converts text to numbers and dates wherever a function or operator needs one
+# (SUM(text_column), text_column * 2, DATEDIFF(day, text_column, ...)). DuckDB refuses to
+# bind those. When it does, find the call it complained about and add the conversion.
+
+_OPERATORS_BY_SIGN = {"+": exp.Add, "-": (exp.Sub, exp.Neg), "*": exp.Mul, "/": exp.Div, "%": exp.Mod, "//": exp.IntDiv}
+_NUMERIC_CALLS = {"sum", "avg", "round", "abs", "floor", "ceil", "ceiling", "sqrt", "power", "pow", "ln", "log", "log10",
+                  "log2", "exp", "sign", "trunc", "mod", "stddev", "stddev_samp", "stddev_pop", "variance", "var_samp",
+                  "var_pop", "median", "quantile_cont", "quantile_disc", "fmod", "bit_count", "cbrt", "sin", "cos", "tan",
+                  "product", "corr", "covar_pop", "covar_samp", "regr_slope", "regr_intercept", "to_seconds", "to_days",
+                  "to_hours", "to_minutes", "to_months", "to_years", "to_weeks", "to_milliseconds", "to_microseconds",
+                  "isnan", "isinf", "kurtosis", "skewness", "favg", "fsum", "range", "generate_series", "chr",
+                  "to_timestamp", "epoch_ms", "make_date", "make_timestamp", "repeat", "lpad", "rpad", "substring",
+                  "substr", "left", "right", "nullifzero", "width_bucket"}
+_DATE_CALLS = {"date_diff", "datediff", "date_add", "date_sub", "date_trunc", "datetrunc", "date_part", "datepart",
+               "dayname", "monthname", "last_day", "strftime", "timezone", "year", "month", "day", "week", "quarter",
+               "dayofweek", "dayofyear", "dayofmonth", "hour", "minute", "second", "epoch", "weekofyear", "isodow",
+               "yearweek", "time_bucket", "age", "isoyear", "millisecond", "microsecond", "epoch_us", "epoch_ns",
+               "julian", "weekday", "century", "decade", "era", "extract"}
+_TEXT_TYPES = {"VARCHAR", "STRING_LITERAL"}
+_DATE_TYPES = ("INTERVAL", "DATE", "TIMESTAMP", "TIME")
+
+
+def _error_details(message: str) -> dict | None:
+    import json
+
+    start = message.find("{")
+    if start < 0:
+        return None
+    try:
+        return json.loads(message[start:])
+    except ValueError:
+        return None
+
+
+def _call_types(call: str) -> list[str]:
+    inner, out, depth, cur = call[call.index("(") + 1:call.rindex(")")], [], 0, ""
+    for ch in inner:
+        depth += ch in "([<"
+        depth -= ch in ")]>"
+        if ch == "," and depth == 0:
+            out.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    return [*out, cur.strip()] if cur.strip() else out
+
+
+def _split_args(text: str) -> list[str]:
+    out, depth, cur, quote = [], 0, "", None
+    for ch in text:
+        if quote:
+            quote = None if ch == quote else quote
+        elif ch in "'\"":
+            quote = ch
+        elif ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        if ch == "," and depth == 0 and not quote:
+            out.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    return [*out, cur.strip()]
+
+
+def _convert(node: exp.Expression, to: str) -> None:
+    node.replace(exp.cast(node.copy(), to))
+
+
+def _repair(tree: exp.Expression, text: str, details: dict) -> bool:
+    """Add the one conversion DuckDB asked for. False when the complaint is not one we understand."""
+    name, call, pos = details.get("name"), details.get("call"), int(details.get("position") or -1)
+    ambiguous = re.search(r'function call "([^"(]+)(\(.*?\))"', details.get("exception_message", ""))
+    if not name and ambiguous:
+        name, call = ambiguous.group(1), ambiguous.group(1) + ambiguous.group(2)
+    if not name or not call or pos < 0:
+        return False
+    types = _call_types(call)
+    if "VARCHAR" not in types:
+        return False
+    if name in _OPERATORS_BY_SIGN:
+        temporal = any(t.startswith(_DATE_TYPES) for t in types)
+        for node in tree.find_all(_OPERATORS_BY_SIGN[name]):
+            sql = node.sql(dialect="duckdb")
+            sides = [node.this] if isinstance(node, exp.Neg) else [node.this, node.expression]
+            left = sides[0].sql(dialect="duckdb")
+            at_operator = len(sides) == 2 and text.startswith(sql, pos - len(left) - 1)
+            if not (text.startswith(sql, pos) or at_operator) or len(sides) != len(types):
+                continue
+            for side, kind in zip(sides, types):
+                if kind == "VARCHAR":
+                    _convert(side, "timestamp" if temporal else "double")
+            return True
+        for node in tree.find_all(exp.DateAdd, exp.DateSub, exp.TsOrDsAdd, exp.TimestampAdd, exp.DatetimeAdd,
+                                  exp.TimestampSub, exp.DatetimeSub, exp.TimeAdd, exp.TimeSub):
+            sql, left = node.sql(dialect="duckdb"), node.this.sql(dialect="duckdb")
+            if sql.startswith(left) and (text.startswith(sql, pos) or text.startswith(sql, pos - len(left) - 1)) \
+                    and types[0] == "VARCHAR":
+                _convert(node.this, "timestamp")  # DATEADD(day, 1, text_column)
+                return True
+        return False
+    lowered = name.lower()
+    to = "double" if lowered in _NUMERIC_CALLS else "timestamp" if lowered in _DATE_CALLS else None
+    if to is None:
+        return False
+    for node in tree.find_all(exp.Func):
+        sql = node.sql(dialect="duckdb")
+        if not sql.lower().startswith(lowered + "(") or not text.startswith(sql, pos):
+            continue
+        parts = _split_args(sql[len(lowered) + 1:-1])
+        if len(parts) != len(types):
+            continue
+        children = {c.sql(dialect="duckdb"): c for c in node.iter_expressions()}
+        done = False
+        for part, kind in zip(parts, types):
+            child = children.get(part) or children.get(part.split(" ORDER BY ")[0])
+            if kind == "VARCHAR" and child is not None:
+                _convert(child, to)
+                done = True
+        if done:
+            return True
+    return False
+
+
+def repair_types(transformed: exp.Expression, conn, params=None) -> exp.Expression | None:  # noqa: ANN001
+    """The statement with Snowflake's implicit text conversions made explicit, or None."""
+    tree, fixed = transformed.copy(), 0
+    conn.execute("set errors_as_json = true")
+    try:
+        for _ in range(80):
+            text = tree.sql(dialect="duckdb")
+            try:
+                conn.execute("explain " + text, params) if params else conn.execute("explain " + text)
+                return tree if fixed else None
+            except Exception as e:  # noqa: BLE001
+                details = _error_details(str(e))
+                if details and details.get("position"):
+                    details["position"] = int(details["position"]) - len("explain ")
+                if not details or not _repair(tree, text, details):
+                    return tree if fixed else None  # keep what was fixed: the remaining error is the one to report
+                fixed += 1
+        return tree
+    finally:
+        conn.execute("set errors_as_json = false")

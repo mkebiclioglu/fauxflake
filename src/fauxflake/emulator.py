@@ -177,7 +177,15 @@ def _patch_fakesnow() -> None:
     original_execute = FakeSnowflakeCursor._execute
 
     def _execute(self, transformed, params=None):  # noqa: ANN001
-        original_execute(self, transformed, params)
+        try:
+            original_execute(self, transformed, params)
+        except ProgrammingError as e:
+            if "No function matches" not in str(e) and "Could not choose a best candidate" not in str(e):
+                raise
+            repaired = semantics.repair_types(transformed, self._duck_conn, params)
+            if repaired is None:
+                raise
+            original_execute(self, repaired, params)
         semantics.coerce_result(self)
 
     FakeSnowflakeCursor._execute = _execute
@@ -232,6 +240,7 @@ def engine() -> Iterator[Emulator]:
     for macro in semantics.MACROS:
         fs.duck_conn.execute(macro)
     semantics.reserved_words(fs.duck_conn)
+    fs.duck_conn.execute("set global old_implicit_casting = true")  # text compares with numbers and dates, as in Snowflake
     try:
         yield Emulator(port=0, duck=fs.duck_conn, _fs=fs)
     finally:
@@ -265,6 +274,7 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
     for macro in semantics.MACROS:
         fs.duck_conn.execute(macro)
     semantics.reserved_words(fs.duck_conn)
+    fs.duck_conn.execute("set global old_implicit_casting = true")  # text compares with numbers and dates, as in Snowflake
     previous = fakesnow.server.shared_fs
     fakesnow.server.shared_fs = fs
 
