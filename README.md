@@ -54,6 +54,26 @@ Incremental models differ from a full refresh after simulated time passed.
 Every dbt test still passes in that run. The model is simply wrong, and on Snowflake you would
 find out weeks later from a dashboard.
 
+## What did my change do?
+
+```sh
+uv run fauxflake diff --base origin/main
+```
+
+The base branch and your working tree are built on exactly the same synthetic rows, so any
+difference in the output is caused by the code change and nothing else. Changing one
+expression in `stg_orders` gives, in 7 seconds:
+
+| model | rows | changed rows | columns |
+| --- | --- | --- | --- |
+| `fct_orders` | 79,967 | 3,715 (4.6%) | `NET_AMOUNT` 3,715 |
+| `stg_orders` | 79,967 | 3,715 (4.6%) (no unique key: counted as rows present in only one version) |  |
+
+3 other models unchanged.
+
+The output is Markdown; [`docs/workflows/dbt-ci.yml`](docs/workflows/dbt-ci.yml) posts it as
+a pull request comment. Models with a `unique` test get per-column change counts.
+
 ## How it works
 
 ```

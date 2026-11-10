@@ -204,3 +204,31 @@ def init(spec_path, project_dir, database, force):
     for note in notes:
         click.echo(f"  note: {note}")
     click.echo("next: fauxflake build")
+
+
+@main.command(context_settings={"ignore_unknown_options": True})
+@with_common
+@click.option("--base", default="origin/main", show_default=True, help="Git ref to compare the working tree against.")
+@click.option("--output", default=None, help="Also write the Markdown report to this file.")
+@click.option("--fail-on-change", is_flag=True, help="Exit 1 when any model output changed.")
+@click.argument("dbt_args", nargs=-1, type=click.UNPROCESSED)
+def diff(spec_path, project_dir, scale, history, base, output, fail_on_change, dbt_args):
+    """Build a base ref and the working tree on identical data and report what changed."""
+    from pathlib import Path
+
+    from .diff import markdown, run
+    from .emulator import serve
+    from .generate import Warehouse
+
+    spec = Spec.load(spec_path)
+    with serve() as emu:
+        wh = Warehouse(emu, spec, scale)
+        rows = sum(wh.advance_to(_start(spec, history)).values())
+        diffs = run(emu, Path(project_dir).resolve(), base, spec.dbt.get("database", "ANALYTICS"),
+                    list(dbt_args), log=lambda m: click.echo(m, err=True))
+    report = markdown(diffs, base, rows)
+    click.echo(report)
+    if output:
+        Path(output).write_text(report + "\n")
+    if fail_on_change and any(d.status != "same" for d in diffs):
+        sys.exit(1)
