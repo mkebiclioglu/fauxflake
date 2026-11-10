@@ -47,6 +47,7 @@ class SourceUse:
         self.formats: dict[str, str] = {}  # text column -> strftime format it is parsed with
         self.json_text: set[str] = set()  # text columns holding JSON (passed to PARSE_JSON)
         self.texts: set[str] = set()  # columns compared with string literals
+        self.numbers: set[str] = set()  # columns that are summed, averaged or used in arithmetic
         self.star = False
 
     def add(self, column: str, type_hint: str | None = None) -> None:
@@ -59,7 +60,8 @@ def _table_id(table: exp.Table) -> str:
 
 
 def scan_model(sql: str, sources: dict[str, SourceUse],
-               models: dict[str, dict[str, tuple[str, str]]] | None = None) -> dict[str, tuple[str, str]]:
+               models: dict[str, dict[str, tuple[str, str]]] | None = None,
+               links: list[set[tuple[str, str]]] | None = None) -> dict[str, tuple[str, str]]:
     """Record source columns used by one model. Returns {output column: (source, source column)}
     for outputs that are a plain (possibly cast or renamed) source column."""
     try:
@@ -70,6 +72,7 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
     computed: dict[str, set[str]] = {}  # CTE name -> columns it adds next to the star
     lineage: dict[str, dict[str, tuple[str, str]]] = {}  # CTE name -> its outputs
     last: dict[str, tuple[str, str]] = {}
+    positional: dict[int, list] = {}  # select -> source column behind each projection, by position
     for scope in traverse_scope(tree):
         select = scope.expression
         if not isinstance(select, exp.Select):
@@ -123,6 +126,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 cast = col.parent if isinstance(col.parent, (exp.Cast, exp.TryCast)) else None
                 use, parent = sources[hit[0]], col.parent
                 use.add(hit[1], cast.to.sql(dialect="duckdb") if cast else None)
+                if isinstance(parent, (exp.Sum, exp.Avg, exp.Add, exp.Sub, exp.Mul, exp.Div)):
+                    use.numbers.add(hit[1])
                 if isinstance(parent, exp.ParseJSON):
                     use.json_text.add(hit[1])  # parse_json(col):a.b  ->  col is text holding {"a": {"b": ...}}
                     col, parent = parent, parent.parent
@@ -150,14 +155,15 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
 
         outputs: dict[str, tuple[str, str]] = {}
         stars = [p for p in select.expressions if isinstance(p, exp.Star) or (isinstance(p, exp.Column) and isinstance(p.this, exp.Star))]
+        positional[id(select)] = by_position = []
         for proj in select.expressions:
             inner = proj.unalias()
             while isinstance(inner, (exp.Cast, exp.TryCast, exp.Paren)):
                 inner = inner.this
-            if isinstance(inner, exp.Column) and not isinstance(inner.this, exp.Star):
-                hit = resolve(inner)
-                if hit:
-                    outputs[proj.alias_or_name.upper()] = hit
+            hit = resolve(inner) if isinstance(inner, exp.Column) and not isinstance(inner.this, exp.Star) else None
+            by_position.append(hit)
+            if hit:
+                outputs[proj.alias_or_name.upper()] = hit
         name = scope.expression.parent.alias.upper() if isinstance(scope.expression.parent, exp.CTE) else None
         if stars and only and not select.args.get("joins"):
             if name:  # `select *, row_number() ... as rn from source` still passes every column through
@@ -171,6 +177,20 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
         if name:
             lineage[name] = outputs
         last = outputs
+    if links is not None:
+        # UNION branches line up by position, and aligned columns must share a type
+        def branches(node):
+            node = node.unnest()
+            return branches(node.left) + branches(node.right) if isinstance(node, exp.SetOperation) else [node]
+
+        for union in tree.find_all(exp.SetOperation):
+            if isinstance(union.parent, exp.SetOperation):
+                continue
+            rows = [positional.get(id(b), []) for b in branches(union)]
+            for aligned in zip(*rows):
+                group = {hit for hit in aligned if hit}
+                if len(group) > 1:
+                    links.append(group)
     return last
 
 
@@ -218,6 +238,7 @@ def build_spec(manifest: dict, database: str) -> tuple[dict, list[str]]:
     # how each model's outputs map back to source columns
     outputs: dict[str, dict[str, tuple[str, str]]] = {}
     by_relation: dict[str, dict[str, tuple[str, str]]] = {}
+    links: list[set[tuple[str, str]]] = []
 
     def scan(uid: str) -> None:
         node = manifest["nodes"].get(uid)
@@ -227,12 +248,27 @@ def build_spec(manifest: dict, database: str) -> tuple[dict, list[str]]:
         for parent in node["depends_on"]["nodes"]:
             scan(parent)
         if node.get("compiled_code"):
-            outputs[uid] = scan_model(node["compiled_code"], uses, by_relation)
+            outputs[uid] = scan_model(node["compiled_code"], uses, by_relation, links)
         if node.get("relation_name"):
             by_relation[node["relation_name"].replace('"', "").upper()] = outputs[uid]
 
     for uid in manifest["nodes"]:
         scan(uid)
+
+    # what is known about one column of a union holds for the columns aligned with it
+    for _ in range(3):
+        for group in links:
+            members = [(uses[s], c) for s, c in group if s in uses]
+            if any(c in u.numbers for u, c in members):
+                for u, c in members:
+                    u.numbers.add(c)
+            if any(c in u.texts for u, c in members):
+                for u, c in members:
+                    u.texts.add(c)
+            hint = next((u.columns.get(c) for u, c in members if u.columns.get(c)), None)
+            for u, c in members:
+                if hint and not u.columns.get(c):
+                    u.columns[c] = hint
 
     def locate(node_id: str, column: str) -> tuple[str, str] | None:
         if node_id in ids:
@@ -280,6 +316,8 @@ def build_spec(manifest: dict, database: str) -> tuple[dict, list[str]]:
         for col, hint in cols.items():
             if col in use.texts and not hint:
                 hint = "VARCHAR"
+            if col in use.numbers and not hint and col not in use.texts:
+                hint = "BIGINT"
             if col == key:
                 numeric = (hint or "").upper().startswith(("BIGINT", "INT", "DECIMAL", "NUMBER")) or (not hint and col.endswith("ID"))
                 out[col] = {"gen": "sequence" if numeric else "hash_id"}

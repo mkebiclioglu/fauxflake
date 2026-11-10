@@ -88,3 +88,13 @@ def test_generated_objects_and_text_dates_are_usable(emu):
                min(to_date(closed_on, 'YYYY/MM/DD')) >= '2025-01-01', count(f.value) > 0
         from raw.gh.issues, lateral flatten(input => labels, outer => true) f""").fetchone()
     assert row[1] == 200 and row[2:] == (True, "acme", True, True)
+
+
+def test_union_branches_share_what_is_known_about_a_column():
+    sources = {"RAW.GH.ISSUES": SourceUse(), "RAW.GL.ISSUES": SourceUse()}
+    links = []
+    scan_model("""
+        select id, comments as comment_count from raw.gh.issues
+        union all
+        select id, user_notes_count::int as comment_count from raw.gl.issues""", sources, links=links)
+    assert {("RAW.GH.ISSUES", "COMMENTS"), ("RAW.GL.ISSUES", "USER_NOTES_COUNT")} in links

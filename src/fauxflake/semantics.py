@@ -25,9 +25,7 @@ MACROS = [
     # DATE_TRUNC keeps the input type. DuckDB turns a DATE into a TIMESTAMP.
     f"""create or replace macro {_NS}_sf_date_trunc
           (p varchar, x date) as date_trunc(p, x)::date,
-          (p varchar, x timestamp) as date_trunc(p, x),
-          (p varchar, x timestamptz) as date_trunc(p, x),
-          (p varchar, x varchar) as date_trunc(p, x::timestamp)""",
+          (p, x) as date_trunc(p, x::timestamp)""",
     # TYPEOF looks inside a VARIANT. DuckDB only says JSON.
     f"""create or replace macro {_NS}_sf_typeof(v) as case when typeof(v) <> 'JSON' then typeof(v) else
           case json_type(v::varchar)
@@ -51,6 +49,9 @@ MACROS = [
           when typeof(x) in ('DOUBLE', 'FLOAT') then format('{{:.15g}}', x::double) else x::varchar end""",
     f"""create or replace macro {_NS}_sf_width_bucket(x, lo, hi, n) as case
           when x < lo then 0 when x >= hi then n + 1 else floor((x - lo) * n / (hi - lo))::bigint + 1 end""",
+    f"""create or replace macro {_NS}_sf_array_size
+          (x json) as json_array_length(x),
+          (x) as len(x)""",
     f"create or replace macro {_NS}_sf_current_account_name() as 'FAUXFLAKE'",
     f"create or replace macro {_NS}_sf_try_base64(x) as try(from_base64(x)::varchar)",
     f"create or replace macro {_NS}_sf_try_timestamp(x) as try_cast(x::varchar as timestamp)",
@@ -80,6 +81,8 @@ _RENAMED = {  # Snowflake function -> macro, same arguments
 _DATE_TOKENS = re.compile(r"YYYY|YY|MM|DD|HH|MI|SS|MON|DY|AM|PM", re.IGNORECASE)
 _HASHES = (exp.MD5, exp.SHA, exp.SHA2, exp.MD5Digest)
 UDFS: dict[str, str] = {}  # user-defined functions from the spec: name -> macro name
+_TIMESTAMP_PARSERS = {"try_to_timestamp", "try_to_timestamp_ntz", "try_to_timestamp_ltz", "try_to_timestamp_tz",
+                      "to_timestamp_ntz", "to_timestamp_ltz", "to_timestamp_tz"}
 _DAY_UNITS = {"YEAR", "QUARTER", "MONTH", "WEEK", "DAY", "YEARS", "QUARTERS", "MONTHS", "WEEKS", "DAYS"}
 _ARITHMETIC = (exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Mod)
 _NUMERIC_TEXT = re.compile(r"^\s*-?\d+(\.\d+)?\s*$")
@@ -224,8 +227,16 @@ def _fix(node: exp.Expression) -> exp.Expression:
             return exp.Coalesce(this=node, expressions=[exp.Literal.string("")])  # and no rows gives ''
     if isinstance(node, (exp.ToChar, exp.StrToTime, exp.StrToDate, exp.TsOrDsToDate)) and isinstance(node.args.get("format"), exp.Literal):
         node.args["format"].set("this", node.args["format"].name.replace("Mon", "MON").replace("Dy", "DY"))
-    if isinstance(node, exp.ToNumber) and isinstance(node.args.get("format"), exp.Literal) and "," in node.args["format"].name:
-        scale = len(node.args["format"].name.partition(".")[2])
+    if isinstance(node, exp.ArraySize):
+        return _fn("_sf_array_size", node.this)
+    if isinstance(node, exp.Anonymous) and node.name.lower() in _TIMESTAMP_PARSERS and len(node.expressions) == 1:
+        # TRY_TO_TIMESTAMP_NTZ(column): the one-argument forms on a non-literal
+        return _fn("_sf_try_timestamp", node.expressions[0]) if node.name.lower().startswith("try_") \
+            else exp.cast(node.expressions[0], "timestamp")
+    if isinstance(node, exp.ToNumber) and isinstance(node.args.get("format"), exp.Literal) \
+            and re.fullmatch(r"[09,.$]+", node.args["format"].name.strip()):
+        declared = node.args.get("scale")  # the format only guides parsing; the result scale is 0 unless given
+        scale = int(declared.name) if isinstance(declared, exp.Literal) else 0
         return exp.cast(exp.func("replace", node.this, exp.Literal.string(","), exp.Literal.string("")), f"decimal(38, {scale})")
     if isinstance(node, exp.Anonymous) and node.name.lower() in _RENAMED:
         return _fn(_RENAMED[node.name.lower()], *node.expressions)
@@ -361,6 +372,7 @@ def keep_outer_rows(transformed: exp.Expression, flags: list[bool]) -> exp.Expre
     for call, outer in zip(calls, flags):
         join = call.find_ancestor(exp.Join)
         if outer and join is not None:
+            join.set("kind", None)  # an explicit INNER JOIN LATERAL FLATTEN(... OUTER => TRUE)
             join.set("side", "LEFT")
             join.set("on", exp.true())
     return transformed
