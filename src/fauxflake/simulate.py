@@ -44,6 +44,27 @@ def compare(emu: Emulator, project: DbtProject, schema: str, rebuilt_schema: str
     return out
 
 
+def check_snapshots(emu: Emulator, project: DbtProject) -> list[Drift]:
+    """After many runs a snapshot must still hold one current row per key and no overlapping
+    validity windows. Reported in the same shape as model drift: the two counts are keys with
+    several current rows, and versions that overlap the next one."""
+    cur, out = emu.cursor(), []
+    for node in project.snapshots():
+        rel = f'{node["database"]}.{node["schema"]}.{node.get("alias") or node["name"]}'
+        key = node["config"].get("unique_key")
+        keys = ", ".join(f'"{k.upper()}"' for k in ([key] if isinstance(key, str) else key or []))
+        if not keys:
+            continue
+        rows, current, overlaps = cur.execute(f"""
+            with v as (select *, lead(DBT_VALID_FROM) over (partition by {keys} order by DBT_VALID_FROM) as _next from {rel})
+            select (select count(*) from {rel}),
+                   (select count(*) from (select {keys} from {rel} where DBT_VALID_TO is null group by all having count(*) > 1)),
+                   (select count(*) from v where _next is not null and (DBT_VALID_TO is null or DBT_VALID_TO > _next))
+        """).fetchone()
+        out.append(Drift(f"{node['name']} (snapshot)", rows, rows, current, overlaps))
+    return out
+
+
 def simulate(wh: Warehouse, project: DbtProject, start: datetime, days: int, step_hours: float = 24,
              dbt_args: list[str] | None = None, log=print, failures: list[datetime] | None = None) -> list[Drift]:
     """With `failures`, a failing dbt build is recorded there instead of ending the run."""
@@ -68,6 +89,8 @@ def simulate(wh: Warehouse, project: DbtProject, start: datetime, days: int, ste
             f"(generate {t1 - t0:.1f}s, dbt {time.time() - t1:.1f}s)")
 
     log("rebuilding from scratch to compare ...")
-    if not project.invoke(["run", "--full-refresh", *dbt_args], schema="CI_REBUILD", quiet=True):
+    # snapshots keep history that cannot be rebuilt, so they are left alone here and checked separately
+    rebuild = ["build", "--full-refresh", "--resource-type", "model", "--resource-type", "seed"]
+    if not project.invoke([*rebuild, *dbt_args], schema="CI_REBUILD", quiet=True):
         raise SystemExit("dbt full refresh failed")
-    return compare(wh.emu, project, "CI", "CI_REBUILD")
+    return compare(wh.emu, project, "CI", "CI_REBUILD") + check_snapshots(wh.emu, project)

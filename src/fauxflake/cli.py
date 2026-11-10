@@ -75,6 +75,10 @@ def simulate(spec_path, project_dir, scale, history, days, step_hours, dbt_args)
     click.echo("")
     for d in drifts:
         mark = "ok   " if d.ok else "DRIFT"
+        if d.model.endswith("(snapshot)"):
+            click.echo(f"{mark} {d.model:<32} versions={d.incremental_rows:,} "
+                       f"keys_with_several_current_rows={d.only_incremental:,} overlapping_versions={d.only_rebuilt:,}")
+            continue
         click.echo(f"{mark} {d.model:<32} incremental={d.incremental_rows:,} rebuilt={d.rebuilt_rows:,} "
                    f"only_incremental={d.only_incremental:,} only_rebuilt={d.only_rebuilt:,}")
     if not all(d.ok for d in drifts):

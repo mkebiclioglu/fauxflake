@@ -1,0 +1,30 @@
+version: 2
+sources:
+  - name: app
+    database: RAW
+    schema: APP
+    tables:
+      - name: users
+        columns:
+          - name: id
+            data_tests: [unique, not_null]
+      - name: payments
+        columns:
+          - name: user_id
+            data_tests:
+              - relationships:
+                  arguments: {to: "source('app', 'users')", field: id}
+models:
+  - name: fct_payments
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments: {combination_of_columns: [payment_id, currency]}
+      - dbt_utils.expression_is_true:
+          arguments: {expression: "amount_usd >= 0"}
+    columns:
+      - name: payment_key
+        data_tests: [unique, not_null]
+  - name: dim_users
+    columns:
+      - name: user_id
+        data_tests: [unique]

@@ -1,0 +1,10 @@
+name: kitchen_sink
+version: "1.0"
+profile: kitchen_sink
+model-paths: [models]
+seed-paths: [seeds]
+snapshot-paths: [snapshots]
+macro-paths: [macros]
+models:
+  kitchen_sink:
+    +materialized: table

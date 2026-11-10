@@ -65,6 +65,10 @@ class DbtProject:
         return [n for n in manifest["nodes"].values()
                 if n["resource_type"] == "model" and n["config"]["materialized"] != "ephemeral"]
 
+    def snapshots(self) -> list[dict]:
+        manifest = json.loads((self.target_path / "manifest.json").read_text())
+        return [n for n in manifest["nodes"].values() if n["resource_type"] == "snapshot"]
+
     def incremental_models(self) -> list[dict]:
         return [
             n for n in self.models()

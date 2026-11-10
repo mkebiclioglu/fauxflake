@@ -1,0 +1,23 @@
+seed: 7
+start: 2025-01-01
+dbt: {database: ANALYTICS}
+tables:
+  RAW.APP.USERS:
+    volume: {rows_per_day: 20}
+    lateness: {p: [0, 1], seconds: [1, 60]}
+    columns:
+      ID: {gen: sequence}
+      EMAIL: {gen: template, template: "u{n}@example.com"}
+      PLAN: {gen: categorical, values: {free: 0.7, pro: 0.25, team: 0.05}}
+      SIGNED_UP_AT: {gen: event_time}
+      _LOADED_AT: {gen: loaded_at}
+  RAW.APP.PAYMENTS:
+    volume: {rows_per_day: 300}
+    lateness: {p: [0, 1], seconds: [1, 600]}
+    columns:
+      ID: {gen: sequence}
+      USER_ID: {gen: fk, ref: RAW.APP.USERS}
+      AMOUNT_CENTS: {gen: dist, type: BIGINT, p: [0, 0.5, 1], v: [100, 2500, 90000]}
+      CURRENCY: {gen: categorical, values: {usd: 0.8, eur: 0.2}}
+      PAID_AT: {gen: event_time}
+      _LOADED_AT: {gen: loaded_at}

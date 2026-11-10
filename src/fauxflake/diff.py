@@ -18,6 +18,10 @@ from .dbt import DbtProject, emulator_output
 from .emulator import Emulator
 
 
+# models and seeds, no tests: a diff reports what changed, it does not judge it
+BUILD = ["build", "--resource-type", "model", "--resource-type", "seed"]
+
+
 @dataclass
 class ModelDiff:
     name: str
@@ -115,10 +119,10 @@ def run(emu: Emulator, project_dir: Path, base_ref: str, database: str, dbt_args
         head = DbtProject(project_dir, emulator_output(emu.port, database))
         base = DbtProject(base_dir, emulator_output(emu.port, database))
         log(f"building {base_ref} ...")
-        if not base.invoke(["run", *dbt_args], schema="BASE", quiet=True):
+        if not base.invoke([*BUILD, *dbt_args], schema="BASE", quiet=True):
             raise SystemExit(f"dbt run failed on {base_ref}")
         log("building the working tree ...")
-        if not head.invoke(["run", *dbt_args], schema="HEAD", quiet=True):
+        if not head.invoke([*BUILD, "--resource-type", "snapshot", *dbt_args], schema="HEAD", quiet=True):
             raise SystemExit("dbt run failed on the working tree")
         return compare(emu, base, head, "BASE", "HEAD")
     finally:

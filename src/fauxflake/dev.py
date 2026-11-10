@@ -59,7 +59,7 @@ class DevSession:
         return sorted(out)
 
     def start(self) -> bool:
-        if self.base and not self.base.invoke(["run"], schema="BASE", quiet=True):
+        if self.base and not self.base.invoke(differ.BUILD, schema="BASE", quiet=True):
             self.log("the last commit does not build; continuing without a baseline")
             self.base = None
         return self.rebuild([])
