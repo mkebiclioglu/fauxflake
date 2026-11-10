@@ -66,7 +66,7 @@ REWRITES: list[tuple[re.Pattern[str], str, str]] = [
 ]
 
 
-_MERGE = re.compile(r"\s*(?:/\*.*?\*/\s*)*merge\s+into\b", re.IGNORECASE | re.DOTALL)
+_MERGE = re.compile(r"(?:\s|--[^\n]*\n|/\*.*?\*/)*merge\s+into\b", re.IGNORECASE | re.DOTALL)
 
 
 def _qualify_merge_insert(sql: str) -> str:

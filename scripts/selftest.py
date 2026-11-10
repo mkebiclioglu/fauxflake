@@ -30,6 +30,8 @@ def main() -> None:
     ap.add_argument("--snowflake", default=None, metavar="CONNECTION",
                     help="also build on this real account (~/.snowflake/connections.toml) and compare every model row for row")
     ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--snowflake-steps", default="seed --full-refresh; run --full-refresh",
+                    help="dbt commands for the Snowflake side of --snowflake (same format as --steps)")
     ap.add_argument("--schema", default="CI", help="default schema, for projects whose sources expect a fixed one")
     ap.add_argument("--target", default=None, help="dbt target name, for projects that branch on target.name")
     ap.add_argument("dbt_args", nargs="*", help="extra arguments for `dbt build` (after --)")
@@ -67,7 +69,7 @@ def main() -> None:
             from fauxflake.parity import compare
 
             remote = DbtProject(args.project_dir, snowflake_output(args.snowflake, args.database, args.threads), name="selftest_snowflake")
-            for step in (["seed", "--full-refresh"], ["run", "--full-refresh"]):
+            for step in [shlex.split(part) for part in args.snowflake_steps.split(";") if part.strip()]:
                 remote.invoke([*step, *extra], schema=args.schema, quiet=True)
             conn = snowflake.connector.connect(connection_name=args.snowflake)
             parity = compare(conn, emu, project)
@@ -95,7 +97,7 @@ def main() -> None:
             if node is None or uid in seen:
                 return False
             seen.add(uid)
-            return bool(clock.search(node.get("compiled_code") or "")) or any(reads_clock(d, seen) for d in node["depends_on"]["nodes"])
+            return bool(clock.search(node.get("compiled_code") or "")) or any(reads_clock(d, seen) for d in (node.get("depends_on") or {}).get("nodes") or [])
 
         differing = [p for p in parity if not p.ok]
         timed = [p for p in differing if not p.note and p.emulator_rows == p.snowflake_rows and reads_clock(by_name.get(p.model, ""), set())]
