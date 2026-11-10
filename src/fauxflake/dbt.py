@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 import yaml
@@ -75,8 +76,9 @@ class DbtProject:
             return
         manifest = json.loads((self.target_path / "manifest.json").read_text())
         for node in [*manifest["nodes"].values(), *manifest["sources"].values()]:
-            if node.get("database") and node.get("schema"):
-                emulator.CURRENT.ensure_database(node["database"].strip('"'), node["schema"].strip('"'))
+            names = [str(node.get(k) or "").strip('"') for k in ("database", "schema")]
+            if all(re.fullmatch(r"[\w$]+", n) for n in names):  # skips names dbt has not rendered yet
+                emulator.CURRENT.ensure_database(*names)
 
     def invoke(self, args: list[str], schema: str = "CI", quiet: bool = False, silent: bool = False) -> bool:
         from dbt.cli.main import dbtRunner
