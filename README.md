@@ -78,6 +78,12 @@ from casts and naming, the grain from `unique` tests, references from `relations
 categories from `accepted_values`, the load timestamp from freshness config. Tests written on
 marts are traced back through staging to the raw table. It prints every assumption it made.
 
+It also reads the shape of the data out of the SQL: `user:login::string` means a JSON column
+with a `login` field; `to_date(x, 'YYYY/MM/DD')` means text dates in that format;
+`where state = 'open'` means `open` must be one of the values; `sum(x)` means a number; columns
+lined up by a `UNION` share a type; `author_id` and `author_username` describe one entity, so
+the name follows the id in every table that carries both.
+
 Volumes and distributions start as placeholders. `fauxflake profile` replaces them with
 measurements once it has a read-only Snowflake connection.
 
@@ -270,14 +276,14 @@ matches on all 6 of its models too. The first parity run did not look like this:
 `fct_daily_events` differed, because Snowflake divides integers into `NUMBER(p, 6)`
 (`0.090029`) while DuckDB returns a double. That is how the gaps below were found.
 
-**Conformance.** [`conformance/cases.yml`](conformance/cases.yml) holds 142 small queries
+**Conformance.** [`conformance/cases.yml`](conformance/cases.yml) holds 147 small queries
 covering the SQL analytics code leans on: number scale and rounding, null ordering, implicit
 conversions, dates and time zones, strings and regular expressions, semi-structured data,
 window functions, pivots, set operations. `fauxflake conformance --connection <name>` runs
 them on real Snowflake once and stores the answers in `golden.json`. CI then replays them
 against the emulator with no Snowflake access.
 
-Current score: **138 of 142 match**. The 4 gaps are marked in the file; a gap is a strict
+Current score: **143 of 147 match**. The 4 gaps are marked in the file; a gap is a strict
 expected failure, so fixing one forces the marker to be removed and the list cannot go stale.
 
 The fixes live in [`semantics.py`](src/fauxflake/semantics.py). Some of what the suite found,
@@ -290,25 +296,35 @@ all of it silent before:
 - `FLATTEN(..., OUTER => TRUE)` was dropping the outer rows;
 - `LISTAGG` without a delimiter was using a comma, and `LTRIM(x, chars)` ignored its characters;
 - NULL timestamps reached the client as `1970-01-01`;
-- `v:field = 'x'`, `v:n + 1`, `'1' + 1` and `MD5(42)` convert implicitly, as Snowflake does.
+- `v:field = 'x'`, `v:n + 1`, `'1' + 1` and `MD5(42)` convert implicitly, as Snowflake does;
+- `GET(v, 2) = 'c'` was parsed with the wrong operator precedence.
 
-**Other people's SQL.** [`scripts/compat.py`](scripts/compat.py) renders public Snowflake dbt
-projects with the real adapter and pushes every model through the emulator. Over 3,266 models
-from GitLab's and Mattermost's warehouses and three smaller projects, measured before the
-fixes above:
+**Other people's SQL.** Two measurements on public Snowflake dbt projects.
 
-| | models | share |
-| --- | --- | --- |
-| parse as Snowflake SQL | 3,265 of 3,266 | 99.97% |
-| transpile, and DuckDB parses the result | 3,182 | 97.4% |
-| every function called exists | 3,116 | 95.4% |
-| run end to end on empty stub tables | 2,112 of 3,178 | 66.5% |
+*Zero-config, end to end.* On Meltano's public project (207 nodes, 11 raw tables, JSON-heavy
+sources), `fauxflake init` followed by `fauxflake build`, with no hand edits: every model
+builds and **206 of 207 nodes pass**. The one failure is a `not_null` test on a model whose
+join finds no matches in invented data. The first attempt passed 27; each step up was a fix
+to `init` or the emulator that now ships.
 
-The last row is a floor, not an estimate. Sources had to be stubbed with guessed, all-text
-columns, and 26% of models failed or were undecided for that reason alone; of the models whose
-outcome could be attributed, 89.9% ran. No table held data, so this says nothing about
-correct results; parity and conformance cover that. What failed was a long tail of small
-causes, the largest of which were fixed afterwards.
+*Breadth.* [`scripts/compat.py`](scripts/compat.py) renders projects with the real adapter
+and pushes every model through the emulator on empty stub tables. Over 3,266 rendered models
+from GitLab's and Mattermost's warehouses and three smaller projects, 99.97% parse as
+Snowflake SQL, 97.4% transpile, and 95.4% call only functions that exist. Running them:
+
+| project | models | run end to end | emulator failure | blocked by guessed stub columns, or undecided |
+| --- | --- | --- | --- | --- |
+| GitLab | 2,679 | 1,969 (73.5%) | 78 (2.9%) | 632 (23.6%) |
+| Mattermost analytics | 194 | 143 (73.7%) | 7 (3.6%) | 44 (22.7%) |
+| Flipside near | 63 | 47 (74.6%) | 3 (4.8%) | 13 (20.6%) |
+| Snowflake monitoring | 25 | 19 (76.0%) | 1 (4.0%) | 5 (20.0%) |
+
+"Run end to end" is a floor: the harness has to guess every source column as text, and a
+quarter of the models fail or stay undecided for that reason alone. Emulator failures were
+7.5% on the first run; the fixes that followed brought them to 3%. What remains is mostly
+account-specific functions (give them stand-ins under `udfs`), `ENCRYPT_RAW`, and a few
+name-resolution differences. Tables are empty here, so this says nothing about correct
+results; parity and conformance cover that.
 
 ## Security
 
@@ -351,9 +367,11 @@ Read these before trusting a green check.
   columns, which need the cast they arguably should have had.
 - **It says nothing about Snowflake performance or cost.** Query plans, pruning, spilling and
   warehouse sizing cannot be learned from DuckDB.
-- **Fidelity stops at the spec.** Columns are sampled independently, so cross-column
-  correlations are lost. Lifecycles are declared by hand. `init` guesses types from names
-  when the SQL gives no cast.
+- **Fidelity stops at the spec.** Apart from attributes that follow an id, columns are sampled
+  independently, so cross-column correlations are lost. Lifecycles are declared by hand.
+  `init` guesses types from names when the SQL gives no evidence. A test that encodes a
+  business rule the data cannot know (a join that must find a match in a seed) can fail on
+  invented data until the spec is taught the rule; exclude it or edit the spec.
 - **Scale is relative.** Logic that depends on absolute counts (`having count(*) > 1000`)
   behaves differently at `--scale 0.001`.
 - **The profiler and parity harness have run against one real account**, on synthetic tables.
