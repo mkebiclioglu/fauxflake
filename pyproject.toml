@@ -1,6 +1,6 @@
 [project]
 name = "fauxflake"
-version = "0.1.0"
+version = "0.2.0"
 description = "Run dbt-snowflake CI on synthetic, statistically shaped data, locally on DuckDB."
 readme = "README.md"
 license = "MIT"
@@ -33,3 +33,6 @@ packages = ["src/fauxflake"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = ["ignore"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"conformance" = "fauxflake/conformance_cases"

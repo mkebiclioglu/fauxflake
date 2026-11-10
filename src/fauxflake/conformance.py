@@ -9,7 +9,9 @@ from pathlib import Path
 
 import yaml
 
-ROOT = Path(__file__).resolve().parents[2] / "conformance"
+# in a checkout the cases live at the top of the repository; an installed copy carries them inside the package
+_REPO = Path(__file__).resolve().parents[2] / "conformance"
+ROOT = _REPO if _REPO.exists() else Path(__file__).resolve().parent / "conformance_cases"
 
 
 def cases(root: Path = ROOT) -> list[dict]:
