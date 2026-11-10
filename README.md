@@ -297,7 +297,7 @@ Snowflake account, and every model compared row for row
 | package | models | identical | differ only by the clock | other |
 | --- | --- | --- | --- | --- |
 | HubSpot | 167 | 167 | | |
-| Shopify | SHOPIFY_TOTAL | SHOPIFY_SAME | | SHOPIFY_OTHER |
+| Shopify | 211 | 207 | | 4 |
 | QuickBooks | 96 | 95 | | 1 |
 | NetSuite | 93 | 93 | | |
 | Zendesk | 76 | 71 | 5 | |
