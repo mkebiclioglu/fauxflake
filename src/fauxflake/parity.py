@@ -26,6 +26,8 @@ def seed(conn, wh: Warehouse, after: datetime | None = None, log=print) -> None:
         for t in wh.spec.ordered():
             db, schema, table = t.name.split(".")
             loaded = t.role("loaded_at")
+            if t.raw.get("mode") == "upsert" or not loaded:
+                after = None  # rows change in place, so the table is replaced rather than appended to
             where = f"where {loaded} > '{after}'" if after else ""
             path = Path(tmp) / f"{table}.parquet"
             n = wh.cur.execute(f"copy (select * from {t.name} {where}) to '{path}' (format parquet)").fetchone()[0]

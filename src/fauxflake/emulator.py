@@ -230,6 +230,8 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
         logging.getLogger("fakesnow.server").setLevel(logging.WARNING)
     if db_path:
         Path(db_path).mkdir(parents=True, exist_ok=True)
+        for stale in [*Path(db_path).glob("*.db"), *Path(db_path).glob("*.db.wal")]:
+            stale.unlink()  # every run starts from an empty warehouse
     fs = FakeSnow(db_path=db_path, nop_regexes=NOPS)
     for macro in semantics.MACROS:
         fs.duck_conn.execute(macro)

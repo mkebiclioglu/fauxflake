@@ -60,6 +60,7 @@ class Scenario:
     null_rate: float | None = None
     volume_factor: float = 1.0
     outage_hours: float = 0.0
+    new_column: str | None = None
 
 
 SCENARIOS: dict[str, dict] = {
@@ -69,6 +70,7 @@ SCENARIOS: dict[str, dict] = {
     "volume-spike": {"volume_factor": 10.0},     # launch day
     "empty-day": {"volume_factor": 0.0},         # nothing was produced
     "loader-outage": {"outage_hours": 30.0},     # the loader is down, then delivers everything at once
+    "new-column": {"new_column": "ADDED_UPSTREAM"},  # the source grows a column overnight
 }
 
 
@@ -150,7 +152,7 @@ class TableSQL:
             expr = f"({expr})::{d['type']}"
         return f'{expr} as "{col}"'
 
-    def select(self) -> str:
+    def select(self, with_new_column: bool = False) -> str:
         """SELECT over global row numbers [$lo, $hi) keeping rows loaded in ($after, $until]."""
         t = self.t
         fks = [(c, d) for c, d in t.columns.items() if d.get("gen") == "fk"]
@@ -186,6 +188,9 @@ class TableSQL:
                 up = f"({down} + {ms(repr(self.sc.outage_hours * 3600))})"
                 arrived = f"(select case when x >= {down} and x < {up} then {up} else x end from (select {arrived} as x))"
         cols = ",\n  ".join(self.column(c, d) for c, d in t.columns.items())
+        if with_new_column:
+            since = f"timestamp '{self.sc.start} 00:00:00'"
+            cols += f',\n  case when _loaded >= {since} then \'v2\' end as "{self.sc.new_column}"'
         return f"""
 with b as (
   select r.g, c.day{pcs}
@@ -247,13 +252,29 @@ class Warehouse:
                 "after": self.now or datetime(1, 1, 1),
                 "until": until,
             }
-            select = TableSQL(self.spec, t, self.scenario).select()
-            verb = f"create or replace table {t.name} as" if self.now is None else f"insert into {t.name}"
+            sc = self.scenario
+            changed_at = datetime.combine(sc.start, datetime.min.time()) if sc and sc.new_column else None
+            widened = bool(changed_at and until > changed_at)
+            if widened and self.now is not None and self.now <= changed_at:
+                self.cur.execute(f'alter table {t.name} add column "{sc.new_column}" varchar')
+            select = TableSQL(self.spec, t, sc).select(with_new_column=widened)
+            verb = f"create or replace table {t.name} as" if self.now is None else f"insert into {t.name} by name"
             counts[t.name] = self.cur.execute(f"{verb} {select}", params).fetchone()[0]
+            if t.raw.get("mode") == "upsert":
+                self._keep_latest(t)
         self.now = until
         if self.freeze_clock:
             emulator.FROZEN_NOW = until
         return counts
+
+    def _keep_latest(self, t: Table) -> None:
+        """An upsert-style source holds one row per key: the newest version that has arrived."""
+        key = t.key[0]
+        order = ", ".join(f'"{c}" desc' for c in (t.role("updated_at"), t.role("loaded_at")) if c) or "rowid desc"
+        self.cur.execute(f"""
+            delete from {t.name} where rowid in (
+              select rowid from (select rowid, row_number() over (partition by "{key}" order by {order}) rn from {t.name})
+              where rn > 1)""")
 
     def row_counts(self) -> dict[str, int]:
         return {t: self.cur.execute(f"select count(*) from {t}").fetchone()[0] for t in self.spec.tables}

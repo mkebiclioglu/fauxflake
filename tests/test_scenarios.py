@@ -48,3 +48,17 @@ def test_scenarios_keep_the_clock_deterministic(spec):
             stepped.advance_to(stepped.now + timedelta(days=1))
         for t in TABLES:
             assert checksum(a, t) == checksum(b, t), t
+
+
+def test_new_column_appears_mid_history(spec):
+    sc = scenario("new-column", DAY)
+    with serve() as emu:
+        wh = Warehouse(emu, spec, 0.0005, sc)
+        wh.advance_to(datetime(2025, 2, 9))
+        cols = lambda: {c for c, *_ in emu.cursor().execute("describe RAW.SHOP.EVENTS").fetchall()}  # noqa: E731
+        assert "ADDED_UPSTREAM" not in cols()
+        wh.advance_to(datetime(2025, 2, 12))
+        assert "ADDED_UPSTREAM" in cols()
+        old, new = emu.cursor().execute("""select count(*) filter (where ADDED_UPSTREAM is null and _LOADED_AT < '2025-02-10'),
+            count(*) filter (where ADDED_UPSTREAM = 'v2' and _LOADED_AT >= '2025-02-10') from RAW.SHOP.EVENTS""").fetchone()
+        assert old > 0 and new > 0 and old + new == emu.cursor().execute("select count(*) from RAW.SHOP.EVENTS").fetchone()[0]

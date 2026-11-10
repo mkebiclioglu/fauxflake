@@ -20,6 +20,7 @@ common = [
     click.option("--project-dir", default=".", show_default=True, help="dbt project directory."),
     click.option("--scale", default=0.001, show_default=True, help="Fraction of production volume to generate."),
     click.option("--history", default=60, show_default=True, help="Days of history present at the start."),
+    click.option("--db-path", default=None, help="Keep data in DuckDB files here instead of memory (for large scales)."),
 ]
 
 
@@ -38,14 +39,14 @@ def main() -> None:
 @main.command(context_settings={"ignore_unknown_options": True})
 @with_common
 @click.argument("dbt_args", nargs=-1, type=click.UNPROCESSED)
-def build(spec_path, project_dir, scale, history, dbt_args):
+def build(spec_path, project_dir, scale, history, db_path, dbt_args):
     """Generate sources and run `dbt build` once. Extra args go to dbt."""
     from .dbt import DbtProject, emulator_output
     from .emulator import serve
     from .generate import Warehouse
 
     spec = Spec.load(spec_path)
-    with serve() as emu:
+    with serve(db_path=db_path) as emu:
         t0 = time.time()
         wh = Warehouse(emu, spec, scale)
         counts = wh.advance_to(_start(spec, history))
@@ -60,7 +61,7 @@ def build(spec_path, project_dir, scale, history, dbt_args):
 @click.option("--days", default=7, show_default=True, help="Simulated days to advance.")
 @click.option("--step-hours", default=24.0, show_default=True, help="Hours between dbt runs.")
 @click.argument("dbt_args", nargs=-1, type=click.UNPROCESSED)
-def simulate(spec_path, project_dir, scale, history, days, step_hours, dbt_args):
+def simulate(spec_path, project_dir, scale, history, db_path, days, step_hours, dbt_args):
     """Advance the clock run by run, then compare incremental models to a full refresh."""
     from .dbt import DbtProject, emulator_output
     from .emulator import serve
@@ -68,7 +69,7 @@ def simulate(spec_path, project_dir, scale, history, days, step_hours, dbt_args)
     from .simulate import simulate as run
 
     spec = Spec.load(spec_path)
-    with serve() as emu:
+    with serve(db_path=db_path) as emu:
         wh = Warehouse(emu, spec, scale)
         project = DbtProject(project_dir, emulator_output(emu.port, spec.dbt.get("database", "ANALYTICS")))
         drifts = run(wh, project, _start(spec, history), days, step_hours, list(dbt_args), log=click.echo)
@@ -89,14 +90,14 @@ def simulate(spec_path, project_dir, scale, history, days, step_hours, dbt_args)
 @main.command()
 @with_common
 @click.option("--port", default=8765, show_default=True)
-def serve(spec_path, project_dir, scale, history, port):
+def serve(spec_path, project_dir, scale, history, db_path, port):
     """Keep the emulator running with generated sources, for interactive dbt use."""
     from .dbt import DbtProject, emulator_output
     from .emulator import serve as start
     from .generate import Warehouse
 
     spec = Spec.load(spec_path)
-    with start(port=port) as emu:
+    with start(port=port, db_path=db_path) as emu:
         wh = Warehouse(emu, spec, scale)
         counts = wh.advance_to(_start(spec, history))
         project = DbtProject(project_dir, emulator_output(emu.port, spec.dbt.get("database", "ANALYTICS")))
@@ -133,7 +134,7 @@ def profile(spec_path, connection, days, sample_pct, k_anonymity, max_categories
 @with_common
 @click.option("--connection", required=True, help="Name in ~/.snowflake/connections.toml.")
 @click.option("--days", default=2, show_default=True, help="Simulated days of incremental runs on both engines.")
-def parity(spec_path, project_dir, scale, history, connection, days):
+def parity(spec_path, project_dir, scale, history, db_path, connection, days):
     """Build on the emulator and on real Snowflake from identical synthetic data, and compare."""
     import snowflake.connector
 
@@ -216,7 +217,7 @@ def init(spec_path, project_dir, database, force):
 @click.option("--output", default=None, help="Also write the Markdown report to this file.")
 @click.option("--fail-on-change", is_flag=True, help="Exit 1 when any model output changed.")
 @click.argument("dbt_args", nargs=-1, type=click.UNPROCESSED)
-def diff(spec_path, project_dir, scale, history, base, output, fail_on_change, dbt_args):
+def diff(spec_path, project_dir, scale, history, db_path, base, output, fail_on_change, dbt_args):
     """Build a base ref and the working tree on identical data and report what changed."""
     from pathlib import Path
 
@@ -243,7 +244,7 @@ def diff(spec_path, project_dir, scale, history, base, output, fail_on_change, d
 @click.option("--days", default=7, show_default=True, help="Simulated days per scenario.")
 @click.option("--only", multiple=True, help="Scenario name; repeat to run several. Default: all.")
 @click.argument("dbt_args", nargs=-1, type=click.UNPROCESSED)
-def scenarios(spec_path, project_dir, scale, history, days, only, dbt_args):
+def scenarios(spec_path, project_dir, scale, history, db_path, days, only, dbt_args):
     """Replay bad days (late data, duplicates, nulls, spikes, outages) and report what happens."""
     import contextlib
     import io
@@ -280,7 +281,7 @@ def scenarios(spec_path, project_dir, scale, history, days, only, dbt_args):
 
 @main.command()
 @with_common
-def dev(spec_path, project_dir, scale, history):
+def dev(spec_path, project_dir, scale, history, db_path):
     """Rebuild on save and show how the output differs from the last commit."""
     from pathlib import Path
 
@@ -298,3 +299,27 @@ def dev(spec_path, project_dir, scale, history):
             session.watch()
         finally:
             session.close()
+
+
+@main.command()
+@click.option("--spec", "spec_path", default="fauxflake.yml", show_default=True)
+@click.option("--project-dir", default=".", show_default=True)
+def check(spec_path, project_dir):
+    """Verify the spec still covers every source column the project reads."""
+    import json
+
+    from .dbt import DbtProject, emulator_output
+    from .emulator import serve
+    from .init import check as find_problems
+
+    spec = Spec.load(spec_path)
+    database = spec.dbt.get("database", "ANALYTICS")
+    with serve() as emu:
+        project = DbtProject(project_dir, emulator_output(emu.port, database))
+        project.invoke(["compile"], quiet=True)
+        manifest = json.loads((project.target_path / "manifest.json").read_text())
+    problems = find_problems(manifest, spec, database)
+    for problem in problems:
+        click.echo(problem)
+    click.echo(f"{len(problems)} problem{'s' if len(problems) != 1 else ''}")
+    sys.exit(1 if problems else 0)
