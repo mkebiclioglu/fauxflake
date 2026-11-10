@@ -23,7 +23,7 @@
 - {id: datediff, sql: "select datediff('day', '2025-01-01 23:59'::timestamp, '2025-01-02 00:01'::timestamp), datediff('month', '2025-01-31'::date, '2025-02-01'::date), datediff('week', '2025-01-04'::date, '2025-01-06'::date), datediff('year', '2024-12-31'::date, '2025-01-01'::date)"}
 - {id: date_trunc, sql: "select date_trunc('week', '2025-01-01'::date), date_trunc('quarter', '2025-05-17'::date), date_trunc('month', '2025-05-17 10:11:12'::timestamp)"}
 - {id: date_parts, sql: "select dayofweek('2025-01-05'::date), dayofweekiso('2025-01-05'::date), weekofyear('2025-01-01'::date), quarter('2025-05-01'::date), dayname('2025-01-05'::date), monthname('2025-01-05'::date), last_day('2025-02-10'::date)"}
-- {id: to_date_formats, gap: "to_varchar ignores numeric format models", sql: "select to_date('2025/03/04', 'YYYY/MM/DD'), to_timestamp('2025-03-04 05:06:07'), to_char('2025-03-04'::date, 'YYYY-MM'), to_varchar(1234.5, '9,999.00')"}
+- {id: to_date_formats, sql: "select to_date('2025/03/04', 'YYYY/MM/DD'), to_timestamp('2025-03-04 05:06:07'), to_char('2025-03-04'::date, 'YYYY-MM'), to_varchar(1234.5, '9,999.00')"}
 - {id: epoch, sql: "select to_timestamp(1735689600), date_part(epoch_second, '2025-01-01'::timestamp), to_timestamp(1735689600123, 3)"}
 - {id: convert_tz, sql: "select convert_timezone('UTC', 'America/New_York', '2025-03-09 12:00:00'::timestamp_ntz)"}
 - {id: months_between, sql: "select months_between('2025-03-31'::date, '2025-02-28'::date), add_months('2025-01-31'::date, 1)"}
@@ -35,12 +35,12 @@
 - {id: hashing, sql: "select md5('abc'), sha2('abc', 256), hash(1) is not null"}
 - {id: listagg, sql: "select listagg(x, ',') within group (order by x) from (select column1 x from values ('b'), ('a'), ('c'))"}
 - {id: array_agg, sql: "select array_agg(x) within group (order by x), array_size(array_agg(x)) from (select column1 x from values (2), (1), (3))"}
-- {id: arrays, gap: "ARRAY results cannot be returned to the client", sql: "select array_construct(1, 2, 3), array_contains(2::variant, array_construct(1, 2)), array_to_string(array_construct('a', 'b'), '|'), array_slice(array_construct(1, 2, 3), 0, 2)"}
-- {id: object_construct, gap: "ARRAY results cannot be returned to the client", sql: "select object_construct('a', 1, 'b', 'x'), object_construct('a', null), object_keys(object_construct('a', 1, 'b', 2))"}
+- {id: arrays, sql: "select array_construct(1, 2, 3), array_contains(2::variant, array_construct(1, 2)), array_to_string(array_construct('a', 'b'), '|'), array_slice(array_construct(1, 2, 3), 0, 2)"}
+- {id: object_construct, sql: "select object_construct('a', 1, 'b', 'x'), object_construct('a', null), object_keys(object_construct('a', 1, 'b', 2))"}
 - {id: json_path, sql: "select v:a::int, v:b.c::string, v:d[1]::int, v:missing, get_path(v, 'b.c')::string from (select parse_json('{\"a\": 1, \"b\": {\"c\": \"x\"}, \"d\": [10, 20]}') v)"}
 - {id: flatten, sql: "select f.index, f.value::int from table(flatten(input => parse_json('[10, 20, 30]'))) f order by 1"}
 - {id: lateral_flatten, sql: "select t.id, f.value:k::string from (select 1 id, parse_json('[{\"k\": \"a\"}, {\"k\": \"b\"}]') v) t, lateral flatten(input => t.v) f order by 2"}
-- {id: typeof_variant, gap: "typeof() reports JSON instead of the variant's inner type", sql: "select typeof(parse_json('1')), typeof(parse_json('\"a\"')), is_array(parse_json('[1]')), is_null_value(parse_json('null'))"}
+- {id: typeof_variant, sql: "select typeof(parse_json('1')), typeof(parse_json('\"a\"')), is_array(parse_json('[1]')), is_null_value(parse_json('null'))"}
 - {id: qualify, sql: "select x from (select column1 x, column2 g from values (1, 'a'), (2, 'a'), (3, 'b')) qualify row_number() over (partition by g order by x desc) = 1 order by 1"}
 - {id: window_frames, sql: "select x, sum(x) over (order by x rows between 1 preceding and current row), lag(x) over (order by x), ratio_to_report(x) over () from (select column1 x from values (1), (2), (3)) order by 1"}
 - {id: last_value_ignore_nulls, sql: "select x, last_value(y ignore nulls) over (order by x rows between unbounded preceding and current row) from (select column1 x, column2 y from values (1, 'a'), (2, null), (3, 'c')) order by 1"}
@@ -54,3 +54,95 @@
 - {id: number_overflow_scale, sql: "select 0.1 + 0.2, 1.10 * 1.10, 100::number(5,2) * 3, 7 % 3"}
 - {id: boolean_cast, sql: "select 'true'::boolean, 1::boolean, to_boolean('yes'), true::int, true::string"}
 - {id: timestamp_arith, sql: "select '2025-01-01'::date + 1, '2025-01-31'::date - '2025-01-01'::date, timestampdiff('minute', '2025-01-01 00:00'::timestamp, '2025-01-01 01:30'::timestamp), '2025-01-01 00:00'::timestamp + interval '90 minutes'"}
+# --- ordering, nulls and implicit conversions
+- {id: null_order_asc, sql: "select x from (select column1 x from values (2), (null), (1)) order by x"}
+- {id: null_order_desc, sql: "select x from (select column1 x from values (2), (null), (1)) order by x desc"}
+- {id: null_order_window, sql: "select x, row_number() over (order by x desc) from (select column1 x from values (2), (null), (1)) order by 2"}
+- {id: string_order, sql: "select x from (select column1 x from values ('b'), ('A'), ('a'), ('B'), ('_'), ('1')) order by x"}
+- {id: implicit_string_number, sql: "select '1' + 1, '2' * '3', '10' > 9, 1 = '1'"}
+- {id: concat_number, sql: "select 'a' || 1, concat('a', 1.50, true), 1 || 2"}
+- {id: in_null, sql: "select 1 in (1, null), 2 in (1, null), 2 not in (1, null), null in (null)"}
+- {id: nullif_ifnull, sql: "select nullif(1, 1), nullif(1, 2), ifnull(null, 'x'), nvl(1, 2), coalesce(null, 'a')"}
+- {id: case_null, sql: "select case when null then 1 else 2 end, case null when null then 1 else 2 end, iff(null, 1, 2)"}
+- {id: count_distinct_null, sql: "select count(x), count(distinct x), count(*), sum(x), max(x), min(x) from (select column1 x from values (1), (null), (1), (3))"}
+- {id: agg_empty, sql: "select count(*), sum(x), avg(x), max(x), listagg(x, ',') from (select 1 x where 1 = 0)"}
+- {id: bool_ops, sql: "select true and null, false and null, true or null, not null, true::int + 1"}
+# --- numbers
+- {id: math, sql: "select abs(-2.5), sign(-3), power(2, 10), sqrt(16), exp(0), ln(1), log(10, 1000), square(3), cbrt(27), pi() > 3"}
+- {id: number_types, sql: "select 1.0 + 1, 1.10 + 2.205, 3 * 1.5, 10 - 0.001, 1e2, 5 % 2, -5 % 2"}
+- {id: to_number, sql: "select to_number('12.345', 10, 2), to_decimal('7', 5, 2), to_double('1.5'), '1.999'::number(10, 2), 1.999::number(10, 1), to_number('1,234', '9,999')"}
+- {id: round_float, sql: "select round(2.5::float), round(3.5::float), round(1.005, 2), round(-0.5), round(123.456, 1), round(15, -1)"}
+- {id: bitwise, sql: "select bitand(12, 10), bitor(12, 10), bitxor(12, 10), bitshiftleft(1, 4), bitshiftright(16, 2)"}
+- {id: width_bucket, sql: "select width_bucket(5, 0, 10, 5), width_bucket(-1, 0, 10, 5), width_bucket(10, 0, 10, 5)"}
+- {id: stats_aggs, sql: "select stddev(x), variance(x), var_pop(x), stddev_pop(x), corr(x, y), covar_samp(x, y) from (select column1 x, column2 y from values (1, 2), (2, 4), (4, 9))"}
+- {id: min_max_by, sql: "select min_by(n, x), max_by(n, x), any_value(1), approx_count_distinct(x) from (select column1 n, column2 x from values ('a', 3), ('b', 1), ('c', 2))"}
+- {id: bit_aggs, sql: "select bitand_agg(x), bitor_agg(x), bitxor_agg(x) from (select column1 x from values (12), (10), (6))"}
+# --- dates and times
+- {id: date_from_parts, sql: "select date_from_parts(2025, 2, 30), date_from_parts(2025, 13, 1), timestamp_from_parts(2025, 1, 2, 3, 4, 5), time_from_parts(1, 2, 3)"}
+- {id: date_extract, sql: "select year(d), month(d), day(d), dayofyear(d), extract(dow from d), extract(week from d), yearofweekiso(d), weekiso(d) from (select '2024-12-30'::date d)"}
+- {id: time_extract, sql: "select hour(t), minute(t), second(t), to_time(t), t::date from (select '2025-03-04 05:06:07.891'::timestamp t)"}
+- {id: dateadd_parts, sql: "select dateadd('quarter', 1, '2025-01-31'::date), dateadd('year', 1, '2024-02-29'::date), dateadd('week', 1, '2025-01-01'::date), dateadd('minute', 90, '2025-01-01'::date), timeadd('second', 61, '2025-01-01 00:00:00'::timestamp)"}
+- {id: datediff_parts, sql: "select datediff('hour', '2025-01-01 00:59'::timestamp, '2025-01-01 01:00'::timestamp), datediff('minute', '2025-01-01 00:00:59'::timestamp, '2025-01-01 00:01:00'::timestamp), datediff('quarter', '2025-03-31'::date, '2025-04-01'::date), datediff('second', '2025-01-01'::date, '2025-01-02'::date)"}
+- {id: next_previous_day, sql: "select next_day('2025-01-01'::date, 'fr'), previous_day('2025-01-01'::date, 'monday'), last_day('2025-01-15'::date, 'year'), last_day('2025-01-15'::date, 'week')"}
+- {id: time_slice, sql: "select time_slice('2025-01-01 10:07:00'::timestamp_ntz, 15, 'minute'), time_slice('2025-01-01 10:07:00'::timestamp_ntz, 15, 'minute', 'end')"}
+- {id: trunc_date, sql: "select trunc('2025-05-17'::date, 'month'), date_trunc('year', '2025-05-17'::date), date_trunc('hour', '2025-05-17 10:11:12'::timestamp), date_trunc('day', '2025-05-17 10:11:12'::timestamp)"}
+- {id: date_format, sql: "select to_char('2025-03-04 15:06:07'::timestamp, 'YYYY-MM-DD HH24:MI:SS'), to_char('2025-03-04'::date, 'DD Mon YYYY'), to_char('2025-03-04'::date, 'DY'), to_char('2025-03-04 15:06:07'::timestamp, 'HH12:MI AM'), to_char('2025-03-04'::date, 'YYYYMMDD')"}
+- {id: date_parse, sql: "select to_date('04-Mar-2025', 'DD-MON-YYYY'), to_timestamp('20250304 150607', 'YYYYMMDD HH24MISS'), try_to_timestamp('nope'), to_date('2025-03-04 10:00:00'), '2025-03-04T10:00:00Z'::timestamp_ntz"}
+- {id: date_arith, sql: "select '2025-03-01'::date - 1, '2025-01-31'::date + interval '1 month', '2025-03-04'::date - '2024-03-04'::date, datediff('day', '2025-03-04'::date, current_date) is not null"}
+- {id: timestamp_tz, sql: "select convert_timezone('America/Los_Angeles', 'UTC', '2025-07-01 12:00:00'::timestamp_ntz), convert_timezone('UTC', 'Europe/Berlin', '2025-10-26 00:30:00'::timestamp_ntz), convert_timezone('Asia/Tokyo', '2025-01-01 00:00:00 +00:00'::timestamp_tz)::timestamp_ntz"}
+- {id: epoch_parts, sql: "select date_part('epoch_second', '2025-01-01'::timestamp), date_part('epoch_millisecond', '2025-01-01 00:00:00.5'::timestamp), to_timestamp('1735689600'), to_timestamp(1735689600000, 3), to_date('1735689600')"}
+- {id: age_months, sql: "select months_between('2025-03-15'::date, '2025-01-15'::date), months_between('2025-03-31'::date, '2025-01-01'::date), floor(datediff('day', '1990-05-17'::date, '2025-05-16'::date) / 365.25)"}
+# --- strings
+- {id: string_case_len, gap: "upper('ß') gives the capital sharp s, Snowflake gives SS", sql: "select lower('ÀB'), upper('straße'), length(''), length(null), len('abc'), ascii('A'), chr(65)"}
+- {id: string_slice, sql: "select substr('abcdef', -3), substr('abcdef', 0, 2), substring('abcdef', 3), left('ab', 5), right('ab', 0), insert('abcdef', 2, 3, 'XY')"}
+- {id: string_compare, gap: "soundex is not available", sql: "select editdistance('kitten', 'sitting'), soundex('Robert'), jarowinkler_similarity('abc', 'abd'), 'a' < 'B', 'abc' = 'ABC', collate('abc', 'en-ci') = 'ABC'"}
+- {id: like_escape, sql: "select 'a_c' like 'a\\\\_c', 'abc' like 'a\\\\_c', 'a%c' like 'a!%c' escape '!', 'ABC' like 'abc', 'abc' not like '%z%', 'abc' like all ('a%', '%c')"}
+- {id: regexp_groups, sql: "select regexp_substr('order-123-us', '([a-z]+)-([0-9]+)', 1, 1, 'e', 2), regexp_replace('2025-03-04', '(\\\\d+)-(\\\\d+)-(\\\\d+)', '\\\\3/\\\\2/\\\\1'), regexp_instr('abc123', '[0-9]'), regexp_substr('ABC', 'b', 1, 1, 'i'), regexp_like('abc', 'ABC', 'i')"}
+- {id: regexp_anchoring, sql: "select 'abc' regexp 'b', 'abc' regexp '.*b.*', regexp_like('abc', 'b'), rlike('abc', 'a.c'), regexp_count('aaa', 'a')"}
+- {id: split_tables, sql: "select t.index, t.value from table(split_to_table('a,b,,c', ',')) t order by 1"}
+- {id: strtok_array, sql: "select strtok_to_array('a b  c', ' '), split('a,b,,c', ','), array_size(split('', ',')), split_part('a,b', ',', 5), split_part('a,b', ',', 0)"}
+- {id: trim_variants, sql: "select trim('--x--', '-'), rtrim('x  '), rtrim('xab', 'ab'), trim(' x ') || '|', nullif(trim('  '), '')"}
+- {id: string_agg_distinct, sql: "select listagg(distinct x, '|') within group (order by x), listagg(x) from (select column1 x from values ('b'), ('a'), ('b'))"}
+- {id: hash_encode, sql: "select md5_hex('a'), sha1('a'), sha2('a'), base64_encode('hello'), base64_decode_string('aGVsbG8='), hex_encode('ab'), to_varchar(255, 'XX'), md5(null)"}
+- {id: uuid_shape, sql: "select length(uuid_string()), regexp_like(uuid_string(), '[0-9a-f-]{36}')"}
+- {id: parse_url_ip, gap: "parse_url and parse_ip are not available", sql: "select parse_url('https://example.com:8080/a/b?x=1&y=2'):host::string, parse_url('https://example.com/a?x=1'):parameters:x::string, parse_ip('192.168.1.10/24', 'INET'):network_prefix_length::int"}
+# --- semi-structured
+- {id: variant_casts, sql: "select v:n::number(10,2), v:s::varchar, v:b::boolean, v:d::date, v:t::timestamp_ntz, v:n::string, v:missing::int from (select parse_json('{\"n\": 1.5, \"s\": \"x\", \"b\": true, \"d\": \"2025-01-02\", \"t\": \"2025-01-02 03:04:05\"}') v)"}
+- {id: variant_nulls, sql: "select v:a is null, v:a = null, is_null_value(v:a), v:missing is null, v:a::string, strip_null_value(v:a) is null from (select parse_json('{\"a\": null}') v)"}
+- {id: variant_bracket, gap: "get_ignore_case is not available", sql: "select v['a']['b']::int, v:a.b::int, v:\"A\"::int, v:a:b::int, get(v, 'a'):b::int, get_ignore_case(v, 'A'):b::int from (select parse_json('{\"a\": {\"b\": 1}}') v)"}
+- {id: variant_compare, sql: "select v:n > 1, v:n = 2, v:s = 'x', v:n + 1, v:s || 'y', v:n::int in (2, 3) from (select parse_json('{\"n\": 2, \"s\": \"x\"}') v)"}
+- {id: to_json_roundtrip, sql: "select to_json(parse_json('{\"b\": 1, \"a\": [1, 2]}')), to_variant(1)::int, to_json(object_construct('k', 'v')), check_json('{bad') is not null, check_json('{}'), try_parse_json('{bad') is null, parse_json('1.50')::string"}
+- {id: array_functions, sql: "select array_distinct(array_construct(1, 2, 1)), array_cat(array_construct(1), array_construct(2)), array_position(2::variant, array_construct(1, 2)), arrays_overlap(array_construct(1, 2), array_construct(2, 3)), array_append(array_construct(1), 2), array_prepend(array_construct(1), 0), array_compact(array_construct(1, null, 2)), array_flatten(array_construct(array_construct(1), array_construct(2)))"}
+- {id: array_access, sql: "select a[0]::int, a[5], array_size(a), get(a, 1)::int, array_min(a)::int, array_max(a)::int, array_sort(array_construct(3, 1, 2)), array_reverse(a), array_intersection(a, array_construct(20, 99)), array_except(a, array_construct(10)) from (select array_construct(10, 20, 30) a)"}
+- {id: object_functions, sql: "select object_insert(object_construct('a', 1), 'b', 2), object_delete(object_construct('a', 1, 'b', 2), 'a'), object_pick(object_construct('a', 1, 'b', 2), 'a'), object_construct_keep_null('a', null), object_agg(k, v::variant) from (select column1 k, column2 v from values ('x', 1), ('y', 2))"}
+- {id: flatten_object, sql: "select f.key, f.value::int, f.path from (select parse_json('{\"a\": 1, \"b\": 2}') v) t, lateral flatten(input => t.v) f order by 1"}
+- {id: flatten_outer, sql: "select t.id, f.value::int, f.index from (select column1 id, parse_json(column2) v from values (1, '[1, 2]'), (2, '[]'), (3, null)) t, lateral flatten(input => t.v, outer => true) f order by 1, 2"}
+- {id: flatten_nested_path, sql: "select f.value:sku::string, f.value:qty::int, f.seq is not null from (select parse_json('{\"items\": [{\"sku\": \"a\", \"qty\": 1}, {\"sku\": \"b\", \"qty\": 2}]}') v) t, lateral flatten(input => t.v:items) f order by 1"}
+- {id: array_agg_variants, sql: "select array_agg(distinct x) within group (order by x), array_agg(object_construct('x', x)) within group (order by x), array_sort(array_unique_agg(x)), array_agg(x) within group (order by x desc) from (select column1 x from values (2), (1), (2))"}
+- {id: is_type, sql: "select is_object(parse_json('{}')), is_array(parse_json('[]')), is_integer(parse_json('1')), is_varchar(parse_json('\"a\"')), is_boolean(parse_json('true')), is_decimal(parse_json('1.5')), as_integer(parse_json('7')), as_varchar(parse_json('\"a\"'))"}
+# --- windows, sets and shapes
+- {id: window_ranks, sql: "select x, rank() over (order by x), dense_rank() over (order by x), percent_rank() over (order by x), cume_dist() over (order by x), ntile(2) over (order by x) from (select column1 x from values (1), (2), (2), (3)) order by 1, 2"}
+- {id: window_values, sql: "select x, first_value(x) over (order by x), last_value(x) over (order by x), nth_value(x, 2) over (order by x), lead(x, 1, -1) over (order by x), lag(x, 2) over (order by x) from (select column1 x from values (1), (2), (3)) order by 1"}
+- {id: window_default_frame, sql: "select x, sum(x) over (order by g), count(*) over (order by g), max(x) over (partition by g), sum(x) over () from (select column1 x, column2 g from values (1, 'a'), (2, 'a'), (3, 'b')) order by 1"}
+- {id: window_range_frame, sql: "select x, sum(x) over (order by x range between 1 preceding and 1 following), avg(x) over (order by x rows between unbounded preceding and unbounded following) from (select column1 x from values (1), (2), (4)) order by 1"}
+- {id: set_ops, sql: "select * from (select 1 x union select 1 union all select 2 minus select 2) order by 1"}
+- {id: intersect_except, sql: "select * from (select column1 x from values (1), (2), (2) intersect select column1 from values (2), (3) union all select column1 from values (5), (6) except select 6) order by 1"}
+- {id: recursive_cte, sql: "with recursive r as (select 1 n union all select n + 1 from r where n < 5) select sum(n), count(*) from r"}
+- {id: grouping_sets, sql: "select g, h, sum(x), grouping(g) from (select column1 g, column2 h, column3 x from values ('a', 'p', 1), ('a', 'q', 2), ('b', 'p', 3)) group by rollup (g, h) order by 1 nulls last, 2 nulls last"}
+- {id: group_by_alias_position, sql: "select upper(g) as gg, count(*) c from (select column1 g from values ('a'), ('A'), ('b')) group by gg having c > 1 order by 1"}
+- {id: lateral_alias_reuse, sql: "select x * 2 as double_x, double_x + 1 as plus_one from (select 5 x)"}
+- {id: select_exclude_rename, sql: "select * exclude (b) rename (a as aa) from (select 1 a, 2 b, 3 c)"}
+- {id: values_join_using, sql: "select id, l.v, r.w from (select column1 id, column2 v from values (1, 'a'), (2, 'b')) l full outer join (select column1 id, column2 w from values (2, 'x'), (3, 'y')) r using (id) order by 1"}
+- {id: asof_join, sql: "select t.ts, q.price from (select column1 ts from values (5), (15)) t asof join (select column1 ts, column2 price from values (1, 10), (10, 20)) q match_condition (t.ts >= q.ts) order by 1"}
+- {id: quoted_identifiers, sql: "select \"MixedCase\", lower_case, UPPER_CASE from (select 1 as \"MixedCase\", 2 as lower_case, 3 as UPPER_CASE)"}
+- {id: sample_generator_seq, sql: "select count(*), min(n), max(n) from (select row_number() over (order by seq4()) n from table(generator(rowcount => 100)))"}
+- {id: top_limit_offset, sql: "select top 2 x from (select column1 x from values (3), (1), (2)) order by x"}
+- {id: qualify_rank_filter, sql: "select g, x from (select column1 g, column2 x from values ('a', 1), ('a', 2), ('b', 5)) qualify x = max(x) over (partition by g) order by 1"}
+- {id: count_if_filter, sql: "select count_if(x > 1), sum(iff(x > 1, 1, 0)), count(case when x > 1 then 1 end), boolor_agg(x is null) from (select column1 x from values (1), (2), (null))"}
+- {id: zero_pad_format, sql: "select to_varchar(42, '0000'), to_char(1234567.891, '9,999,999.99'), to_char(5, 'FM999'), to_varchar(0.5, '0.00'), lpad(7::string, 3, '0')"}
+- {id: boolean_strings, sql: "select true::string, false::varchar, to_varchar(true), 'TRUE'::boolean, try_to_boolean('maybe'), iff(to_boolean('0'), 'y', 'n')"}
+- {id: number_to_string, sql: "select 1.50::string, 1.0::string, (1/3)::string, 100::float::string, 1e10::string, 0.1::float::string, 12345678901234567890::string"}
+- {id: null_timestamps, sql: "select null::timestamp, null::date, null::time, x, try_to_timestamp('nope'), try_to_date('nope') from (select column1::timestamp x from values ('2025-01-01'), (null)) order by x"}
+- {id: decimal_to_string, sql: "select 3::number(10,2)::string, 'a' || x, x::varchar, to_varchar(x), concat(x, '|'), 2.5::float::string from (select 1.50::number(10,2) x)"}
+- {id: window_avg_scale, sql: "select avg(x) over (), avg(y) over (), avg(z) over (partition by x), avg(f) over () from (select column1 x, column2::number(12,2) y, column3::number(12,5) z, column4::float f from values (1, 1.5, 1.5, 1.5), (2, 2.25, 1, 2), (4, 0.1, 1, 4)) order by x limit 1"}
+- {id: agg_scales, sql: "select variance(x), variance(y), variance(f), var_pop(z), avg(z), avg(f), sum(y), sum(x), sum(f) from (select column1 x, column2::number(12,2) y, column3::number(12,5) z, column4::float f from values (1, 1.5, 1.5, 1.5), (2, 2.25, 1, 2), (4, 0.1, 1, 4))"}

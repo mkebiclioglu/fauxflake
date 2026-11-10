@@ -212,18 +212,26 @@ a fraction of a credit. The first run did not look like this: every row of
 
 ### Conformance suite
 
-[`conformance/cases.yml`](conformance/cases.yml) holds 52 small queries covering the SQL
-analytics code leans on: division and rounding, dates, strings, regular expressions,
-semi-structured data, window functions, pivots. `fauxflake conformance --connection <name>`
-runs them on real Snowflake once and stores the answers in `golden.json`. CI then replays
-them against the emulator with no Snowflake access.
+[`conformance/cases.yml`](conformance/cases.yml) holds 138 small queries covering the SQL
+analytics code leans on: number scale and rounding, null ordering, implicit conversions, dates
+and time zones, strings and regular expressions, semi-structured data, window functions,
+pivots, set operations. `fauxflake conformance --connection <name>` runs them on real
+Snowflake once and stores the answers in `golden.json`. CI then replays them against the
+emulator with no Snowflake access.
 
-Current score: **48 of 52 match**. The 4 known gaps are marked in the file and listed under
-[Limits](#limits). A gap is a strict expected failure, so fixing one forces the marker to be
-removed and the list cannot go stale. Fixes live in
-[`semantics.py`](src/fauxflake/semantics.py); so far: division scale and divide-by-zero
-errors, `AVG` scale, exact (not double) `SUM`, `DATE_TRUNC` keeping `DATE`, `LTRIM`/`RTRIM`
-with characters, `RATIO_TO_REPORT`, `CONDITIONAL_TRUE_EVENT`.
+Current score: **134 of 138 match**. The 4 gaps are marked in the file; a gap is a strict
+expected failure, so fixing one forces the marker to be removed and the list cannot go stale.
+
+The fixes live in [`semantics.py`](src/fauxflake/semantics.py). Some of what the suite found,
+all of it silent before:
+
+- integer division and `AVG` return 6 decimals, a windowed `AVG` 3, and `/ 0` is an error;
+- `1.50` is `NUMBER(2,1)`, floats print as `100` not `100.0`, `SUM` stays exact;
+- `DATE_TRUNC` and `date + interval '1 month'` keep `DATE`;
+- `FLATTEN(..., OUTER => TRUE)` was dropping the outer rows;
+- `LISTAGG` without a delimiter was using a comma, and `LTRIM(x, chars)` ignored its characters;
+- NULL timestamps reached the client as `1970-01-01`;
+- `v:field = 'x'`, `v:n + 1` and `'1' + 1` convert implicitly, as Snowflake does.
 
 ## Security
 
@@ -275,10 +283,10 @@ Read these before trusting a green check.
 - **Three deliberate differences**, all in [`emulator.py`](src/fauxflake/emulator.py):
   qualified temporary tables become regular tables; explicit transactions run as autocommit;
   bare columns in `MERGE ... INSERT VALUES` are qualified with the source alias.
-- **Known result differences** (from the conformance suite): `TO_VARCHAR` ignores numeric
-  format models; `ARRAY` values cannot be returned to a client (they work inside models);
-  `TYPEOF` on a variant reports `JSON`. Division results have Snowflake's value and scale but
-  are typed `DOUBLE` rather than `NUMBER`.
+- **Known result differences** (from the conformance suite): `SOUNDEX`, `PARSE_URL`,
+  `PARSE_IP` and `GET_IGNORE_CASE` are missing; `UPPER('ß')` differs. Results of division and
+  `AVG` carry Snowflake's value and scale but are typed `DOUBLE` rather than `NUMBER`. Implicit
+  string-to-number conversion works for literals, not for `VARCHAR` columns.
 - **It says nothing about Snowflake performance or cost.** Query plans, pruning, spilling and
   warehouse sizing cannot be learned from DuckDB.
 - **Fidelity stops at the spec.** Columns are sampled independently, so cross-column

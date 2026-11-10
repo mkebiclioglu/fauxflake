@@ -114,6 +114,7 @@ def _patch_fakesnow() -> None:
 
     def execute(self, command, *args, **kwargs):  # noqa: ANN001
         try:
+            self._fauxflake_outer = semantics.outer_flattens(command)
             return original(self, rewrite(command), *args, **kwargs)
         except ProgrammingError:
             raise
@@ -152,9 +153,18 @@ def _patch_fakesnow() -> None:
     original_transform = FakeSnowflakeCursor._transform
 
     def _transform(self, expression, params):  # noqa: ANN001
-        return original_transform(self, semantics.rewrite(expression), params)
+        out = original_transform(self, semantics.rewrite(expression), params)
+        return semantics.keep_outer_rows(out, getattr(self, "_fauxflake_outer", []))
 
     FakeSnowflakeCursor._transform = _transform
+
+    original_execute = FakeSnowflakeCursor._execute
+
+    def _execute(self, transformed, params=None):  # noqa: ANN001
+        original_execute(self, transformed, params)
+        semantics.coerce_result(self)
+
+    FakeSnowflakeCursor._execute = _execute
     _patched = True
 
 

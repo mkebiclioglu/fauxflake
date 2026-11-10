@@ -28,7 +28,7 @@ def normalise(v):
     if isinstance(v, (int, Decimal)):
         return _num(Decimal(v))
     if isinstance(v, float):
-        return _num(Decimal(repr(round(v, 10))))
+        return _num(Decimal(f"{v:.13g}"))  # 13 significant digits: below double noise, above any scale rule
     if isinstance(v, datetime):
         return v.replace(tzinfo=None).isoformat(sep=" ", timespec="milliseconds")
     if isinstance(v, (date, time)):
