@@ -8,3 +8,7 @@ macro-paths: [macros]
 models:
   kitchen_sink:
     +materialized: table
+    # documentation and grants are persisted on Snowflake; locally they must simply not fail
+    +persist_docs: {relation: true, columns: true}
+    +grants: {select: [REPORTER]}
+    +query_tag: kitchen_sink

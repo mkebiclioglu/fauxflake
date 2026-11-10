@@ -16,6 +16,7 @@ sources:
                   arguments: {to: "source('app', 'users')", field: id}
 models:
   - name: fct_payments
+    description: "One row per payment; it's the grain's owner."
     data_tests:
       - dbt_utils.unique_combination_of_columns:
           arguments: {combination_of_columns: [payment_id, currency]}
@@ -23,6 +24,7 @@ models:
           arguments: {expression: "amount_usd >= 0"}
     columns:
       - name: payment_key
+        description: "Surrogate key (payment's id and currency)."
         data_tests: [unique, not_null]
   - name: dim_users
     columns:

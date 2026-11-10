@@ -40,6 +40,12 @@ REWRITES: list[tuple[re.Pattern[str], str, str]] = [
         r"create\1 \2 ",
         "qualified temporary relation -> regular relation",
     ),
+    (
+        # dbt reads the session's query tag before setting its own (`query_tag` config)
+        re.compile(r"(?s)^(?:\s|--[^\n]*\n|/\*.*?\*/)*show\s+parameters\s+like\s+'(\w+)'\s+in\s+session\s*;?(?:\s|/\*.*?\*/)*$", re.IGNORECASE),
+        r"""select upper('\1') as "key", '' as "value", '' as "default", 'SESSION' as "level", '' as "description", 'STRING' as "type" """,
+        "session parameters are empty",
+    ),
 ]
 
 
@@ -72,7 +78,18 @@ def _qualify_merge_insert(sql: str) -> str:
 # Statements acknowledged without being executed. The emulator keeps catalog
 # metadata in a separate DuckDB database, and DuckDB cannot write to two
 # databases in one transaction, so explicit transactions run as autocommit.
-NOPS = [r"(?s)^(\s|--[^\n]*\n|/\*.*?\*/)*(begin|commit)\b"]
+_LEAD = r"(?s)^(\s|--[^\n]*\n|/\*.*?\*/)*"
+NOPS = [
+    _LEAD + r"(begin|commit)\b",
+    # documentation, access control and warehouse settings have nothing to act on locally
+    _LEAD + r"comment\s+(if\s+exists\s+)?on\s",
+    _LEAD + r"alter\s+(table|view|materialized\s+view|dynamic\s+table)\s+\S+\s+(alter|modify)\s.*\bcomment\b",
+    _LEAD + r"alter\s+\w+(\s+\w+)?\s+(if\s+exists\s+)?\S+\s+(un)?set\s+(tag|comment|data_retention_time_in_days|change_tracking|query_tag)\b",
+    _LEAD + r"alter\s+(table|materialized\s+view|dynamic\s+table)\s+\S+\s+(cluster\s+by|drop\s+clustering|resume|suspend)\b",
+    _LEAD + r"(grant|revoke)\s",
+    _LEAD + r"alter\s+(session|warehouse|account)\s",
+    _LEAD + r"use\s+(warehouse|role|secondary\s+roles)\s",
+]
 
 
 # Simulated "now". When set, Snowflake's clock functions return it, so models
