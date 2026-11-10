@@ -1100,11 +1100,12 @@ def _repair(tree: exp.Expression, text: str, details: dict) -> bool:
                 return True
         return False
     if name.lower() == "timezone":
-        for node in tree.find_all(exp.AtTimeZone):
+        for node in tree.find_all(exp.AtTimeZone, exp.ConvertTimezone):
             sql = node.sql(dialect="duckdb")
+            operand = node.args.get("timestamp") if isinstance(node, exp.ConvertTimezone) else node.this
             start = text.find(sql)
-            if start >= 0 and start <= pos <= start + len(sql) and not isinstance(node.this, exp.Cast):
-                _convert(node.this, "timestamp")  # CONVERT_TIMEZONE on a text column
+            if operand is not None and start >= 0 and start <= pos <= start + len(sql) and not isinstance(operand, exp.Cast):
+                _convert(operand, "timestamp")  # CONVERT_TIMEZONE on a text column
                 return True
     lowered = name.lower()
     to = "double" if lowered in _NUMERIC_CALLS else "timestamp" if lowered in _DATE_CALLS else None

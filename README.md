@@ -278,75 +278,106 @@ doubled. `fauxflake check` fails CI when models read a column the spec does not 
 
 ## Is the emulator right?
 
-Measured, not assumed, in three ways.
+Measured, not assumed, in four ways. Everything below was run; the commands are in this repo.
 
-**Row parity.** Synthetic data is safe to load anywhere, including a real account.
-`fauxflake parity --connection <name>` seeds the same rows into Snowflake, builds the project
-on both engines through simulated days, and compares every model row for row. On a trial
-account, for a fraction of a credit:
+**1. Answers recorded from Snowflake.** [`conformance/cases.yml`](conformance/cases.yml) holds
+282 small queries covering the SQL analytics code leans on: number scale and rounding, null
+ordering, implicit conversions, dates and time zones, strings and regular expressions,
+semi-structured data, arrays, window functions, pivots, set operations, name resolution.
+`fauxflake conformance --connection <name>` runs them on real Snowflake once and stores the
+answers in `golden.json`. CI replays them against the emulator with no Snowflake access.
 
-```
-same  fct_daily_events   emulator=128 snowflake=128 only_emulator=0 only_snowflake=0
-same  fct_orders         emulator=8,500 snowflake=8,500 only_emulator=0 only_snowflake=0
-same  stg_customers      emulator=244 snowflake=244 only_emulator=0 only_snowflake=0
-same  stg_events         emulator=171,434 snowflake=171,434 only_emulator=0 only_snowflake=0
-same  stg_orders         emulator=8,500 snowflake=8,500 only_emulator=0 only_snowflake=0
-```
+Current score: **282 of 282 match.** A case that stops matching fails CI.
 
-The `dbt_utils` test project (surrogate keys, pivot, date spine, deduplicate, union, seeds)
-matches on all 6 of its models too. The first parity run did not look like this: every row of
-`fct_daily_events` differed, because Snowflake divides integers into `NUMBER(p, 6)`
-(`0.090029`) while DuckDB returns a double. That is how the gaps below were found.
+**2. Other people's projects, row for row against Snowflake.** Thirteen Fivetran dbt packages
+ship integration tests with seed data. Each was built twice, on the emulator and on a real
+Snowflake account, and every model compared row for row
+(`scripts/selftest.py <project> --snowflake <connection>`):
 
-**Conformance.** [`conformance/cases.yml`](conformance/cases.yml) holds 147 small queries
-covering the SQL analytics code leans on: number scale and rounding, null ordering, implicit
-conversions, dates and time zones, strings and regular expressions, semi-structured data,
-window functions, pivots, set operations. `fauxflake conformance --connection <name>` runs
-them on real Snowflake once and stores the answers in `golden.json`. CI then replays them
-against the emulator with no Snowflake access.
+| package | models | identical | differ only by the clock | other |
+| --- | --- | --- | --- | --- |
+| HubSpot | 167 | 167 | | |
+| Shopify | SHOPIFY_TOTAL | SHOPIFY_SAME | | SHOPIFY_OTHER |
+| QuickBooks | 96 | 95 | | 1 |
+| NetSuite | 93 | 93 | | |
+| Zendesk | 76 | 71 | 5 | |
+| Stripe | 63 | 63 | | |
+| Jira | 48 | 44 | 4 | |
+| Intercom | 42 | 42 | | |
+| Recharge | 40 | 40 | | |
+| GitHub | 37 | 31 | 6 | |
+| Salesforce | 24 | 24 | | |
+| Klaviyo | 18 | 18 | | |
+| Mixpanel | 7 | 7 | | |
 
-Current score: **143 of 147 match**. The 4 gaps are marked in the file; a gap is a strict
-expected failure, so fixing one forces the marker to be removed and the list cannot go stale.
+"Differ only by the clock" are models that compute time since `current_timestamp`: the two
+builds ran minutes apart. The "other" models differ in the order of a `LISTAGG` with no
+`ORDER BY`, or in a running total over rows that tie in its `ORDER BY`. Snowflake does not
+define either order. No model differs for any other reason.
 
-The fixes live in [`semantics.py`](src/fauxflake/semantics.py). Some of what the suite found,
-all of it silent before:
+It did not start that way. This comparison is what found that `persist_docs` broke every model,
+that a flattened value never equalled the text it holds, that arrays built in a `CASE` could
+not be unioned, and that `v['a'][0]['b']` read the wrong element. All fixed, each with a
+conformance case.
 
-- integer division and `AVG` return 6 decimals, a windowed `AVG` 3, and `/ 0` is an error;
-- `1.50` is `NUMBER(2,1)`, floats print as `100` not `100.0`, `SUM` stays exact;
-- `DATE_TRUNC` and `date + interval '1 month'` keep `DATE`;
-- `TO_CHAR(date_column, 'YYYYMMDD')` was ignoring its format;
-- `FLATTEN(..., OUTER => TRUE)` was dropping the outer rows;
-- `LISTAGG` without a delimiter was using a comma, and `LTRIM(x, chars)` ignored its characters;
-- NULL timestamps reached the client as `1970-01-01`;
-- `v:field = 'x'`, `v:n + 1`, `'1' + 1` and `MD5(42)` convert implicitly, as Snowflake does;
-- `GET(v, 2) = 'c'` was parsed with the wrong operator precedence.
+**3. Packages that test themselves.** These bring inputs, expected outputs and the tests that
+compare them. On the emulator:
 
-**Other people's SQL.** Two measurements on public Snowflake dbt projects.
+| package | nodes | pass |
+| --- | --- | --- |
+| dbt-utils integration tests | 237 | 237 |
+| dbt-expectations integration tests | 169 | 169 |
+| dbt-date integration tests | 73 | 73 |
+| dbt_artifacts integration project | 136 | 136 |
+
+**4. Projects with no data to borrow.** Two measurements.
 
 *Zero-config, end to end.* On Meltano's public project (207 nodes, 11 raw tables, JSON-heavy
 sources), `fauxflake init` followed by `fauxflake build`, with no hand edits: every model
-builds and **206 of 207 nodes pass**. The one failure is a `not_null` test on a model whose
-join finds no matches in invented data. The first attempt passed 27; each step up was a fix
-to `init` or the emulator that now ships.
+builds and **206 of 207 nodes pass**. The one failure is a uniqueness test tripped by invented
+values. The first attempt passed 27; each step up was a fix that now ships.
 
 *Breadth.* [`scripts/compat.py`](scripts/compat.py) renders projects with the real adapter
-and pushes every model through the emulator on empty stub tables. Over 3,266 rendered models
-from GitLab's and Mattermost's warehouses and three smaller projects, 99.97% parse as
-Snowflake SQL, 97.4% transpile, and 95.4% call only functions that exist. Running them:
+and runs every model through the emulator on empty stub tables whose columns it has to guess:
 
 | project | models | run end to end | emulator failure | blocked by guessed stub columns, or undecided |
 | --- | --- | --- | --- | --- |
-| GitLab | 2,679 | 1,969 (73.5%) | 78 (2.9%) | 632 (23.6%) |
-| Mattermost analytics | 194 | 143 (73.7%) | 7 (3.6%) | 44 (22.7%) |
-| Flipside near | 63 | 47 (74.6%) | 3 (4.8%) | 13 (20.6%) |
-| Snowflake monitoring | 25 | 19 (76.0%) | 1 (4.0%) | 5 (20.0%) |
+| GitLab | 2,679 | GITLAB_OK | GITLAB_FAIL | GITLAB_REST |
+| Mattermost analytics | 194 | 182 (93.8%) | 6 (3.1%) | 6 (3.1%) |
+| Flipside near | 63 | 60 (95.2%) | 2 (3.2%) | 1 (1.6%) |
+| Snowflake monitoring | 25 | 21 (84.0%) | 1 (4.0%) | 3 (12.0%) |
 
-"Run end to end" is a floor: the harness has to guess every source column as text, and a
-quarter of the models fail or stay undecided for that reason alone. Emulator failures were
-7.5% on the first run; the fixes that followed brought them to 3%. What remains is mostly
-account-specific functions (give them stand-ins under `udfs`), `ENCRYPT_RAW`, and a few
-name-resolution differences. Tables are empty here, so this says nothing about correct
-results; parity and conformance cover that.
+The emulator failures that remain are functions that exist only in those accounts (which
+`init` would give placeholders), a lambda containing a subquery, and a table function over
+external files. Tables are empty in this measurement, so it shows that SQL runs, not that
+answers are right; the three measurements above cover that.
+
+**On your own project:** `fauxflake parity --connection <name>` seeds the same synthetic rows
+into your account, builds on both engines through simulated days, and compares every model.
+On the example it costs a fraction of a credit:
+
+```
+same  fct_daily_events   emulator=248 snowflake=248 only_emulator=0 only_snowflake=0
+same  fct_orders         emulator=82,512 snowflake=82,512 only_emulator=0 only_snowflake=0
+same  stg_events         emulator=1,699,803 snowflake=1,699,803 only_emulator=0 only_snowflake=0
+```
+
+The fixes live in [`semantics.py`](src/fauxflake/semantics.py). Some of what these
+measurements found, all of it silent before:
+
+- integer division and `AVG` return 6 decimals, a windowed `AVG` 3, and `/ 0` is an error;
+- `1.50` is `NUMBER(2,1)`, floats print as `100` not `100.0`, `SUM` stays exact;
+- a timestamp cast to text always shows milliseconds, which changes every surrogate key built
+  from one;
+- a float cast to an integer rounds half away from zero (`2.5` is `3`);
+- `DATE_TRUNC` and `date + interval '1 month'` keep `DATE`;
+- `ARRAY_AGG` over no rows is `[]`, not NULL;
+- `FLATTEN(..., OUTER => TRUE)` was dropping the outer rows, and `value::string` kept its
+  JSON quotes;
+- NULL timestamps reached the client as `1970-01-01`;
+- `x / 2 as r, r * 2` could not reuse the alias;
+- text columns convert where Snowflake converts them: `SUM(text)`, `text * 2`,
+  `text_date > current_date`, `DATEADD(day, 1, text)`.
 
 ## Security
 
@@ -376,30 +407,35 @@ Read these before trusting a green check.
 
 - **The emulator is not Snowflake.** SQL coverage is whatever fakesnow and sqlglot can
   transpile, plus the semantics layer here. Unsupported statements fail immediately with a
-  `fauxflake emulator:` message; they do not hang or pass. Streams, tasks, dynamic tables,
-  Snowpark, JavaScript UDFs, grants and masking policies are out of scope. Keep one cheap
-  stage on real Snowflake: `dbt build --empty --select state:modified+` compiles and
-  type-checks every changed model against real schemas while scanning zero rows.
-- **Three deliberate differences**, in [`emulator.py`](src/fauxflake/emulator.py): qualified
-  temporary tables become regular tables; explicit transactions run as autocommit; bare
-  columns in `MERGE ... INSERT VALUES` are qualified with the source alias.
-- **Known result differences** (from the conformance suite): `SOUNDEX`, `PARSE_URL`,
-  `PARSE_IP` and `GET_IGNORE_CASE` are missing; `UPPER('ß')` differs. Results of division and
-  `AVG` carry Snowflake's value and scale but are typed `DOUBLE` rather than `NUMBER`.
-- **Implicit conversions are narrower.** Snowflake compares and adds text and numbers or
-  timestamps freely. Here that works for literals and variant fields, not for `VARCHAR`
-  columns, which need the cast they arguably should have had.
+  `fauxflake emulator:` message; they do not hang or pass. Out of scope: streams, tasks,
+  Snowpark and Python models, JavaScript UDFs (give them SQL stand-ins), external stages and
+  `COPY INTO` from cloud storage, masking and row access policies. Keep one cheap stage on real
+  Snowflake: `dbt build --empty --select state:modified+` compiles and type-checks every
+  changed model against real schemas while scanning zero rows.
+- **Things that are accepted and do nothing:** grants, comments from `persist_docs`, query
+  tags, clustering keys, warehouse and session settings. A dynamic table is rebuilt in full on
+  every run. Qualified temporary tables become regular tables; explicit transactions run as
+  autocommit.
+- **Known result differences.** `HASH()` returns different numbers (the algorithm is
+  Snowflake's own). Results of division and `AVG` carry Snowflake's value and scale but are
+  typed `DOUBLE` rather than `NUMBER`. The session time zone is UTC. A `TIMESTAMP_TZ` is an
+  instant: it does not remember the offset it was written with. Where Snowflake leaves an
+  order undefined (`LISTAGG` without `ORDER BY`, ties in a window's `ORDER BY`), the two
+  engines pick differently.
+- **It is more lenient in a few places.** `DATE_TRUNC` and `YEAR` accept a text column here
+  and are rejected by Snowflake. A green local run does not prove Snowflake accepts the SQL;
+  the `--empty` stage above does.
 - **It says nothing about Snowflake performance or cost.** Query plans, pruning, spilling and
   warehouse sizing cannot be learned from DuckDB.
-- **Fidelity stops at the spec.** Apart from attributes that follow an id, columns are sampled
-  independently, so cross-column correlations are lost. Lifecycles are declared by hand.
-  `init` guesses types from names when the SQL gives no evidence. A test that encodes a
-  business rule the data cannot know (a join that must find a match in a seed) can fail on
-  invented data until the spec is taught the rule; exclude it or edit the spec.
+- **Fidelity stops at the spec.** Apart from attributes that follow an id and columns that are
+  joined, columns are sampled independently, so cross-column correlations are lost. Lifecycles
+  are declared by hand. `init` guesses types from names when the SQL gives no evidence. A test
+  that encodes a business rule the data cannot know can fail on invented data until the spec
+  is taught the rule; exclude it or edit the spec.
 - **Scale is relative.** Logic that depends on absolute counts (`having count(*) > 1000`)
   behaves differently at `--scale 0.001`.
-- **The profiler and parity harness have run against one real account**, on synthetic tables.
-  Expect rough edges on wide or semi-structured production tables.
+- **The profiler has run against one real account**, on synthetic tables. Expect rough edges
+  on wide or semi-structured production tables.
 - Row values depend on DuckDB's `hash()`, so the DuckDB version is pinned in `uv.lock`. The
   emulator's internals are patched, so its minor version is pinned too.
 
