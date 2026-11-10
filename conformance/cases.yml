@@ -295,3 +295,4 @@
 - {id: duplicate_cte_names, sql: "with a as (select 1 x), a as (select 2 x) select * from a"}
 - {id: using_join_shared_column, sql: "select a.id, v, w from (select 1 id, 'x' v) a left join (select 1 id, 'y' v, 'z' w) b using (id)"}
 - {id: empty_identifier, sql: "select 1 as \"\", 2 as b"}
+- {id: parse_json_empty_text, sql: "select parse_json(x):a::int, try_parse_json(x) is null, parse_json(v):a::int from (select column1 x, parse_json(column2) v from values ('', '{\"a\": 2}'), ('{\"a\": 1}', '{\"a\": 3}')) order by 1 nulls first"}

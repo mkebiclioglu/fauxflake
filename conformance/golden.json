@@ -2501,6 +2501,20 @@
    ]
   ]
  },
+ "parse_json_empty_text": {
+  "rows": [
+   [
+    null,
+    true,
+    "2"
+   ],
+   [
+    "1",
+    false,
+    "3"
+   ]
+  ]
+ },
  "parse_url_ip": {
   "rows": [
    [

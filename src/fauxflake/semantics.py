@@ -546,6 +546,9 @@ def _fix(node: exp.Expression) -> exp.Expression:
         return exp.Anonymous(this="to_json", expressions=[node])
     if isinstance(node, (exp.ArrayFilter, exp.Transform, exp.Reduce)):
         node.set("this", _fn("_sf_list", node.this))  # lambdas walk a list; the array itself is JSON
+    if isinstance(node, exp.ParseJSON) and not isinstance(node.this, (exp.Literal, exp.Null)):
+        text = exp.cast(node.this, "varchar")
+        node.set("this", exp.Nullif(this=text, expression=exp.Literal.string("")))  # PARSE_JSON('') is NULL
     if isinstance(node, exp.ToArray):
         return _fn("_sf_to_array", node.this)
     if isinstance(node, exp.JSONKeys):
