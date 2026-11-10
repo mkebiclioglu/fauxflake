@@ -341,3 +341,19 @@ def write_spec(project, path: Path, database: str) -> list[str]:
         notes.insert(0, f"set placeholders for {len(env)} environment variable(s) the project requires (dbt.env in the spec)")
     path.write_text(HEADER + yaml.safe_dump(spec, sort_keys=False, default_flow_style=None, width=110))
     return notes
+
+
+def check(manifest: dict, spec, database: str) -> list[str]:
+    """Problems that would make the project fail on the generated data: sources or columns
+    the models read that the spec does not generate."""
+    wanted, _ = build_spec(manifest, database)
+    problems = []
+    for name, table in wanted["tables"].items():
+        have = spec.tables.get(name)
+        if have is None:
+            problems.append(f"{name}: used by the project, missing from the spec")
+            continue
+        for col in table["columns"]:
+            if col not in have.columns:
+                problems.append(f"{name}.{col}: used by the project, missing from the spec")
+    return problems
