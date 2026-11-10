@@ -567,6 +567,17 @@ def _fix(node: exp.Expression) -> exp.Expression:
                 return base
             return exp.JSONExtract(this=base, expression=exp.JSONPath(expressions=[exp.JSONPathRoot(), step]),
                                    variant_extract=True, requires_json=True)
+    if isinstance(node, exp.Dot) and isinstance(node.expression, exp.Identifier):
+        # v[0].name: a field of an array element. It is a path step, not a struct field
+        base, key = node.this, exp.JSONPathKey(this=node.expression.name, quoted=True)
+        if isinstance(base, exp.JSONExtract) and base.args.get("variant_extract"):
+            base.args["expression"].append("expressions", key)
+            return base
+        if isinstance(base, exp.Bracket) and len(base.expressions) == 1 and isinstance(base.expressions[0], exp.Literal):
+            index = base.expressions[0]
+            first = exp.JSONPathKey(this=index.name, quoted=True) if index.is_string else exp.JSONPathSubscript(this=int(index.name))
+            return exp.JSONExtract(this=base.this, expression=exp.JSONPath(expressions=[exp.JSONPathRoot(), first, key]),
+                                   variant_extract=True, requires_json=True)
     if isinstance(node, exp.Nullif) and isinstance(node.this, _VARIANT_ACCESS) \
             and isinstance(node.expression, exp.Literal) and node.expression.is_string:
         node.set("this", exp.cast(node.this, "varchar"))  # NULLIF(v:x, '') compares the value, not JSON text

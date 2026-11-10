@@ -75,16 +75,41 @@ def _comparable(column: str, kind: str, source: str) -> str:
     (pretty-printed JSON text, floats that differ in the last bit)."""
     quoted = f'"{column}"'
     if kind == "JSON":
-        return f"json({quoted}::varchar)::varchar as {quoted}"  # same text whatever the whitespace
+        return f"_fx_canonical({quoted}::varchar) as {quoted}"  # same text whatever the whitespace and key order
     if kind in ("DOUBLE", "FLOAT"):
         return f"format('{{:.10g}}', {quoted}::double) as {quoted}"
     return f"{quoted}::{kind} as {quoted}" if source == "theirs" else quoted
+
+
+def _canonical(text: str | None) -> str | None:
+    """JSON as both engines would agree on it: Snowflake stores object keys sorted and prints 1.0."""
+    import json
+
+    def tidy(v):
+        if isinstance(v, float) and v.is_integer():
+            return int(v)
+        if isinstance(v, dict):
+            return {k: tidy(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [tidy(x) for x in v]
+        return v
+
+    if text is None:
+        return None
+    try:
+        return json.dumps(tidy(json.loads(text)), sort_keys=True, separators=(",", ":"))
+    except ValueError:
+        return text
 
 
 def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_schema: str | None = None) -> list[Parity]:
     """Each model on the emulator against the same model on Snowflake, row for row. Without
     `schema`, each model is read from the schema dbt built it in (the same on both sides)."""
     duck, out = emu.cursor(), []
+    try:
+        duck.create_function("_fx_canonical", _canonical, ["VARCHAR"], "VARCHAR")
+    except Exception:  # noqa: BLE001  (already registered on this warehouse)
+        pass
     for node in sorted(local.models(), key=lambda n: n["name"]):
         name = node.get("alias") or node["name"]
         try:
