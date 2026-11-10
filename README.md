@@ -54,6 +54,24 @@ Incremental models differ from a full refresh after simulated time passed.
 Every dbt test still passes in that run. The model is simply wrong, and on Snowflake you would
 find out weeks later from a dashboard.
 
+## While you type
+
+```sh
+uv run fauxflake dev
+```
+
+```
+generated 1,872,531 source rows
+ok     everything  (1.9s)
+watching for changes (Ctrl-C to stop)
+ok     stg_orders.sql  (1.1s)
+       fct_orders: 3,715 of 79,967 rows differ from HEAD  [NET_AMOUNT 3,715]
+       stg_orders: 3,715 of 79,967 rows differ from HEAD
+```
+
+Save a file and the edited models and their children are rebuilt, followed by how the output
+now differs from your last commit. Offline, no warehouse, about a second.
+
 ## What did my change do?
 
 ```sh
@@ -240,7 +258,7 @@ Column generators: `sequence`, `hash_id`, `fk`, `categorical`, `dist`, `template
 `null_rate` and `type`. Exclude a model from the drift comparison with
 `meta: {fauxflake_drift: false}`.
 
-`fauxflake serve` keeps the emulator up with data loaded, for interactive `dbt` runs.
+`fauxflake serve` keeps the emulator up with data loaded, for running `dbt` yourself.
 
 ## Limits
 

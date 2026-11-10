@@ -272,3 +272,25 @@ def scenarios(spec_path, project_dir, scale, history, days, only, dbt_args):
         click.echo(f"{name:<17} {verdict:<16} {detail}")
     if silent:
         sys.exit(1)
+
+
+@main.command()
+@with_common
+def dev(spec_path, project_dir, scale, history):
+    """Rebuild on save and show how the output differs from the last commit."""
+    from pathlib import Path
+
+    from .dev import DevSession
+    from .emulator import serve
+    from .generate import Warehouse
+
+    spec = Spec.load(spec_path)
+    with serve() as emu:
+        rows = sum(Warehouse(emu, spec, scale).advance_to(_start(spec, history)).values())
+        click.echo(f"generated {rows:,} source rows")
+        session = DevSession(emu, Path(project_dir), spec.dbt.get("database", "ANALYTICS"), log=click.echo)
+        try:
+            session.start()
+            session.watch()
+        finally:
+            session.close()
