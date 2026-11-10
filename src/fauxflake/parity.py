@@ -107,9 +107,10 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
         log(f"{now:%Y-%m-%d}  seeding Snowflake")
         seed(conn, wh, after=prev, log=log)
         full = ["--full-refresh"] if i == 0 else []
-        if not local.invoke(["build", *full], quiet=True):
+        # the same schema name on both sides: some models embed their own relation names
+        if not local.invoke(["build", *full], schema=remote_schema, quiet=True):
             raise SystemExit(f"dbt build failed on the emulator at {now}")
         if not remote.invoke(["build", *full], schema=remote_schema, quiet=True):
             raise SystemExit(f"dbt build failed on Snowflake at {now}")
         log(f"{now:%Y-%m-%d}  built on both engines")
-    return compare(conn, wh, local, "CI", remote_schema)
+    return compare(conn, wh, local, remote_schema, remote_schema)
