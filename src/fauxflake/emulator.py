@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import re
 import socket
+import sys
 import threading
 import time
 import warnings
@@ -115,6 +117,7 @@ def _patch_fakesnow() -> None:
     def execute(self, command, *args, **kwargs):  # noqa: ANN001
         try:
             self._fauxflake_outer = semantics.outer_flattens(command)
+            self._fauxflake_recursive = semantics.outer_flattens(command, "recursive")
             return original(self, rewrite(command), *args, **kwargs)
         except ProgrammingError:
             raise
@@ -155,7 +158,10 @@ def _patch_fakesnow() -> None:
     def _transform(self, expression, params):  # noqa: ANN001
         out = original_transform(self, semantics.rewrite(expression), params)
         out = semantics.parenthesize_arrows(out)
-        return semantics.keep_outer_rows(out, getattr(self, "_fauxflake_outer", []))
+        out = semantics.keep_outer_rows(out, getattr(self, "_fauxflake_outer", []), getattr(self, "_fauxflake_recursive", []))
+        if os.environ.get("FAUXFLAKE_SHOW_SQL"):  # what DuckDB is actually asked to run
+            print(out.sql(dialect="duckdb"), file=sys.stderr)
+        return out
 
     FakeSnowflakeCursor._transform = _transform
 

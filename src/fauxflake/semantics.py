@@ -44,9 +44,25 @@ MACROS = [
     f"""create or replace macro {_NS}_sf_like
           (x date, r timestamp) as r::date,
           (x, r) as r""",
-    # Floats print the way C's %g does: 100, 1e+20, 0.1.
+    # Text of a value: floats print the way C's %g does (100, 1e+20, 0.1), timestamps always
+    # show milliseconds, and a VARIANT string loses its JSON quotes.
     f"""create or replace macro {_NS}_sf_text(x) as case
-          when typeof(x) in ('DOUBLE', 'FLOAT') then format('{{:.15g}}', x::double) else x::varchar end""",
+          when typeof(x) in ('DOUBLE', 'FLOAT') then format('{{:.15g}}', x::double)
+          when typeof(x) = 'JSON' then (x::json ->> '$')
+          when typeof(x) in ('TIMESTAMP', 'TIMESTAMP_NS', 'TIMESTAMP_MS', 'TIMESTAMP_S')
+            then strftime(try_cast(x::varchar as timestamp), '%Y-%m-%d %H:%M:%S.%g')
+          when typeof(x) = 'TIMESTAMP WITH TIME ZONE'
+            then strftime(timezone('UTC', try_cast(x::varchar as timestamptz)), '%Y-%m-%d %H:%M:%S.%g') || ' +0000'
+          else x::varchar end""",
+    # Text of a division: NUMBER / NUMBER prints every decimal of its scale ('1.500000').
+    f"""create or replace macro {_NS}_sf_fixed(v, s) as
+          rtrim(left(v::decimal(38, 12)::varchar, length(v::decimal(38, 12)::varchar) - (12 - s)), '.')""",
+    f"""create or replace macro {_NS}_sf_div_text(a, b) as case
+          when typeof(a) in ('DOUBLE', 'FLOAT') or typeof(b) in ('DOUBLE', 'FLOAT') then {_NS}_sf_text(a / b)
+          else {_NS}_sf_fixed({_NS}_sf_div(a, b), greatest({_SCALE}, least({_SCALE} + 6, 12))) end""",
+    f"""create or replace macro {_NS}_sf_round_div_text(a, b, n) as case
+          when typeof(a) in ('DOUBLE', 'FLOAT') or typeof(b) in ('DOUBLE', 'FLOAT') then {_NS}_sf_text(round(a / b, n))
+          else {_NS}_sf_fixed(round({_NS}_sf_div(a, b), n), least(n, greatest({_SCALE}, least({_SCALE} + 6, 12)))) end""",
     f"""create or replace macro {_NS}_sf_width_bucket(x, lo, hi, n) as case
           when x < lo then 0 when x >= hi then n + 1 else floor((x - lo) * n / (hi - lo))::bigint + 1 end""",
     f"""create or replace macro {_NS}_sf_array_size
@@ -54,10 +70,11 @@ MACROS = [
           (x) as len(x)""",
     f"create or replace macro {_NS}_sf_current_account_name() as 'FAUXFLAKE'",
     f"create or replace macro {_NS}_sf_try_base64(x) as try(from_base64(x)::varchar)",
-    f"create or replace macro {_NS}_sf_try_timestamp(x) as try_cast(x::varchar as timestamp)",
     f"create or replace macro {_NS}_sf_array_distinct(l) as list_filter(l, lambda x, i: list_position(l, x) = i)",
     f"create or replace macro {_NS}_sf_jarowinkler(a, b) as round(jaro_winkler_similarity(upper(a), upper(b)) * 100)::bigint",
-    f"create or replace macro {_NS}_sf_object_insert(o, k, v) as json_merge_patch(o::json, json_object(k::varchar, v))",
+    f"""create or replace macro {_NS}_sf_object_insert
+          (o, k, v) as json_merge_patch(o::json, json_object(k::varchar, v)),
+          (o, k, v, f) as json_merge_patch(o::json, json_object(k::varchar, v))""",
     f"create or replace macro {_NS}_sf_object_delete(o, k) as json_merge_patch(o::json, json_object(k::varchar, null))",
     f"create or replace macro {_NS}_sf_object_pick(o, k) as json_object(k::varchar, json_extract(o::json, '$.' || k))",
     *[f"create or replace macro {_NS}_sf_is_{name}(v) as json_type(v::varchar) in ({kinds})" for name, kinds in {
@@ -112,17 +129,120 @@ MACROS = [
     f"""create or replace macro {_NS}_sf_get_ignore_case(v, k) as json_extract(v::json, '$."' || coalesce(
           list_filter(json_keys(v::json), lambda x: x = k)[1],
           list_filter(json_keys(v::json), lambda x: lower(x) = lower(k))[1], k) || '"')""",
+    # Dates out of range roll over: month 14 is February of the next year, day 0 the day before.
+    f"""create or replace macro {_NS}_sf_date_from_parts(y, m, d) as
+          (make_date(y::bigint, 1, 1) + to_months((m - 1)::integer) + to_days((d - 1)::integer))::date""",
+    f"""create or replace macro {_NS}_sf_timestamp_from_parts
+          (y, m, d, h, mi, sec) as {_NS}_sf_date_from_parts(y, m, d)::timestamp + to_hours(h::bigint) + to_minutes(mi::bigint) + to_seconds(sec::double),
+          (y, m, d, h, mi, sec, ns) as {_NS}_sf_date_from_parts(y, m, d)::timestamp + to_hours(h::bigint) + to_minutes(mi::bigint) + to_seconds(sec::double) + to_microseconds((ns / 1000)::bigint),
+          (d, t) as (d::date + t::time)""",
+    # Strings Snowflake reads as booleans beyond DuckDB's: on / off.
+    f"""create or replace macro {_NS}_sf_bool(x) as case
+          when typeof(x) = 'VARCHAR' and lower(trim(x::varchar)) = 'on' then true
+          when typeof(x) = 'VARCHAR' and lower(trim(x::varchar)) = 'off' then false
+          else x::boolean end""",
+    f"""create or replace macro {_NS}_sf_try_bool(x) as case
+          when lower(trim(x::varchar)) = 'on' then true
+          when lower(trim(x::varchar)) = 'off' then false
+          else try_cast(x::varchar as boolean) end""",
+    # Replace only the nth match, counting from a start position.
+    f"""create or replace macro {_NS}_sf_regexp_replace_nth(s, p, r, pos, occ) as case
+          when occ = 0 then left(s, pos - 1) || regexp_replace(substr(s, pos), p, r, 'g')
+          else left(s, pos - 1) || array_to_string(list_transform(
+            range(1, len(regexp_split_to_array(substr(s, pos), p)) + 1),
+            lambda _i: regexp_split_to_array(substr(s, pos), p)[_i] || coalesce(case
+              when _i = occ then regexp_replace(regexp_extract_all(substr(s, pos), p)[_i], p, r)
+              else regexp_extract_all(substr(s, pos), p)[_i] end, '')), '') end""",
+    f"create or replace macro {_NS}_sf_try_hex(x) as try(decode(unhex(x)))",
+    # Dates in text: ISO first, then the other formats Snowflake detects, then epoch numbers.
+    f"""create or replace macro {_NS}_sf_epoch(x) as case
+          when not regexp_full_match(x::varchar, '-?[0-9]{{1,18}}') then null
+          when abs(x::varchar::bigint) < 31536000000 then to_timestamp(x::varchar::bigint)
+          when abs(x::varchar::bigint) < 31536000000000 then to_timestamp(x::varchar::bigint / 1000.0)
+          when abs(x::varchar::bigint) < 31536000000000000 then to_timestamp(x::varchar::bigint / 1000000.0)
+          else to_timestamp(x::varchar::bigint / 1000000000.0) end""",
+    f"""create or replace macro {_NS}_sf_try_timestamp(x) as coalesce(
+          try_cast(x::varchar as timestamp),
+          try_strptime(x::varchar, ['%m/%d/%Y %H:%M:%S', '%m/%d/%Y %H:%M', '%m/%d/%Y', '%d-%b-%Y %H:%M:%S', '%d-%b-%Y']),
+          timezone('UTC', {_NS}_sf_epoch(x)))""",
+    f"""create or replace macro {_NS}_sf_try_date(x) as coalesce(try_cast(x as date), {_NS}_sf_try_timestamp(x)::date)""",
+    f"""create or replace macro {_NS}_sf_to_date(x) as coalesce({_NS}_sf_try_date(x), cast(x::varchar as date))""",
+    f"""create or replace macro {_NS}_sf_try_time(x) as coalesce(
+          case when regexp_matches(x::varchar, '^\s*[0-9]{{1,2}}:[0-9]{{2}}') then try_cast(x::varchar as time) end,
+          timezone('UTC', {_NS}_sf_epoch(x))::time)""",
+    # Object keys come back sorted: Snowflake stores objects ordered by key.
+    f"create or replace macro {_NS}_sf_object_keys(o) as to_json(list_sort(json_keys(o::json)))",
+    f"create or replace macro {_NS}_sf_hash_agg(x) as bit_xor(hash(x))",
+    # FLATTEN(..., RECURSIVE => TRUE) walks every level.
+    f"""create or replace macro {_NS}_sf_flatten_recursive(input) as table
+          select hash(to_json(input))::ubigint as SEQ,
+                 case when fullkey like '%]' then null else "key" end as KEY,
+                 regexp_replace(fullkey, '^\\$\\.?', '') as PATH,
+                 case when fullkey like '%]' then "key"::bigint end as INDEX,
+                 "value"::json as VALUE,
+                 json_extract(to_json(input), "path") as THIS
+          from json_tree(to_json(input)::varchar) where parent is not null order by id""",
+    *[f"create or replace macro {_NS}_sf_is_{name}(v) as json_type(v::varchar) = 'VARCHAR' and try_cast((v::json ->> '$') as {kind}) is not null"
+      for name, kind in {"date": "date", "time": "time", "timestamp_ntz": "timestamp", "timestamp_ltz": "timestamp", "timestamp_tz": "timestamp"}.items()],
+    *[f"create or replace macro {_NS}_sf_as_{name}(v) as try_cast((v::json ->> '$') as {kind})"
+      for name, kind in {"date": "date", "time": "time", "timestamp_ntz": "timestamp", "timestamp_ltz": "timestamp", "timestamp_tz": "timestamp"}.items()],
+    *[f"create or replace macro {_NS}_sf_as_{name}(v) as case when json_type(v::varchar) in ('UBIGINT', 'BIGINT', 'DOUBLE') then v::double end"
+      for name in ("double", "real", "number", "decimal")],
+    f"create or replace macro {_NS}_sf_as_boolean(v) as case when json_type(v::varchar) = 'BOOLEAN' then v::boolean end",
+    f"create or replace macro {_NS}_sf_as_object(v) as case when json_type(v::varchar) = 'OBJECT' then v::json end",
+    f"create or replace macro {_NS}_sf_as_array(v) as case when json_type(v::varchar) = 'ARRAY' then v::json end",
+    # Arrays: a stored ARRAY is JSON, an array built inside a query may be a DuckDB list.
+    # Every array function reads either as a list of JSON values and answers with JSON.
+    f"create or replace macro {_NS}_sf_list(x) as to_json(x)::json[]",
+    f"""create or replace macro {_NS}_sf_sorted(a) as list_transform(list_sort(list_transform({_NS}_sf_list(a),
+          lambda e: struct_pack(n := case when json_type(e) in ('UBIGINT', 'BIGINT', 'DOUBLE') then e::double end,
+                                s := e::varchar, e := e))), lambda x: x.e)""",
+    f"create or replace macro {_NS}_sf_array_contains(a, v) as case when v is null then null else list_contains({_NS}_sf_list(a), to_json(v)) end",
+    f"create or replace macro {_NS}_sf_array_position(a, v) as nullif(list_position({_NS}_sf_list(a), to_json(v)), 0) - 1",
+    f"""create or replace macro {_NS}_sf_array_to_string(a, s) as
+          array_to_string(list_transform({_NS}_sf_list(a), lambda e: coalesce(e ->> '$', '')), s)""",
+    f"create or replace macro {_NS}_sf_arrays_overlap(a, b) as list_has_any({_NS}_sf_list(a), {_NS}_sf_list(b))",
+    f"""create or replace macro {_NS}_sf_array_slice(a, f, t) as to_json(list_slice({_NS}_sf_list(a),
+          case when f >= 0 then f + 1 else f end, case when t < 0 then t - 1 else t end))""",
+    f"create or replace macro {_NS}_sf_array_cat(a, b) as to_json(list_concat({_NS}_sf_list(a), {_NS}_sf_list(b)))",
+    f"create or replace macro {_NS}_sf_array_append(a, v) as to_json(list_append({_NS}_sf_list(a), to_json(v)))",
+    f"create or replace macro {_NS}_sf_array_prepend(a, v) as to_json(list_prepend(to_json(v), {_NS}_sf_list(a)))",
+    f"create or replace macro {_NS}_sf_array_unique(a) as to_json({_NS}_sf_array_distinct({_NS}_sf_list(a)))",
+    f"""create or replace macro {_NS}_sf_array_sort
+          (a) as to_json({_NS}_sf_sorted(a)),
+          (a, up) as to_json(case when up then {_NS}_sf_sorted(a) else list_reverse({_NS}_sf_sorted(a)) end)""",
+    f"create or replace macro {_NS}_sf_array_max(a) as list_last(list_filter({_NS}_sf_sorted(a), lambda e: json_type(e) <> 'NULL'))",
+    f"create or replace macro {_NS}_sf_array_min(a) as list_first(list_filter({_NS}_sf_sorted(a), lambda e: json_type(e) <> 'NULL'))",
+    f"""create or replace macro {_NS}_sf_array_compact(a) as
+          to_json(list_filter({_NS}_sf_list(a), lambda e: e is not null and json_type(e) <> 'NULL'))""",
+    *[f"""create or replace macro {_NS}_sf_array_{name}(a, b) as to_json(list_transform(list_filter(
+          list_zip({_NS}_sf_list(a), range(1, len({_NS}_sf_list(a)) + 1)),
+          lambda p: len(list_filter({_NS}_sf_list(a)[1:p[2]], lambda e: e = p[1])) {op} len(list_filter({_NS}_sf_list(b), lambda e: e = p[1]))),
+          lambda p: p[1]))""" for name, op in (("intersection", "<="), ("except", ">"))],
+    f"create or replace macro {_NS}_sf_array_remove(a, v) as to_json(list_filter({_NS}_sf_list(a), lambda e: e <> to_json(v)))",
+    f"""create or replace macro {_NS}_sf_array_insert(a, p, v) as
+          to_json(list_concat({_NS}_sf_list(a)[1:p], [to_json(v)], {_NS}_sf_list(a)[p + 1:]))""",
+    f"create or replace macro {_NS}_sf_array_remove_at(a, p) as to_json(list_concat({_NS}_sf_list(a)[1:p], {_NS}_sf_list(a)[p + 2:]))",
+    f"create or replace macro {_NS}_sf_array_flatten(a) as to_json(flatten(list_transform({_NS}_sf_list(a), lambda e: e::json[])))",
+    f"create or replace macro {_NS}_sf_array_reverse(a) as to_json(list_reverse({_NS}_sf_list(a)))",
+    f"""create or replace macro {_NS}_sf_array_range
+          (f, t) as to_json(range(f, t)),
+          (f, t, s) as to_json(range(f, t, s))""",
     # UPPER('ß') is 'SS'.
     f"create or replace macro {_NS}_sf_upper(s) as replace(upper(s), 'ẞ', 'SS')",
 ]
 
 _RENAMED = {  # Snowflake function -> macro, same arguments
-    "width_bucket": "_sf_width_bucket", "array_distinct": "_sf_array_distinct",
+    "width_bucket": "_sf_width_bucket",
     "jarowinkler_similarity": "_sf_jarowinkler", "object_insert": "_sf_object_insert",
     "object_delete": "_sf_object_delete", "object_pick": "_sf_object_pick",
     "current_account_name": "_sf_current_account_name", "try_base64_decode_string": "_sf_try_base64",
     "soundex": "_sf_soundex", "parse_url": "_sf_parse_url", "parse_ip": "_sf_parse_ip",
-    "get_ignore_case": "_sf_get_ignore_case", "upper": "_sf_upper", "ucase": "_sf_upper",
+    "get_ignore_case": "_sf_get_ignore_case", "object_keys": "_sf_object_keys", "hash_agg": "_sf_hash_agg",
+    "try_hex_decode_string": "_sf_try_hex",
+    **{f"is_{k}": f"_sf_is_{k}" for k in ("date", "time", "timestamp_ntz", "timestamp_ltz", "timestamp_tz")},
+    **{f"as_{k}": f"_sf_as_{k}" for k in ("date", "time", "timestamp_ntz", "timestamp_ltz", "timestamp_tz", "double", "real",
+                                          "number", "decimal", "boolean", "object", "array")}, "upper": "_sf_upper", "ucase": "_sf_upper",
     "as_integer": "_sf_as_integer", "as_varchar": "_sf_as_varchar", "as_char": "_sf_as_varchar",
     **{f"is_{k}": f"_sf_is_{k}" for k in ("object", "array", "integer", "varchar", "char", "boolean", "decimal", "double", "real")},
 }
@@ -165,9 +285,11 @@ def _number_format(value: exp.Expression, model: str) -> exp.Expression | None:
     spec = ("," if "," in whole else "") + f".{decimals}f"
     if "0" in digits and "," not in whole:  # zero padded to the width of the model
         spec = f"0{len(digits) + (decimals + 1 if decimals else 0)}.{decimals}f"
-    text = f"format('{{:{spec}}}', ({value.sql(dialect='duckdb')})::double)"
+    v = f"({value.sql(dialect='duckdb')})::double"
+    text = f"format('{{:{spec}}}', abs({v}))"
     if dollar:
         text = f"concat('$', {text})"
+    text = f"(case when {v} < 0 then '-' else '' end || {text})"
     if not fill:  # Snowflake right-aligns in the model's width, plus one position for the sign
         text = f"lpad({text}, {len(model.strip()) + 1}, ' ')"
     return sqlglot.parse_one(text, read="duckdb")
@@ -194,6 +316,92 @@ def _avg(avg: exp.Avg, window: exp.Window | None = None) -> exp.Expression:
         ifs=[exp.If(this=exp.EQ(this=count, expression=exp.Literal.number(0)), true=exp.Null())],
         default=_fn("_sf_div", total, count.copy()),
     )
+
+
+_ARRAYS = {  # array function -> macro and the arguments it takes, in order
+    exp.ArrayContains: ("_sf_array_contains", ("this", "expression")),
+    exp.ArrayPosition: ("_sf_array_position", ("this", "expression")),
+    exp.ArrayToString: ("_sf_array_to_string", ("this", "expression")),
+    exp.ArrayOverlaps: ("_sf_arrays_overlap", ("this", "expression")),
+    exp.ArraySlice: ("_sf_array_slice", ("this", "start", "end")),
+    exp.ArrayConcat: ("_sf_array_cat", ("this", "expressions")),
+    exp.ArrayAppend: ("_sf_array_append", ("this", "expression")),
+    exp.ArrayPrepend: ("_sf_array_prepend", ("this", "expression")),
+    exp.ArrayDistinct: ("_sf_array_unique", ("this",)),
+    exp.SortArray: ("_sf_array_sort", ("this", "asc")),
+    exp.ArrayMax: ("_sf_array_max", ("this",)),
+    exp.ArrayMin: ("_sf_array_min", ("this",)),
+    exp.ArrayCompact: ("_sf_array_compact", ("this",)),
+    exp.ArrayIntersect: ("_sf_array_intersection", ("expressions",)),
+    exp.ArrayExcept: ("_sf_array_except", ("this", "expression")),
+    exp.ArrayRemove: ("_sf_array_remove", ("this", "expression")),
+    exp.ArrayInsert: ("_sf_array_insert", ("this", "position", "expression")),
+    exp.ArrayRemoveAt: ("_sf_array_remove_at", ("this", "position")),
+    exp.Flatten: ("_sf_array_flatten", ("this",)),
+    exp.ArrayReverse: ("_sf_array_reverse", ("this",)),
+}
+_ARRAY_FUNCTIONS = tuple(_ARRAYS)
+
+
+def _is(node: exp.Expression, name: str) -> bool:
+    return isinstance(node, exp.Anonymous) and node.name == _NS + name
+
+
+def _average(node: exp.Expression) -> bool:
+    return isinstance(node, exp.Case) and _is(node.args.get("default"), "_sf_div")
+
+
+def _text(node: exp.Expression) -> exp.Expression:
+    """The value as Snowflake prints it. A division carries its scale into the text."""
+    inner = node.unnest()
+    if _is(inner, "_sf_div"):
+        return _fn("_sf_div_text", *inner.expressions)
+    if _average(inner):
+        inner.set("default", _fn("_sf_div_text", *inner.args["default"].expressions))
+        return inner
+    if isinstance(inner, exp.Round) and isinstance(inner.args.get("decimals"), exp.Literal) and inner.args["decimals"].is_int:
+        of, places = inner.this.unnest(), inner.args["decimals"]
+        if _is(of, "_sf_div"):
+            return _fn("_sf_round_div_text", *of.expressions, places)
+        if _average(of):
+            of.set("default", _fn("_sf_round_div_text", *of.args["default"].expressions, places))
+            return of
+    return _fn("_sf_text", node)
+
+
+_OFFSET = re.compile(r"\s*(Z|[+-]\d{2}:?\d{2})$")
+_SPLIT_TO_TABLE = ("(select 1 as seq, unnest(range(1, len(string_split(__s, __d)) + 1)) as index, "
+                   "unnest(string_split(__s, __d)) as value)")
+
+
+def _split_to_table(call: exp.SplitToTable) -> exp.Expression:
+    body = sqlglot.parse_one(_SPLIT_TO_TABLE, read="duckdb")
+    for split in list(body.find_all(exp.Split)):  # keep it a DuckDB list: a Snowflake SPLIT is an ARRAY
+        split.replace(exp.Anonymous(this="string_split", expressions=[split.this, split.expression]))
+    for col in list(body.find_all(exp.Column)):
+        if col.name in ("__s", "__d"):
+            col.replace((call.this if col.name == "__s" else call.expression).copy())
+    return body
+
+
+def _dynamic_pivot(pivot: exp.Pivot) -> exp.Expression | None:
+    """PIVOT (agg FOR col IN (ANY)) names its columns from the data: DuckDB's PIVOT ... ON form."""
+    field = pivot.args.get("fields") and pivot.args["fields"][0]
+    if not isinstance(field, exp.In) or not any(isinstance(e, exp.PivotAny) for e in field.expressions):
+        return None
+    source = pivot.parent
+    if not isinstance(source, (exp.Table, exp.Subquery)) or len(pivot.expressions) != 1:
+        return None
+    inner = source.copy()
+    inner.set("pivots", None)
+    inner.set("alias", None)
+    if isinstance(inner, exp.Table):
+        inner = exp.select("*").from_(inner).subquery()
+    out = exp.Subquery(this=exp.Pivot(this=inner, expressions=[field.this.copy()], using=[pivot.expressions[0].copy()], unpivot=False))
+    alias = pivot.args.get("alias") or source.args.get("alias")
+    if alias:
+        out.set("alias", alias.copy())
+    return out
 
 
 def _operand(node: exp.Expression) -> exp.Expression:
@@ -225,6 +433,89 @@ def _fix(node: exp.Expression) -> exp.Expression:
     if isinstance(node, exp.CollateColumnConstraint) and isinstance(node.this, (exp.Literal, exp.Var, exp.Identifier)):
         node.set("this", exp.var(_collation(node.this.name) or "BINARY"))
         return node
+    if isinstance(node, exp.Interval) and isinstance(node.this, exp.Literal) and "," in node.this.name:
+        node.this.set("this", node.this.name.replace(",", " "))  # INTERVAL '1 day, 2 hours'
+    if isinstance(node, (exp.Mul, exp.Add, exp.Sub)) and all(
+            isinstance(side, exp.Literal) and side.is_int for side in (node.this, node.expression)):
+        node.set("this", exp.cast(node.this, "bigint"))  # 86400 * 30000 does not overflow a NUMBER
+    if isinstance(node, exp.Cast) and not isinstance(node, exp.TryCast):
+        to, inner = node.to, node.this
+        if to.is_type("timestamp", "timestampntz") and isinstance(inner, exp.Cast) and inner.to.is_type("timestamptz") \
+                and isinstance(inner.this, exp.Literal) and inner.this.is_string:
+            # a TIMESTAMP_TZ keeps its wall-clock time when the zone is dropped
+            return exp.cast(exp.Literal.string(_OFFSET.sub("", inner.this.name)), "timestamp")
+        if to.is_type("timestamp", "timestampntz", "timestampltz", "timestamptz") and to.expressions \
+                and to.expressions[0].name == "0":
+            return exp.Anonymous(this="date_trunc", expressions=[exp.Literal.string("second"), node])
+        if to.is_type("boolean") and not isinstance(inner, (*_VARIANT_ACCESS, exp.Boolean, exp.Null)):
+            return _fn("_sf_bool", inner)
+        if to.is_type("date") and not isinstance(inner, (*_VARIANT_ACCESS, exp.Null, exp.Cast, exp.Anonymous)) \
+                and not (isinstance(inner, exp.Literal) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", inner.name)):
+            return _fn("_sf_to_date", inner)
+        if to.is_type("variant") and not isinstance(inner, exp.Null):
+            return exp.ToVariant(this=inner)  # 'a'::variant is the string a, not JSON text to parse
+    if isinstance(node, exp.TryCast) and node.to.is_type("date") and not isinstance(node.this, _VARIANT_ACCESS):
+        return _fn("_sf_try_date", node.this)
+    if isinstance(node, exp.TsOrDsToDate) and not node.args.get("format") and not isinstance(node.this, _VARIANT_ACCESS):
+        return _fn("_sf_try_date" if node.args.get("safe") else "_sf_to_date", node.this)
+    if isinstance(node, exp.TsOrDsToTime) and node.args.get("safe") and not node.args.get("format"):
+        return _fn("_sf_try_time", node.this)
+    if isinstance(node, exp.ToBoolean):
+        return _fn("_sf_try_bool" if node.args.get("safe") else "_sf_bool", node.this)
+    if isinstance(node, exp.DateFromParts):
+        return _fn("_sf_date_from_parts", node.args["year"], node.args["month"], node.args["day"])
+    if isinstance(node, exp.TimestampFromParts):
+        parts = [node.args.get(k) for k in ("year", "month", "day", "hour", "min", "sec", "nano")]
+        if node.args.get("year") is None:
+            return _fn("_sf_timestamp_from_parts", node.this, node.expression)
+        return _fn("_sf_timestamp_from_parts", *[p for p in parts if p is not None])
+    if isinstance(node, exp.ByteLength):
+        return exp.Anonymous(this="strlen", expressions=[exp.cast(node.this, "varchar")])
+    if isinstance(node, exp.RegexpReplace) and (node.args.get("position") or node.args.get("occurrence")):
+        position = node.args.pop("position", None) or exp.Literal.number(1)
+        occurrence = node.args.pop("occurrence", None) or exp.Literal.number(0)
+        if not (position.name == "1" and occurrence.name == "0"):
+            return _fn("_sf_regexp_replace_nth", node.this, node.expression,
+                       node.args.get("replacement") or exp.Literal.string(""), position, occurrence)
+    if isinstance(node, exp.Struct) and node.expressions and all(isinstance(e, exp.PropertyEQ) for e in node.expressions):
+        pairs = [x for e in node.expressions for x in (exp.Literal.string(e.this.name), e.expression)]
+        return exp.func("OBJECT_CONSTRUCT", *pairs, dialect="snowflake")
+    if isinstance(node, exp.Anonymous) and node.name.lower() == "to_object" and len(node.expressions) == 1:
+        return node.expressions[0]
+    if isinstance(node, (exp.Sum, exp.Avg)) and isinstance(node.this, _VARIANT_ACCESS):
+        node.set("this", exp.cast(node.this, "double"))  # SUM(v:n) adds the numbers inside
+    if isinstance(node, exp.Parameter) and isinstance(node.this, exp.Literal) and node.this.is_int:
+        return exp.column(f"column{node.this.name}")  # $1 is the first column of a VALUES list
+    if isinstance(node, exp.Count) and node.expressions and not isinstance(node.this, exp.Distinct):
+        present = exp.and_(*[exp.Is(this=c.copy(), expression=exp.Null()).not_() for c in (node.this, *node.expressions)])
+        return exp.Count(this=exp.Case(ifs=[exp.If(this=present, true=exp.Literal.number(1))]))
+    if isinstance(node, exp.ToChar) and not node.args.get("format"):
+        return _text(node.this)
+    if isinstance(node, (exp.ArrayAgg, exp.ObjectAgg)) or (isinstance(node, exp.WithinGroup) and isinstance(node.this, exp.ArrayAgg)):
+        if not isinstance(node.parent, (exp.Window, exp.WithinGroup)):
+            empty = "{}" if isinstance(node, exp.ObjectAgg) else "[]"  # no rows give an empty value, not NULL
+            return exp.Coalesce(this=node, expressions=[exp.ParseJSON(this=exp.Literal.string(empty))])
+    if isinstance(node, exp.Lateral) and isinstance(node.this, exp.SplitToTable):
+        node.set("this", _split_to_table(node.this))
+        return node
+    if isinstance(node, exp.Pivot):
+        dynamic = _dynamic_pivot(node)
+        if dynamic is not None:
+            node.parent.replace(dynamic)
+            return node
+    if isinstance(node, _ARRAY_FUNCTIONS):
+        name, keys = _ARRAYS[type(node)]
+        args = [a for k in keys for a in (node.args.get(k) if isinstance(node.args.get(k), list) else [node.args.get(k)])]
+        return _fn(name, *[a for a in args if a is not None])
+    if isinstance(node, exp.GenerateSeries) and node.args.get("is_end_exclusive"):
+        return _fn("_sf_array_range", *[node.args[k] for k in ("start", "end", "step") if node.args.get(k) is not None])
+    if isinstance(node, exp.Array):
+        kinds = {e.is_string for e in node.expressions if isinstance(e, exp.Literal)}
+        if len(kinds) > 1 or (kinds and len(node.expressions) > sum(isinstance(e, (exp.Literal, exp.Null)) for e in node.expressions)):
+            # mixed element types: an ARRAY holds variants, a DuckDB list needs one type
+            node.set("expressions", [e if isinstance(e, exp.Null) else exp.ToVariant(this=e) for e in node.expressions])
+    if isinstance(node, exp.JSONKeys):
+        return _fn("_sf_object_keys", node.this)
     if isinstance(node, exp.GetExtract):
         # GET(v, key) is v[key]; as a bracket it gets the same handling as every other access
         bracket = sqlglot.parse_one("x[0]", read="snowflake")
@@ -244,7 +535,7 @@ def _fix(node: exp.Expression) -> exp.Expression:
             if isinstance(part, exp.JSONExtract):
                 node.set(side, exp.cast(part, "varchar"))  # v:s || 'y'
             elif not (isinstance(part, exp.Literal) and part.is_string) and not isinstance(part, exp.DPipe):
-                node.set(side, _fn("_sf_text", part))
+                node.set(side, _text(part))
     if isinstance(node, _COMPARISONS) or isinstance(node, exp.In):
         other = node.expression if isinstance(node, _COMPARISONS) else (node.expressions[0] if node.expressions else None)
         if isinstance(node.this, _VARIANT_ACCESS) and isinstance(other, exp.Literal) and other.is_string:
@@ -269,7 +560,7 @@ def _fix(node: exp.Expression) -> exp.Expression:
     if isinstance(node, exp.Cast) and not isinstance(node, exp.TryCast) and node.to.is_type("varchar", "text") \
             and not node.to.expressions and not isinstance(node.this, (exp.JSONExtract, exp.Bracket)) \
             and not (isinstance(node.this, exp.Literal) and node.this.is_string):
-        return _fn("_sf_text", node.this)
+        return _text(node.this)
     if isinstance(node, exp.Add) and isinstance(node.expression, exp.Interval) \
             and (node.expression.unit and node.expression.unit.name.upper() in _DAY_UNITS):
         return _fn("_sf_like", node.this.copy(), node)
@@ -305,7 +596,7 @@ def _fix(node: exp.Expression) -> exp.Expression:
     if isinstance(node, exp.Anonymous) and node.name.lower() in _RENAMED:
         return _fn(_RENAMED[node.name.lower()], *node.expressions)
     if isinstance(node, exp.TableFromRows) and isinstance(node.this, exp.SplitToTable):
-        call = exp.Table(this=_fn("_sf_split_to_table", node.this.this, node.this.expression))
+        call = _split_to_table(node.this)
         if node.args.get("alias"):
             call.set("alias", node.args["alias"])
         return call
@@ -404,15 +695,15 @@ def coerce_result(cursor) -> None:  # noqa: ANN001
 _FLATTEN_CALL = re.compile(r"\bflatten\s*\(", re.IGNORECASE)
 
 
-def outer_flattens(sql: str) -> list[bool]:
-    """For each FLATTEN(...) in order: was it called with OUTER => TRUE?"""
+def outer_flattens(sql: str, option: str = "outer") -> list[bool]:
+    """For each FLATTEN(...) in order: was it called with OUTER => TRUE (or another option)?"""
     flags = []
     for m in _FLATTEN_CALL.finditer(sql):
         depth, i = 1, m.end()
         while i < len(sql) and depth:
             depth += {"(": 1, ")": -1}.get(sql[i], 0)
             i += 1
-        flags.append(bool(re.search(r"outer\s*=>\s*true", sql[m.end():i], re.IGNORECASE)))
+        flags.append(bool(re.search(option + r"\s*=>\s*true", sql[m.end():i], re.IGNORECASE)))
     return flags
 
 
@@ -428,11 +719,14 @@ def parenthesize_arrows(transformed: exp.Expression) -> exp.Expression:
     return transformed
 
 
-def keep_outer_rows(transformed: exp.Expression, flags: list[bool]) -> exp.Expression:
+def keep_outer_rows(transformed: exp.Expression, flags: list[bool], recursive: list[bool] = ()) -> exp.Expression:
     """FLATTEN(..., OUTER => TRUE) keeps rows that have nothing to expand: a LEFT lateral join."""
-    if not any(flags):
+    if not any(flags) and not any(recursive):
         return transformed
     calls = [n for n in transformed.find_all(exp.Anonymous) if n.name.upper() == "_FS_FLATTEN"]
+    for call, deep in zip(calls, recursive):
+        if deep:
+            call.set("this", _NS + "_sf_flatten_recursive")
     for call, outer in zip(calls, flags):
         join = call.find_ancestor(exp.Join)
         if outer and join is not None:
