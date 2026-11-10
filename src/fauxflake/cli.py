@@ -187,6 +187,49 @@ def conformance(connection):
 
 @main.command()
 @click.option("--spec", "spec_path", default="fauxflake.yml", show_default=True)
+@click.option("--db-path", required=True, help="The directory a previous run kept its data in (--db-path).")
+@click.option("--schema", default="CI", show_default=True)
+@click.option("--limit", default=50, show_default=True, help="Rows to print.")
+@click.argument("sql")
+def query(spec_path, db_path, schema, limit, sql):
+    """Run Snowflake SQL against the warehouse a previous run left in --db-path."""
+    import os
+    from pathlib import Path
+
+    import snowflake.connector
+
+    from .emulator import define_udfs
+    from .emulator import serve as serve_emulator
+
+    if not list(Path(db_path).glob("*.db")):
+        raise click.ClickException(f"no warehouse in {db_path}: run `fauxflake build --db-path {db_path}` first")
+    spec = Spec.load(spec_path) if os.path.exists(spec_path) else None
+    database = (spec.dbt.get("database") if spec else None) or "ANALYTICS"
+    with serve_emulator(db_path=db_path, keep=True) as emu:
+        if spec:
+            define_udfs(emu, spec.udfs)
+        for file in Path(db_path).glob("*.db"):
+            emu.ensure_database(file.stem, schema)
+        conn = snowflake.connector.connect(**emu.connect_kwargs(database=database, schema=schema.upper()))
+        cur = conn.cursor()
+        try:
+            cur.execute(sql)
+        except snowflake.connector.errors.ProgrammingError as e:
+            raise click.ClickException(str(e)) from e
+        names = [d[0] for d in cur.description or []]
+        rows = [["" if v is None else str(v) for v in row] for row in cur.fetchmany(limit)]
+        more = cur.fetchone() is not None
+        conn.close()
+    widths = [min(60, max(len(n), *(len(r[i]) for r in rows))) if rows else len(n) for i, n in enumerate(names)]
+    click.echo("  ".join(n.ljust(w) for n, w in zip(names, widths)))
+    click.echo("  ".join("-" * w for w in widths))
+    for row in rows:
+        click.echo("  ".join(v[:60].ljust(w) for v, w in zip(row, widths)))
+    click.echo(f"({len(rows)} row{'s' if len(rows) != 1 else ''}{', more not shown' if more else ''})")
+
+
+@main.command()
+@click.option("--spec", "spec_path", default="fauxflake.yml", show_default=True)
 @click.option("--project-dir", default=".", show_default=True)
 @click.option("--database", default="ANALYTICS", show_default=True, help="Database dbt builds into.")
 @click.option("--force", is_flag=True, help="Overwrite an existing spec.")

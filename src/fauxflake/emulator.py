@@ -265,7 +265,8 @@ def engine() -> Iterator[Emulator]:
 
 
 @contextlib.contextmanager
-def serve(port: int | None = None, db_path: str | Path | None = None, verbose: bool = False) -> Iterator[Emulator]:
+def serve(port: int | None = None, db_path: str | Path | None = None, verbose: bool = False,
+          keep: bool = False) -> Iterator[Emulator]:
     """Start the emulator. With `db_path`, each database persists as `<db_path>/<NAME>.db`.
 
     The Snowflake endpoint of the most recently started emulator wins: run one per process
@@ -283,7 +284,7 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
     _patch_fakesnow()
     if not verbose:
         logging.getLogger("fakesnow.server").setLevel(logging.WARNING)
-    if db_path:
+    if db_path and not keep:
         Path(db_path).mkdir(parents=True, exist_ok=True)
         for stale in [*Path(db_path).glob("*.db"), *Path(db_path).glob("*.db.wal")]:
             stale.unlink()  # every run starts from an empty warehouse

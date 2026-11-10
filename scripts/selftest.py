@@ -26,6 +26,7 @@ def main() -> None:
     ap.add_argument("--vars", default=None)
     ap.add_argument("--json")
     ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--schema", default="CI", help="default schema, for projects whose sources expect a fixed one")
     ap.add_argument("--target", default=None, help="dbt target name, for projects that branch on target.name")
     ap.add_argument("dbt_args", nargs="*", help="extra arguments for `dbt build` (after --)")
     args = ap.parse_args()
@@ -43,8 +44,14 @@ def main() -> None:
         project.deps()
         provide_env(project)
         extra = (["--vars", args.vars] if args.vars else []) + args.dbt_args
-        project.invoke(["build", *extra], quiet=True)
-    results = json.loads((project.target_path / "run_results.json").read_text())["results"]
+        # seeds first: these packages read them as sources, which dbt cannot order after the seeds
+        results = []
+        for step in (["seed"], ["build", "--exclude-resource-type", "seed"]):
+            project.invoke([*step, *extra], schema=args.schema, quiet=True)
+            path = project.target_path / "run_results.json"
+            if path.exists():
+                results += json.loads(path.read_text())["results"]
+                path.unlink()
     counts = collections.Counter(r["status"] for r in results)
     reasons: dict[str, list[str]] = collections.defaultdict(list)
     for r in results:
