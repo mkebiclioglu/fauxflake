@@ -90,9 +90,15 @@ class TableSQL:
 
     base = "g"  # what a column's randomness is keyed on: the row, or another column's value (`follows`)
 
+    def salt(self, name: str) -> str:
+        if self.base == "g":
+            return f"{self.spec.seed}:{self.t.name}:{name}"
+        # keyed on an entity's id: the same id must give the same attributes in every table
+        return f"{self.spec.seed}:entity:{name.split('.')[-1].lower()}"
+
     def u(self, salt: str, *extra: str) -> str:
         args = "".join(f", {e}" for e in extra)
-        return f"((hash({self.base}, {lit(f'{self.spec.seed}:{self.t.name}:{salt}')}{args}) >> 11)::double / 9007199254740992.0)"
+        return f"((hash({self.base}, {lit(self.salt(salt))}{args}) >> 11)::double / 9007199254740992.0)"
 
     def key_expr(self, table: Table, index: str) -> str:
         _col, d = table.key
@@ -103,7 +109,10 @@ class TableSQL:
     def column(self, col: str, d: dict) -> str:
         return f'{self.expr(col, d)} as "{col}"'
 
-    def _object(self, col: str, fields: dict[str, dict]) -> str:
+    def _object(self, col: str, fields: dict[str, dict], keyed_by: str | None = None) -> str:
+        """`keyed_by` names the field that identifies the entity the object describes (a user's
+        id): the other fields are then a function of it, so the same id always has the same name."""
+        key_expr = f"({self.expr(f'{col}.{keyed_by}', fields[keyed_by])})" if keyed_by in fields else None
         tree: dict = {}
         for path, d in fields.items():
             node = tree
@@ -118,7 +127,16 @@ class TableSQL:
         def build(node: dict) -> str:
             parts = []
             for key, value in node.items():
-                inner = self.expr(f"{col}.{value[1]}", value[2]) if isinstance(value, tuple) else build(value)
+                if not isinstance(value, tuple):
+                    inner = build(value)
+                elif key_expr and value[1] != keyed_by and self.base == "g":
+                    self.base = key_expr
+                    try:
+                        inner = self._expr(f"{col}.{value[1]}", value[2])
+                    finally:
+                        self.base = "g"
+                else:
+                    inner = self.expr(f"{col}.{value[1]}", value[2])
                 parts.append(f"{lit(key)}, {inner}")
             return f"json_object({', '.join(parts)})"
 
@@ -162,7 +180,7 @@ class TableSQL:
                 if chunk == "n":
                     parts.append(f"({self.base} + 1)::varchar" if self.base == "g" else f"({self.base})::varchar")
                 elif chunk == "hex":
-                    parts.append(f"substr(md5(concat({lit(f'{self.spec.seed}:{self.t.name}:{col}:')}, {self.base})), 1, 12)")
+                    parts.append(f"substr(md5(concat({lit(self.salt(col) + ':')}, {self.base})), 1, 12)")
                 elif chunk:
                     parts.append(lit(chunk))
             expr = f"concat({', '.join(parts)})"
@@ -171,7 +189,7 @@ class TableSQL:
             if d.get("format"):  # a text column holding dates in this format
                 expr = f"strftime({expr}, {lit(d['format'])})"
         elif gen == "object":
-            expr = self._object(col, d["fields"])
+            expr = self._object(col, d["fields"], d.get("keyed_by"))
         elif gen == "array":
             n = f"floor({self.u(col)} * 4)::bigint"
             expr = f"to_json(list_transform(range({n}), lambda i: concat({lit(col.lower() + '_')}, i)))::JSON"

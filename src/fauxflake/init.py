@@ -290,6 +290,8 @@ def build_spec(manifest: dict, database: str) -> tuple[dict, list[str]]:
                 out[col] = {"gen": "categorical", "values": {v: round(1 / len(values), 4) for v in values}}
             elif col in use.paths:
                 out[col] = {"gen": "object", "fields": {path: guess(path.split(".")[-1], h) for path, h in sorted(use.paths[col].items())}}
+                if "id" in out[col]["fields"]:
+                    out[col]["keyed_by"] = "id"  # {"id": 7, "login": "x"}: the login belongs to the id
                 if col in use.json_text:
                     out[col]["type"] = "VARCHAR"
             elif col in use.arrays:
