@@ -10,10 +10,10 @@ incremental models and snapshots are tested the way production exercises them.
 
 No credentials in CI, no rows leave the warehouse, no warehouse spins up.
 
-How close is it to the real thing? Thirteen third-party dbt packages (922 models) were built
-on this emulator and on real Snowflake and compared row for row: 902 models are identical,
-15 differ only because they read the clock, and 5 differ in an order Snowflake leaves
-undefined. [Details and the other measurements](#is-the-emulator-right).
+How close is it to the real thing? Fourteen third-party dbt packages (973 models) were built
+on this emulator and on real Snowflake and compared row for row: 944 models are identical,
+22 differ only because they read the clock, and 7 differ in an order Snowflake leaves
+undefined or hold values made with `RANDOM()`. [Details and the other measurements](#is-the-emulator-right).
 
 | | |
 | --- | --- |
@@ -286,16 +286,16 @@ doubled. `fauxflake check` fails CI when models read a column the spec does not 
 Measured, not assumed, in four ways. Everything below was run; the commands are in this repo.
 
 **1. Answers recorded from Snowflake.** [`conformance/cases.yml`](conformance/cases.yml) holds
-285 small queries covering the SQL analytics code leans on: number scale and rounding, null
+287 small queries covering the SQL analytics code leans on: number scale and rounding, null
 ordering, implicit conversions, dates and time zones, strings and regular expressions,
 semi-structured data, arrays, window functions, pivots, set operations, name resolution.
 `fauxflake conformance --connection <name>` runs them on real Snowflake once and stores the
 answers in `golden.json`. CI replays them against the emulator with no Snowflake access.
 
-Current score: **285 of 285 match.** A case that stops matching fails CI.
+Current score: **287 of 287 match.** A case that stops matching fails CI.
 
-**2. Other people's projects, row for row against Snowflake.** Thirteen Fivetran dbt packages
-ship integration tests with seed data. Each was built twice, on the emulator and on a real
+**2. Other people's projects, row for row against Snowflake.** Thirteen Fivetran packages and
+Snowplow's unified package ship integration tests with seed data. Each was built twice, on the emulator and on a real
 Snowflake account, and every model compared row for row
 (`scripts/selftest.py <project> --snowflake <connection>`):
 
@@ -307,6 +307,7 @@ Snowflake account, and every model compared row for row
 | NetSuite | 93 | 93 | | |
 | Zendesk | 76 | 71 | 5 | |
 | Stripe | 63 | 63 | | |
+| Snowplow unified | 51 | 42 | 7 | 2 |
 | Jira | 48 | 44 | 4 | |
 | Intercom | 42 | 42 | | |
 | Recharge | 40 | 40 | | |
@@ -317,12 +318,14 @@ Snowflake account, and every model compared row for row
 
 "Differ only by the clock" are models that compute time since `current_timestamp`: the two
 builds ran minutes apart. The "other" models differ in the order of a `LISTAGG` with no
-`ORDER BY`, or in a running total over rows that tie in its `ORDER BY`. Snowflake does not
-define either order. No model differs for any other reason.
+`ORDER BY` (Shopify), in a running total over rows that tie in its `ORDER BY` (QuickBooks), or
+hold test values made with `RANDOM()` (Snowplow). No model differs for any other reason, and
+on the emulator each package also passes all of its own tests.
 
 It did not start that way. This comparison is what found that `persist_docs` broke every model,
 that a flattened value never equalled the text it holds, that arrays built in a `CASE` could
-not be unioned, and that `v['a'][0]['b']` read the wrong element. All fixed, each with a
+not be unioned, that `v['a'][0]['b']` and `v[0].name` read the wrong element, and that
+`ARRAY_AGG ... WITHIN GROUP` kept NULLs. All fixed, each with a
 conformance case.
 
 **3. Packages that test themselves.** These bring inputs, expected outputs and the tests that
@@ -334,6 +337,7 @@ compare them. On the emulator:
 | dbt-expectations integration tests | 169 | 169 |
 | dbt-date integration tests | 73 | 73 |
 | dbt_artifacts integration project | 136 | 136 |
+| Snowplow unified integration tests | 234 | 234 |
 
 **4. Projects with no data to borrow.** Two measurements.
 
@@ -347,7 +351,7 @@ and runs every model through the emulator on empty stub tables whose columns it 
 
 | project | models | run end to end | emulator failure | blocked by guessed stub columns, or undecided |
 | --- | --- | --- | --- | --- |
-| GitLab | 2,679 | GITLAB_OK | GITLAB_FAIL | GITLAB_REST |
+| GitLab | 2,679 | 2,266 (84.6%) | 14 (0.5%) | 399 (14.9%) |
 | Mattermost analytics | 194 | 182 (93.8%) | 6 (3.1%) | 6 (3.1%) |
 | Flipside near | 63 | 60 (95.2%) | 2 (3.2%) | 1 (1.6%) |
 | Snowflake monitoring | 25 | 21 (84.0%) | 1 (4.0%) | 3 (12.0%) |
