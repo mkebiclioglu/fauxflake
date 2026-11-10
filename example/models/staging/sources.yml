@@ -1,0 +1,11 @@
+version: 2
+sources:
+  - name: shop
+    database: RAW
+    schema: SHOP
+    config:
+      loaded_at_field: _loaded_at
+    tables:
+      - name: customers
+      - name: orders
+      - name: events

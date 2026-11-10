@@ -1,0 +1,11 @@
+name: shop
+version: "1.0"
+profile: shop
+model-paths: [models]
+target-path: target
+models:
+  shop:
+    staging: {+materialized: view}
+    marts: {+materialized: table}
+vars:
+  late_window_days: 3

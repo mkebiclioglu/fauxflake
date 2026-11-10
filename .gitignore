@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+.pytest_cache/
+target/
+logs/
+dbt_packages/
+.fauxflake/
+*.db
+*.duckdb
+.user.yml

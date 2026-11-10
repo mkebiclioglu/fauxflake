@@ -1,0 +1,52 @@
+# What the raw sources look like. Aggregates only: no rows ever leave Snowflake.
+# `fauxflake profile` measures volume, lateness and plain columns from prod;
+# keys, foreign keys and lifecycles are declared by hand.
+seed: 42
+start: 2025-01-01          # first event day of the synthetic universe
+dbt:
+  database: ANALYTICS      # where dbt builds models inside the emulator
+
+tables:
+  RAW.SHOP.CUSTOMERS:
+    volume: {rows_per_day: 40000, growth_per_year: 0.3, weekly: [1, 1, 1, 1, 1, 0.8, 0.7], noise: 0.05}
+    lateness: {p: [0, 0.5, 0.99, 1], seconds: [2, 30, 600, 3600]}
+    columns:
+      CUSTOMER_ID: {gen: sequence}
+      EMAIL: {gen: template, template: "user_{hex}@example.com"}   # PII is always invented
+      COUNTRY: {gen: categorical, values: {US: 0.46, DE: 0.17, GB: 0.14, FR: 0.11, TR: 0.07, JP: 0.05}, null_rate: 0.01}
+      CREATED_AT: {gen: event_time}
+      _LOADED_AT: {gen: loaded_at}
+
+  RAW.SHOP.ORDERS:
+    # Change log: every status change appends a new version of the order.
+    volume: {rows_per_day: 1200000, growth_per_year: 0.4, weekly: [0.9, 0.95, 1, 1, 1.15, 1.3, 1.2], noise: 0.08}
+    lateness: {p: [0, 0.5, 0.95, 0.999, 1], seconds: [1, 20, 300, 7200, 86400]}
+    duplicate_rate: 0.002    # at-least-once delivery
+    intraday: {p: [0, 0.2, 0.6, 0.9, 1], hours: [0, 8, 14, 21, 24]}
+    columns:
+      ORDER_ID: {gen: sequence}
+      CUSTOMER_ID: {gen: fk, ref: RAW.SHOP.CUSTOMERS, skew: 1.6}   # a few customers order a lot
+      STATUS:
+        gen: lifecycle
+        initial: placed
+        steps:
+          - {to: shipped, p: 0.97, delay: {p: [0, 0.5, 0.95, 1], seconds: [1800, 43200, 172800, 432000]}}
+          - {to: delivered, p: 0.96, delay: {p: [0, 0.5, 0.95, 1], seconds: [43200, 172800, 432000, 1209600]}}
+          - {to: returned, p: 0.06, delay: {p: [0, 0.5, 1], seconds: [86400, 604800, 2592000]}}
+      CHANNEL: {gen: categorical, values: {web: 0.58, app: 0.37, store: 0.05}}
+      AMOUNT: {gen: dist, type: "DECIMAL(12,2)", p: [0, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99, 1], v: [1.5, 8, 21, 39, 74, 180, 420, 5000]}
+      ORDERED_AT: {gen: event_time}
+      UPDATED_AT: {gen: updated_at}
+      _LOADED_AT: {gen: loaded_at}
+
+  RAW.SHOP.EVENTS:
+    # Mobile clients buffer offline: most events land in seconds, a tail takes days.
+    volume: {rows_per_day: 25000000, growth_per_year: 0.6, weekly: [1, 1, 1, 1, 1.05, 1.2, 1.2], noise: 0.1}
+    lateness: {p: [0, 0.5, 0.9, 0.99, 0.999, 1], seconds: [1, 3, 60, 21600, 172800, 250000]}
+    duplicate_rate: 0.001
+    columns:
+      EVENT_ID: {gen: hash_id}
+      CUSTOMER_ID: {gen: fk, ref: RAW.SHOP.CUSTOMERS, skew: 2.0, null_rate: 0.12}   # anonymous sessions
+      EVENT_TYPE: {gen: categorical, values: {page_view: 0.7, add_to_cart: 0.18, checkout: 0.08, purchase: 0.04}}
+      OCCURRED_AT: {gen: event_time}
+      _LOADED_AT: {gen: loaded_at}

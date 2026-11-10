@@ -1,0 +1,20 @@
+version: 2
+models:
+  - name: fct_orders
+    columns:
+      - name: order_id
+        data_tests: [unique, not_null]
+      - name: customer_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments: {to: "ref('stg_customers')", field: customer_id}
+              config: {severity: warn}  # dimensions can arrive after their facts
+      - name: status
+        data_tests:
+          - accepted_values:
+              arguments: {values: [placed, shipped, delivered, returned]}
+  - name: fct_daily_events
+    columns:
+      - name: event_date
+        data_tests: [not_null]
