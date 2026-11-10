@@ -50,7 +50,12 @@ class DbtProject:
         (self.dir / ".fauxflake" / ".gitignore").write_text("*\n")
         declared = any((self.dir / f).exists() for f in ("packages.yml", "dependencies.yml"))
         if declared and not (self.dir / "dbt_packages").exists():
-            self.invoke(["deps"], quiet=True)  # so a fresh checkout works without a separate step
+            self.deps()  # so a fresh checkout works without a separate step
+
+    def deps(self) -> bool:
+        from dbt.cli.main import dbtRunner
+
+        return bool(dbtRunner().invoke(["--quiet", "deps", "--project-dir", str(self.dir)]).success)
 
     def invoke(self, args: list[str], schema: str = "CI", quiet: bool = False) -> bool:
         from dbt.cli.main import dbtRunner

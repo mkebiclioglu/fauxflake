@@ -14,8 +14,7 @@ PROJECT = Path(__file__).parent / "projects" / "kitchen_sink"
 def test_dbt_utils_seeds_snapshots_and_ephemerals(emu):
     spec = Spec.load(PROJECT / "fauxflake.yml")
     project = DbtProject(PROJECT, emulator_output(emu.port, "ANALYTICS"))
-    if not (PROJECT / "dbt_packages" / "dbt_utils").exists():
-        assert project.invoke(["deps"], quiet=True)
+    assert (PROJECT / "dbt_packages" / "dbt_utils").exists()  # installed on first use
     results = simulate(Warehouse(emu, spec, 1.0), project, datetime(2025, 1, 21), days=3, log=lambda *_: None)
     snapshot = next(r for r in results if r.model == "users_snapshot (snapshot)")
     assert snapshot.ok and snapshot.incremental_rows > 400
