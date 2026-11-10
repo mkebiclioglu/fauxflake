@@ -85,6 +85,7 @@ class Spec:
     tables: dict[str, Table]
     dbt: dict
     path: Path | None = None
+    udfs: dict[str, str] = field(default_factory=dict)  # name -> "(args) as <DuckDB SQL>"
 
     @classmethod
     def load(cls, path: str | Path) -> "Spec":
@@ -97,7 +98,8 @@ class Spec:
             cols = {c.upper(): dict(d or {}) for c, d in (t.get("columns") or {}).items()}
             tables[name] = Table(name=name, raw=t, columns=cols)
         spec = cls(seed=int(raw.get("seed", 1)), start=_date(raw["start"]), tables=tables,
-                   dbt=raw.get("dbt") or {}, path=Path(path))
+                   dbt=raw.get("dbt") or {}, path=Path(path),
+                   udfs={k.lower(): v for k, v in (raw.get("udfs") or {}).items()})
         spec.validate()
         return spec
 

@@ -219,6 +219,7 @@ class Warehouse:
                  freeze_clock: bool = True):
         self.emu, self.spec, self.scale, self.scenario = emu, spec, scale, scenario
         self.freeze_clock = freeze_clock
+        emulator.define_udfs(emu, spec.udfs)
         self.cur: duckdb.DuckDBPyConnection = emu.cursor()
         self.now: datetime | None = None
 

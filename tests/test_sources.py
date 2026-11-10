@@ -60,3 +60,15 @@ def test_check_finds_columns_the_spec_does_not_generate(emu, spec):
     assert check(manifest, broken, "ANALYTICS") == [
         "RAW.SHOP.ORDERS.CHANNEL: used by the project, missing from the spec",
         "RAW.SHOP.EVENTS: used by the project, missing from the spec"]
+
+
+def test_udfs_from_the_spec_are_callable(emu, spec):
+    import snowflake.connector
+
+    with_udfs = upsert_spec(spec)
+    with_udfs.udfs = {"fiscal_year": "(d) as year(d + interval 11 month)", "id15to18": "(x) as x || 'AAA'"}
+    Warehouse(emu, with_udfs, 0.0002)
+    conn = snowflake.connector.connect(**emu.connect_kwargs(database="ANALYTICS", schema="CI"))
+    row = conn.cursor().execute(
+        "select fiscal_year('2025-03-01'::date), analytics.udfs.fiscal_year('2025-01-15'::date), ID15TO18('abc')").fetchone()
+    assert row == (2026, 2025, "abcAAA")

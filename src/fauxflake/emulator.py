@@ -188,6 +188,15 @@ class Emulator:
         ) | overrides
 
 
+def define_udfs(emu: "Emulator", udfs: dict[str, str]) -> None:
+    """Stand-ins for functions that exist only in your Snowflake account, from the spec's `udfs:`.
+    Each is `name: "(args) as <DuckDB SQL>"` and is callable with or without qualification."""
+    semantics.UDFS.clear()
+    for name, body in udfs.items():
+        emu.duck.execute(f"create or replace macro _fs_global.main._udf_{name}{body}")
+        semantics.UDFS[name] = f"_udf_{name}"
+
+
 def free_port() -> int:
     with contextlib.closing(socket.socket(type=socket.SOCK_STREAM)) as sock:
         sock.bind(("127.0.0.1", 0))

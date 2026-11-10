@@ -19,7 +19,7 @@ MACROS = [
     # NUMBER / NUMBER keeps max(s, min(s + 6, 12)) decimals and raises on zero.
     # DuckDB returns a full-precision double, and NULL on zero.
     f"""create or replace macro {_NS}_sf_div(a, b) as case
-          when b = 0 then error('Division by zero')
+          when b = 0 and a is not null then error('Division by zero')
           when typeof(a) in ('DOUBLE', 'FLOAT') or typeof(b) in ('DOUBLE', 'FLOAT') then a / b
           else round(a::double / b, greatest({_SCALE}, least({_SCALE} + 6, 12))) end""",
     # DATE_TRUNC keeps the input type. DuckDB turns a DATE into a TIMESTAMP.
@@ -51,6 +51,8 @@ MACROS = [
           when typeof(x) in ('DOUBLE', 'FLOAT') then format('{{:.15g}}', x::double) else x::varchar end""",
     f"""create or replace macro {_NS}_sf_width_bucket(x, lo, hi, n) as case
           when x < lo then 0 when x >= hi then n + 1 else floor((x - lo) * n / (hi - lo))::bigint + 1 end""",
+    f"create or replace macro {_NS}_sf_current_account_name() as 'FAUXFLAKE'",
+    f"create or replace macro {_NS}_sf_try_base64(x) as try(from_base64(x)::varchar)",
     f"create or replace macro {_NS}_sf_try_timestamp(x) as try_cast(x::varchar as timestamp)",
     f"create or replace macro {_NS}_sf_array_distinct(l) as list_filter(l, lambda x, i: list_position(l, x) = i)",
     f"create or replace macro {_NS}_sf_jarowinkler(a, b) as round(jaro_winkler_similarity(upper(a), upper(b)) * 100)::bigint",
@@ -71,9 +73,13 @@ _RENAMED = {  # Snowflake function -> macro, same arguments
     "width_bucket": "_sf_width_bucket", "array_distinct": "_sf_array_distinct",
     "jarowinkler_similarity": "_sf_jarowinkler", "object_insert": "_sf_object_insert",
     "object_delete": "_sf_object_delete", "object_pick": "_sf_object_pick",
+    "current_account_name": "_sf_current_account_name", "try_base64_decode_string": "_sf_try_base64",
     "as_integer": "_sf_as_integer", "as_varchar": "_sf_as_varchar", "as_char": "_sf_as_varchar",
     **{f"is_{k}": f"_sf_is_{k}" for k in ("object", "array", "integer", "varchar", "char", "boolean", "decimal", "double", "real")},
 }
+_DATE_TOKENS = re.compile(r"YYYY|YY|MM|DD|HH|MI|SS|MON|DY|AM|PM", re.IGNORECASE)
+_HASHES = (exp.MD5, exp.SHA, exp.SHA2, exp.MD5Digest)
+UDFS: dict[str, str] = {}  # user-defined functions from the spec: name -> macro name
 _DAY_UNITS = {"YEAR", "QUARTER", "MONTH", "WEEK", "DAY", "YEARS", "QUARTERS", "MONTHS", "WEEKS", "DAYS"}
 _ARITHMETIC = (exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Mod)
 _NUMERIC_TEXT = re.compile(r"^\s*-?\d+(\.\d+)?\s*$")
@@ -224,12 +230,30 @@ def _fix(node: exp.Expression) -> exp.Expression:
         return _fn("_sf_div", node.this, node.expression)
     if isinstance(node, (exp.TimestampTrunc, exp.DateTrunc)):
         return _fn("_sf_date_trunc", exp.Literal.string(node.unit.name.lower()), node.this)
+    if isinstance(node, _HASHES) and not (isinstance(node.this, exp.Literal) and node.this.is_string):
+        node.set("this", _fn("_sf_text", node.this))  # MD5(42) hashes the text '42'
+    if isinstance(node, exp.Anonymous) and node.name.lower() in UDFS:
+        call = _fn(UDFS[node.name.lower()], *node.expressions)
+        if isinstance(node.parent, exp.Dot):  # db.schema.my_udf(x): drop the qualification
+            top = node.parent
+            while isinstance(top.parent, exp.Dot):
+                top = top.parent
+            top.replace(call)
+        return call
     if isinstance(node, exp.Typeof):
         return _fn("_sf_typeof", node.this)
     if isinstance(node, exp.ToChar) and isinstance(node.args.get("format"), exp.Literal):
         formatted = _number_format(node.this, node.args["format"].name)
         if formatted is not None:
             return formatted
+        if _DATE_TOKENS.search(node.args["format"].name):
+            # TO_CHAR(column, 'YYYYMMDD'): without a known column type the format was dropped
+            from sqlglot.dialects.snowflake import Snowflake
+            from sqlglot.time import format_time
+
+            model = node.args["format"].name.replace("Mon", "MON").replace("Dy", "DY")
+            fmt = format_time(model, Snowflake.TIME_MAPPING, Snowflake.TIME_TRIE)
+            return exp.TimeToStr(this=exp.cast(node.this, "timestamp"), format=exp.Literal.string(fmt))
     if isinstance(node, exp.Avg) and not (isinstance(node.parent, exp.Window) and node.parent.this is node):
         return _avg(node)
     if isinstance(node, exp.Window):

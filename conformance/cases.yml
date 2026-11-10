@@ -146,3 +146,7 @@
 - {id: decimal_to_string, sql: "select 3::number(10,2)::string, 'a' || x, x::varchar, to_varchar(x), concat(x, '|'), 2.5::float::string from (select 1.50::number(10,2) x)"}
 - {id: window_avg_scale, sql: "select avg(x) over (), avg(y) over (), avg(z) over (partition by x), avg(f) over () from (select column1 x, column2::number(12,2) y, column3::number(12,5) z, column4::float f from values (1, 1.5, 1.5, 1.5), (2, 2.25, 1, 2), (4, 0.1, 1, 4)) order by x limit 1"}
 - {id: agg_scales, sql: "select variance(x), variance(y), variance(f), var_pop(z), avg(z), avg(f), sum(y), sum(x), sum(f) from (select column1 x, column2::number(12,2) y, column3::number(12,5) z, column4::float f from values (1, 1.5, 1.5, 1.5), (2, 2.25, 1, 2), (4, 0.1, 1, 4))"}
+- {id: to_char_column, sql: "select to_char(d, 'YYYYMMDD'), to_char(d, 'YYYY-MM'), to_char(t, 'YYYY-MM-DD HH24:MI'), to_varchar(d, 'DD/MM/YYYY'), to_char(d, 'YYYYMMDD')::int from (select '2025-03-04'::date d, '2025-03-04 15:06:07'::timestamp t)"}
+- {id: hash_numbers, sql: "select md5(42), md5(1.5), md5(x), sha2(x), md5(d) from (select 7 x, '2025-03-04'::date d)"}
+- {id: null_division, sql: "select null / 0, x / nullif(y, 0), div0(x, y), sum(x) / nullif(count(z), 0) from (select 1 x, 0 y, null::int z)"}
+- {id: try_timestamps, sql: "select try_to_timestamp_ntz('2025-01-01 00:00:00'), to_timestamp_ntz('2025-01-01'), try_to_timestamp('2025-01-01', 'YYYY-MM-DD'), try_to_timestamp('x', 'YYYY-MM-DD'), try_to_date('31/12/2025', 'DD/MM/YYYY'), try_to_number('1x'), try_to_decimal('1.5', 10, 2)"}
