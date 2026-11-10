@@ -159,6 +159,9 @@
    ]
   ]
  },
+ "array_agg_skips_nulls": {
+  "error": "000979 (42601): SQL compilation error:"
+ },
  "array_agg_variants": {
   "rows": [
    [

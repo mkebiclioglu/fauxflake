@@ -821,6 +821,16 @@ def finish(transformed: exp.Expression) -> exp.Expression:
         if not ident.args.get("quoted") and ident.name.upper() in _RESERVED \
                 and not (isinstance(ident.parent, exp.Column) and ident.name.upper() in _BARE):
             ident.set("quoted", True)
+    for agg in list(transformed.find_all(exp.ArrayAgg)):
+        # ARRAY_AGG leaves NULLs out, also with DISTINCT or WITHIN GROUP (ORDER BY ...)
+        if isinstance(agg.parent, exp.Filter):
+            continue
+        value = agg.this
+        while isinstance(value, (exp.Order, exp.Distinct)):
+            value = value.this if isinstance(value, exp.Order) else value.expressions[0]
+        slot = exp.Null()
+        agg.replace(slot)
+        slot.replace(exp.Filter(this=agg, expression=exp.Where(this=exp.Is(this=value.copy(), expression=exp.Null()).not_())))
     for window in list(transformed.find_all(exp.Window)):
         # OBJECT_AGG(...) OVER (...) became to_json(map(list(..), list(..))) OVER: window each aggregate
         wrapper = window.this
