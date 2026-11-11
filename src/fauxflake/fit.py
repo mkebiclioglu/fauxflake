@@ -491,6 +491,36 @@ class Fitter:
                         self.retyped.add(table)
                         self.dirty = True
 
+    def split_number(self, uid: str, name: str) -> bool:
+        """`split_part(split_part(value, ':', 2), ',', 1) as field_id`, later read as a number: the text
+        column holds delimited pieces, and that piece is a number. Generate text of that shape."""
+        changed = False
+        for node_id in [uid, *sorted(a for a in self._ancestors(uid) if a.startswith(("model.", "snapshot.")))]:
+            tree = self.tree(node_id)
+            for alias in (tree.find_all(exp.Alias) if tree is not None else []):
+                if alias.alias.upper() != name:
+                    continue
+                arg, template = alias.this, "{n}"
+                while isinstance(arg, (exp.Cast, exp.TryCast, exp.Paren, exp.Trim, exp.SplitPart, exp.Replace)):
+                    if isinstance(arg, exp.SplitPart):
+                        delimiter, part = arg.args.get("delimiter"), arg.args.get("part_index")
+                        if not (isinstance(delimiter, exp.Literal) and isinstance(part, exp.Literal) and part.is_int):
+                            break
+                        template = delimiter.name.join([*["x"] * (int(part.name) - 1), template, "x"])
+                    arg = arg.this
+                if not isinstance(arg, exp.Column) or template == "{n}":
+                    continue
+                for table in self.sources_of(uid):
+                    columns = self.tables[table].get("columns") or {}
+                    column = arg.name.upper()
+                    if column in columns and columns[column] != {"gen": "template", "template": template}:
+                        columns[column] = {"gen": "template", "template": template}
+                        self.retyped.add(table)
+                        self.learned.append(f"{table}.{column}: {name} is a piece of it read as a number; generated as {template!r}.")
+                        changed = True
+        self.dirty |= changed
+        return changed
+
     def split_format(self, uid: str, column: str, fmt: str) -> str:
         """`to_date(split_part(col, ' - ', 2), fmt)`: the column holds several dates in that format,
         joined by the delimiter. The format that makes every part parse."""
@@ -1300,7 +1330,7 @@ class Fitter:
             return True
         named = _FROM_COLUMN.search(message)
         bad = _BAD_CAST.search(message)
-        if bad and named and bad.group("from").startswith("TIMESTAMP") and re.match(r"DECIMAL|DOUBLE|BIGINT|INTEGER|HUGEINT", bad.group("to")):
+        if bad and named and bad.group("from").startswith(("TIMESTAMP", "DATE")) and re.match(r"DECIMAL|DOUBLE|BIGINT|INTEGER|HUGEINT", bad.group("to")):
             # a column the SQL casts to a number before reading it as a time holds epoch numbers
             return self.retype_column(sql_key, named.group(1).upper(), "EPOCH")
         for pattern, fixed in _CONVERT:
@@ -1325,6 +1355,8 @@ class Fitter:
                         return True
                 if hint == "TIMESTAMP" and re.fullmatch(r"\d{4}-\d\d-\d\d \d{4}-\d\d-\d\d[ T][\d:.]+", m.group("value")):
                     return any([self.retype_column(sql_key, c, "TIMESTAMP", "%H:%M:%S") for c in self.columns_used(sql_key, "time_of_day")])
+                if hint in ("BIGINT", "DOUBLE") and named and self.split_number(sql_key, named.group(1).upper()):
+                    return True
                 if m.group("value") == "" and hint in ("BIGINT", "DOUBLE", "DATE", "TIMESTAMP", "BOOLEAN"):
                     # `nullif(col, '')` on a column generated as a number or a date: the SQL treats it as text
                     return any([self.retype_column(sql_key, c, "TEXT") for c in self.columns_used(sql_key, "empty")])
@@ -1548,6 +1580,9 @@ class Fitter:
             self.log(f"  {len(self.deferred)} model(s) inspect the warehouse while compiling, or read one that does: left to the build")
         self.hidden_dependencies()
         nodes = manifest["nodes"]
+        for uid in order:  # `(log_date || ' ' || log_time)::timestamp`: known from the SQL before anything runs
+            for column in self._columns_used(self.tree(uid), "time_of_day"):
+                self.retype_column(uid, column, "TIMESTAMP", "%H:%M:%S")
         sources = {uid: _fq(f'{n["database"]}.{n["schema"]}.{n.get("identifier") or n["name"]}')
                    for uid, n in manifest.get("sources", {}).items()}
         failures: dict[str, str] = {}
