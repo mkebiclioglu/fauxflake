@@ -476,6 +476,9 @@ class Fitter:
         names = list(dict.fromkeys([name, *self.origins(uid, name)]))  # and the source columns an output column is made from
         for table, name in [(t, n) for t in tables for n in names]:
             columns = self.tables[table].get("columns") or {}
+            if name not in columns:  # "Sum of Open Opportunities" is sum_of_open_opportunities in generated text
+                flat = re.sub(r"\W+", "_", name).strip("_")
+                name = next((c for c in columns if re.sub(r"\W+", "_", c).strip("_") == flat), name)
             gen = columns.get(name)
             if gen is None:
                 continue
@@ -895,11 +898,13 @@ class Fitter:
                     continue
                 inner = alias.this
                 found = [inner] if isinstance(inner, exp.Column) else []
-                if isinstance(inner, exp.Case):
-                    found += [e for e in [*(i.args.get("true") for i in inner.args.get("ifs") or []), inner.args.get("default")]
-                              if isinstance(e, exp.Column)]
-                elif isinstance(inner, (exp.Coalesce, exp.Cast, exp.TryCast)):
-                    found += [e for e in inner.iter_expressions() if isinstance(e, exp.Column)]
+                if isinstance(inner, exp.Case):  # what the branches give, not what they test
+                    for e in [*(i.args.get("true") for i in inner.args.get("ifs") or []), inner.args.get("default")]:
+                        found += list(e.find_all(exp.Column))[:2] if e is not None else []
+                elif not found and not inner.find(exp.Window, exp.AggFunc, exp.Subquery):
+                    # a cast, a concatenation, a function of one or two columns: `concat(period, '01') as period_id`
+                    columns = list(inner.find_all(exp.Column))
+                    found += columns if len({c.name.upper() for c in columns}) <= 2 else []
                 for col in found:
                     if col.name.upper() != name:
                         out += self.origins(node_id, col.name.upper(), depth + 1)
@@ -973,8 +978,46 @@ class Fitter:
         self.dirty |= changed
         return changed
 
+    def runaway(self, sql_key: str, message: str) -> bool:
+        """The model did not finish, or filled the disk: on generated data that is a join that pairs
+        every row with every row. Tables joined on a range (`a.day between b.start and b.finish`) are
+        small reference tables in real life: generate them small."""
+        if not re.search(r"statement stopped after|stopped after \d+s|No space left on device|max_temp_directory_size|"
+                         r"Out of Memory|could not allocate|exceeds the limit", message, re.I):
+            return False
+        tree = self.tree(sql_key)
+        if tree is None:
+            return False
+        ctes = {c.alias.upper(): c.this for c in tree.find_all(exp.CTE)}
+        targets: set[str] = set()
+        for join in tree.find_all(exp.Join):
+            on = join.args.get("on")
+            equal = [e for e in (on.find_all(exp.EQ) if on is not None else [])
+                     if isinstance(e.this, exp.Column) and isinstance(e.expression, exp.Column) and e.this.table != e.expression.table]
+            if equal or join.args.get("using"):
+                continue  # joined on a key
+            for fq in self.real_tables(join.this, ctes):
+                source = self._source_behind(fq) or (fq if fq in self.tables else None)
+                owner = self.by_rel.get(fq) or self.relation_owner.get(fq) or ""
+                targets |= {source} if source else {t for t in self.sources_of(owner) if t in self.tables}
+        changed = False
+        for table in sorted(targets):
+            volume = self.tables[table].setdefault("volume", {})
+            rows = float(volume.get("rows_per_day", 1000))
+            if rows <= 1000:
+                continue
+            volume["rows_per_day"] = max(1000, int(rows / 100))
+            self.retyped.add(table)
+            self.learned.append(f"{table}: joined on a range by {self.nodes.get(sql_key, {}).get('name', sql_key)}, which did not "
+                                f"finish; generated as a small reference table ({volume['rows_per_day']} rows a day before scaling).")
+            changed = True
+        self.dirty |= changed
+        return changed
+
     def learn(self, sql_key: str, message: str) -> bool:
         """Apply whatever one error message teaches. True when the spec changed."""
+        if self.runaway(sql_key, message):
+            return True
         if self.udf_input(sql_key, message) or self.pivot_values(sql_key, message) or self.missing_column(sql_key, message) or self.missing_relation(sql_key, message) \
                 or self.union_widths(sql_key, message):
             return True
@@ -1197,6 +1240,7 @@ class Fitter:
                     continue
                 if "INTERRUPT" in message.upper() or "statement stopped after" in message or isinstance(e, TimeoutError):
                     message = f"stopped after {self.model_timeout:.0f}s: the query runs away on the generated data"
+                    self.runaway(uid, message)
                 else:
                     known, self.retyped = self.retyped, set()
                     learned = self.learn(uid, message)
@@ -1306,7 +1350,7 @@ class Fitter:
         summary: dict = {}
         selected: list[str] = []
         outcome: dict[str, tuple[str, str, str]] = {}  # node -> (kind, status, message), across rounds
-        os.environ["FAUXFLAKE_STATEMENT_TIMEOUT"] = "900"  # a real build, at build scale: give statements room
+        os.environ["FAUXFLAKE_STATEMENT_TIMEOUT"] = "300"  # a real build, at build scale: more room than a trial run gets
         for n_round in range(1, rounds + 1):
             # at the scale and history `fauxflake build` uses, so that what is reported here is what a build gives
             self.generate(scale=0.001, history=60)
@@ -1393,6 +1437,16 @@ class Fitter:
             # next round: what failed, what reads a source whose values changed, and everything downstream
             changed = [f"source:{n['source_name']}.{n['name']}+" for uid, n in manifest.get("sources", {}).items()
                        if self.source_names.get(uid) in self.retyped]
+            # and the models that name a changed table themselves, or find it by looking at the warehouse
+            hit = {fq.upper() for fq in self.retyped} | {fq.split(".", 1)[1].upper() for fq in self.retyped}
+            for node in nodes.values():
+                code = (node.get("compiled_code") or "").upper().replace('"', "") if node.get("resource_type") in ("model", "snapshot") else ""
+                if code and any(name in code for name in hit):
+                    again.add(node["name"])
+            for fq, members in self.unions.items():
+                owner = self.by_rel.get(fq) or self.relation_owner.get(fq)
+                if owner in nodes and any(m in self.retyped for m in members):
+                    again.add(nodes[owner]["name"])
             others = len(self.learned) - before - len(self.retyped)  # lessons about something else than a source's values
             if not again or len(again) + len(changed) > 300 or (others > 0 and not changed and not again):
                 selected = []
