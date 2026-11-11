@@ -345,14 +345,19 @@ def init(spec_path, project_dir, database, force, fit):
     Needs no Snowflake access."""
     from pathlib import Path
 
+    import os
+
     from .dbt import DbtProject, emulator_output
     from .emulator import serve
-    from .init import write_spec
+    from .init import production_target, write_spec
 
     path = Path(spec_path)
     if path.exists() and not force:
         raise click.ClickException(f"{path} already exists (use --force to overwrite)")
     import tempfile
+
+    if not os.environ.get("FAUXFLAKE_TARGET") and production_target(project_dir):
+        os.environ["FAUXFLAKE_TARGET"] = production_target(project_dir)
 
     # on disk, so that a project with thousands of models is bounded by DuckDB's buffer pool, not by RAM
     with tempfile.TemporaryDirectory(prefix="fauxflake-") as scratch, serve(db_path=scratch if fit else None) as emu:

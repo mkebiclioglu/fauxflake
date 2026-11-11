@@ -520,7 +520,10 @@ class Fitter:
                     arg = arg.this
                 if not isinstance(arg, exp.Column) or template == "{n}":
                     continue
-                for table in self.sources_of(uid):
+                scope = alias.find_ancestor(exp.Select)
+                produced = scope is not None and scope.find(exp.Lateral, exp.TableFromRows, exp.Unnest) is not None \
+                    and arg.name.upper() in ("VALUE", "SEQ", "INDEX", "KEY", "PATH", "THIS")
+                for table in ([] if produced else self.sources_of(uid)):  # `value` of a table function is no source column
                     columns = self.tables[table].get("columns") or {}
                     column = arg.name.upper()
                     if column in columns and columns[column] != {"gen": "template", "template": template}:
@@ -528,6 +531,21 @@ class Fitter:
                         self.retyped.add(table)
                         self.learned.append(f"{table}.{column}: {name} is a piece of it read as a number; generated as {template!r}.")
                         changed = True
+                if changed:
+                    continue
+                # the pieces come from an array written out as text (ARRAY_TO_STRING, then SPLIT_TO_TABLE on
+                # '},{'): it is an array of objects whose first field is the number
+                shape = {"gen": "array", "fields": {"id": "number", "value": "text"}}
+                for written in tree.find_all(exp.ArrayToString):
+                    source = written.this
+                    for table in (self.sources_of(uid) if isinstance(source, exp.Column) else []):
+                        columns = self.tables[table].get("columns") or {}
+                        if source.name.upper() in columns and columns[source.name.upper()] != shape:
+                            columns[source.name.upper()] = dict(shape)
+                            self.retyped.add(table)
+                            self.learned.append(f"{table}.{source.name.upper()}: written out and split into fields, one read as a number; "
+                                                "generated as an array of {id, value} objects.")
+                            changed = True
         self.dirty |= changed
         return changed
 
@@ -905,6 +923,20 @@ class Fitter:
         candidates: set[str] = set()
         alias = (m.groupdict().get("table") or "").upper()
         if alias:
+            for c in t.find_all(exp.Column):  # `s` can name a different table in each CTE: take the one in scope
+                select = c.find_ancestor(exp.Select)
+                if c.name.upper() != col or c.table.upper() != alias or select is None or select.args.get("from_") is None:
+                    continue
+                for rel in [select.args["from_"].this, *[j.this for j in select.args.get("joins") or []]]:
+                    if rel.alias_or_name.upper() != alias:
+                        continue
+                    if isinstance(rel, exp.Table) and rel.catalog and rel.db:
+                        candidates.add(f"{rel.catalog.upper()}.{rel.db.upper()}.{rel.name.upper()}")
+                    elif isinstance(rel, exp.Table) and rel.name.upper() in ctes:
+                        candidates |= self.real_tables(ctes[rel.name.upper()], ctes)
+                    elif isinstance(rel, exp.Subquery):
+                        candidates |= self.real_tables(rel.this, ctes)
+        if alias and not candidates:
             for tb in t.find_all(exp.Table):
                 if tb.alias_or_name.upper() != alias:
                     continue
@@ -1119,6 +1151,8 @@ class Fitter:
                 if isinstance(inner, exp.Case):  # what the branches give, not what they test
                     for e in [*(i.args.get("true") for i in inner.args.get("ifs") or []), inner.args.get("default")]:
                         found += list(e.find_all(exp.Column))[:2] if e is not None else []
+                elif not found and isinstance(inner, (exp.Max, exp.Min, exp.AnyValue)) and isinstance(inner.this, exp.Column):
+                    found.append(inner.this)  # max(ts) as max_ts: the same kind of value
                 elif not found and not inner.find(exp.Window, exp.AggFunc, exp.Subquery):
                     # a cast, a concatenation, a function of one or two columns: `concat(period, '01') as period_id`
                     columns = list(inner.find_all(exp.Column))
@@ -1393,6 +1427,10 @@ class Fitter:
         if bad and named and bad.group("from").startswith(("TIMESTAMP", "DATE")) and re.match(r"DECIMAL|DOUBLE|BIGINT|INTEGER|HUGEINT", bad.group("to")):
             # a column the SQL casts to a number before reading it as a time holds epoch numbers
             return self.retype_column(sql_key, named.group(1).upper(), "EPOCH")
+        if bad and named and re.match(r"DECIMAL|DOUBLE|BIGINT|INTEGER|HUGEINT", bad.group("from")) and bad.group("to").startswith(("DATE", "TIMESTAMP")):
+            # `max_ts::date` on a column generated as a number: Snowflake has no such cast, so it is a time
+            if self.retype_column(sql_key, named.group(1).upper(), "TIMESTAMP"):
+                return True
         for pattern, fixed in _CONVERT:
             m = pattern.search(message)
             if m:

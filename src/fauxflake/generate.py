@@ -220,7 +220,11 @@ class TableSQL:
             expr = self._object(col, d["fields"], d.get("keyed_by"))
         elif gen == "array":
             n = f"floor({self.u(col)} * 4)::bigint"
-            if d.get("values"):  # elements drawn from a known list
+            if d.get("fields"):  # an array of objects: {name: number | text}
+                pairs = ", ".join(f"{lit(name)}, " + ("i + 1" if str(kind) == "number" else f"concat({lit(str(name) + '_')}, i)")
+                                  for name, kind in d["fields"].items())
+                expr = f"to_json(list_transform(range(1 + {n}), lambda i: json_object({pairs})))::JSON"
+            elif d.get("values"):  # elements drawn from a known list
                 known = "[" + ", ".join(lit(v) for v in d["values"]) + "]"
                 expr = f"to_json(list_slice({known}, 1, {n}))::JSON"
             else:

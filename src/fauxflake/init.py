@@ -16,6 +16,7 @@ columns through renames. Volumes and distributions are placeholders until
 
 from __future__ import annotations
 
+import collections
 import json
 import os
 import re
@@ -646,7 +647,12 @@ def analyse(manifest: dict, database: str) -> Analysis:
             table["volume"]["rows_per_day"] = rows
         notes.append(f"{len(tables)} source tables: placeholder volumes are {rows} rows a day ({rows // 1000} at the default scale) "
                      "to keep builds quick. `fauxflake profile` replaces them with what production has.")
-    analysis = Analysis({"seed": 42, "start": "2025-01-01", "dbt": {"database": database}, "tables": tables}, notes, locate)
+    settings = {"database": database}
+    if os.environ.get("FAUXFLAKE_TARGET"):
+        settings["target"] = os.environ["FAUXFLAKE_TARGET"]
+        notes.append(f"the project names its schemas differently for the target `{settings['target']}` and refers to those names "
+                     f"directly, so it is built as that target (`dbt: {{target: {settings['target']}}}`). Nothing leaves this machine.")
+    analysis = Analysis({"seed": 42, "start": "2025-01-01", "dbt": settings, "tables": tables}, notes, locate)
     analysis.bounds = {(name, col): numbers for name, use in uses.items() for col, numbers in use.bounds.items()}
     return analysis
 
@@ -658,6 +664,22 @@ HEADER = """# Written by `fauxflake init` from the dbt project. Keys, relationsh
 
 
 _MISSING_ENV = re.compile(r"Env var required but not provided: '(\w+)'")
+
+
+def production_target(project_dir: str | Path) -> str | None:
+    """The target name a project's own `generate_schema_name` (or database, or alias) macro singles
+    out: `prefix = target.name + '_' if target.name != 'prod' else ''`. Such a project names its
+    relations as production does only under that target, and its models often refer to those names
+    directly (`from finance.daily_arr`). Under any other target they would look for tables nobody builds."""
+    names: collections.Counter = collections.Counter()
+    for path in Path(project_dir).glob("macros/**/*.sql"):
+        try:
+            text = path.read_text(errors="ignore")
+        except OSError:
+            continue
+        for macro in re.finditer(r"(?s)\{%-?\s*macro\s+generate_(?:schema|database|alias)_name\b.*?endmacro", text):
+            names.update(re.findall(r"target\.name\s*[!=]=\s*['\"](\w+)['\"]", macro.group(0)))
+    return names.most_common(1)[0][0] if names else None
 
 
 def provide_env(project) -> dict[str, str]:
