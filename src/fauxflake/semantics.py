@@ -1456,6 +1456,55 @@ def _branches(node: exp.Expression) -> list[exp.Expression]:
     return _branches(node.left) + _branches(node.right) if isinstance(node, exp.SetOperation) else [node]
 
 
+def _cte_prefix(node: exp.Expression) -> str:
+    """The WITH clause that makes `node` bind on its own: the CTEs of every query around it."""
+    withs, scope = [], node
+    while scope is not None:
+        if scope.args.get("with_") is not None:
+            withs.append(scope.args["with_"])
+        scope = scope.parent
+    ctes = [c for w in reversed(withs) for c in w.expressions]
+    if not ctes:
+        return ""
+    recursive = any(w.args.get("recursive") for w in withs)
+    return "with " + ("recursive " if recursive else "") + ", ".join(c.sql(dialect="duckdb") for c in ctes) + " "
+
+
+def resolve_equalities(transformed: exp.Expression, conn) -> exp.Expression:  # noqa: ANN001
+    """`_sf_eq(a, b)` compares a VARIANT with text by value. Inside a JOIN condition or a WHERE it also
+    hides the equality from DuckDB, which then cannot hash-join and falls back to comparing every
+    pair of rows. The types are known once the query binds: ask for them, and write each comparison
+    out as the plain equality (or the explicit VARIANT-to-text one) it stands for."""
+    for select in list(transformed.find_all(exp.Select)):
+        calls = [n for n in select.find_all(exp.Anonymous)
+                 if _is(n, "_sf_eq") and n.find_ancestor(exp.Select) is select and n.find_ancestor(exp.Join, exp.Where) is not None]
+        if not calls or select.args.get("from_") is None:
+            continue
+        probe = exp.Select(expressions=[exp.alias_(side.copy(), f"_k{2 * i + j}") for i, call in enumerate(calls)
+                                        for j, side in enumerate(call.expressions)])
+        probe.set("from_", select.args["from_"].copy())
+        if select.args.get("joins"):
+            probe.set("joins", [j.copy() for j in select.args["joins"]])
+        try:
+            described = conn.execute("describe " + _cte_prefix(select) + probe.sql(dialect="duckdb")).fetchall()
+        except Exception:  # noqa: BLE001 - binds only in its context (a correlated subquery): leave it as it is
+            continue
+        if len(described) != 2 * len(calls):
+            continue
+        for i, call in enumerate(calls):
+            left, right = call.expressions
+            kinds = described[2 * i][1], described[2 * i + 1][1]
+            value = lambda side: exp.Anonymous(this="json_extract_string", expressions=[side.copy(), exp.Literal.string("$")])  # noqa: E731
+            if kinds[0] == "JSON" and kinds[1] != "JSON":
+                same = exp.EQ(this=value(left), expression=exp.cast(right.copy(), "varchar"))
+            elif kinds[1] == "JSON" and kinds[0] != "JSON":
+                same = exp.EQ(this=exp.cast(left.copy(), "varchar"), expression=value(right))
+            else:
+                same = exp.EQ(this=left.copy(), expression=right.copy())
+            call.replace(exp.paren(same))
+    return transformed
+
+
 def coerce_union_literals(transformed: exp.Expression, conn) -> exp.Expression:  # noqa: ANN001
     """`select created_at from t union all select '2025-01-04'`: Snowflake reads the text as a
     timestamp, because that is the column's type in the other branch. DuckDB makes the whole column
@@ -1465,15 +1514,7 @@ def coerce_union_literals(transformed: exp.Expression, conn) -> exp.Expression: 
     for union in list(transformed.find_all(exp.SetOperation)):
         if isinstance(union.parent, exp.SetOperation) or (isinstance(union.parent, exp.Subquery) and isinstance(union.parent.parent, exp.SetOperation)):
             continue  # handled with the outermost operation of its chain
-        # the CTEs a branch can see: those of the union itself and of every query around it
-        withs, scope = [], union
-        while scope is not None:
-            if scope.args.get("with_") is not None:
-                withs.append(scope.args["with_"])
-            scope = scope.parent
-        ctes = [c for w in reversed(withs) for c in w.expressions]
-        recursive = any(w.args.get("recursive") for w in withs)
-        prefix = ("with " + ("recursive " if recursive else "") + ", ".join(c.sql(dialect="duckdb") for c in ctes) + " ") if ctes else ""
+        prefix = _cte_prefix(union)  # the CTEs a branch can see: those of the union and of every query around it
         branches = [b for b in _branches(union) if isinstance(b, exp.Select)]
         if len(branches) < 2 or len({len(b.expressions) for b in branches}) != 1:
             continue

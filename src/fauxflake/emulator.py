@@ -370,10 +370,11 @@ def _patch_fakesnow() -> None:
     def _execute(self, transformed, params=None):  # noqa: ANN001
         def attempt() -> None:
             nonlocal transformed
-            try:
-                transformed = semantics.coerce_union_literals(transformed, self._duck_conn)
-            except Exception:  # noqa: BLE001, S110 - an optional adjustment: the statement runs as written
-                pass
+            for adjust in (semantics.coerce_union_literals, semantics.resolve_equalities):
+                try:
+                    transformed = adjust(transformed, self._duck_conn)
+                except Exception:  # noqa: BLE001, S110 - an optional adjustment: the statement runs as written
+                    pass
             try:
                 original_execute(self, transformed, params)
             except ProgrammingError as e:
