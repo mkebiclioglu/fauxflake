@@ -666,17 +666,31 @@ def provide_env(project) -> dict[str, str]:
     import os
 
     provided: dict[str, str] = {}
+
+    def provide(var: str) -> None:
+        value = re.sub(r"^(DBT_)?(SNOWFLAKE_)?((DATABASE|SCHEMA|DB)_)?", "", var.upper()) or "FAUXFLAKE"
+        if re.search(r"SALT|SECRET|PASSWORD|TOKEN|_KEY|HASH", var.upper()):
+            value = "A1B2C3D4E5F60718"  # secrets are often read as hex: to_binary(env_var('SALT'), 'HEX')
+        provided[var] = os.environ[var] = value
+
+    # the variables the project names without a default, read off its files: dbt reports only one per run
+    for path in project.dir.rglob("*"):
+        if path.suffix not in (".sql", ".yml", ".yaml") or any(part in ("target", "logs", ".fauxflake") for part in path.parts):
+            continue
+        try:
+            text = path.read_text(errors="ignore")
+        except OSError:
+            continue
+        for var in re.findall(r"env_var\(\s*['\"]([A-Za-z_]\w*)['\"]\s*\)", text):
+            if var not in os.environ:
+                provide(var)
     for _ in range(200):
         if project.invoke(["parse"], silent=True):  # the errors are expected: they name the variables
             break
         missing = _MISSING_ENV.search(project.last_error)
         if not missing:
             raise RuntimeError(f"dbt could not parse the project:\n{project.last_error}")
-        var = missing.group(1)
-        value = re.sub(r"^(DBT_)?(SNOWFLAKE_)?((DATABASE|SCHEMA|DB)_)?", "", var.upper()) or "FAUXFLAKE"
-        if re.search(r"SALT|SECRET|PASSWORD|TOKEN|_KEY|HASH", var.upper()):
-            value = "A1B2C3D4E5F60718"  # secrets are often read as hex: to_binary(env_var('SALT'), 'HEX')
-        provided[var] = os.environ[var] = value
+        provide(missing.group(1))
     return provided
 
 
