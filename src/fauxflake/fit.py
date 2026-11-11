@@ -1101,6 +1101,40 @@ class Fitter:
         self.dirty |= changed
         return changed
 
+    def jinja_columns(self, sql_key: str, message: str) -> bool:
+        """The model's SQL does not parse: a macro wrote it from the columns it found in the tables it
+        reads (`if 'TYPE' in columns ... type not in (...)`), and they have none of them yet. Give those
+        tables the columns the macro tests for by name and the ones the models downstream read."""
+        if not re.search(r"Parser Error|syntax error|Expected |Required keyword|Invalid expression", message):
+            return False
+        code = (self.sql_of.get(sql_key) or self.nodes.get(sql_key, {}).get("compiled_code") or "").upper().replace('"', "")
+        tables = [t for t in self.tables if t in code or t.split(".", 1)[1] in code]
+        if not tables:
+            return False
+        macros, pile = {}, list(self.nodes.get(sql_key, {}).get("depends_on", {}).get("macros", []))
+        while pile and len(macros) < 60:
+            uid = pile.pop()
+            macro = getattr(self, "macros", {}).get(uid)
+            if macro is None or uid in macros or uid.startswith(("macro.dbt.", "macro.dbt_snowflake.")):
+                continue
+            macros[uid] = macro.get("macro_sql") or ""
+            pile += macro.get("depends_on", {}).get("macros", [])
+        tested = [c for text in macros.values() for c in re.findall(r"'([A-Z][A-Z0-9_]*)'\s+(?:not\s+)?in\s+[\w.\[\]]*column", text)]
+        wanted = list(dict.fromkeys([*tested, *self.columns_children_read(sql_key)]))
+        changed = False
+        for table in tables:
+            columns = self.tables[table].setdefault("columns", {})
+            for name in wanted:
+                if name not in columns:
+                    columns[name] = guess(name, None)
+                    self.retyped.add(table)
+                    changed = True
+        if changed:
+            self.learned.append(f"{self.nodes[sql_key]['name']}: its SQL is written from the columns of {len(tables)} table(s) and did not "
+                                f"parse; gave them {', '.join(wanted[:8])}{' ...' if len(wanted) > 8 else ''}.")
+        self.dirty |= changed
+        return changed
+
     def few_values(self, sql_key: str) -> bool:
         """`dbt_utils.pivot('feature', get_column_values(...))` writes one column per value it finds.
         On made-up text that is one column per row; the column really holds a handful of values."""
@@ -1158,7 +1192,7 @@ class Fitter:
 
     def learn(self, sql_key: str, message: str) -> bool:
         """Apply whatever one error message teaches. True when the spec changed."""
-        if self.runaway(sql_key, message) or self.looked_for(sql_key):
+        if self.runaway(sql_key, message) or self.looked_for(sql_key) or self.jinja_columns(sql_key, message):
             return True
         if self.udf_input(sql_key, message) or self.pivot_values(sql_key, message) or self.missing_column(sql_key, message) or self.missing_relation(sql_key, message) \
                 or self.union_widths(sql_key, message):
@@ -1257,6 +1291,7 @@ class Fitter:
 
     def load(self, manifest: dict) -> list[str]:
         nodes = self.nodes = manifest["nodes"]
+        self.macros = manifest.get("macros") or {}
         self.project_relations = {_fq(n["relation_name"]) for n in nodes.values() if n.get("relation_name")}
         self.relation_owner = {_fq(n["relation_name"]): uid for uid, n in nodes.items() if n.get("relation_name")}
         self.source_names = {uid: _fq(f'{n["database"]}.{n["schema"]}.{n.get("identifier") or n["name"]}')
@@ -1516,6 +1551,7 @@ class Fitter:
             results = json.loads(results_path.read_text())["results"]
             manifest = json.loads((project.target_path / "manifest.json").read_text())
             nodes = self.nodes = manifest["nodes"]
+            self.macros = manifest.get("macros") or {}
             self.project_relations = {_fq(n["relation_name"]) for n in nodes.values() if n.get("relation_name")}
             self.relation_owner = {_fq(n["relation_name"]): uid for uid, n in nodes.items() if n.get("relation_name")}
             self.source_names = {uid: _fq(f'{n["database"]}.{n["schema"]}.{n.get("identifier") or n["name"]}')
