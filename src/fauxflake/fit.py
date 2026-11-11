@@ -1,0 +1,527 @@
+"""Teach a spec what reading the SQL could not tell, by trying the project out.
+
+`init` reads the project's SQL to find each source's columns and types. That misses whatever
+is only implied: a source read with `select *` and used three models later, a text column that
+is summed, a column that must be unique because a test says so. `fit` finds those the way a
+person would: run it, read the error, fix the spec, run it again.
+
+Two loops, cheap one first:
+
+* `learn_from_models` runs every compiled model straight on the emulator against a few
+  generated rows. "Table X does not have a column named Y" adds Y to the source behind X;
+  "Could not convert string 'amount_3fa2' to DOUBLE" retypes the column that produced the value.
+* `learn_from_build` runs the real `dbt build` and reads `run_results.json`: models that only
+  compile once their parents exist, and the tests (`unique`, `not_null`, `accepted_values`).
+
+Nothing here hides a failure: what cannot be fixed by editing the spec is reported as it is.
+"""
+
+from __future__ import annotations
+
+import graphlib
+import json
+import os
+import re
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Callable
+
+import sqlglot
+import yaml
+from sqlglot import exp
+
+from . import emulator
+from .init import guess, within_bounds
+
+Log = Callable[[str], None]
+
+_MISSING = [
+    re.compile(r'(?:Table|Values list) "(?P<table>[^"]+)" does not have a column named "(?P<col>[^"]+)"'),
+    re.compile(r'Referenced column "(?P<col>[^"]+)" not found in FROM clause'),
+    re.compile(r'Referenced column "?(?P<col>[^"\s]+)"? not found in FROM clause'),
+    re.compile(r'Referenced column "(?P<col>[^"]+)" was not found because the FROM clause is missing'),
+    re.compile(r'Column "(?P<col>[^"]+)" referenced that exists in the SELECT clause'),
+    re.compile(r'Alias with name "+(?P<col>[^"]+)"+ exists, but aliases cannot be used'),
+    re.compile(r'Column "(?P<col>[^"]+)" in EXCLUDE list not found'),
+    re.compile(r'Referenced table "(?P<table>[^"]+)" not found!?\s+Candidate tables: (?P<cands>[^\n]+)\n\n?LINE \d+:[^\n]*?(?P=table)\.(?P<col>\w+)', re.S),
+]
+_CONVERT = [
+    (re.compile(r"Could not convert string '(?P<value>[^']*)' to (?P<type>[A-Z0-9]+)"), None),
+    (re.compile(r'(?P<type>date|timestamp|time) field (?:format|value out of range): "(?P<value>[^"]*)"'), None),
+    (re.compile(r"""Malformed JSON.*?Input: "?(?P<value>[^"\n]*)""", re.S), "VARIANT"),
+    (re.compile(r'''Could not parse string "(?P<value>[^"]*)" according to format'''), "TIMESTAMP"),
+    (re.compile(r"""Failed to cast value: Could not convert string '(?P<value>[^']*)' to (?P<type>[A-Z0-9]+)"""), None),
+]
+_NO_TABLE = re.compile(r'Table with name "?(?:[\w$]+\.)*(?P<name>[\w$]+)"? does not exist')
+_NOT_STRUCT = re.compile(r"""Cannot extract field '(?P<field>[^']+)' from expression "(?P<col>[^"]+)" because it is not a struct""")
+_HINTS = {"INT8": "BIGINT", "INT16": "BIGINT", "INT32": "BIGINT", "INT64": "BIGINT", "INT128": "BIGINT", "UINT8": "BIGINT",
+          "UINT16": "BIGINT", "UINT32": "BIGINT", "UINT64": "BIGINT", "HUGEINT": "BIGINT", "BIGINT": "BIGINT", "INTEGER": "BIGINT",
+          "DOUBLE": "DOUBLE", "FLOAT": "DOUBLE", "DECIMAL": "DOUBLE", "BOOL": "BOOLEAN", "BOOLEAN": "BOOLEAN", "DATE": "DATE",
+          "TIMESTAMP": "TIMESTAMP", "TIME": "TIMESTAMP", "VARIANT": "VARIANT"}
+_FREE = ("template", "pool")  # generators that only make up text: safe to retype
+
+
+def duck_type(gen: dict) -> str:
+    """The DuckDB type of the column a generator entry produces (close enough to add it empty)."""
+    if gen.get("type"):
+        return str(gen["type"])
+    kind = gen["gen"]
+    if kind in ("time_offset", "loaded_at", "event_time", "updated_at"):
+        return "TIMESTAMP"
+    if kind in ("object", "array"):
+        return "JSON"
+    if kind in ("sequence", "dist", "fk"):
+        return "BIGINT"
+    return "VARCHAR"
+
+
+def _fq(relation_name: str) -> str:
+    return ".".join(part.strip('"').upper() for part in relation_name.split("."))
+
+
+class Fitter:
+    def __init__(self, emu, spec_path: Path, log: Log = print, bounds: dict | None = None) -> None:  # noqa: ANN001
+        self.emu, self.path, self.log = emu, Path(spec_path), log
+        self.bounds = bounds or {}
+        text = self.path.read_text()
+        self.header = "".join(line + "\n" for line in text.splitlines() if line.startswith("#"))
+        self.spec = yaml.safe_load(text)
+        self.tables: dict[str, dict] = self.spec.setdefault("tables", {})
+        self.existing: dict[str, dict] = self.spec.get("existing") or {}
+        self.nodes: dict[str, dict] = {}
+        self.project_relations: set[str] = set()
+        self.learned: list[str] = []
+        self.dirty = False
+        self.trees: dict[str, exp.Expression | None] = {}
+        self.sql_of: dict[str, str] = {}
+        self.by_rel: dict[str, str] = {}
+        self.parents: dict[str, set[str]] = {}
+
+    # --- the spec
+
+    def save(self) -> None:
+        if self.existing:
+            self.spec["existing"] = self.existing
+        self.path.write_text(self.header + yaml.safe_dump(self.spec, sort_keys=False, default_flow_style=None, width=110))
+
+    def generate(self, scale: float = 1e-5, history: int = 3):  # noqa: ANN201
+        from .generate import Warehouse
+        from .spec import Spec
+
+        self.save()
+        spec = Spec.load(self.path)
+        wh = Warehouse(self.emu, spec, scale)
+        wh.advance_to(datetime.combine(spec.start, datetime.min.time()) + timedelta(days=history))
+        self.dirty = False
+        return wh
+
+    def add_column(self, table: str, col: str) -> bool:
+        columns = self.tables[table].setdefault("columns", {})
+        if col in columns:
+            return False
+        columns[col] = guess(col, None)
+        self.emu.duck.execute(f'alter table {table} add column if not exists "{col}" {duck_type(columns[col])}')
+        self.learned.append(f"{table}.{col}: read by a model, added.")
+        return True
+
+    def missing_relation(self, sql_key: str, message: str) -> bool:
+        """A model reads a relation that nothing has created. If the project builds it later (a
+        hard-coded name instead of ref(), as in a model that looks at its own previous output), it
+        starts out as an empty view, like a first run after the table was created by hand. Anything
+        else is a source nobody declared: it becomes a generated table."""
+        m = _NO_TABLE.search(message)
+        t = self.tree(sql_key) if m else None
+        node = self.nodes.get(sql_key)
+        if t is None or node is None:
+            return False
+        ctes = {c.alias.upper() for c in t.find_all(exp.CTE)}
+        name = m.group("name").upper()
+        for tb in t.find_all(exp.Table):
+            if tb.name.upper() != name or (not tb.db and name in ctes):
+                continue
+            fq = ".".join([(tb.catalog or node["database"]).upper(), (tb.db or node["schema"]).upper(), name])
+            if fq in self.tables or fq in self.existing:
+                continue
+            db, schema, _ = fq.split(".")
+            self.emu.ensure_database(db, schema)
+            read = self.columns_read(t, tb)
+            if fq in self.project_relations:
+                self.existing[fq] = {"columns": {c: duck_type(guess(c, None)) for c in read}}
+                self.create_existing(fq)
+                self.learned.append(f"{fq}: read by {node['name']} before the project builds it; starts as an empty relation.")
+            else:
+                self.tables[fq] = {"volume": {"rows_per_day": 1_000_000, "weekly": [1] * 7},
+                                   "lateness": {"p": [0, 0.5, 0.99, 1], "seconds": [1, 30, 3600, 86400]},
+                                   "columns": {"_LOADED_AT": {"gen": "loaded_at"}, **{c: guess(c, None) for c in read if c != "_LOADED_AT"}}}
+                cols = ", ".join(f'"{c}" {duck_type(g)}' for c, g in self.tables[fq]["columns"].items())
+                self.emu.duck.execute(f"create table if not exists {fq} ({cols})")
+                self.learned.append(f"{fq}: read by {node['name']} but not declared as a source; now generated.")
+                self.dirty = True
+            return True
+        return False
+
+    @staticmethod
+    def columns_read(tree: exp.Expression, table: exp.Table) -> list[str]:
+        """Columns a query reads from one table: those qualified with its name, and the bare
+        ones in a SELECT that reads nothing else."""
+        select = table.find_ancestor(exp.Select)
+        if select is None:
+            return []
+        alias = table.alias_or_name.upper()
+        alone = not select.args.get("joins") and select.args.get("from_") is not None and select.args["from_"].this is table
+        out: list[str] = []
+        for col in select.find_all(exp.Column):
+            if isinstance(col.this, exp.Star) or col.find_ancestor(exp.Select) is not select:
+                continue
+            if (col.table.upper() == alias if col.table else alone) and col.name.upper() not in out:
+                out.append(col.name.upper())
+        return out
+
+    def bootstrap(self, fq: str, built: str) -> None:
+        """A model that reads its own relation by name was just built against the empty stand-in.
+        Its real columns are now known: from here on the relation starts each run as an empty
+        table of that shape, which is what a project like this finds in production."""
+        duck = self.emu.duck
+        kind = duck.execute("select table_type from information_schema.tables where table_catalog = ? and table_schema = ? "
+                            "and table_name = ?", fq.split(".")).fetchone()
+        duck.execute(f"drop {'view' if kind and kind[0] == 'VIEW' else 'table'} if exists {fq}")
+        duck.execute(f'alter table {built} rename to "{fq.split(".")[2]}"')
+        columns = {r[0]: r[1] for r in duck.execute(f"describe {fq}").fetchall()}
+        if self.existing[fq] != {"columns": columns, "as": "table"}:
+            self.existing[fq] = {"columns": columns, "as": "table"}
+            self.learned.append(f"{fq}: built once; later runs start from an empty table with its {len(columns)} columns.")
+
+    def create_existing(self, fq: str) -> None:
+        from .generate import existing_view
+
+        self.emu.duck.execute(existing_view(fq, self.existing[fq].get("columns") or {}, replace=True))
+
+    def retype(self, value: str, hint: str) -> bool:
+        """The generated text `value` was converted to `hint`: retype the column(s) that made it."""
+        name = value.rsplit("_", 1)[0].upper() if "_" in value else ""
+        changed = False
+        for table, t in self.tables.items():
+            gen = (t.get("columns") or {}).get(name)
+            if not gen or gen.get("gen") not in _FREE or gen.get("type"):
+                continue
+            fresh = guess(name, hint)
+            if fresh["gen"] in _FREE:
+                continue
+            for keep in ("follows",):
+                if keep in gen:
+                    fresh[keep] = gen[keep]
+            within_bounds(fresh, self.bounds.get((table, name)))
+            t["columns"][name] = fresh
+            self.learned.append(f"{table}.{name}: used as {hint}, retyped.")
+            changed = True
+        self.dirty |= changed
+        return changed
+
+    def make_variant(self, col: str, field: str) -> bool:
+        changed = False
+        for table, t in self.tables.items():
+            gen = (t.get("columns") or {}).get(col.upper())
+            if gen and gen.get("gen") in _FREE and not gen.get("type"):
+                t["columns"][col.upper()] = {"gen": "object", "fields": {field.lower(): guess(field, None)}}
+                self.learned.append(f"{table}.{col.upper()}: read as an object ({field}), retyped.")
+                changed = True
+            elif gen and gen.get("gen") == "object" and field.lower() not in gen.get("fields", {}) and field.upper() not in gen.get("fields", {}):
+                gen.setdefault("fields", {})[field.lower()] = guess(field, None)
+                changed = True
+        self.dirty |= changed
+        return changed
+
+    # --- which source owns a column
+
+    def tree(self, uid: str):  # noqa: ANN201
+        if uid not in self.trees:
+            try:
+                self.trees[uid] = sqlglot.parse_one(self.sql_of[uid], read="snowflake")
+            except Exception:  # noqa: BLE001
+                self.trees[uid] = None
+        return self.trees[uid]
+
+    def real_tables(self, node: exp.Expression, ctes: dict[str, exp.Expression], depth: int = 0) -> set[str]:
+        out: set[str] = set()
+        for t in node.find_all(exp.Table):
+            name = t.name.upper()
+            if not t.db and name in ctes:
+                if depth < 6:
+                    out |= self.real_tables(ctes[name], ctes, depth + 1)
+            elif t.catalog and t.db:
+                out.add(f"{t.catalog.upper()}.{t.db.upper()}.{name}")
+        return out
+
+    def passthrough(self, fq: str):  # noqa: ANN201
+        """The single relation a model is a `select *` of, if that is what it is."""
+        uid = self.by_rel.get(fq)
+        t = self.tree(uid) if uid else None
+        if t is None or not t.find(exp.Star):
+            return None
+        tables = self.real_tables(t, {c.alias.upper(): c.this for c in t.find_all(exp.CTE)})
+        return next(iter(tables)) if len(tables) == 1 else None
+
+    def blameable(self, fq: str, depth: int = 0) -> bool:
+        if fq in self.tables or fq in self.existing:
+            return True
+        parent = self.passthrough(fq) if depth <= 8 else None
+        return bool(parent) and self.blameable(parent, depth + 1)
+
+    def blame(self, fq: str, col: str, depth: int = 0) -> bool:
+        if fq in self.tables:
+            return self.add_column(fq, col)
+        if fq in self.existing:
+            columns = self.existing[fq].setdefault("columns", {})
+            if col in columns:
+                return False
+            columns[col] = duck_type(guess(col, None))
+            self.create_existing(fq)
+            return True
+        parent = self.passthrough(fq) if depth <= 8 else None
+        if parent and self.blame(parent, col, depth + 1):
+            try:  # the model was already built without the column: give it one so the pass can go on
+                self.emu.duck.execute(f'alter table {fq} add column if not exists "{col}" varchar')
+            except Exception:  # noqa: BLE001, S110
+                pass
+            return True
+        return False
+
+    def missing_column(self, sql_key: str, message: str) -> bool:
+        m = next((m for m in (p.search(message) for p in _MISSING) if m), None)
+        t = self.tree(sql_key) if m else None
+        if t is None:
+            return False
+        ctes = {c.alias.upper(): c.this for c in t.find_all(exp.CTE)}
+        col = m.group("col").upper().split(".")[-1]
+        candidates: set[str] = set()
+        alias = (m.groupdict().get("table") or "").upper()
+        if alias:
+            for tb in t.find_all(exp.Table):
+                if tb.alias_or_name.upper() != alias:
+                    continue
+                if not tb.db and tb.name.upper() in ctes:
+                    candidates |= self.real_tables(ctes[tb.name.upper()], ctes)
+                elif tb.catalog and tb.db:
+                    candidates.add(f"{tb.catalog.upper()}.{tb.db.upper()}.{tb.name.upper()}")
+            if not candidates and alias in ctes:
+                candidates = self.real_tables(ctes[alias], ctes)
+        if not candidates:
+            candidates = self.real_tables(t, ctes)
+        candidates = {c for c in candidates if self.blameable(c)}
+        if len(candidates) > 1:
+            # several sources could own it: the one already known to have a column of that name
+            # cannot be the one missing it
+            lacking = {c for c in candidates if c not in self.tables or col not in self.tables[c].get("columns", {})}
+            candidates = lacking or candidates
+        if len(candidates) > 1:
+            # still ambiguous: prefer the tables this very SELECT reads directly
+            direct = {f"{tb.catalog.upper()}.{tb.db.upper()}.{tb.name.upper()}" for tb in t.find_all(exp.Table) if tb.catalog and tb.db}
+            if len(candidates & direct) == 1:
+                candidates &= direct
+        return len(candidates) == 1 and self.blame(next(iter(candidates)), col)
+
+    def learn(self, sql_key: str, message: str) -> bool:
+        """Apply whatever one error message teaches. True when the spec changed."""
+        if self.missing_column(sql_key, message) or self.missing_relation(sql_key, message):
+            return True
+        for pattern, fixed in _CONVERT:
+            m = pattern.search(message)
+            if m:
+                hint = fixed or _HINTS.get(m.group("type").upper())
+                return bool(hint) and self.retype(m.group("value"), hint)
+        m = _NOT_STRUCT.search(message)
+        if m:
+            return self.make_variant(m.group("col"), m.group("field"))
+        return False
+
+    # --- loop 1: compiled models straight on the emulator
+
+    def load(self, manifest: dict) -> list[str]:
+        nodes = self.nodes = manifest["nodes"]
+        self.project_relations = {_fq(n["relation_name"]) for n in nodes.values() if n.get("relation_name")}
+        self.sql_of = {uid: n["compiled_code"].strip().rstrip(";") for uid, n in nodes.items()
+                       if n["resource_type"] in ("model", "snapshot") and n.get("compiled_code") and n.get("language", "sql") == "sql"
+                       and n.get("relation_name") and n["config"].get("materialized") != "ephemeral"}
+        self.trees = {}
+        rel = {uid: _fq(nodes[uid]["relation_name"]) for uid in self.sql_of}
+        self.by_rel = {fq: uid for uid, fq in rel.items() if fq.count(".") == 2}
+        ephemeral = {uid for uid, n in nodes.items() if n["resource_type"] == "model" and n["config"].get("materialized") == "ephemeral"}
+
+        def deps(uid: str, seen: frozenset = frozenset()) -> set[str]:
+            out: set[str] = set()
+            for d in nodes[uid]["depends_on"]["nodes"]:
+                if d in ephemeral and d not in seen:
+                    out |= deps(d, seen | {d})
+                elif d in self.sql_of:
+                    out.add(d)
+            return out
+
+        graph = {uid: deps(uid) - {uid} for uid in self.sql_of if rel[uid].count(".") == 2}
+        self.parents = graph
+        try:
+            return list(graphlib.TopologicalSorter(graph).static_order())
+        except graphlib.CycleError:
+            return list(graph)
+
+    def learn_from_models(self, manifest: dict, database: str, passes: int = 4) -> dict[str, str]:
+        """Returns {model: error} for the models that still fail after the spec stopped changing."""
+        order = [uid for uid in self.load(manifest)]
+        nodes = manifest["nodes"]
+        failures: dict[str, str] = {}
+        for n_pass in range(1, passes + 1):
+            self.generate()
+            before = len(self.learned)
+            failures = {}
+            conn = self.emu._fs.connect(database=database, schema="CI")
+            for uid in order:
+                fq = _fq(nodes[uid]["relation_name"])
+                db, schema, _ = fq.split(".")
+                self.emu.ensure_database(db, schema)
+                broken = next((p for p in self.parents.get(uid, ()) if p in failures), None)
+                if broken:  # its input is wrong, so its errors would teach nothing true
+                    failures[uid] = f"upstream failed: {broken}"
+                    continue
+                target = f'{db}.{schema}."__FX_BOOT"' if fq in self.existing else fq
+                statement = f"create or replace table {target} as (\n{self.sql_of[uid]}\n)"
+                for _ in range(400):
+                    cur = conn.cursor()
+                    try:
+                        cur.execute(statement)
+                        if target != fq:
+                            self.bootstrap(fq, target)
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        message = str(e)
+                        if self.missing_column(uid, message) or self.missing_relation(uid, message):
+                            continue  # the column or relation now exists (empty): bind again
+                        self.learn(uid, message)
+                        failures[uid] = message
+                        break
+                    finally:
+                        cur.close()
+            conn.close()
+            roots = sum(1 for m in failures.values() if not m.startswith("upstream failed"))
+            self.log(f"  pass {n_pass}: {len(order) - len(failures)}/{len(order)} models run ({roots} fail on their own), "
+                     f"{len(self.learned) - before} thing(s) learned")
+            if len(self.learned) == before:
+                break
+        self.save()
+        if os.environ.get("FAUXFLAKE_FIT_DEBUG"):  # why each model did not run, for working on the emulator
+            Path(os.environ["FAUXFLAKE_FIT_DEBUG"]).write_text(json.dumps(failures, indent=1))
+        return failures
+
+    def drop_models(self, manifest: dict) -> None:
+        """Remove what loop 1 built, so dbt starts from the state a first run has."""
+        for uid in self.sql_of:
+            fq = _fq(manifest["nodes"][uid]["relation_name"])
+            if fq.count(".") == 2:
+                try:
+                    self.emu.duck.execute(f"drop table if exists {fq}")
+                except Exception:  # noqa: BLE001, S110
+                    pass
+
+    # --- loop 2: the real dbt build
+
+    def learn_from_build(self, project, analysis, rounds: int = 8) -> dict:  # noqa: ANN001
+        """Run `dbt build`, read the results, fix what the spec can fix. Returns the last summary."""
+        summary: dict = {}
+        selected: list[str] = []
+        for n_round in range(1, rounds + 1):
+            self.generate()
+            before = len(self.learned)
+            project.invoke(["build", *selected], silent=True)
+            results_path = project.target_path / "run_results.json"
+            if not results_path.exists():
+                self.log(f"  dbt build did not run: {project.last_error[:400]}")
+                return {"error": project.last_error}
+            results = json.loads(results_path.read_text())["results"]
+            manifest = json.loads((project.target_path / "manifest.json").read_text())
+            nodes = self.nodes = manifest["nodes"]
+            self.project_relations = {_fq(n["relation_name"]) for n in nodes.values() if n.get("relation_name")}
+            failed = [r for r in results if r["status"] in ("error", "fail")]
+            expected = self.spec.setdefault("dbt", {}).setdefault("expected_failures", [])
+            accepted = 0
+            for r in failed:
+                node = nodes.get(r["unique_id"])
+                if node is None:
+                    continue
+                message = r.get("message") or ""
+                if node["resource_type"] == "test":
+                    # a failing test either teaches the spec something, or states a fact about production
+                    # data that invented data does not share: that one goes on the list of expected failures
+                    if r["status"] == "fail" and not self.learn_from_test(node, analysis) and node["name"] not in expected:
+                        expected.append(node["name"])
+                        accepted += 1
+                    continue
+                compiled = self._compiled(project, node)
+                if compiled:
+                    self.sql_of[node["unique_id"]] = compiled
+                    self.trees.pop(node["unique_id"], None)
+                    self.by_rel[_fq(node["relation_name"])] = node["unique_id"]
+                    self.learn(node["unique_id"], message)
+            counts: dict[str, int] = {}
+            for r in results:
+                kind = nodes.get(r["unique_id"], {}).get("resource_type", "other")
+                counts[f"{kind}:{r['status']}"] = counts.get(f"{kind}:{r['status']}", 0) + 1
+            summary = {"counts": counts, "failed": [(r["unique_id"], r["status"], (r.get("message") or "").strip()) for r in failed]}
+            self.log(f"  build {n_round}: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+                     + f"; {len(self.learned) - before} thing(s) learned")
+            if not failed or (len(self.learned) == before and not accepted):
+                break
+            selected = []  # a fix can change anything downstream: build everything again
+        if not self.spec["dbt"].get("expected_failures"):
+            self.spec["dbt"].pop("expected_failures", None)
+        self.save()
+        return summary
+
+    def _compiled(self, project, node: dict) -> str | None:  # noqa: ANN001
+        if node.get("compiled_code"):
+            return node["compiled_code"].strip().rstrip(";")
+        path = project.target_path / "compiled" / node["package_name"] / node["original_file_path"]
+        return path.read_text().strip().rstrip(";") if path.exists() else None
+
+    def learn_from_test(self, node: dict, analysis) -> bool:  # noqa: ANN001
+        """A failing generic test states a fact about the data the spec did not know."""
+        meta = node.get("test_metadata")
+        if not meta or not node.get("attached_node"):
+            return False
+        kwargs = meta["kwargs"].get("arguments") or meta["kwargs"]
+        column = node.get("column_name") or kwargs.get("column_name") or meta["kwargs"].get("column_name")
+        here = analysis.locate(node["attached_node"], column) if column and re.fullmatch(r"\w+", str(column)) else None
+        if not here or here[0] not in self.tables or here[1] not in self.tables[here[0]].get("columns", {}):
+            return False
+        table, col = here
+        columns = self.tables[table]["columns"]
+        gen = columns[col]
+        name = meta["name"]
+        if name == "unique":
+            if gen["gen"] in ("sequence", "hash_id"):
+                return False
+            numeric = gen["gen"] == "dist" or str(gen.get("type", "")).upper().startswith(("BIGINT", "INT", "DECIMAL", "DOUBLE"))
+            if not any(d["gen"] in ("sequence", "hash_id") for d in columns.values()):
+                columns[col] = {"gen": "sequence" if numeric else "hash_id"}  # the table had no key: this is it
+            elif numeric:
+                if gen.get("unique"):
+                    return False
+                columns[col] = {"gen": "dist", "type": gen.get("type", "BIGINT"), "p": [0, 1], "v": [1, 1000], "unique": True}
+            else:
+                fresh = {"gen": "template", "template": f"{col.lower()}_{{hex}}"}  # one value per row
+                if gen == fresh:
+                    return False
+                columns[col] = fresh
+            self.learned.append(f"{table}.{col}: a `unique` test failed, now generated without repeats.")
+        elif name == "not_null":
+            if not gen.get("null_rate"):
+                return False
+            gen.pop("null_rate")
+            self.learned.append(f"{table}.{col}: a `not_null` test failed, no longer generated with NULLs.")
+        elif name == "accepted_values":
+            values = kwargs.get("values") or []
+            if not values or gen["gen"] in ("sequence", "hash_id", "fk"):
+                return False
+            columns[col] = {"gen": "categorical", "values": {v: round(1 / len(values), 4) for v in values}}
+            self.learned.append(f"{table}.{col}: an `accepted_values` test failed, now drawn from its values.")
+        else:
+            return False
+        self.dirty = True
+        return True

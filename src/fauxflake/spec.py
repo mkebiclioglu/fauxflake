@@ -87,6 +87,8 @@ class Spec:
     dbt: dict
     path: Path | None = None
     udfs: dict[str, str] = field(default_factory=dict)  # name -> "(args) as <DuckDB SQL>"
+    # relations the project reads before it builds them (hard-coded names): DB.SCHEMA.NAME -> {columns: {COL: type}}
+    existing: dict[str, dict] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: str | Path) -> "Spec":
@@ -100,10 +102,13 @@ class Spec:
             tables[name] = Table(name=name, raw=t, columns=cols)
         spec = cls(seed=int(raw.get("seed", 1)), start=_date(raw["start"]), tables=tables,
                    dbt=raw.get("dbt") or {}, path=Path(path),
-                   udfs={k.lower(): v for k, v in (raw.get("udfs") or {}).items()})
+                   udfs={k.lower(): v for k, v in (raw.get("udfs") or {}).items()},
+                   existing={k.upper(): dict(v or {}) for k, v in (raw.get("existing") or {}).items()})
         spec.validate()
         for var, value in (spec.dbt.get("env") or {}).items():
             os.environ.setdefault(var, str(value))  # placeholders for env vars the project requires
+        # tests that state facts about production data the generated data does not share
+        os.environ["FAUXFLAKE_EXPECTED_FAILURES"] = " ".join(spec.dbt.get("expected_failures") or [])
         if (raw.get("dbt") or {}).get("target"):
             os.environ.setdefault("FAUXFLAKE_TARGET", str(raw["dbt"]["target"]))  # for `target.name` checks
         return spec

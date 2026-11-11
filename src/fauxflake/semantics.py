@@ -12,6 +12,8 @@ import re
 import sqlglot
 from sqlglot import exp
 
+from . import catalog
+
 _NS = "_fs_global.main."
 _SCALE = r"coalesce(try_cast(nullif(regexp_extract(typeof(a), ',(\d+)\)', 1), '') as integer), 0)"
 
@@ -187,8 +189,11 @@ MACROS = [
     f"""create or replace macro {_NS}_sf_try_date(x) as coalesce(try_cast(x as date), {_NS}_sf_try_timestamp(x)::date)""",
     f"""create or replace macro {_NS}_sf_to_date(x) as coalesce({_NS}_sf_try_date(x), cast(x::varchar as date))""",
     f"""create or replace macro {_NS}_sf_try_time(x) as coalesce(
-          case when regexp_matches(x::varchar, '^\s*[0-9]{{1,2}}:[0-9]{{2}}') then try_cast(x::varchar as time) end,
+          case when regexp_matches(x::varchar, '^[[:space:]]*[0-9]{{1,2}}:[0-9]{{2}}') then try_cast(x::varchar as time) end,
           timezone('UTC', {_NS}_sf_epoch(x))::time)""",
+    f"""create or replace macro {_NS}_sf_object_pick(o, keys) as coalesce((
+          select json_group_object(k, json_extract(o, '$."' || k || '"'))
+          from (select unnest(cast(to_json(keys) as varchar[])) as k) where json_exists(o, '$."' || k || '"')), '{{}}'::json)""",
     # Object keys come back sorted: Snowflake stores objects ordered by key.
     f"create or replace macro {_NS}_sf_object_keys(o) as to_json(list_sort(json_keys(o::json)))",
     f"create or replace macro {_NS}_sf_hash_agg(x) as bit_xor(hash(x))",
@@ -463,6 +468,12 @@ def _operand(node: exp.Expression) -> exp.Expression:
 
 
 _VARIANT_ACCESS = (exp.JSONExtract, exp.Bracket)
+_STRING_FUNCTIONS = (exp.Right, exp.Left, exp.Substring, exp.Upper, exp.Lower, exp.Trim, exp.Length, exp.RegexpReplace,
+                     exp.RegexpExtract, exp.RegexpLike, exp.SplitPart, exp.Split, exp.StartsWith, exp.EndsWith, exp.Contains,
+                     exp.Initcap, exp.Pad, exp.StrPosition, exp.Concat, exp.ConcatWs, exp.DPipe, exp.Reverse, exp.Repeat,
+                     exp.RegexpExtractAll, exp.RegexpCount, exp.Replace)
+_MAPS = {"MAP_KEYS": "", "MAP_SIZE": "", "MAP_CONTAINS_KEY": "", "MAP_DELETE": "OBJECT_DELETE", "MAP_INSERT": "OBJECT_INSERT",
+         "MAP_PICK": "OBJECT_PICK"}
 
 
 def _collation(spec: str) -> str | None:
@@ -508,6 +519,8 @@ def _fix(node: exp.Expression) -> exp.Expression:
             return _fn("_sf_int", inner)
         if to.is_type("variant") and not isinstance(inner, exp.Null):
             return exp.ToVariant(this=inner)  # 'a'::variant is the string a, not JSON text to parse
+        if to.is_type("map", "object") and not isinstance(inner, exp.Null):
+            return exp.cast(inner, "json")  # a MAP or OBJECT is held as JSON, like every semi-structured value
     if isinstance(node, exp.TryCast) and node.to.is_type("date") and not isinstance(node.this, _VARIANT_ACCESS):
         return _fn("_sf_try_date", node.this)
     if isinstance(node, exp.TsOrDsToDate) and not node.args.get("format") and not isinstance(node.this, _VARIANT_ACCESS):
@@ -531,6 +544,41 @@ def _fix(node: exp.Expression) -> exp.Expression:
         if not (position.name == "1" and occurrence.name == "0"):
             return _fn("_sf_regexp_replace_nth", node.this, node.expression,
                        node.args.get("replacement") or exp.Literal.string(""), position, occurrence)
+    if isinstance(node, _STRING_FUNCTIONS):
+        # RIGHT(v:a, 1), UPPER(SPLIT(s, '.')[0]): a string function reads a VARIANT as its text, without JSON quotes
+        for key in ("this", "expression"):
+            arg = node.args.get(key)
+            if isinstance(arg, _VARIANT_ACCESS) and not (key == "expression" and isinstance(node, (exp.Split, exp.SplitPart))):
+                node.set(key, _text(arg))
+        if isinstance(node, (exp.Concat, exp.ConcatWs)):
+            node.set("expressions", [_text(e) if isinstance(e, _VARIANT_ACCESS) else e for e in node.expressions])
+    if isinstance(node, exp.MapCat):  # keys of the second map win
+        return exp.Anonymous(this="json_merge_patch", expressions=[exp.cast(node.this, "json"), exp.cast(node.expression, "json")])
+    name = node.sql_name().upper() if isinstance(node, exp.Func) and not isinstance(node, exp.Anonymous) else \
+        node.name.upper() if isinstance(node, exp.Anonymous) and isinstance(node.this, str) else ""
+    if name.startswith("MAP_") and name in _MAPS:
+        args = _func_args(node) if not isinstance(node, exp.Anonymous) else list(node.expressions)
+        if name == "MAP_KEYS":
+            return _fn("_sf_object_keys", args[0])
+        if name == "MAP_SIZE":
+            return exp.Anonymous(this="len", expressions=[exp.Anonymous(this="json_keys", expressions=[exp.cast(args[0], "json")])])
+        if name == "MAP_CONTAINS_KEY":
+            return exp.Anonymous(this="list_contains", expressions=[
+                exp.Anonymous(this="json_keys", expressions=[exp.cast(args[1], "json")]), exp.cast(args[0], "varchar")])
+        name = _MAPS[name]  # a MAP is an OBJECT here: same operation
+    if name in ("OBJECT_DELETE", "OBJECT_INSERT", "OBJECT_PICK"):
+        args = _func_args(node) if not isinstance(node, exp.Anonymous) else list(node.expressions)
+        plain_fn = lambda fn, *a: exp.Anonymous(this=fn, expressions=list(a))  # noqa: E731
+        target = exp.cast(args[0], "json")
+        if name == "OBJECT_DELETE":  # merging a null deletes the key
+            gone = [x for key in args[1:] for x in (key, exp.Null())]
+            return plain_fn("json_merge_patch", target, plain_fn("json_object", *gone))
+        if name == "OBJECT_INSERT":
+            return plain_fn("json_merge_patch", target, plain_fn("json_object", args[1], exp.ToVariant(this=args[2])))
+        keys = args[1] if len(args) == 2 and not (isinstance(args[1], exp.Literal) and args[1].is_string) else plain_fn("list_value", *args[1:])
+        return _fn("_sf_object_pick", target, keys)
+    if isinstance(node, exp.Struct) and not node.expressions:
+        return exp.cast(exp.Literal.string("{}"), "json")
     if isinstance(node, exp.Struct) and node.expressions and all(isinstance(e, exp.PropertyEQ) for e in node.expressions):
         pairs = [x for e in node.expressions for x in (exp.Literal.string(e.this.name), e.expression)]
         return exp.func("OBJECT_CONSTRUCT", *pairs, dialect="snowflake")
@@ -731,12 +779,18 @@ def _fix(node: exp.Expression) -> exp.Expression:
         return exp.EQ(this=exp.Upper(this=node.expressions[0]), expression=_fn("_sf_current_role"))
     if isinstance(node, exp.Anonymous) and node.name.upper() == "GET_DDL" and len(node.expressions) >= 2:
         return _fn("_sf_get_ddl", *node.expressions[:2])
-    if isinstance(node, exp.TableFromRows) and UDTFS:
+    if isinstance(node, exp.TableFromRows):
         call = node.this
         while isinstance(call, exp.Dot):  # table(db.schema.my_udtf(x)): drop the qualification
             call = call.expression
         if isinstance(call, exp.Anonymous) and call.name.lower() in UDTFS:
             return exp.Table(this=_fn(UDTFS[call.name.lower()], *call.expressions), alias=node.args.get("alias"))
+        columns = catalog.table_function(call.name) if isinstance(call, exp.Anonymous) and isinstance(call.this, str) else None
+        if columns:
+            # a Snowflake system table function (task_history, copy_history...): its columns, and no rows locally
+            empty = exp.select(*[exp.alias_(exp.cast(exp.Null(), kind), col, quoted=True) for col, kind in columns.items()]).where("false")
+            alias = node.args.get("alias") or exp.TableAlias(this=exp.to_identifier(call.name.upper()))
+            return exp.Subquery(this=empty, alias=alias)
     if isinstance(node, exp.Anonymous) and node.name.lower() in UDFS:
         call = _fn(UDFS[node.name.lower()], *node.expressions)
         if isinstance(node.parent, exp.Dot):  # db.schema.my_udf(x): drop the qualification
@@ -830,7 +884,9 @@ def inline_aliases(tree: exp.Expression, names: set[str]) -> exp.Expression:
         changed = False
         for select in tree.find_all(exp.Select):
             defined = {p.alias.upper(): p for p in select.expressions if isinstance(p, exp.Alias) and p.alias.upper() in names}
-            for proj in select.expressions:
+            # the other projections, and the JOIN conditions: Snowflake lets `on` use a SELECT alias
+            users = [*select.expressions, *[j.args["on"] for j in select.args.get("joins") or [] if j.args.get("on")]]
+            for proj in users:
                 for col in list(proj.find_all(exp.Column)):
                     owner = defined.get(col.name.upper())
                     if owner is None or owner is proj or col.table or col.find_ancestor(exp.Select) is not select:
@@ -839,6 +895,15 @@ def inline_aliases(tree: exp.Expression, names: set[str]) -> exp.Expression:
                     changed = True
         if not changed:
             break
+    return tree
+
+
+def qualify_schemas(tree: exp.Expression, database: str) -> exp.Expression:
+    """`schema.table` always means the current database in Snowflake. DuckDB hesitates when a
+    database carries the schema's name: spell the database out."""
+    for table in tree.find_all(exp.Table):
+        if table.db and not table.catalog and isinstance(table.this, exp.Identifier) and table.db.upper() != "INFORMATION_SCHEMA":
+            table.set("catalog", exp.to_identifier(database))
     return tree
 
 
@@ -869,8 +934,16 @@ def finish(transformed: exp.Expression) -> exp.Expression:
         if not ident.args.get("quoted") and ident.name.upper() in _RESERVED \
                 and not (isinstance(ident.parent, exp.Column) and ident.name.upper() in _BARE):
             ident.set("quoted", True)
+    for access in list(transformed.find_all(exp.JSONExtract, exp.JSONExtractScalar)):
+        # v:"" reads the key that is the empty string. DuckDB's JSONPath cannot name it; a JSON pointer can
+        path = access.expression
+        if isinstance(path, exp.JSONPath) and any(isinstance(p, exp.JSONPathKey) and p.this == "" for p in path.expressions):
+            steps = [str(p.this).replace("~", "~0").replace("/", "~1") for p in path.expressions
+                     if isinstance(p, (exp.JSONPathKey, exp.JSONPathSubscript))]
+            access.set("expression", exp.Literal.string("/" + "/".join(steps)))
     for agg in list(transformed.find_all(exp.ArrayAgg)):
         # ARRAY_AGG leaves NULLs out, also with DISTINCT or WITHIN GROUP (ORDER BY ...)
+        agg.args.pop("nulls_excluded", None)  # the filter is added here, once, for every form
         if isinstance(agg.parent, exp.Filter):
             continue
         value = agg.this

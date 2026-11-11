@@ -119,7 +119,10 @@ class TableSQL:
         id): the other fields are then a function of it, so the same id always has the same name."""
         key_expr = f"({self.expr(f'{col}.{keyed_by}', fields[keyed_by])})" if keyed_by in fields else None
         tree: dict = {}
+        nested = {p.rsplit(".", 1)[0] for p in fields if "." in p}
         for path, d in fields.items():
+            if path in nested or any(p.startswith(path + ".") for p in nested):
+                continue  # `header` next to `header.height`: the children say what the object holds
             node = tree
             *parents, leaf = path.split(".")
             for key in parents:
@@ -181,6 +184,8 @@ class TableSQL:
             expr = f"({n} + 1)" if d.get("numeric") else f"concat({lit(str(d['pool']) + '_')}, {n})"
         elif gen == "dist":
             expr = piecewise(self.u(col), d["p"], d["v"])
+            if d.get("unique") and self.base == "g":
+                expr = "(g + 1)"  # a `unique` test covers it: one value per row
             if "round" in d:
                 expr = f"round({expr}, {int(d['round'])})"
         elif gen == "template":
@@ -290,6 +295,15 @@ from d
 where _loaded > $after and _loaded <= $until"""
 
 
+def existing_view(name: str, columns: dict[str, str], replace: bool = False, table: bool = False) -> str:
+    """An empty relation standing for one that exists before the run (the spec's `existing:`).
+    A table once its full shape is known, so an incremental model finds what it would in production."""
+    if table:
+        return f"create table if not exists {name} ({', '.join(f'"{col}" {kind}' for col, kind in columns.items())})"
+    cols = ", ".join(f'null::{kind} as "{col}"' for col, kind in columns.items()) or 'null::varchar as "_FX_EMPTY"'
+    return f"create {'or replace view' if replace else 'view if not exists'} {name} as select {cols} where false"
+
+
 class Warehouse:
     """The synthetic sources at a point in simulated time."""
 
@@ -343,6 +357,14 @@ class Warehouse:
             counts[t.name] = self.cur.execute(f"{verb} {select}", params).fetchone()[0]
             if t.raw.get("mode") == "upsert":
                 self._keep_latest(t)
+        if self.now is None:
+            for name, rel in self.spec.existing.items():
+                db, schema, _ = name.split(".")
+                self.emu.ensure_database(db, schema)
+                kind = self.cur.execute("select table_type from information_schema.tables where table_catalog = ? and "
+                                        "table_schema = ? and table_name = ?", [db, schema, name.split(".")[2]]).fetchone()
+                if kind is None:  # the project has not built it yet in this warehouse
+                    self.cur.execute(existing_view(name, rel.get("columns") or {}, table=rel.get("as") == "table"))
         self.now = until
         if self.freeze_clock:
             emulator.FROZEN_NOW = until

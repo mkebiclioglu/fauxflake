@@ -25,6 +25,8 @@ import yaml
 from sqlglot import exp
 from sqlglot.optimizer.scope import traverse_scope
 
+from . import catalog
+
 LOADED_AT = ["_LOADED_AT", "_FIVETRAN_SYNCED", "_AIRBYTE_EXTRACTED_AT", "_SDC_BATCHED_AT", "_ETL_LOADED_AT",
              "LOADED_AT", "_INGESTED_AT", "INGESTED_AT", "_PARTITIONTIME"]
 EVENT_TIME = ["OCCURRED_AT", "EVENT_TIMESTAMP", "EVENT_TIME", "EVENT_AT", "ORDERED_AT", "CREATED_AT", "CREATED",
@@ -47,6 +49,8 @@ class SourceUse:
         self.formats: dict[str, str] = {}  # text column -> strftime format it is parsed with
         self.json_text: set[str] = set()  # text columns holding JSON (passed to PARSE_JSON)
         self.texts: set[str] = set()  # columns compared with string literals
+        self.bounds: dict[str, set[float]] = {}  # column -> numbers the SQL compares it with
+        self.splits: dict[str, dict] = {}  # text column -> {"seps": {"/": {0: "BIGINT"}}, "digits": False} from split()[i]::type
         self.numbers: set[str] = set()  # columns that are summed, averaged or used in arithmetic
         self.literals: dict[str, set[str]] = {}  # column -> string values the SQL compares it with
         self.patterns: dict[str, set[str]] = {}  # column -> LIKE patterns the SQL keeps rows by
@@ -65,6 +69,45 @@ def _table_id(table: exp.Table) -> str:
 
 
 _WRAPPERS = (exp.Cast, exp.TryCast, exp.Paren, exp.Lower, exp.Upper, exp.Trim)
+
+
+def _parsed_as(node: exp.Expression) -> str | None:
+    """TIMESTAMP or DATE when the value (possibly cast to text first) is handed to a function that
+    reads it as a point in time: to_timestamp_ntz(v:header:timestamp::string)."""
+    top = node
+    while isinstance(top.parent, (exp.Cast, exp.TryCast, exp.Paren)) and (
+            isinstance(top.parent, exp.Paren) or top.parent.to.is_type(*exp.DataType.TEXT_TYPES)):
+        top = top.parent
+    reader = top.parent
+    if isinstance(reader, exp.TsOrDsToDate) and reader.this is top and not reader.args.get("format"):
+        return "DATE"
+    if isinstance(reader, exp.Anonymous) and reader.expressions and reader.expressions[0] is top and len(reader.expressions) == 1 \
+            and re.fullmatch(r"(TRY_)?TO_TIMESTAMP(_NTZ|_LTZ|_TZ)?", reader.name.upper()):
+        return "TIMESTAMP"
+    return None
+
+
+def _split_use(use: "SourceUse", column: str, call: exp.Expression) -> bool:
+    """Record `split(col, sep)[i]::type` or `split_part(col, sep, i)::type`: which part of the text is
+    read and what it is cast to. `right(split(col, '.')[0], 1)::number` says the part ends in digits."""
+    if isinstance(call, exp.SplitPart):
+        sep, index, part = call.args.get("delimiter"), call.args.get("part_index"), call
+        base = 1
+    else:
+        sep, part, base = call.expression, call.parent if isinstance(call.parent, exp.Bracket) else None, 0
+        index = part.expressions[0] if part is not None and part.expressions else None
+    if not (isinstance(sep, exp.Literal) and sep.is_string and isinstance(index, exp.Literal) and index.is_int and int(index.name) >= base):
+        return False
+    outer, sliced = part.parent, False
+    while isinstance(outer, (exp.Right, exp.Left, exp.Substring, exp.Trim, exp.Paren)):
+        outer, sliced = outer.parent, True
+    hint = outer.to.sql(dialect="duckdb") if isinstance(outer, (exp.Cast, exp.TryCast)) else None
+    found = use.splits.setdefault(column, {"seps": {}, "digits": False})
+    parts = found["seps"].setdefault(sep.name, {})
+    position = int(index.name) - base
+    parts[position] = (None if sliced else hint) or parts.get(position)
+    found["digits"] |= sliced and hint_is_number(hint)
+    return True
 
 
 def scan_model(sql: str, sources: dict[str, SourceUse],
@@ -127,8 +170,17 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
         others = {a.upper() for a in selected} - set(direct) - laterals
         only = next(iter(direct.values())) if len(direct) == 1 and not renames and not others else None
 
-        def resolve(col: exp.Column):
+        # `metadata$filename as _filename, split(_filename, '/')`: the second use is the alias, not a column
+        aliases = {p.alias.upper(): p.this for p in select.expressions if isinstance(p, exp.Alias)
+                   and not any(c.name.upper() == p.alias.upper() for c in p.this.find_all(exp.Column))}
+
+        def resolve(col: exp.Column, depth: int = 0):
             table = col.table.upper()
+            if not table and col.name.upper() in aliases and not isinstance(col.parent, exp.Alias):
+                inner = aliases[col.name.upper()]
+                while isinstance(inner, (exp.Cast, exp.TryCast, exp.Paren)):
+                    inner = inner.this
+                return resolve(inner, depth + 1) if isinstance(inner, exp.Column) and depth < 4 else None
             if not table and laterals and col.name.upper() in FLATTEN_COLUMNS:
                 return None
             if table in direct or (not table and only):
@@ -148,6 +200,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 cast = col.parent if isinstance(col.parent, (exp.Cast, exp.TryCast)) else None
                 use, parent = sources[hit[0]], col.parent
                 use.add(hit[1], cast.to.sql(dialect="duckdb") if cast else None)
+                if not cast and _parsed_as(col) and not use.columns.get(hit[1]):
+                    use.columns[hit[1]] = _parsed_as(col)
                 if isinstance(parent, (exp.Sum, exp.Avg, exp.Add, exp.Sub, exp.Mul, exp.Div)):
                     use.numbers.add(hit[1])
                 if joins is not None:
@@ -162,6 +216,18 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                         there = resolve(other) if isinstance(other, exp.Column) else None
                         if there and there[0] != hit[0]:
                             joins.append((hit, there))
+                if isinstance(parent, (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ, exp.Between)):
+                    # `where block_number between 9820000 and 10000000`: the numbers that should select something
+                    sides = [parent.args.get("low"), parent.args.get("high")] if isinstance(parent, exp.Between) else \
+                        [parent.expression if parent.this is col else parent.this]
+                    for side in sides:
+                        negative = isinstance(side, exp.Neg)
+                        number = side.this if negative else side
+                        if isinstance(number, exp.Literal) and not number.is_string:
+                            try:
+                                use.bounds.setdefault(hit[1], set()).add(-float(number.name) if negative else float(number.name))
+                            except ValueError:
+                                pass
                 if isinstance(parent, exp.ParseJSON):
                     use.json_text.add(hit[1])  # parse_json(col):a.b  ->  col is text holding {"a": {"b": ...}}
                     col, parent = parent, parent.parent
@@ -184,10 +250,13 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     keys = [k.name for k in parent.expression.expressions if isinstance(k, exp.JSONPathKey)]
                     outer = parent.parent
                     hint = outer.to.sql(dialect="duckdb") if isinstance(outer, (exp.Cast, exp.TryCast)) else None
+                    hint = _parsed_as(parent) or hint
                     if keys:
                         use.paths.setdefault(hit[1], {})[".".join(keys)] = hint
                     else:
                         use.arrays.add(hit[1])
+                elif isinstance(parent, (exp.Split, exp.SplitPart)) and parent.this is col and _split_use(use, hit[1], parent):
+                    pass  # split(col, '/')[0]::number: the text has parts, and this one is a number
                 elif isinstance(parent, exp.Bracket) or col.find_ancestor(exp.Explode, exp.Lateral, exp.Unnest) is not None:
                     use.arrays.add(hit[1])
                 elif isinstance(parent, (exp.StrToTime, exp.StrToDate, exp.TsOrDsToDate)) and parent.this is col \
@@ -301,12 +370,14 @@ def guess(column: str, hint: str | None) -> dict:
         return {"gen": "dist", "type": h, **AMOUNT}
     if h in ("DOUBLE", "FLOAT", "REAL"):
         return {"gen": "dist", "type": "DOUBLE", **AMOUNT}
-    if h == "BOOLEAN" or re.match(r"^(IS|HAS|WAS)_", c):
+    if h in ("BIGINT", "INTEGER", "INT", "SMALLINT", "NUMBER") or h.endswith(",0)"):  # an explicit type beats a name
+        return {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000]}
+    if h == "BOOLEAN" or (not h and re.match(r"^(IS|HAS|WAS)_", c)):
         return {"gen": "categorical", "type": "BOOLEAN", "values": {True: 0.5, False: 0.5}}
-    if h == "DATE" or c.endswith(("_DATE", "_DAY")):
+    if h == "DATE" or (not h.startswith("TIMESTAMP") and c.endswith(("_DATE", "_DAY"))):
         return {"gen": "time_offset", "type": "DATE", **WEEK}
     if h.startswith("TIMESTAMP") or c.endswith(("_AT", "_TS", "_TIME", "_TIMESTAMP")):
-        return {"gen": "time_offset", **WEEK}
+        return {"gen": "time_offset", **({"type": "TIMESTAMPTZ"} if h == "TIMESTAMPTZ" else {}), **WEEK}
     if h in ("VARCHAR", "TEXT"):
         return {"gen": "template", "template": f"{column.lower()}_{{hex}}"}
     if h in ("BIGINT", "INTEGER", "INT", "SMALLINT") or h.endswith(",0)") or c.endswith(("_ID", "_COUNT", "_QTY", "_QUANTITY")) or c == "ID":
@@ -318,6 +389,18 @@ def guess(column: str, hint: str | None) -> dict:
     return {"gen": "template", "template": f"{column.lower()}_{{hex}}"}
 
 
+def within_bounds(gen: dict, bounds: set[float] | None) -> None:
+    """Make a numeric column's values straddle the numbers the SQL compares it with, so that
+    `where block_number between 9820000 and 10000000` keeps rows."""
+    if not bounds or gen.get("gen") != "dist" or str(gen.get("type", "")).upper() not in ("BIGINT", "DOUBLE", ""):
+        return
+    lo, hi = min(bounds), max(bounds)
+    if lo == hi:  # one threshold: values on both sides of it
+        lo, hi = (0, max(2 * hi, 10)) if hi >= 0 else (2 * lo, 0)
+    whole = str(gen.get("type", "")).upper() == "BIGINT"
+    gen.update(p=[0, 1], v=[int(lo), int(hi)] if whole else [lo, hi])
+
+
 def hint_is_number(hint: str | None) -> bool:
     return (hint or "").upper().startswith(("BIGINT", "INT", "DECIMAL", "NUMERIC", "DOUBLE", "FLOAT"))
 
@@ -326,7 +409,21 @@ def first(candidates: list[str], columns) -> str | None:
     return next((c for c in candidates if c in columns), None)
 
 
+class Analysis:
+    """What reading the project gives: a first spec, notes for the user, and where each model
+    column comes from (so a failing test can be traced to the source column it is about)."""
+
+    def __init__(self, spec: dict, notes: list[str], locate) -> None:  # noqa: ANN001
+        self.spec, self.notes, self.locate = spec, notes, locate
+        self.bounds: dict[tuple[str, str], set[float]] = {}
+
+
 def build_spec(manifest: dict, database: str) -> tuple[dict, list[str]]:
+    analysis = analyse(manifest, database)
+    return analysis.spec, analysis.notes
+
+
+def analyse(manifest: dict, database: str) -> Analysis:
     notes: list[str] = []
     src_nodes = manifest["sources"]
     ids = {uid: f'{s["database"]}.{s["schema"]}.{s.get("identifier") or s["name"]}'.upper() for uid, s in src_nodes.items()}
@@ -400,19 +497,26 @@ def build_spec(manifest: dict, database: str) -> tuple[dict, list[str]]:
                 fks[here] = there
 
     tables: dict[str, dict] = {}
+    assumed: list[str] = []
+    keyless: list[str] = []
     for uid, name in ids.items():
         use, src = uses[name], src_nodes[uid]
         cols = dict(use.columns)
+        for col, kind in catalog.view(name).items():  # a Snowflake system view: its real columns
+            if not cols.get(col):
+                cols[col] = kind
+            if kind:
+                use.texts.discard(col)
         if not cols:
-            notes.append(f"{name}: no columns found (only `select *`?). Declare them, or run `fauxflake profile`.")
-            continue
+            # only ever read with `select *`: `init` learns the columns by running the models (see fit.py)
+            cols = {"_LOADED_AT": None}
         loaded = (src.get("loaded_at_field") or (src.get("config") or {}).get("loaded_at_field") or "").upper()
         loaded = loaded if loaded in cols else first(LOADED_AT, cols)
         key = keys.get(name) or first([f"{name.split('.')[-1].rstrip('S')}_ID", "ID"], cols)
         event = first([c for c in EVENT_TIME if c != loaded], cols)
         updated = first(UPDATED_AT, cols)
         if not keys.get(name):
-            notes.append(f"{name}: no `unique` test found, {'assuming ' + key if key else 'no key'}.")
+            (assumed if key else keyless).append(f"{name}.{key}" if key else name)
         out: dict[str, dict] = {}
         for col, hint in cols.items():
             if col in use.texts and not hint:
@@ -436,6 +540,13 @@ def build_spec(manifest: dict, database: str) -> tuple[dict, list[str]]:
                 # `where name like 'tap-%'` should keep some rows: make values that fit each pattern
                 shapes = sorted(p.replace("\\", "").replace("%", "{hex}").replace("_", "x") for p in use.patterns[col])
                 out[col] = {"gen": "template", "templates": [*shapes, f"{col.lower()}_{{hex}}"]}
+            elif col in use.splits and not hint_is_number(hint):
+                # the SQL takes this text apart: give every part it reads the type it is cast to
+                found = use.splits[col]
+                (sep, wanted), *others = found["seps"].items()
+                shape = ["{n}" if found["digits"] or hint_is_number(wanted.get(i)) else "{hex}" for i in range(max(max(wanted) + 1, 2))]
+                # other separators the SQL splits on come after: 123/456.json
+                out[col] = {"gen": "template", "template": sep.join(shape) + "".join(f"{other}x" for other, _ in others)}
             elif col in use.paths:
                 out[col] = {"gen": "object", "fields": {path: guess(path.split(".")[-1], h) for path, h in sorted(use.paths[col].items())}}
                 if "id" in out[col]["fields"]:
@@ -454,6 +565,7 @@ def build_spec(manifest: dict, database: str) -> tuple[dict, list[str]]:
                 out[col] = {"gen": "updated_at"}
             else:
                 out[col] = guess(col, hint)
+            within_bounds(out[col], use.bounds.get(col))
         # author_id + author_username: the name belongs to the id, so it must not vary between rows
         for col, d in out.items():
             if col.endswith("_ID") and d["gen"] in ("dist", "fk", "template"):
@@ -465,6 +577,11 @@ def build_spec(manifest: dict, database: str) -> tuple[dict, list[str]]:
             "lateness": {"p": [0, 0.5, 0.99, 1], "seconds": [1, 30, 3600, 86400]},  # placeholder
             "columns": out,
         }
+    if assumed:
+        notes.append(f"{len(assumed)} source(s) have no `unique` test; assumed keys: {', '.join(assumed[:12])}{' ...' if len(assumed) > 12 else ''}.")
+    if keyless:
+        notes.append(f"{len(keyless)} source(s) have no `unique` test and no id-like column, so no key: "
+                     f"{', '.join(keyless[:12])}{' ...' if len(keyless) > 12 else ''}.")
     # a column named like another table's key is almost always a reference to it
     key_owner = {c: t for t, spec in tables.items() for c, d in spec["columns"].items() if d["gen"] in ("sequence", "hash_id")}
     for name, spec in tables.items():
@@ -479,7 +596,9 @@ def build_spec(manifest: dict, database: str) -> tuple[dict, list[str]]:
         if child in tables and parent in tables and tables[parent]["columns"].get(pcol, {}).get("gen") not in ("sequence", "hash_id"):
             notes.append(f"{child}.{col}: references {parent}.{pcol}, which is not that table's key; generated as a plain column.")
             tables[child]["columns"][col] = guess(col, None)
-    return {"seed": 42, "start": "2025-01-01", "dbt": {"database": database}, "tables": tables}, notes
+    analysis = Analysis({"seed": 42, "start": "2025-01-01", "dbt": {"database": database}, "tables": tables}, notes, locate)
+    analysis.bounds = {(name, col): numbers for name, use in uses.items() for col, numbers in use.bounds.items()}
+    return analysis
 
 
 HEADER = """# Written by `fauxflake init` from the dbt project. Keys, relationships and categories come
@@ -521,7 +640,10 @@ def unknown_functions(manifest: dict, emu) -> dict[str, set[int]]:  # noqa: ANN0
         except Exception:  # noqa: BLE001
             continue
         for call in tree.find_all(exp.Anonymous):
-            if isinstance(call.parent, (exp.Window, exp.TableFromRows, exp.Lateral, exp.Table)) or not isinstance(call.this, str):
+            owner = call.parent
+            while isinstance(owner, exp.Dot):  # information_schema.task_history(...)
+                owner = owner.parent
+            if isinstance(owner, (exp.Window, exp.TableFromRows, exp.Lateral, exp.Table)) or not isinstance(call.this, str):
                 continue
             calls.setdefault(call.name.lower(), set()).add(len(call.expressions))
     conn = emu._fs.connect(database="FAUXFLAKE_PROBE", schema="PUBLIC")
@@ -549,21 +671,79 @@ def udf_stubs(missing: dict[str, set[int]]) -> dict[str, str]:
             for name, arities in missing.items()}
 
 
-def write_spec(project, path: Path, database: str, emu=None) -> list[str]:  # noqa: ANN001
-    """`project` is a DbtProject pointed at a running emulator."""
+def write_spec(project, path: Path, database: str, emu=None, fit: bool = True, log=print) -> list[str]:  # noqa: ANN001
+    """`project` is a DbtProject pointed at a running emulator. With `fit`, the first spec is then
+    tried out: models are run and the project is built, and what the failures teach goes into the spec."""
     env = provide_env(project)
-    project.invoke(["compile"], quiet=True)  # best effort: models that fail to compile are skipped
-    manifest = json.loads((project.target_path / "manifest.json").read_text())
-    spec, notes = build_spec(manifest, database)
+    manifest = project.compile()  # best effort: models that fail to compile are skipped for now
+    analysis = analyse(manifest, database)
+    spec, notes = analysis.spec, analysis.notes
     stubs = udf_stubs(unknown_functions(manifest, emu)) if emu is not None else {}
     if stubs:
         spec["udfs"] = stubs
-        notes.insert(0, f"{len(stubs)} function(s) are not Snowflake built-ins the emulator knows ({', '.join(sorted(stubs))}). "
-                        "Each got a placeholder under `udfs` that returns NULL: replace it with DuckDB SQL that does the same job.")
     if env:
         spec["dbt"]["env"] = env
         notes.insert(0, f"set placeholders for {len(env)} environment variable(s) the project requires (dbt.env in the spec)")
     path.write_text(HEADER + yaml.safe_dump(spec, sort_keys=False, default_flow_style=None, width=110))
+    if fit and emu is not None:
+        notes += _fit(project, path, database, emu, manifest, analysis, log)
+    elif stubs:
+        notes.insert(0, _stub_note(stubs))
+    return notes
+
+
+def _stub_note(stubs) -> str:  # noqa: ANN001
+    return (f"{len(stubs)} function(s) are neither Snowflake built-ins the emulator knows nor created by the project "
+            f"({', '.join(sorted(stubs))}). Each has a placeholder under `udfs` that returns NULL: "
+            "replace it with DuckDB SQL that does the same job.")
+
+
+def _fit(project, path: Path, database: str, emu, manifest: dict, analysis: Analysis, log) -> list[str]:  # noqa: ANN001
+    from . import objects
+    from .fit import Fitter
+
+    fitter = Fitter(emu, path, log, bounds=analysis.bounds)
+    models = [n for n in manifest["nodes"].values() if n["resource_type"] == "model"]
+    log(f"trying the spec out on {len(models)} models")
+    fitter.generate()
+    project.invoke(["seed"], silent=True)
+    fitter.learn_from_models(manifest, database)
+    if any(not n.get("compiled_code") for n in models):
+        # some models only compile once the relations they inspect exist: they do now
+        manifest = project.compile()
+        fitter.learn_from_models(manifest, database)
+    fitter.drop_models(manifest)
+    summary = fitter.learn_from_build(project, analysis)
+    # a function the project creates itself (in a hook) needs no placeholder
+    state = emu._fs.results_cache.get(objects._KEY)
+    created = set(state.functions) if state else set()
+    stubs = {k: v for k, v in (fitter.spec.get("udfs") or {}).items() if k not in created}
+    if stubs:
+        fitter.spec["udfs"] = stubs
+    else:
+        fitter.spec.pop("udfs", None)
+    fitter.save()
+    notes = [_stub_note(stubs)] if stubs else []
+    if fitter.learned:
+        notes.append(f"learned {len(fitter.learned)} thing(s) by running the project, for example: " + " ".join(fitter.learned[:5]))
+    counts = summary.get("counts") or {}
+    built = sum(v for k, v in counts.items() if k.startswith(("model:", "snapshot:", "seed:")) and k.endswith(":success"))
+    total = sum(v for k, v in counts.items() if k.startswith(("model:", "snapshot:", "seed:")))
+    tests = sum(v for k, v in counts.items() if k.startswith("test:"))
+    passed = sum(v for k, v in counts.items() if k.startswith("test:") and k.endswith((":pass", ":warn", ":success")))
+    expected = (fitter.spec.get("dbt") or {}).get("expected_failures") or []
+    if counts:
+        notes.append(f"on the generated data: {built}/{total} models, seeds and snapshots build; {passed}/{tests} tests pass.")
+    if expected:
+        notes.append(f"{len(expected)} test(s) state facts about production data that the generated data does not share. They are "
+                     f"listed under dbt.expected_failures in the spec and left out of the build: teach the spec the rule and remove "
+                     f"them from the list, or keep them there. For example: {', '.join(expected[:3])}.")
+    for uid, status, message in (summary.get("failed") or [])[:25]:
+        lines = [line.strip() for line in message.splitlines() if line.strip()]
+        first = next((line for line in lines if not re.match(r"(Database|Runtime|Compilation) Error", line)), lines[0] if lines else "")
+        notes.append(f"{'FAILS' if status == 'fail' else 'ERROR'} {uid.split('.', 2)[-1]}: {first[:200]}")
+    if len(summary.get("failed") or []) > 25:
+        notes.append(f"... and {len(summary['failed']) - 25} more: run `fauxflake build` to see them all.")
     return notes
 
 

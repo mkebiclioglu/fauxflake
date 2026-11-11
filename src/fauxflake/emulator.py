@@ -138,6 +138,7 @@ def rewrite(sql: str) -> str:
 
 
 _ALIAS_ERROR = re.compile(r'Alias (?:with name )?"+([^"]+)"+ (?:exists, but aliases cannot be used|referenced(?: in a SELECT clause)? - but the expression has (?:side effects|a subquery))')
+_MISSING_COLUMN = re.compile(r'Referenced column "([^"]+)" not found in FROM clause')
 _AMBIGUOUS_ERROR = re.compile(r"""Ambiguous reference to column name "+([^"]+)"+ \(use: '"?([^'".]+)"?\.""")
 _patched = False
 
@@ -156,6 +157,7 @@ def _patch_fakesnow() -> None:
             self._fauxflake_outer = semantics.outer_flattens(command)
             self._fauxflake_recursive = semantics.outer_flattens(command, "recursive")
             self._fauxflake_layer, self._fauxflake_inline, self._fauxflake_owners = False, set(), {}
+            self._fauxflake_qualify = False
             command = objects.session_functions(self, command)
             handled = objects.intercept(self, command, original)  # functions, procedures, streams, tasks, policies
             if handled is not None:
@@ -170,8 +172,15 @@ def _patch_fakesnow() -> None:
                     # constructs DuckDB will not plan as written: say how to rewrite them, then run again
                     message = str(e)
                     alias = _ALIAS_ERROR.search(message)
+                    if not alias:  # a SELECT alias used in a JOIN condition reads as a missing column
+                        missing = _MISSING_COLUMN.search(message)
+                        if missing and re.search(r"(?i)\bas\s+\"?" + re.escape(missing.group(1)) + r"\b", command) \
+                                and re.search(r"(?i)\bjoin\b", command):
+                            alias = missing
                     ambiguous = _AMBIGUOUS_ERROR.search(message)
-                    if "window function calls cannot be nested" in message and not self._fauxflake_layer:
+                    if "Ambiguous reference to catalog or schema" in message and not self._fauxflake_qualify:
+                        self._fauxflake_qualify = True  # schema.table when a database has the schema's name
+                    elif "window function calls cannot be nested" in message and not self._fauxflake_layer:
                         self._fauxflake_layer = True  # an aliased window used inside another window
                     elif alias and alias.group(1).upper() not in self._fauxflake_inline:
                         self._fauxflake_inline.add(alias.group(1).upper())  # an alias built from another alias
@@ -216,11 +225,21 @@ def _patch_fakesnow() -> None:
     server.app.exception_handlers[server.ServerError] = server_error
     server.app.middleware_stack = None
 
+    # a SUM over integers is a HUGEINT in DuckDB and a NUMBER in Snowflake: describe it as one
+    import fakesnow.info_schema as info
+
+    whole = "('BIGINT', 'HUGEINT', 'INTEGER', 'SMALLINT', 'TINYINT', 'UBIGINT', 'UINTEGER', 'USMALLINT', 'UTINYINT', 'UHUGEINT')"
+    info.SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW = info.SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW \
+        .replace("columns.data_type='BIGINT'", f"columns.data_type in {whole}").replace("columns.data_type='DOUBLE'", "columns.data_type in ('DOUBLE', 'FLOAT')") \
+        .replace("then NULL else columns.numeric_scale end", f"then NULL when columns.data_type in {whole} then 0 else columns.numeric_scale end")
+
     semantics.patch_upstream()
     original_transform = FakeSnowflakeCursor._transform
 
     def _transform(self, expression, params):  # noqa: ANN001
         expression = objects.apply_policies(objects.result_scans(expression, self), self)
+        if getattr(self, "_fauxflake_qualify", False) and self._conn.database:
+            expression = semantics.qualify_schemas(expression, self._conn.database)
         if getattr(self, "_fauxflake_owners", None):
             expression = semantics.qualify_using(expression, self._fauxflake_owners)
         if getattr(self, "_fauxflake_inline", None):

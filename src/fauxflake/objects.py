@@ -602,6 +602,7 @@ _SIMPLE = [  # (pattern, handler name)
 ]
 
 
+_TRAILING_COMMENT = re.compile(r"(?s)(?:\s*;)?\s*/\*(?:(?!\*/).)*\*/\s*;?\s*$")
 _LAST_QUERY = re.compile(r"(?i)\blast_query_id\(\s*(?:-1)?\s*\)")
 
 
@@ -642,6 +643,7 @@ def remember(cursor) -> None:  # noqa: ANN001
 def intercept(cursor, command: str, original):  # noqa: ANN001, ANN201
     """Handle a statement about one of the objects above. Returns None for everything else."""
     head = re.match(_LEAD + r"(\w+)", command)
+    command = _TRAILING_COMMENT.sub("", command)  # dbt appends its query comment after the statement
     if not head or head.group(1).lower() not in ("create", "alter", "drop", "show", "call", "execute", "declare", "begin", "use"):
         return None
     state = state_of(cursor._conn)

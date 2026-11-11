@@ -51,6 +51,9 @@ def build(spec_path, project_dir, scale, history, db_path, dbt_args):
         wh = Warehouse(emu, spec, scale)
         counts = wh.advance_to(_start(spec, history))
         click.echo(f"generated {sum(counts.values()):,} rows in {time.time() - t0:.1f}s")
+        expected = spec.dbt.get("expected_failures") or []
+        if expected:
+            click.echo(f"leaving out {len(expected)} test(s) listed under dbt.expected_failures in {spec_path}")
         project = DbtProject(project_dir, emulator_output(emu.port, spec.dbt.get("database", "ANALYTICS")))
         ok = project.invoke(["build", *dbt_args])
     sys.exit(0 if ok else 1)
@@ -233,8 +236,11 @@ def query(spec_path, db_path, schema, limit, sql):
 @click.option("--project-dir", default=".", show_default=True)
 @click.option("--database", default="ANALYTICS", show_default=True, help="Database dbt builds into.")
 @click.option("--force", is_flag=True, help="Overwrite an existing spec.")
-def init(spec_path, project_dir, database, force):
-    """Write a first spec from the dbt project itself. Needs no Snowflake access."""
+@click.option("--fit/--no-fit", default=True, show_default=True,
+              help="Try the spec out (run the models, build the project) and learn from what fails.")
+def init(spec_path, project_dir, database, force, fit):
+    """Write a spec from the dbt project itself, then fit it until the project builds.
+    Needs no Snowflake access."""
     from pathlib import Path
 
     from .dbt import DbtProject, emulator_output
@@ -245,7 +251,8 @@ def init(spec_path, project_dir, database, force):
     if path.exists() and not force:
         raise click.ClickException(f"{path} already exists (use --force to overwrite)")
     with serve() as emu:
-        notes = write_spec(DbtProject(project_dir, emulator_output(emu.port, database)), path, database, emu)
+        notes = write_spec(DbtProject(project_dir, emulator_output(emu.port, database)), path, database, emu,
+                           fit=fit, log=click.echo)
     spec = Spec.load(path)
     click.echo(f"wrote {path}: {len(spec.tables)} source tables, "
                f"{sum(len(t.columns) for t in spec.tables.values())} columns")

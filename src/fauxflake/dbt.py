@@ -87,13 +87,45 @@ class DbtProject:
         if self._local and not self._databases_ready and args and args[0] in ("build", "run", "seed", "snapshot", "test"):
             self._create_databases()
         os.environ.setdefault("DBT_SEND_ANONYMOUS_USAGE_STATS", "false")
-        cmd = (["--log-level", "none"] if silent else ["--quiet"] if quiet else []) + list(args) + [
+        args = list(args)
+        expected = os.environ.get("FAUXFLAKE_EXPECTED_FAILURES", "").split()
+        if expected and args and args[0] in ("build", "test"):
+            # tests known to fail on generated data (dbt.expected_failures in the spec) are left out by name
+            at = args.index("--exclude") + 1 if "--exclude" in args else None
+            args = args[:at] + expected + args[at:] if at else [*args, "--exclude", *expected]
+        cmd = (["--log-level", "none"] if silent else ["--quiet"] if quiet else []) + args + [
             "--project-dir", str(self.dir), "--profiles-dir", str(self.profiles_dir), "--target", self.target,
             "--target-path", str(self.target_path),
         ]
         result = dbtRunner().invoke(cmd)
         self.last_error = str(result.exception) if result.exception else ""
         return bool(result.success)
+
+    def compile(self) -> dict:
+        """Compile every model that compiles and return the manifest with their SQL. A model whose
+        Jinja needs relations that do not exist yet fails alone instead of stopping the rest."""
+        from dbt.cli.main import dbtRunner
+        from dbt.task.compile import CompileTask
+
+        os.environ["FAUXFLAKE_SCHEMA"] = "CI"
+        os.environ.setdefault("DBT_SEND_ANONYMOUS_USAGE_STATS", "false")
+        saved = CompileTask.raise_on_first_error, CompileTask._mark_dependent_errors
+        CompileTask.raise_on_first_error = lambda self: False
+        CompileTask._mark_dependent_errors = lambda self, *a, **k: None  # compiling needs no upstream
+        try:
+            result = dbtRunner().invoke([
+                "--log-level", "none", "compile", "--select", "resource_type:model", "resource_type:snapshot",
+                "--project-dir", str(self.dir), "--profiles-dir", str(self.profiles_dir), "--target", self.target,
+                "--target-path", str(self.target_path)])
+        finally:
+            CompileTask.raise_on_first_error, CompileTask._mark_dependent_errors = saved
+        self.last_error = str(result.exception) if result.exception else ""
+        manifest = json.loads((self.target_path / "manifest.json").read_text())
+        for r in getattr(result.result, "results", None) or []:
+            code = getattr(r.node, "compiled_code", None)
+            if code and r.node.unique_id in manifest["nodes"]:
+                manifest["nodes"][r.node.unique_id]["compiled_code"] = code
+        return manifest
 
     def models(self) -> list[dict]:
         manifest = json.loads((self.target_path / "manifest.json").read_text())
