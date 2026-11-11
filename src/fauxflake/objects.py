@@ -20,6 +20,7 @@ import json
 import re
 import sys
 import threading
+import zlib
 from dataclasses import dataclass, field
 
 import sqlglot
@@ -45,6 +46,9 @@ class State:
     row_policies: dict[tuple[str, str, str], list[tuple[str, list[str]]]] = field(default_factory=dict)
     pinned: set[str] = field(default_factory=set)  # functions the spec defines: the project cannot replace them
     native: list[str] = field(default_factory=list)  # Python functions registered in DuckDB
+    handlers: dict[str, object] = field(default_factory=dict)  # registered name -> the handler it calls now
+    dispatchers: dict[str, object] = field(default_factory=dict)  # what DuckDB holds, kept alive here
+    root: object = None  # the emulator's own DuckDB connection
     js: object = None
     lock: threading.RLock = field(default_factory=threading.RLock)
 
@@ -326,10 +330,14 @@ def _convert_out(value, kind: str):  # noqa: ANN001, ANN202
 
 
 def _register_native(cursor, state: State, defn: dict) -> str:  # noqa: ANN001
-    """Register a Python callable for a Python or JavaScript function; returns its DuckDB name."""
-    name = f"_udfx_{defn['name'].lower()}_{len(defn['args'])}"
+    """Make a Python or JavaScript function callable from DuckDB; returns its DuckDB name.
+
+    DuckDB keeps a registered function for the life of the database, so each signature is
+    registered once, as a dispatcher. `CREATE OR REPLACE` only swaps the handler behind it."""
     kinds = [duck_type(k) for _, k in defn["args"]]
     out_kind = duck_type(defn["returns"])
+    signature = zlib.crc32("|".join([*kinds, out_kind]).encode()) % 100000
+    name = f"_udfx_{defn['name'].lower()}_{len(kinds)}_{signature}"
     if defn["language"] == "python":
         handler = _python_handler(defn)
 
@@ -337,20 +345,20 @@ def _register_native(cursor, state: State, defn: dict) -> str:  # noqa: ANN001
             return _convert_out(handler(*[_convert_in(v, k) for v, k in zip(values, kinds)]), out_kind)
     else:
         engine = _js(state)
-        key = engine.define(name, [a for a, _ in defn["args"]], defn["body"])
+        key = engine.define(f"{name}_{len(state.handlers)}", [a for a, _ in defn["args"]], defn["body"])
 
         def call(*values):  # noqa: ANN002, ANN202
             return _convert_out(engine.call(key, [plain(_convert_in(v, k)) for v, k in zip(values, kinds)]), out_kind)
-    duck = cursor._duck_conn
-    try:
-        duck.remove_function(name)
-    except Exception:  # noqa: BLE001, S110 - not registered yet
-        pass
-    # DuckDB reads the arity off the callable's signature: give it one parameter per argument
-    names = ", ".join(f"a{i}" for i in range(len(kinds)))
-    exact = eval(f"lambda {names}: call({names})", {"call": call})  # noqa: S307 - built from a count, not from input
-    duck.create_function(name, exact, kinds, out_kind, null_handling="special", side_effects=True)
-    if name not in state.native:
+    registered = name in state.handlers
+    state.handlers[name] = call
+    if not registered:
+        # DuckDB reads the arity off the callable's signature: give it one parameter per argument
+        names = ", ".join(f"a{i}" for i in range(len(kinds)))
+        dispatch = eval(f"lambda {names}: handlers[name]({names})", {"handlers": state.handlers, "name": name})  # noqa: S307
+        # on the emulator's own connection, which outlives every session: a function registered on a
+        # session's cursor is left dangling when that session closes
+        (state.root or cursor._duck_conn).create_function(name, dispatch, kinds, out_kind, null_handling="special", side_effects=True)
+        state.dispatchers[name] = dispatch
         state.native.append(name)
     return name
 

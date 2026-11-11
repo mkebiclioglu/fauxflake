@@ -44,6 +44,12 @@ def f(s):
     return None if s is None else sorted(set(s.split(',')))
 $$""")
     assert run("select array_size(tags('b,a,b')), tags(null)") == [(2, None)]
+    # a hook creates its functions again on every dbt run: replacing one swaps the code behind it
+    run("""create or replace function tags(s string) returns array language python runtime_version='3.11' handler='f' as $$
+def f(s):
+    return None if s is None else ['replaced']
+$$""")
+    assert run("select tags('b,a,b')") == [('["replaced"]',)]
     # several arguments, quoted lower-case names, a body in single quotes: as real projects write them
     run("""create or replace function "ANALYTICS".ci.regexp_to_array("input_text" string, "regex_text" STRING) returns array language javascript as '
     var found = input_text == null ? null : input_text.match(new RegExp(regex_text, "g"));

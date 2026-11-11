@@ -455,6 +455,7 @@ def engine() -> Iterator[Emulator]:
     semantics.reserved_words(fs.duck_conn)
     fs.duck_conn.execute("set global old_implicit_casting = true")  # text compares with numbers and dates, as in Snowflake
     spill = _spill_directory(fs.duck_conn)
+    fs.results_cache.setdefault(objects._KEY, objects.State()).root = fs.duck_conn
     try:
         emu = Emulator(port=0, duck=fs.duck_conn, _fs=fs)
         yield emu
@@ -494,6 +495,7 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
     semantics.reserved_words(fs.duck_conn)
     fs.duck_conn.execute("set global old_implicit_casting = true")  # text compares with numbers and dates, as in Snowflake
     spill = _spill_directory(fs.duck_conn)
+    fs.results_cache.setdefault(objects._KEY, objects.State()).root = fs.duck_conn
     previous = fakesnow.server.shared_fs
     fakesnow.server.shared_fs = fs
 
