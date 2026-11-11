@@ -185,7 +185,7 @@ class Fitter:
                 self.create_existing(fq)
                 self.learned.append(f"{fq}: read by {node['name']} before the project builds it; starts as an empty relation.")
             else:
-                self.tables[fq] = {"volume": {"rows_per_day": 1_000_000, "weekly": [1] * 7},
+                self.tables[fq] = {"volume": {"rows_per_day": 100_000, "weekly": [1] * 7},
                                    "lateness": {"p": [0, 0.5, 0.99, 1], "seconds": [1, 30, 3600, 86400]},
                                    "columns": {"_LOADED_AT": {"gen": "loaded_at"}, **{c: guess(c, None) for c in read if c != "_LOADED_AT"}}}
                 cols = ", ".join(f'"{c}" {duck_type(g)}' for c, g in self.tables[fq]["columns"].items())
@@ -727,7 +727,8 @@ class Fitter:
         selected: list[str] = []
         outcome: dict[str, tuple[str, str, str]] = {}  # node -> (kind, status, message), across rounds
         for n_round in range(1, rounds + 1):
-            self.generate()
+            # at the scale and history `fauxflake build` uses, so that what is reported here is what a build gives
+            self.generate(scale=0.001, history=60)
             before = len(self.learned)
             project.invoke(["build", *selected], silent=True)
             results_path = project.target_path / "run_results.json"

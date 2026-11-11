@@ -600,7 +600,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
                     if sibling != col and sibling.startswith(col[:-2]) and sd["gen"] in ("template", "categorical"):
                         sd["follows"] = col
         tables[name] = {
-            "volume": {"rows_per_day": 1_000_000, "weekly": [1, 1, 1, 1, 1, 1, 1]},  # placeholder
+            "volume": {"rows_per_day": 100_000, "weekly": [1, 1, 1, 1, 1, 1, 1]},  # placeholder: 100 rows a day at the default scale
             "lateness": {"p": [0, 0.5, 0.99, 1], "seconds": [1, 30, 3600, 86400]},  # placeholder
             "columns": out,
         }
