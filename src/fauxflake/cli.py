@@ -41,6 +41,16 @@ def with_common(f):
 @click.version_option(__version__)
 def main() -> None:
     """Run dbt-snowflake CI on synthetic data, locally, on DuckDB."""
+    import signal
+    import sys
+
+    def stop(*_: object) -> None:  # a cancelled CI job: leave through the normal exit, so temporary files go
+        sys.exit(143)
+
+    try:
+        signal.signal(signal.SIGTERM, stop)
+    except ValueError:  # not the main thread (the test runner)
+        pass
 
 
 @main.command(context_settings={"ignore_unknown_options": True})
