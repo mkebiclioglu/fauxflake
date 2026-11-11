@@ -336,7 +336,8 @@ class Fitter:
                     found += self.columns_read(tree, tb)
                     select = tb.find_ancestor(exp.Select)
                     cte = select.parent if select is not None and isinstance(select.parent, exp.CTE) else None
-                    if cte is not None and select.find(exp.Star) and not select.args.get("joins"):
+                    listed = select is not None and all(isinstance(e, (exp.Star, exp.Column)) for e in select.expressions)
+                    if cte is not None and listed and not select.args.get("joins"):  # select *, or dbt_utils.star written out
                         for other in tree.find_all(exp.Table):  # `with t as (select * from it) select a, b from t`
                             if other.name.upper() == cte.alias.upper() and not other.db:
                                 found += self.columns_read(tree, other)
@@ -355,10 +356,12 @@ class Fitter:
 
     def sources_of(self, uid: str) -> list[str]:
         """The generated tables a model reads, directly or through the models before it."""
-        out = [self.source_names[dep] for dep in self._ancestors(uid) if dep in self.source_names]
-        tree = self.tree(uid)
-        if tree is not None:  # and tables it names without source()
-            out += [t for t in self.real_tables(tree, {c.alias.upper(): c.this for c in tree.find_all(exp.CTE)}) if t in self.tables]
+        ancestors = self._ancestors(uid)
+        out = [self.source_names[dep] for dep in ancestors if dep in self.source_names]
+        for node_id in [uid, *sorted(a for a in ancestors if a.startswith(("model.", "snapshot.")))]:
+            tree = self.tree(node_id) if node_id in self.sql_of else None
+            if tree is not None:  # and tables it, or a model before it, names without source()
+                out += [t for t in self.real_tables(tree, {c.alias.upper(): c.this for c in tree.find_all(exp.CTE)}) if t in self.tables]
         return [t for t in dict.fromkeys(out) if t in self.tables]
 
     def columns_used(self, uid: str, how: str, fmt: str | None = None) -> list[str]:
@@ -695,9 +698,11 @@ class Fitter:
         """Is `fq` a model that only stacks generated tables (dbt_utils.union_relations)? Remember which."""
         if fq in self.unions:
             return True
-        uid = self.by_rel.get(fq)
+        uid = self.by_rel.get(fq) or self.relation_owner.get(fq)
         if not uid or "union_relations" not in (self.nodes.get(uid, {}).get("raw_code") or ""):
             return False
+        if uid not in self.sql_of and self.nodes[uid].get("compiled_code"):
+            self.sql_of[uid] = self.nodes[uid]["compiled_code"].strip().rstrip(";")
         tree = self.tree(uid)
         if tree is None or not isinstance(tree.unnest() if isinstance(tree, exp.Subquery) else tree, (exp.SetOperation, exp.Select)):
             return False
@@ -871,9 +876,7 @@ class Fitter:
                 if source is None or cols == target or not target:
                     continue
                 old = self.tables[source].get("columns") or {}
-                extra = [c for c in old if c not in target and old[c].get("gen") != "loaded_at"]
-                if extra and fixed:
-                    continue  # it has columns the other branch does not: not ours to remove
+                extra = [] if fixed else [c for c in old if c not in target and old[c].get("gen") != "loaded_at"]
                 fresh = {c: old.get(c) or guess(c, None) for c in [*target, *extra]}
                 if list(fresh) == list(old):
                     continue
@@ -1370,6 +1373,14 @@ class Fitter:
             self.relation_owner = {_fq(n["relation_name"]): uid for uid, n in nodes.items() if n.get("relation_name")}
             self.source_names = {uid: _fq(f'{n["database"]}.{n["schema"]}.{n.get("identifier") or n["name"]}')
                                  for uid, n in manifest.get("sources", {}).items()}
+            for uid, n in nodes.items():  # what the build compiled, also for the models loop 1 left alone
+                code = n.get("compiled_code")
+                if code and n.get("resource_type") in ("model", "snapshot") and n.get("language", "sql") == "sql":
+                    if self.sql_of.get(uid) != code.strip().rstrip(";"):
+                        self.sql_of[uid] = code.strip().rstrip(";")
+                        self.trees.pop(uid, None)
+                    if n.get("relation_name") and _fq(n["relation_name"]).count(".") == 2:
+                        self.by_rel[_fq(n["relation_name"])] = uid
             failed = [r for r in results if r["status"] in ("error", "fail")]
             expected = self.spec.setdefault("dbt", {}).setdefault("expected_failures", [])
             accepted = 0
