@@ -315,7 +315,7 @@ def _convert_out(value, kind: str):  # noqa: ANN001, ANN202
     if value is None:
         return None
     if kind == "JSON":
-        return json.dumps(plain(value))
+        return json.dumps(plain(value), separators=(",", ":"))  # the way DuckDB writes JSON everywhere else
     if kind == "BIGINT":
         return int(value)
     if kind == "DOUBLE":
@@ -346,7 +346,10 @@ def _register_native(cursor, state: State, defn: dict) -> str:  # noqa: ANN001
         duck.remove_function(name)
     except Exception:  # noqa: BLE001, S110 - not registered yet
         pass
-    duck.create_function(name, call, kinds, out_kind, null_handling="special", side_effects=True)
+    # DuckDB reads the arity off the callable's signature: give it one parameter per argument
+    names = ", ".join(f"a{i}" for i in range(len(kinds)))
+    exact = eval(f"lambda {names}: call({names})", {"call": call})  # noqa: S307 - built from a count, not from input
+    duck.create_function(name, exact, kinds, out_kind, null_handling="special", side_effects=True)
     if name not in state.native:
         state.native.append(name)
     return name

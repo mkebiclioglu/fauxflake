@@ -44,6 +44,12 @@ def f(s):
     return None if s is None else sorted(set(s.split(',')))
 $$""")
     assert run("select array_size(tags('b,a,b')), tags(null)") == [(2, None)]
+    # several arguments, quoted lower-case names, a body in single quotes: as real projects write them
+    run("""create or replace function "ANALYTICS".ci.regexp_to_array("input_text" string, "regex_text" STRING) returns array language javascript as '
+    var found = input_text == null ? null : input_text.match(new RegExp(regex_text, "g"));
+    return found == null ? [] : found;
+'""")
+    assert run("select regexp_to_array('a1b22c333', '[0-9]+'), array_size(analytics.ci.regexp_to_array(null, 'x'))") == [('["1","22","333"]', 0)]
     run("create or replace function dbl(x float) returns float language javascript as $$ return X * 2; $$")
     assert run("select dbl(amt) from t order by id") == [(20.0,), (40.0,)]
     # variants cross as objects; newer syntax than ES5 is compiled down
