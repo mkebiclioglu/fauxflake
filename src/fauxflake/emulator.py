@@ -12,6 +12,7 @@ import contextlib
 import logging
 import os
 import re
+import shutil
 import socket
 import sys
 import threading
@@ -427,6 +428,16 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
+def _spill_directory(duck: duckdb.DuckDBPyConnection) -> str:
+    """Where DuckDB writes what does not fit in memory. Its default is `.tmp` in the working directory,
+    which is the user's dbt repository: use a private directory outside it, removed on exit."""
+    import tempfile
+
+    path = tempfile.mkdtemp(prefix="fauxflake-spill-")
+    duck.execute("set temp_directory = '" + path.replace("'", "''") + "'")
+    return path
+
+
 @contextlib.contextmanager
 def engine() -> Iterator[Emulator]:
     """Only the DuckDB side, with no Snowflake endpoint: enough to generate and inspect data."""
@@ -438,12 +449,14 @@ def engine() -> Iterator[Emulator]:
         fs.duck_conn.execute(macro)
     semantics.reserved_words(fs.duck_conn)
     fs.duck_conn.execute("set global old_implicit_casting = true")  # text compares with numbers and dates, as in Snowflake
+    spill = _spill_directory(fs.duck_conn)
     try:
         emu = Emulator(port=0, duck=fs.duck_conn, _fs=fs)
         yield emu
     finally:
         objects.close(emu)
         fs.duck_conn.close()
+        shutil.rmtree(spill, ignore_errors=True)
 
 
 @contextlib.contextmanager
@@ -475,6 +488,7 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
         fs.duck_conn.execute(macro)
     semantics.reserved_words(fs.duck_conn)
     fs.duck_conn.execute("set global old_implicit_casting = true")  # text compares with numbers and dates, as in Snowflake
+    spill = _spill_directory(fs.duck_conn)
     previous = fakesnow.server.shared_fs
     fakesnow.server.shared_fs = fs
 
@@ -500,3 +514,4 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
         thread.join(timeout=5)
         fakesnow.server.shared_fs = previous
         fs.duck_conn.close()
+        shutil.rmtree(spill, ignore_errors=True)

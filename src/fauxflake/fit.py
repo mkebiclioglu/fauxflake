@@ -298,20 +298,26 @@ class Fitter:
         for child, node in self.nodes.items():
             if uid not in node.get("depends_on", {}).get("nodes", []) or node.get("resource_type") != "model":
                 continue
-            tree = self.tree(child)
-            if tree is None:
-                continue
-            for tb in tree.find_all(exp.Table):
-                if tb.name.upper() != name:
-                    continue
-                found = self.columns_read(tree, tb)
-                select = tb.find_ancestor(exp.Select)
-                cte = select.parent if select is not None and isinstance(select.parent, exp.CTE) else None
-                if cte is not None and select.find(exp.Star) and not select.args.get("joins"):
-                    for other in tree.find_all(exp.Table):  # `with t as (select * from it) select a, b from t`
-                        if other.name.upper() == cte.alias.upper() and not other.db:
-                            found += self.columns_read(tree, other)
+            trees = [self.tree(child)]
+            try:  # what was compiled before the parent existed can be a placeholder: the Jinja itself says more
+                trees.append(sqlglot.parse_one(self.sketch(child), read="snowflake"))
+            except Exception:  # noqa: BLE001, S110
+                pass
+            for tree in trees:
+                found: list[str] = []
+                for tb in (tree.find_all(exp.Table) if tree is not None else ()):
+                    if tb.name.upper() != name:
+                        continue
+                    found += self.columns_read(tree, tb)
+                    select = tb.find_ancestor(exp.Select)
+                    cte = select.parent if select is not None and isinstance(select.parent, exp.CTE) else None
+                    if cte is not None and select.find(exp.Star) and not select.args.get("joins"):
+                        for other in tree.find_all(exp.Table):  # `with t as (select * from it) select a, b from t`
+                            if other.name.upper() == cte.alias.upper() and not other.db:
+                                found += self.columns_read(tree, other)
                 out += [c for c in found if c not in out]
+                if found:
+                    break
         return out
 
     def create_existing(self, fq: str) -> None:
