@@ -530,8 +530,8 @@ def analyse(manifest: dict, database: str) -> Analysis:
     for uid, name in ids.items():
         use, src = uses[name], src_nodes[uid]
         cols = dict(use.columns)
-        for col, kind in catalog.view(name).items():  # a Snowflake system view: its real columns
-            if not cols.get(col):
+        for col, kind in catalog.view(name, tuple(cols)).items():  # a Snowflake system view: its real columns
+            if kind or not cols.get(col):
                 cols[col] = kind
             if kind:
                 use.texts.discard(col)

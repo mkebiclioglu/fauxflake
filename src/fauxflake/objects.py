@@ -17,6 +17,7 @@ State lives with the emulator instance, so every connection sees the same object
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 import re
 import sys
 import threading
@@ -44,6 +45,8 @@ class State:
     alerts: dict[str, dict] = field(default_factory=dict)
     masks: dict[tuple[str, str, str], dict[str, tuple[str, list[str]]]] = field(default_factory=dict)
     row_policies: dict[tuple[str, str, str], list[tuple[str, list[str]]]] = field(default_factory=dict)
+    tags: dict[str, dict] = field(default_factory=dict)  # tag name -> where it lives, allowed values, comment
+    tagged: dict[tuple, dict[str, str]] = field(default_factory=dict)  # (domain, object, column) -> tag -> value
     pinned: set[str] = field(default_factory=set)  # functions the spec defines: the project cannot replace them
     native: list[str] = field(default_factory=list)  # Python functions registered in DuckDB
     handlers: dict[str, object] = field(default_factory=dict)  # registered name -> the handler it calls now
@@ -58,8 +61,8 @@ def state_of(conn) -> State:  # noqa: ANN001
     return conn.results_cache.setdefault(_KEY, State())
 
 
-def error(message: str) -> ProgrammingError:
-    return ProgrammingError(msg=message, errno=2003, sqlstate="42S02")
+def error(message: str, errno: int = 2003, sqlstate: str = "42S02") -> ProgrammingError:
+    return ProgrammingError(msg=message, errno=errno, sqlstate=sqlstate)
 
 
 # ---------------------------------------------------------------- small parsers
@@ -77,7 +80,7 @@ def qualified(cursor, name: str) -> tuple[str, str, str]:  # noqa: ANN001
     parts = [_unquote(p) for p in re.findall(r'"[^"]*"|[^.]+', name.strip())]
     conn = cursor._conn
     defaults = [conn.database or "", conn.schema or ""]
-    return tuple((defaults + parts)[-3:]) if len(parts) < 3 else tuple(parts[-3:])  # type: ignore[return-value]
+    return tuple(defaults[:3 - len(parts)] + parts) if len(parts) < 3 else tuple(parts[-3:])  # type: ignore[return-value]
 
 
 def _sql_name(fq: tuple[str, str, str]) -> str:
@@ -751,12 +754,158 @@ _SIMPLE = [  # (pattern, handler name)
     (re.compile(_LEAD + r"alter\s+external\s+table\s"), "nothing"),
     (re.compile(_LEAD + r"create\s+(?P<replace>or\s+replace\s+)?(?:transient\s+)?schema\s+(?:if\s+not\s+exists\s+)?(?P<name>" + _NAME + r")\s+clone\s+(?P<source>" + _NAME + r")"), "clone_schema"),
     (re.compile(_LEAD + r"show\s+(?:terse\s+)?(?P<kind>warehouses|roles|users|shares|integrations|(?:api|security|storage|notification|external\s+access|catalog)\s+integrations|"
-                        r"network\s+policies|network\s+rules|resource\s+monitors|tags|secrets|dynamic\s+tables|materialized\s+views|external\s+tables|"
+                        r"network\s+policies|network\s+rules|resource\s+monitors|secrets|dynamic\s+tables|materialized\s+views|external\s+tables|"
                         r"event\s+tables|iceberg\s+tables|managed\s+accounts|replication\s+\w+|failover\s+groups|password\s+policies|session\s+policies|"
                         r"packages\s+policies|external\s+functions|compute\s+pools|services|image\s+repositories|streamlits|notebooks|models|datasets|"
                         r"git\s+repositories|cortex\s+search\s+services|semantic\s+views|grants)\b"), "show_nothing"),
     (re.compile(_LEAD + r"execute\s+immediate\s+(?P<rest>.*)$"), "execute_immediate"),
     (re.compile(_LEAD + r"(?P<rest>(?:declare\b|begin\s+(?!transaction\b|work\b|name\b)\S).*\bend\b[\s;]*)$"), "block"),
+]
+
+
+# ---------------------------------------------------------------- tags
+
+_TAG_DOMAINS = r"table|view|materialized\s+view|dynamic\s+table|external\s+table|schema|database|warehouse|user|role|stream|task|procedure|function"
+_TAG_PAIR = re.compile(r"(" + _NAME + r")\s*=\s*'((?:[^']|'')*)'")
+_TAG_COLUMNS = ["TAG_DATABASE", "TAG_SCHEMA", "TAG_NAME", "TAG_VALUE", "LEVEL", "OBJECT_DATABASE", "OBJECT_SCHEMA", "OBJECT_NAME",
+                "DOMAIN", "COLUMN_NAME"]
+
+
+def _tag_name(name: str) -> str:
+    return _unquote(re.findall(r'"[^"]*"|[^.]+', name.strip())[-1]).upper()
+
+
+def _tag_object(cursor, domain: str, name: str) -> tuple[str, tuple]:  # noqa: ANN001
+    domain = re.sub(r"\s+", " ", domain.strip().upper())
+    parts = tuple(_unquote(p).upper() for p in re.findall(r'"[^"]*"|[^.]+', name.strip()))
+    if domain in ("DATABASE", "WAREHOUSE", "USER", "ROLE"):
+        return domain, parts[-1:]
+    if domain == "SCHEMA":
+        return domain, ((cursor._conn.database or "").upper(), *parts)[-2:]
+    kind = "TABLE" if domain.endswith(("TABLE", "VIEW")) else domain
+    return kind, tuple(p.upper() for p in qualified(cursor, name))
+
+
+def _create_tag(cursor, original, state, m):  # noqa: ANN001, ANN202
+    name = _tag_name(m.group("name"))
+    if name in state.tags and not m.group("replace"):
+        if m.group("exists"):
+            return _status(cursor, original, f"{name} already exists, statement succeeded.")
+        raise error(f"Object '{name}' already exists.", 2002, "42710")
+    db, schema, _ = qualified(cursor, m.group("name"))
+    allowed = re.search(r"(?is)allowed_values\s+((?:'(?:[^']|'')*'\s*,?\s*)+)", m.group("rest") or "")
+    comment = re.search(r"(?is)comment\s*=\s*'((?:[^']|'')*)'", m.group("rest") or "")
+    state.tags[name] = {"database": db.upper(), "schema": schema.upper(), "created": datetime.now(timezone.utc),
+                        "allowed": re.findall(r"'((?:[^']|'')*)'", allowed.group(1)) if allowed else None,
+                        "comment": comment.group(1) if comment else None}
+    return _status(cursor, original, f"Tag {name} successfully created.")
+
+
+def _drop_tag(cursor, original, state, m):  # noqa: ANN001, ANN202
+    name = _tag_name(m.group("name"))
+    if name not in state.tags and not m.group("exists"):
+        raise error(f"Tag '{name}' does not exist or not authorized.", 2003, "02000")
+    state.tags.pop(name, None)
+    for values in state.tagged.values():
+        values.pop(name, None)
+    return _status(cursor, original, f"{name} successfully dropped.")
+
+
+def _set_tag(cursor, original, state, m):  # noqa: ANN001, ANN202
+    domain, obj = _tag_object(cursor, m.group("domain"), m.group("object"))
+    column = _unquote(m.group("column")).upper() if m.group("column") else None
+    values = state.tagged.setdefault((domain, obj, column), {})
+    if m.group("verb").lower() == "unset":
+        for name in re.findall(_NAME, m.group("rest")):
+            values.pop(_tag_name(name), None)
+        return _status(cursor, original, "Statement executed successfully.")
+    pairs = _TAG_PAIR.findall(m.group("rest"))
+    if not pairs:
+        raise error("SET TAG: expected <tag> = '<value>'")
+    for name, value in pairs:
+        tag, value = _tag_name(name), value.replace("''", "'")
+        known = state.tags.get(tag)
+        if known is None:
+            raise error(f"Tag '{tag}' does not exist or not authorized.", 2003, "02000")
+        if known["allowed"] is not None and value not in known["allowed"]:
+            raise error(f"Tag value {value} is not in the allowed list of values for tag {tag}.", 394, "22023")
+        values[tag] = value
+    return _status(cursor, original, "Statement executed successfully.")
+
+
+def _show_tags(cursor, original, state, m):  # noqa: ANN001, ANN202
+    like = re.search(r"(?i)like\s+'([^']*)'", m.group("rest") or "")
+    pattern = re.compile("^" + re.escape(like.group(1)).replace("%", ".*").replace("_", ".") + "$", re.IGNORECASE) if like else None
+    rows = [(t["created"].isoformat(sep=" "), name, t["database"], t["schema"], getattr(cursor._conn, "_fauxflake_role", None) or "SYSADMIN",
+             t["comment"], json.dumps(t["allowed"]) if t["allowed"] is not None else None, "ROLE")
+            for name, t in sorted(state.tags.items()) if pattern is None or pattern.match(name)]
+    columns = ["created_on", "name", "database_name", "schema_name", "owner", "comment", "allowed_values", "owner_role_type"]
+    if not rows:
+        return original(cursor, "select " + ", ".join(f'null::varchar as "{c}"' for c in columns) + " where false")
+    body = ", ".join("(" + ", ".join(scripting.literal(v) for v in row) + ")" for row in rows)
+    return original(cursor, f"select * from (values {body}) as t(" + ", ".join(f'"{c}"' for c in columns) + ")")
+
+
+def tag_references(cursor, name: str, domain: str, columns: bool = False) -> list[tuple]:  # noqa: ANN001
+    """Rows of INFORMATION_SCHEMA.TAG_REFERENCES (the tags an object carries, its own and those it
+    inherits from its schema and database) or, with `columns`, TAG_REFERENCES_ALL_COLUMNS."""
+    state = state_of(cursor._conn)
+    kind, obj = _tag_object(cursor, "table" if domain.strip().upper() == "COLUMN" else domain, name.rsplit(".", 1)[0] if domain.strip().upper() == "COLUMN" else name)
+    column = _unquote(name.rsplit(".", 1)[1]).upper() if domain.strip().upper() == "COLUMN" else None
+    rows: dict[tuple, tuple] = {}
+
+    def add(level: str, values: dict[str, str], col: str | None, reported: str) -> None:
+        for tag, value in values.items():
+            known = state.tags.get(tag, {})
+            padded = (None, None, None, *obj)[-3:]
+            rows.setdefault((tag, col), (known.get("database"), known.get("schema"), tag, value, level, *padded, reported, col))
+
+    if columns:
+        for (k, o, c), values in state.tagged.items():
+            if k == kind and o == obj and c is not None:
+                add("COLUMN", values, c, "COLUMN")
+        add(kind, state.tagged.get((kind, obj, None), {}), None, kind)
+    else:
+        if column:
+            add("COLUMN", state.tagged.get((kind, obj, column), {}), column, "COLUMN")
+        add(kind, state.tagged.get((kind, obj, None), {}), column, "COLUMN" if column else kind)
+    if len(obj) == 3:
+        add("SCHEMA", state.tagged.get(("SCHEMA", obj[:2], None), {}), column, "COLUMN" if column else kind)
+    if len(obj) >= 2:
+        add("DATABASE", state.tagged.get(("DATABASE", obj[:1], None), {}), column, "COLUMN" if column else kind)
+    return list(rows.values())
+
+
+def tag_scans(tree: exp.Expression, cursor) -> exp.Expression:  # noqa: ANN001
+    """TABLE(INFORMATION_SCHEMA.TAG_REFERENCES[_ALL_COLUMNS]('<object>', '<domain>')) and SYSTEM$GET_TAG."""
+    for node in list(tree.find_all(exp.TableFromRows)):
+        call = node.this
+        while isinstance(call, exp.Dot):
+            call = call.expression
+        if not (isinstance(call, exp.Anonymous) and call.name.upper() in ("TAG_REFERENCES", "TAG_REFERENCES_ALL_COLUMNS")
+                and len(call.expressions) == 2 and all(isinstance(a, exp.Literal) for a in call.expressions)):
+            continue
+        rows = tag_references(cursor, call.expressions[0].name, call.expressions[1].name, call.name.upper().endswith("COLUMNS"))
+        typed = ", ".join(f'null::varchar as "{c}"' for c in _TAG_COLUMNS)
+        body = " union all ".join("select " + ", ".join(scripting.literal(v) for v in row) for row in rows)
+        sql = f"select * from (select {typed} where false" + (f" union all {body}" if rows else "") + ")"
+        alias = node.args.get("alias") or exp.TableAlias(this=exp.to_identifier(call.name.upper()))
+        node.replace(exp.Subquery(this=sqlglot.parse_one(sql, dialect="snowflake"), alias=alias))
+    for node in list(tree.find_all(exp.Anonymous)):
+        if node.name.upper() == "SYSTEM$GET_TAG" and len(node.expressions) == 3 and all(isinstance(a, exp.Literal) for a in node.expressions):
+            tag, name, domain = (a.name for a in node.expressions)
+            found = [r[3] for r in tag_references(cursor, name, domain) if r[2] == _tag_name(tag)]
+            node.replace(exp.Literal.string(found[0]) if found else exp.cast(exp.Null(), "varchar"))
+    return tree
+
+
+_SIMPLE[:0] = [
+    (re.compile(_LEAD + r"create\s+(?P<replace>or\s+replace\s+)?tag\s+(?P<exists>if\s+not\s+exists\s+)?(?P<name>" + _NAME + r")(?P<rest>.*)$"), "create_tag"),
+    (re.compile(_LEAD + r"drop\s+tag\s+(?P<exists>if\s+exists\s+)?(?P<name>" + _NAME + r")"), "drop_tag"),
+    (re.compile(_LEAD + r"alter\s+tag\s"), "nothing"),
+    (re.compile(_LEAD + r"show\s+tags\b(?P<rest>.*)$"), "show_tags"),
+    (re.compile(_LEAD + r"alter\s+(?P<domain>" + _TAG_DOMAINS + r")\s+(?:if\s+exists\s+)?(?P<object>" + _NAME + r")\s+"
+                        r"(?:(?:modify|alter)\s+(?:column\s+)?(?P<column>" + _NAME + r")\s+)?(?P<verb>set|unset)\s+tag\s+(?P<rest>.*)$"), "set_tag"),
 ]
 
 

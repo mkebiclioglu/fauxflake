@@ -347,7 +347,7 @@ def _patch_fakesnow() -> None:
     original_transform = FakeSnowflakeCursor._transform
 
     def _transform(self, expression, params):  # noqa: ANN001
-        expression = objects.apply_policies(objects.result_scans(expression, self), self)
+        expression = objects.apply_policies(objects.tag_scans(objects.result_scans(expression, self), self), self)
         if getattr(self, "_fauxflake_qualify", False) and self._conn.database:
             expression = semantics.qualify_schemas(expression, self._conn.database)
         if getattr(self, "_fauxflake_owners", None):

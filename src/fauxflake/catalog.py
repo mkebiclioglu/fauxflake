@@ -7,6 +7,7 @@ by hand from the documentation; locally they return no rows, with the right colu
 
 from __future__ import annotations
 
+import collections
 import json
 from pathlib import Path
 
@@ -72,7 +73,16 @@ def _views() -> dict[str, dict[str, str]]:
     return _VIEWS
 
 
-def view(name: str) -> dict[str, str | None]:
+def _usual(column: str) -> str | None:
+    """The type a column of this name has across the recorded SNOWFLAKE usage views, when they agree."""
+    kinds = collections.Counter(cols[column] for key, cols in _views().items() if "_USAGE." in key and column in cols)
+    if not kinds:
+        return None
+    kind, n = kinds.most_common(1)[0]
+    return kind if n == sum(kinds.values()) else None
+
+
+def view(name: str, columns: tuple[str, ...] = ()) -> dict[str, str | None]:
     """Columns and types of a view in the SNOWFLAKE database (ACCOUNT_USAGE and friends), or of an
     INFORMATION_SCHEMA view, where known. A view missing from the recording borrows from its
     namesake in another schema (ACCOUNT_USAGE.QUERY_HISTORY from READER_ACCOUNT_USAGE.QUERY_HISTORY)."""
@@ -84,6 +94,10 @@ def view(name: str) -> dict[str, str | None]:
         return dict(views[rest])
     table = rest.split(".")[-1]
     borrowed = next((cols for key, cols in sorted(views.items()) if key.split(".")[-1] == table), {})
+    if not borrowed and columns:
+        # a view never recorded: its columns are named like those of its neighbours (START_TIME is
+        # a TIMESTAMP_LTZ in every usage view), so each takes the type that name has elsewhere
+        return {col: kind for col in columns if (kind := _usual(col)) and kind != "VARIANT"}
     # a namesake can differ in the odd type (the reader view holds some durations as VARIANT):
     # keep its column names, and leave those types to how the project uses the column
     return {col: (None if kind == "VARIANT" else kind) for col, kind in borrowed.items()}

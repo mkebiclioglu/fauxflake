@@ -287,3 +287,19 @@ def test_frozen_clock_leaves_text_alone(run):
                       from (select 1 as "current_date")""") == [("macro.dbt.current_timestamp", 1, datetime(2025, 3, 2).date())]
     finally:
         emulator.FROZEN_NOW = None
+
+
+def test_tags_are_set_inherited_and_read_back(run):
+    run("create tag if not exists cost_center allowed_values 'finance', 'eng'")
+    run("create tag pii")
+    run("alter table t set tag cost_center = 'eng'")
+    run("alter table t modify column name set tag pii = 'name'")
+    run("alter schema ci set tag pii = 'none'")
+    refs = run("select level, tag_name, tag_value, column_name from table(information_schema.tag_references_all_columns('ci.t', 'table')) order by 1")
+    assert refs == [("COLUMN", "PII", "name", "NAME"), ("SCHEMA", "PII", "none", None), ("TABLE", "COST_CENTER", "eng", None)]
+    assert run("select system$get_tag('cost_center', 't', 'table'), system$get_tag('pii', 't.name', 'column')") == [("eng", "name")]
+    assert [r[1] for r in run("show tags")] == ["COST_CENTER", "PII"]
+    with pytest.raises(Exception, match="allowed"):
+        run("alter table t set tag cost_center = 'sales'")
+    run("alter table t unset tag cost_center")
+    assert run("select tag_name from table(information_schema.tag_references('t', 'table'))") == [("PII",)]
