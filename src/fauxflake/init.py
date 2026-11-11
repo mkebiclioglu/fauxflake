@@ -658,6 +658,8 @@ def provide_env(project) -> dict[str, str]:
             raise RuntimeError(f"dbt could not parse the project:\n{project.last_error}")
         var = missing.group(1)
         value = re.sub(r"^(DBT_)?(SNOWFLAKE_)?((DATABASE|SCHEMA|DB)_)?", "", var.upper()) or "FAUXFLAKE"
+        if re.search(r"SALT|SECRET|PASSWORD|TOKEN|_KEY|HASH", var.upper()):
+            value = "A1B2C3D4E5F60718"  # secrets are often read as hex: to_binary(env_var('SALT'), 'HEX')
         provided[var] = os.environ[var] = value
     return provided
 

@@ -570,7 +570,30 @@ class Fitter:
             direct = {f"{tb.catalog.upper()}.{tb.db.upper()}.{tb.name.upper()}" for tb in t.find_all(exp.Table) if tb.catalog and tb.db}
             if len(candidates & direct) == 1:
                 candidates &= direct
+        if len(candidates) > 1 and self._unioned(t, ctes, candidates):
+            # `select * from a union all select * from b`: the branches line up, so every one of them has it
+            return any([self.blame(c, col) for c in sorted(candidates)])
         return len(candidates) == 1 and self.blame(next(iter(candidates)), col)
+
+    def _unioned(self, tree: exp.Expression, ctes: dict[str, exp.Expression], candidates: set[str]) -> bool:
+        """Are these tables the branches of one UNION of `select *`s?"""
+        for union in tree.find_all(exp.SetOperation):
+            if isinstance(union.parent, exp.SetOperation):
+                continue
+            members: set[str] = set()
+            branches = [union]
+            while branches:
+                node = branches.pop().unnest()
+                if isinstance(node, exp.SetOperation):
+                    branches += [node.left, node.right]
+                elif isinstance(node, exp.Select) and node.find(exp.Star):
+                    members |= self.real_tables(node, ctes)
+                else:
+                    members = set()
+                    break
+            if candidates <= members and members:
+                return True
+        return False
 
     def learn(self, sql_key: str, message: str) -> bool:
         """Apply whatever one error message teaches. True when the spec changed."""

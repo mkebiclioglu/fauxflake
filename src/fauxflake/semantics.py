@@ -850,6 +850,80 @@ def _self_referencing(cte: exp.CTE) -> bool:
     return any(not t.db and t.name.lower() == cte.alias.lower() for t in cte.this.find_all(exp.Table))
 
 
+def _layer_joined_windows(select: exp.Select) -> bool:
+    """The same for a SELECT with joins. Its FROM cannot be folded into `select *`, so the split goes
+    the other way: the query as written, minus the projections that use an aliased window, becomes
+    the inner query, and those projections are computed outside from its output columns."""
+    projections = list(select.expressions)
+    if any(isinstance(p, exp.Star) or (isinstance(p, exp.Column) and isinstance(p.this, exp.Star)) for p in projections):
+        return False
+    if any(not isinstance(p, (exp.Alias, exp.Column)) for p in projections):
+        return False  # an unnamed expression has no name to carry it outside
+    names = [p.alias_or_name.lower() for p in projections]
+    windowed = {p.alias.lower() for p in projections if isinstance(p, exp.Alias) and p.find(exp.Window)}
+
+    def reads(expr: exp.Expression, aliases: set[str], inside_window: bool) -> bool:
+        for col in expr.find_all(exp.Column):
+            if col.table or col.name.lower() not in aliases or col.find_ancestor(exp.Select) is not select:
+                continue
+            if not inside_window or col.find_ancestor(exp.Window) is not None:
+                return True
+        return False
+
+    outside = {i for i, p in enumerate(projections) if isinstance(p, exp.Alias) and p.find(exp.Window)
+               and reads(p.this, windowed - {p.alias.lower()}, True)}
+    if not outside:
+        return False
+    for _ in range(len(projections)):  # and whatever reads those in turn
+        more = {i for i, p in enumerate(projections) if i not in outside and isinstance(p, exp.Alias)
+                and reads(p.this, {names[j] for j in outside}, False)}
+        if not more:
+            break
+        outside |= more
+    inner = select.copy()
+    kept = [p for i, p in enumerate(inner.expressions) if i not in outside]
+    inner_names = {names[i] for i in range(len(projections)) if i not in outside}
+    hidden: dict[str, str] = {}
+
+    def lift(expr: exp.Expression) -> exp.Expression:
+        """Columns of the joined tables that an outside expression needs come along under hidden names."""
+        expr = expr.copy()
+        for col in list(expr.find_all(exp.Column)):
+            if not col.table and col.name.lower() in (inner_names | {names[j] for j in outside}):
+                continue
+            key = col.sql(dialect="snowflake")
+            hidden.setdefault(key, f"_lw_{len(hidden)}")
+            col.replace(exp.column(hidden[key]))
+        return expr
+
+    outer_projections = []
+    for i, p in enumerate(projections):
+        if i in outside:
+            outer_projections.append(exp.alias_(lift(p.this), p.args["alias"].copy()))
+        else:
+            outer_projections.append(exp.Column(this=(p.args["alias"] if isinstance(p, exp.Alias) else p.this).copy()))
+    trailing = {}
+    for key in ("qualify", "order", "limit", "offset"):
+        clause = inner.args.pop(key, None)
+        select.args.pop(key, None)
+        if clause is not None:
+            trailing[key] = lift(clause)
+    inner.set("expressions", kept + [exp.alias_(sqlglot.parse_one(key, into=exp.Column, read="snowflake"), name)
+                                    for key, name in hidden.items()])
+    with_ = inner.args.pop("with_", None)
+    outer = exp.select(*outer_projections).from_(inner.subquery("_lw"))
+    for key, clause in trailing.items():
+        outer.set(key, clause)
+    if with_ is not None:
+        outer.set("with_", with_)
+    select.replace(outer) if select.parent is not None else None
+    if select.parent is None:  # the statement itself: rebuild it in place
+        select.args.clear()
+        for key, value in outer.args.items():
+            select.set(key, value)
+    return True
+
+
 def layer_windows(tree: exp.Expression) -> exp.Expression:
     """`lag(x) over (...) as prev, sum(prev) over (...)`: Snowflake computes the first window, then
     the second. DuckDB will not nest them, so compute the aliased windows in a subquery first."""
@@ -857,6 +931,9 @@ def layer_windows(tree: exp.Expression) -> exp.Expression:
         changed = False
         for select in list(tree.find_all(exp.Select)):
             source = select.args.get("from_")
+            if source is not None and select.args.get("joins") and not select.args.get("group"):
+                changed |= _layer_joined_windows(select)
+                continue
             if source is None or select.args.get("group") or select.args.get("joins") or select.args.get("laterals"):
                 continue
             windowed = {p.alias.lower(): p for p in select.expressions if isinstance(p, exp.Alias) and p.find(exp.Window)}
@@ -1311,6 +1388,15 @@ def _repair(tree: exp.Expression, text: str, details: dict) -> bool:
         return False
     types = _call_types(call)
     types = ["VARCHAR" if t == "JSON" else t for t in types]  # a VARIANT converts the same way
+    if name.lower() == "to_timestamp" and len(types) == 1 and types[0].startswith(("TIMESTAMP", "DATE")):
+        # TO_TIMESTAMP of something that already is a point in time gives it back (as TIMESTAMP_NTZ)
+        for node in tree.find_all(exp.Func):
+            sql = node.sql(dialect="duckdb")
+            args = list(node.iter_expressions())
+            if sql.lower().startswith("to_timestamp(") and text.startswith(sql, pos) and len(args) == 1:
+                node.replace(exp.cast(args[0].copy(), "timestamp"))
+                return True
+        return False
     if "VARCHAR" not in types:
         return False
     if name in _OPERATORS_BY_SIGN:
@@ -1363,6 +1449,62 @@ def _repair(tree: exp.Expression, text: str, details: dict) -> bool:
         if done:
             return True
     return False
+
+
+def _branches(node: exp.Expression) -> list[exp.Expression]:
+    node = node.unnest()
+    return _branches(node.left) + _branches(node.right) if isinstance(node, exp.SetOperation) else [node]
+
+
+def coerce_union_literals(transformed: exp.Expression, conn) -> exp.Expression:  # noqa: ANN001
+    """`select created_at from t union all select '2025-01-04'`: Snowflake reads the text as a
+    timestamp, because that is the column's type in the other branch. DuckDB makes the whole column
+    text. Where one branch gives a string literal and another a typed value, cast the literal."""
+    if not transformed.find(exp.SetOperation):
+        return transformed
+    for union in list(transformed.find_all(exp.SetOperation)):
+        if isinstance(union.parent, exp.SetOperation) or (isinstance(union.parent, exp.Subquery) and isinstance(union.parent.parent, exp.SetOperation)):
+            continue  # handled with the outermost operation of its chain
+        # the CTEs a branch can see: those of the union itself and of every query around it
+        withs, scope = [], union
+        while scope is not None:
+            if scope.args.get("with_") is not None:
+                withs.append(scope.args["with_"])
+            scope = scope.parent
+        ctes = [c for w in reversed(withs) for c in w.expressions]
+        recursive = any(w.args.get("recursive") for w in withs)
+        prefix = ("with " + ("recursive " if recursive else "") + ", ".join(c.sql(dialect="duckdb") for c in ctes) + " ") if ctes else ""
+        branches = [b for b in _branches(union) if isinstance(b, exp.Select)]
+        if len(branches) < 2 or len({len(b.expressions) for b in branches}) != 1:
+            continue
+        literal_at: dict[int, list[exp.Expression]] = {}
+        for branch in branches:
+            for i, proj in enumerate(branch.expressions):
+                value = proj.unalias()
+                if isinstance(value, exp.Literal) and value.is_string:
+                    literal_at.setdefault(i, []).append(value)
+        if not literal_at:
+            continue
+        types: dict[int, str] = {}
+        for branch in branches:
+            if all(isinstance(v := branch.expressions[i].unalias(), exp.Literal) and v.is_string for i in literal_at):
+                continue  # nothing to learn from this one
+            try:
+                described = conn.execute("describe " + prefix + branch.sql(dialect="duckdb")).fetchall()
+            except Exception:  # noqa: BLE001 - a branch that only binds in its context: leave the union as it is
+                continue
+            for i in literal_at:
+                kind = described[i][1] if i < len(described) else "VARCHAR"
+                value = branch.expressions[i].unalias()
+                if not (isinstance(value, exp.Literal) and value.is_string) and kind not in ("VARCHAR", "JSON", "BLOB", '"NULL"', "NULL"):
+                    types.setdefault(i, kind)
+        for i, kind in types.items():
+            if not kind.startswith(("TIMESTAMP", "DATE", "TIME", "DECIMAL", "BIGINT", "INTEGER", "DOUBLE", "FLOAT", "HUGEINT", "SMALLINT",
+                                    "TINYINT", "BOOLEAN", "UBIGINT", "UINTEGER")):
+                continue
+            for value in literal_at[i]:
+                value.replace(exp.cast(value.copy(), exp.DataType.build(kind, dialect="duckdb")))
+    return transformed
 
 
 def repair_types(transformed: exp.Expression, conn, params=None) -> exp.Expression | None:  # noqa: ANN001
