@@ -31,6 +31,9 @@ MACROS = [
           (p, x) as date_trunc(p, x::timestamp)""",
     f"create table if not exists {_NS}_fx_session as select 'SYSADMIN' as role",
     f"create or replace macro {_NS}_sf_current_role() as (select role from {_NS}_fx_session)",
+    # RANDSTR(n, seed): n characters from [0-9A-Za-z], the same for the same seed
+    f"""create or replace macro {_NS}_sf_randstr(n, seed) as array_to_string(list_transform(range(n::bigint), lambda i:
+          substr('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz', 1 + (hash(i, seed) % 62)::integer, 1)), '')""",
     # GET_DDL: the statement DuckDB keeps for the object (DuckDB types, not Snowflake's).
     f"""create or replace macro {_NS}_sf_get_ddl(kind, name) as (
           select sql from (select table_name as n, sql from duckdb_tables() where database_name = current_database()
@@ -416,6 +419,8 @@ def _average(node: exp.Expression) -> bool:
 def _text(node: exp.Expression) -> exp.Expression:
     """The value as Snowflake prints it. A division carries its scale into the text."""
     inner = node.unnest()
+    if _is(inner, "_sf_text"):
+        return node  # already text: wrapping again only repeats the argument
     if _is(inner, "_sf_div"):
         return _fn("_sf_div_text", *inner.expressions)
     if _average(inner):
@@ -560,6 +565,10 @@ def _fix(node: exp.Expression) -> exp.Expression:
                 node.set(key, _text(arg))
         if isinstance(node, (exp.Concat, exp.ConcatWs)):
             node.set("expressions", [_text(e) if isinstance(e, _VARIANT_ACCESS) else e for e in node.expressions])
+    if isinstance(node, exp.Randstr):
+        # sqlglot writes RANDSTR as a correlated subquery, which the planner chokes on once it is repeated
+        seed = node.args.get("generator") or exp.Rand()
+        return _fn("_sf_randstr", node.this, exp.Anonymous(this="hash", expressions=[seed]))
     if isinstance(node, exp.MapCat):  # keys of the second map win
         return exp.Anonymous(this="json_merge_patch", expressions=[exp.cast(node.this, "json"), exp.cast(node.expression, "json")])
     name = node.sql_name().upper() if isinstance(node, exp.Func) and not isinstance(node, exp.Anonymous) else \

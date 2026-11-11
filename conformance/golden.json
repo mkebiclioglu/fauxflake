@@ -2875,6 +2875,17 @@
    ]
   ]
  },
+ "randstr_shapes": {
+  "rows": [
+   [
+    "32",
+    true,
+    true,
+    true,
+    "64"
+   ]
+  ]
+ },
  "recursive_cte": {
   "rows": [
    [
