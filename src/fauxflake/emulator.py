@@ -599,16 +599,27 @@ class Emulator:
         ) | overrides
 
 
+_SPEC_UDFS: set[str] = set()  # the stand-ins currently defined from a spec
+
+
 def define_udfs(emu: "Emulator", udfs: dict[str, str]) -> None:
     """Stand-ins for functions that exist only in your Snowflake account, from the spec's `udfs:`.
     Each is `name: "(args) as <DuckDB SQL>"` and is callable with or without qualification."""
-    semantics.UDFS.clear()
-    semantics.UDTFS.clear()
+    # only the stand-ins of an earlier spec go: the functions and policies the project itself created
+    # (in hooks that later runs may not repeat) stay known
+    for name in _SPEC_UDFS:
+        if semantics.UDFS.get(name) == f"_udf_{name}":
+            semantics.UDFS.pop(name, None)
+    _SPEC_UDFS.clear()
     # a placeholder written by `init` gives way to the project's own CREATE FUNCTION; a real stand-in does not
     objects.pin(emu, [n for n, body in udfs.items() if not body.rstrip().endswith("as null::varchar")])
+    created = objects.state_of(emu._fs).functions if hasattr(emu, "_fs") else {}
     for name, body in udfs.items():
+        if name in created and body.rstrip().endswith("as null::varchar"):
+            continue  # the project has since created the real one
         emu.duck.execute(f"create or replace macro _fs_global.main._udf_{name}{body}")
         semantics.UDFS[name] = f"_udf_{name}"
+        _SPEC_UDFS.add(name)
 
 
 CURRENT: "Emulator | None" = None  # the emulator whose Snowflake endpoint is being served
@@ -652,6 +663,9 @@ def engine() -> Iterator[Emulator]:
     semantics.reserved_words(fs.duck_conn)
     fs.duck_conn.execute("set global old_implicit_casting = true")  # text compares with numbers and dates, as in Snowflake
     spill = _spill_directory(fs.duck_conn)
+    semantics.UDFS.clear()  # functions belong to the emulator that defined them
+    semantics.UDTFS.clear()
+    _SPEC_UDFS.clear()
     fs.results_cache.setdefault(objects._KEY, objects.State()).root = fs.duck_conn
     try:
         emu = Emulator(port=0, duck=fs.duck_conn, _fs=fs)
@@ -692,6 +706,9 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
     semantics.reserved_words(fs.duck_conn)
     fs.duck_conn.execute("set global old_implicit_casting = true")  # text compares with numbers and dates, as in Snowflake
     spill = _spill_directory(fs.duck_conn)
+    semantics.UDFS.clear()  # functions belong to the emulator that defined them
+    semantics.UDTFS.clear()
+    _SPEC_UDFS.clear()
     fs.results_cache.setdefault(objects._KEY, objects.State()).root = fs.duck_conn
     previous = fakesnow.server.shared_fs
     fakesnow.server.shared_fs = fs
