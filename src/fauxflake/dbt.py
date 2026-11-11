@@ -39,6 +39,18 @@ def snowflake_output(connection_name: str, database: str, threads: int = 4) -> d
     return out
 
 
+def _tolerate_exposures() -> None:
+    """When an on-run-start hook fails, dbt marks every node as skipped and reads `node.schema` on
+    each, which exposures do not have: the run dies with an AttributeError that hides the hook's
+    error. Give exposures an empty schema so dbt reports what actually failed."""
+    try:
+        from dbt.contracts.graph.nodes import Exposure
+    except ImportError:
+        return
+    if not hasattr(Exposure, "schema"):
+        Exposure.schema = ""
+
+
 class DbtProject:
     def __init__(self, project_dir: str | Path, output: dict, name: str = "emulator"):
         self.dir = Path(project_dir).resolve()
@@ -111,6 +123,7 @@ class DbtProject:
             "--project-dir", str(self.dir), "--profiles-dir", str(self.profiles_dir), "--target", self.target,
             "--target-path", str(self.target_path),
         ]
+        _tolerate_exposures()
         result = dbtRunner().invoke(cmd)
         self.last_error = str(result.exception) if result.exception else ""
         return bool(result.success)
