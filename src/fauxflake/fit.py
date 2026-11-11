@@ -829,7 +829,45 @@ class Fitter:
         if len(candidates) > 1 and self._unioned(t, ctes, candidates):
             # `select * from a union all select * from b`: the branches line up, so every one of them has it
             return any([self.blame(c, col) for c in sorted(candidates)])
-        return len(candidates) == 1 and self.blame(next(iter(candidates)), col)
+        if len(candidates) != 1:
+            return False
+        owner = next(iter(candidates))
+        if not self.blame(owner, col):
+            return False
+        if owner in self.tables:
+            # one error names one column; the model usually reads many more from the same table
+            # (a wide config table, read with `select *`): add them all now, not one run at a time
+            for name in self.read_through(t, owner):
+                if name != col and re.fullmatch(r"[\w$ ]+", name):
+                    self.add_column(owner, name)
+        return True
+
+    def read_through(self, tree: exp.Expression, fq: str) -> list[str]:
+        """Columns a query certainly reads from table `fq`: qualified with its alias, or bare where it
+        is the only table, also through a CTE or subquery that is a `select *` of it."""
+        out: list[str] = []
+        for tb in tree.find_all(exp.Table):
+            if not (tb.catalog and tb.db) or f"{tb.catalog.upper()}.{tb.db.upper()}.{tb.name.upper()}" != fq:
+                continue
+            out += self.columns_read(tree, tb)
+            select = tb.find_ancestor(exp.Select)
+            starred = select is not None and any(
+                isinstance(e, exp.Star) or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star)
+                                            and (not e.table or e.table.upper() == tb.alias_or_name.upper()))
+                for e in select.expressions)
+            holder = select.parent if starred else None
+            name = holder.alias.upper() if isinstance(holder, (exp.CTE, exp.Subquery)) and holder.alias else None
+            if not name:
+                continue
+            if isinstance(holder, exp.CTE):
+                for other in tree.find_all(exp.Table):
+                    if other.name.upper() == name and not other.db:
+                        out += self.columns_read(tree, other)
+            else:
+                outer = holder.find_ancestor(exp.Select)
+                out += [c.name.upper() for c in (outer.find_all(exp.Column) if outer is not None else [])
+                        if c.table and c.table.upper() == name and not isinstance(c.this, exp.Star)]
+        return list(dict.fromkeys(out))
 
     def _unioned(self, tree: exp.Expression, ctes: dict[str, exp.Expression], candidates: set[str]) -> bool:
         """Are these tables the branches of one UNION of `select *`s?"""
