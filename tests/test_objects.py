@@ -182,3 +182,41 @@ def test_pipes_and_alerts_are_stored_and_run_on_demand(run):
     assert run("select count(*) from t where id = 77") == [(1,)]
     run("create or replace pipe p auto_ingest = true as copy into t from @some_stage")
     assert [r[1] for r in run("show pipes")] == ["P"]
+
+
+def test_copy_into_from_cloud_storage_served_locally(run, tmp_path):
+    import gzip
+
+    from fauxflake import objects
+
+    (tmp_path / "v1").mkdir()
+    with gzip.open(tmp_path / "v1" / "codes.csv_0_0_0.csv.gz", "wt") as f:
+        f.write('"A, with comma",1,\n"B",2,__NULL__\n')
+    (tmp_path / "v1" / "other.csv").write_text("x,9,y\n")
+    objects.LOCATIONS = {"s3://my-bucket/sets": str(tmp_path)}
+    try:
+        run("create or replace table codes (label string, n int, note string)")
+        loaded = run("""copy into codes from s3://my-bucket/sets/v1
+            file_format = (type = CSV compression = 'GZIP' empty_field_as_null = true field_optionally_enclosed_by = '"'
+                           escape_unenclosed_field = NONE null_if = ('__NULL__'))
+            pattern = '.*\\/codes.csv.*';""")
+        assert [(r[1], r[3]) for r in loaded] == [("LOADED", 2)]
+        assert run("select label, n, note from codes order by n") == [("A, with comma", 1, None), ("B", 2, None)]
+    finally:
+        objects.LOCATIONS = {}
+
+
+def test_anonymous_procedure_and_system_table_function(run):
+    assert run("""with total as procedure (floor int) returns int language sql as
+$$ begin return (select count(*) from t where id >= :floor); end; $$
+call total(2);""") == [(1,)]
+    assert run("select count(*) from table(information_schema.task_history(task_name => 'x'))") == [(0,)]
+    assert run("select query_id from table(information_schema.query_history_by_session()) limit 1") == []
+
+
+def test_objects_maps_and_empty_keys(run):
+    row = run("""select object_delete(parse_json('{"a":1,"b":2}'), 'a'), object_insert(object_construct('a', 1), 'b', 'x'),
+                        object_pick(parse_json('{"a":1,"b":2,"c":3}'), 'a', 'z'),
+                        map_cat({'a': 1}::map(varchar, number), {'a': 2, 'c': 3}::map(varchar, number)),
+                        parse_json('{"": 5, "a": {"": 7}}'):a:""::int""")
+    assert [json.loads(v) if isinstance(v, str) else v for v in row[0]] == [{"b": 2}, {"a": 1, "b": "x"}, {"a": 1}, {"a": 2, "c": 3}, 7]

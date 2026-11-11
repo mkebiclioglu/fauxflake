@@ -14,14 +14,16 @@ property gives everything else:
 
 from __future__ import annotations
 
+import json
 import zlib
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
 import duckdb
 
 from . import emulator, objects
-from .spec import Spec, Table
+from .spec import Spec, Table, quoted
 
 
 def lit(v) -> str:
@@ -207,7 +209,8 @@ class TableSQL:
         elif gen == "time_offset":
             expr = f"_ev + {ms(piecewise(self.u(col), d['p'], d['seconds']))}"
             if d.get("format"):  # a text column holding dates in this format
-                expr = f"strftime({expr}, {lit(d['format'])})"
+                # nanoseconds are written as microseconds and three zeros: DuckDB's strftime pads %n with NUL bytes
+                expr = f"strftime({expr}, {lit(d['format'].replace('%n', '%f000'))})"
         elif gen == "object":
             expr = self._object(col, d["fields"], d.get("keyed_by"))
         elif gen == "array":
@@ -298,6 +301,7 @@ where _loaded > $after and _loaded <= $until"""
 def existing_view(name: str, columns: dict[str, str], replace: bool = False, table: bool = False) -> str:
     """An empty relation standing for one that exists before the run (the spec's `existing:`).
     A table once its full shape is known, so an incremental model finds what it would in production."""
+    name = quoted(name)
     if table:
         return f"create table if not exists {name} ({', '.join(f'"{col}" {kind}' for col, kind in columns.items())})"
     cols = ", ".join(f'null::{kind} as "{col}"' for col, kind in columns.items()) or 'null::varchar as "_FX_EMPTY"'
@@ -351,9 +355,9 @@ class Warehouse:
             changed_at = datetime.combine(sc.start, datetime.min.time()) if sc and sc.new_column else None
             widened = bool(changed_at and until > changed_at)
             if widened and self.now is not None and self.now <= changed_at:
-                self.cur.execute(f'alter table {t.name} add column "{sc.new_column}" varchar')
+                self.cur.execute(f'alter table {t.sql} add column "{sc.new_column}" varchar')
             select = TableSQL(self.spec, t, sc).select(with_new_column=widened)
-            verb = f"create or replace table {t.name} as" if self.now is None else f"insert into {t.name} by name"
+            verb = f"create or replace table {t.sql} as" if self.now is None else f"insert into {t.sql} by name"
             counts[t.name] = self.cur.execute(f"{verb} {select}", params).fetchone()[0]
             if t.raw.get("mode") == "upsert":
                 self._keep_latest(t)
@@ -366,6 +370,8 @@ class Warehouse:
                 if kind is None:  # the project has not built it yet in this warehouse
                     self.cur.execute(existing_view(name, rel.get("columns") or {}, table=rel.get("as") == "table"))
         self.now = until
+        if self.emu.db_path:  # `fauxflake query` reads the clock back from here
+            (Path(self.emu.db_path) / "fauxflake.json").write_text(json.dumps({"now": until.isoformat()}))
         if self.freeze_clock:
             emulator.FROZEN_NOW = until
         return counts
@@ -375,9 +381,9 @@ class Warehouse:
         key = t.key[0]
         order = ", ".join(f'"{c}" desc' for c in (t.role("updated_at"), t.role("loaded_at")) if c) or "rowid desc"
         self.cur.execute(f"""
-            delete from {t.name} where rowid in (
-              select rowid from (select rowid, row_number() over (partition by "{key}" order by {order}) rn from {t.name})
+            delete from {t.sql} where rowid in (
+              select rowid from (select rowid, row_number() over (partition by "{key}" order by {order}) rn from {t.sql})
               where rn > 1)""")
 
     def row_counts(self) -> dict[str, int]:
-        return {t: self.cur.execute(f"select count(*) from {t}").fetchone()[0] for t in self.spec.tables}
+        return {t: self.cur.execute(f"select count(*) from {quoted(t)}").fetchone()[0] for t in self.spec.tables}

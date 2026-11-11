@@ -54,6 +54,14 @@ class DbtProject:
         profile = {project["profile"]: {"target": self.target, "outputs": {self.target: output}}}
         (self.profiles_dir / "profiles.yml").write_text(yaml.safe_dump(profile, sort_keys=False))
         (self.dir / ".fauxflake" / ".gitignore").write_text("*\n")
+        self._default_selector = False
+        for name in ("selectors.yml", "selectors.yaml"):
+            if (self.dir / name).exists():
+                try:
+                    selectors = (yaml.safe_load((self.dir / name).read_text()) or {}).get("selectors") or []
+                    self._default_selector = any(str(sel.get("default", "")).strip().lower() not in ("", "false", "none") for sel in selectors)
+                except yaml.YAMLError:
+                    pass
         declared = any((self.dir / f).exists() for f in ("packages.yml", "dependencies.yml"))
         if declared and not (self.dir / "dbt_packages").exists():
             self.deps()  # so a fresh checkout works without a separate step
@@ -61,7 +69,7 @@ class DbtProject:
     def deps(self) -> bool:
         from dbt.cli.main import dbtRunner
 
-        return bool(dbtRunner().invoke(["--quiet", "deps", "--project-dir", str(self.dir)]).success)
+        return bool(dbtRunner().invoke(["--quiet", "--no-version-check", "deps", "--project-dir", str(self.dir)]).success)
 
     def _create_databases(self) -> None:
         """On Snowflake the databases a project writes to already exist. Create them here."""
@@ -72,7 +80,7 @@ class DbtProject:
         self._databases_ready = True
         flags = ["--project-dir", str(self.dir), "--profiles-dir", str(self.profiles_dir),
                  "--target", self.target, "--target-path", str(self.target_path)]
-        if emulator.CURRENT is None or not dbtRunner().invoke(["--quiet", "parse", *flags]).success:
+        if emulator.CURRENT is None or not dbtRunner().invoke(["--quiet", "--no-version-check", "parse", *flags]).success:
             return
         manifest = json.loads((self.target_path / "manifest.json").read_text())
         for node in [*manifest["nodes"].values(), *manifest["sources"].values()]:
@@ -88,12 +96,18 @@ class DbtProject:
             self._create_databases()
         os.environ.setdefault("DBT_SEND_ANONYMOUS_USAGE_STATS", "false")
         args = list(args)
+        if self._local and args and args[0] in ("build", "run", "test") and self._default_selector \
+                and not any(a in ("-s", "--select", "--selector", "-m", "--models") for a in args):
+            # the project's default selector assumes a warehouse that already holds part of the project
+            # (views built by another job, say). This one starts empty: build everything.
+            args += ["--select", "fqn:*"]
         expected = os.environ.get("FAUXFLAKE_EXPECTED_FAILURES", "").split()
         if expected and args and args[0] in ("build", "test"):
             # tests known to fail on generated data (dbt.expected_failures in the spec) are left out by name
             at = args.index("--exclude") + 1 if "--exclude" in args else None
             args = args[:at] + expected + args[at:] if at else [*args, "--exclude", *expected]
-        cmd = (["--log-level", "none"] if silent else ["--quiet"] if quiet else []) + args + [
+        # the project may pin another dbt version than the one fauxflake ships: its SQL is what is under test
+        cmd = ["--no-version-check"] + (["--log-level", "none"] if silent else ["--quiet"] if quiet else []) + args + [
             "--project-dir", str(self.dir), "--profiles-dir", str(self.profiles_dir), "--target", self.target,
             "--target-path", str(self.target_path),
         ]
@@ -114,7 +128,7 @@ class DbtProject:
         CompileTask._mark_dependent_errors = lambda self, *a, **k: None  # compiling needs no upstream
         try:
             result = dbtRunner().invoke([
-                "--log-level", "none", "compile", "--select", "resource_type:model", "resource_type:snapshot",
+                "--no-version-check", "--log-level", "none", "compile", "--select", "resource_type:model", "resource_type:snapshot",
                 "--project-dir", str(self.dir), "--profiles-dir", str(self.profiles_dir), "--target", self.target,
                 "--target-path", str(self.target_path)])
         finally:
@@ -123,8 +137,14 @@ class DbtProject:
         manifest = json.loads((self.target_path / "manifest.json").read_text())
         for r in getattr(result.result, "results", None) or []:
             code = getattr(r.node, "compiled_code", None)
-            if code and r.node.unique_id in manifest["nodes"]:
-                manifest["nodes"][r.node.unique_id]["compiled_code"] = code
+            node = manifest["nodes"].get(r.node.unique_id)
+            if node is None:
+                continue
+            if code:
+                node["compiled_code"] = code
+            if str(r.status) in ("error", "RunStatus.Error") or not code:
+                node["compile_error"] = str(r.message or "")
+                node["compiled_code"] = None
         return manifest
 
     def models(self) -> list[dict]:

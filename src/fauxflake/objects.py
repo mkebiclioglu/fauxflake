@@ -286,13 +286,21 @@ def _js(state: State):  # noqa: ANN202
     return state.js
 
 
+class _MissingPackage(ProgrammingError):
+    def __init__(self, why: str) -> None:
+        super().__init__(msg=why, errno=2003, sqlstate="42S02")
+        self.why = why
+
+    def __str__(self) -> str:
+        return self.why
+
+
 def _python_handler(defn: dict):  # noqa: ANN202
     namespace: dict = {"__name__": f"fauxflake_udf_{defn['name'].lower()}"}
     try:
         exec(compile(defn["body"], f"<{defn['kind']} {defn['name']}>", "exec"), namespace)  # noqa: S102 - the project's own code
     except ImportError as e:
-        raise error(f"{defn['name']}: its Python code imports {e.name!r}, which is not installed locally. "
-                    "Install it next to fauxflake, or give the function a stand-in under `udfs:` in the spec.") from e
+        raise _MissingPackage(f"its Python code imports {e.name!r}, which is not installed locally") from e
     target = namespace
     for part in (defn["handler"] or "main").split("."):
         target = target[part] if isinstance(target, dict) else getattr(target, part)
@@ -361,9 +369,17 @@ def _define_function(cursor, state: State, defn: dict) -> None:  # noqa: ANN001
     elif defn["language"] == "sql":
         defn["duck"] = _transpile_expression(cursor, defn["body"])
     else:
-        native = _register_native(cursor, state, defn)
+        try:
+            native = _register_native(cursor, state, defn)
+        except _MissingPackage as e:
+            if name in semantics.UDFS:
+                print(f"fauxflake: function {defn['name']} keeps its stand-in from the spec ({e}).", file=sys.stderr)
+                return
+            print(f"fauxflake: function {defn['name']} returns NULL here ({e}). Install the package next to fauxflake "
+                  "to run the real code, or give the function a stand-in under `udfs:` in the spec.", file=sys.stderr)
+            native = None
         passed = ", ".join(f'to_json("{a}")' if duck_type(k) == "JSON" else f'cast("{a}" as {duck_type(k)})' for a, k in args)
-        defn["duck"] = f"{native}({passed})"
+        defn["duck"] = f"{native}({passed})" if native else ("null::json" if duck_type(defn["returns"]) == "JSON" else "null")
     overloads = state.functions.setdefault(name, {})
     if overloads and next(iter(overloads.values()))["table"] != defn["table"]:
         overloads.clear()
@@ -381,7 +397,9 @@ def pin(emu, names) -> None:  # noqa: ANN001
 
 
 def _session(cursor):  # noqa: ANN001, ANN202
-    return scripting.Session(lambda sql: _run(cursor, sql))
+    """What a Python procedure or model gets as `session`: a real Snowpark session on this
+    connection when Snowpark is installed, the small built-in one otherwise."""
+    return scripting.snowpark_session(cursor._conn) or scripting.Session(lambda sql: _run(cursor, sql))
 
 
 def call_procedure(cursor, proc: dict, values: list):  # noqa: ANN001, ANN201
@@ -395,10 +413,16 @@ def call_procedure(cursor, proc: dict, values: list):  # noqa: ANN001, ANN201
     if proc["language"] == "javascript":
         return scripting.JavaScript().procedure(names, proc["body"], [plain(v) for v in values], run)
     if proc["language"] == "python":
-        return _python_handler(proc)(_session(cursor), *values)
+        session = _session(cursor)
+        try:
+            return _python_handler(proc)(session, *values)
+        finally:
+            scripting.release(session)
     raise error(f"procedure {proc['name']}: {proc['language']} handlers do not run locally")
 
 
+# `WITH name AS PROCEDURE (...) ... AS $$...$$ CALL name(...)`: an anonymous procedure, which is how dbt runs a Python model
+_ANONYMOUS = re.compile(_LEAD + r"with\s+(?P<name>" + _NAME + r")\s+as\s+procedure\s*(?P<rest>\(.*)\bcall\s+(?P=name)\s*\((?P<args>[^)]*)\)\s*;?\s*$")
 _CALL = re.compile(_LEAD + r"call\s+(?P<name>" + _NAME + r")\s*\((?P<args>.*)\)\s*(?:into\s+:\w+\s*)?;?\s*$")
 
 
@@ -419,8 +443,10 @@ def _call(cursor, original, state: State, m: re.Match):  # noqa: ANN001, ANN202
 def _result(cursor, original, result, name: str):  # noqa: ANN001, ANN202
     if isinstance(result, scripting.Table):
         return original(cursor, result.query)
-    if hasattr(result, "queries") and getattr(result, "queries", None):  # a Snowpark-like DataFrame
+    if hasattr(result, "queries") and getattr(result, "queries", None):  # a Snowpark DataFrame
         return original(cursor, result.queries["queries"][-1])
+    if hasattr(result, "to_dict") and hasattr(result, "columns"):  # a pandas DataFrame
+        return original(cursor, scripting.Session(lambda sql: _run(cursor, sql)).create_dataframe(result).query)
     return original(cursor, f'select {scripting.literal(plain(result))} as "{name}"')
 
 
@@ -459,6 +485,95 @@ def consume_streams(cursor, command: str) -> None:  # noqa: ANN001
     for fq, stream in state.streams.items():
         if re.search(r'(?i)(?<![\w$])"?' + re.escape(fq[2]) + r'"?(?![\w$])', command):
             cursor._duck_conn.execute(f"create or replace table {stream['base']} as select * from {stream['source']}")
+
+
+# ---------------------------------------------------------------- COPY INTO from cloud storage
+
+LOCATIONS: dict[str, str] = {}  # the spec's `locations:`: URL prefix -> local directory holding the same files
+_COPY = re.compile(_LEAD + r"copy\s+into\s+(?P<table>" + _NAME + r")\s*(?P<columns>\([^)]*\))?\s*from\s+'?(?P<url>(?:s3|s3a|gcs|gs|azure|https?)://[^\s']+)'?(?P<rest>.*)$")
+_COPY_COLUMNS = ["file", "status", "rows_parsed", "rows_loaded", "error_limit", "errors_seen", "first_error", "first_error_line",
+                 "first_error_character", "first_error_column_name"]
+
+
+def _option(text: str, name: str) -> str | None:
+    m = re.search(r"(?is)\b" + name + r"\s*=\s*('(?:[^']|'')*'|[^\s)(]+|\()", text)
+    if not m:
+        return None
+    if m.group(1) == "(":  # a parenthesised value, possibly with nested parentheses
+        return text[m.end() - 1:_close_paren(text, m.end() - 1) + 1]
+    return m.group(1)
+
+
+def _unquoted(value: str | None) -> str | None:
+    return value[1:-1].replace("''", "'") if value and value.startswith("'") and value.endswith("'") else value
+
+
+def _copy_into(cursor, original, state: State, m: re.Match):  # noqa: ANN001, ANN202
+    """`COPY INTO t FROM s3://bucket/prefix FILE_FORMAT = (...) PATTERN = '...'`: DuckDB reads the files.
+    A public bucket needs nothing; a private one uses the AWS credentials in the environment. A prefix
+    listed under `locations:` in the spec is read from a local directory instead."""
+    duck, rest = cursor._duck_conn, m.group("rest")
+    url = m.group("url").rstrip("/")
+    local = next((path for prefix, path in LOCATIONS.items() if url.startswith(prefix.rstrip("/"))), None)
+    if local is not None:
+        prefix = next(p for p in LOCATIONS if url.startswith(p.rstrip("/")))
+        root = local.rstrip("/") + url[len(prefix.rstrip("/")):]
+    else:
+        root = url.replace("gcs://", "gs://").replace("s3a://", "s3://")
+        duck.execute("install httpfs; load httpfs")
+        if root.startswith("s3://"):
+            import os
+
+            if os.environ.get("AWS_ACCESS_KEY_ID") or os.environ.get("AWS_PROFILE"):
+                duck.execute("create or replace secret _fx_s3 (type s3, provider credential_chain)")
+    listed = [r[0] for r in duck.execute("select file from glob(?)", [root + "/**"]).fetchall()]
+    if not listed and re.search(r"\.\w+$", root):
+        listed = [r[0] for r in duck.execute("select file from glob(?)", [root]).fetchall()]
+    pattern = _unquoted(_option(rest, "pattern"))
+    files = _option(rest, "files")
+    if files:
+        wanted = [_unquoted(f) for f in split_top(files.strip("()"))]
+        listed = [f for f in listed if any(f.endswith("/" + w.lstrip("/")) for w in wanted)]
+    if pattern:
+        listed = [f for f in listed if re.fullmatch(pattern, f[len(root) + 1:]) or re.fullmatch(pattern, f)
+                  or re.fullmatch(pattern, "/" + f.split("://", 1)[-1].split("/", 1)[-1])]
+    fmt = _option(rest, "file_format") or "()"
+    named = re.search(r"(?i)format_name\s*=\s*'?([\w$.\"]+)'?", fmt)
+    if named or not fmt.startswith("("):  # a named file format: let the emulator's own COPY resolve it
+        raise error("COPY INTO from a URL with a named file format: declare the options inline (FILE_FORMAT = (TYPE = CSV ...))")
+    kind = (_unquoted(_option(fmt, "type")) or "CSV").upper()
+    table = _sql_name(qualified(cursor, m.group("table")))
+    columns = m.group("columns") or ""
+    target = [r[0] for r in duck.execute(f"describe {table}").fetchall()]
+    if columns:
+        target = [bare(c) for c in split_top(columns.strip("()"))]
+    rows = []
+    for f in sorted(listed):
+        if kind == "CSV":
+            header = int(_option(fmt, "skip_header") or 0) > 0 or (_option(fmt, "parse_header") or "").lower() == "true"
+            delim = _unquoted(_option(fmt, "field_delimiter")) or ","
+            quote = _unquoted(_option(fmt, "field_optionally_enclosed_by"))
+            nulls = [_unquoted(v) for v in split_top((_option(fmt, "null_if") or "()").strip("()"))]
+            options = [f"header = {'true' if header else 'false'}", "delim = " + scripting.literal(delim.replace("\\t", "\t")),
+                       "all_varchar = true", "auto_detect = false", "null_padding = true",
+                       "columns = {" + ", ".join(f"'c{i}': 'VARCHAR'" for i in range(len(target))) + "}"]
+            options.append("quote = " + scripting.literal(quote if quote and quote.upper() != "NONE" else ""))
+            if nulls:
+                options.append("nullstr = [" + ", ".join(scripting.literal(v) for v in ["", *nulls]) + "]")
+            source = f"read_csv({scripting.literal(f)}, {', '.join(options)})"
+        elif kind == "PARQUET":
+            source = f"read_parquet({scripting.literal(f)})"
+        elif kind == "JSON":
+            source = f"(select to_json(j) from read_json_auto({scripting.literal(f)}) j)"
+        else:
+            raise error(f"COPY INTO: file type {kind} is not supported")
+        names = ", ".join('"' + c + '"' for c in target)
+        loaded = duck.execute(f"insert into {table} ({names}) select * from {source}").fetchone()[0]
+        rows.append([f, "LOADED", loaded, loaded, 1, 0, None, None, None, None])
+    if not rows:
+        return original(cursor, "select 'Copy executed with 0 files processed.' as \"status\"")
+    selects = ["select " + ", ".join(f'{scripting.literal(v)} as "{c}"' for c, v in zip(_COPY_COLUMNS, row)) for row in rows]
+    return original(cursor, " union all ".join(selects))
 
 
 # ---------------------------------------------------------------- tasks, pipes, alerts
@@ -644,7 +759,7 @@ def intercept(cursor, command: str, original):  # noqa: ANN001, ANN201
     """Handle a statement about one of the objects above. Returns None for everything else."""
     head = re.match(_LEAD + r"(\w+)", command)
     command = _TRAILING_COMMENT.sub("", command)  # dbt appends its query comment after the statement
-    if not head or head.group(1).lower() not in ("create", "alter", "drop", "show", "call", "execute", "declare", "begin", "use"):
+    if not head or head.group(1).lower() not in ("create", "alter", "drop", "show", "call", "execute", "declare", "begin", "use", "with", "copy"):
         return None
     state = state_of(cursor._conn)
     with state.lock:
@@ -657,9 +772,20 @@ def intercept(cursor, command: str, original):  # noqa: ANN001, ANN201
             else:
                 _define_function(cursor, state, defn)
             return _status(cursor, original, f"{defn['kind'].capitalize()} {defn['name']} successfully created.")
+        m = _ANONYMOUS.match(command)
+        if m:
+            proc = _parse_callable(f"create procedure {m.group('name')}{m.group('rest').rstrip().rstrip(';')}")
+            if proc is None or proc["body"] is None:
+                raise error("anonymous procedure: no body found")
+            args = m.group("args").strip()
+            values = list(_run(cursor, f"select {args}")[1][0]) if args else []
+            return _result(cursor, original, call_procedure(cursor, proc, values), proc["name"])
         m = _CALL.match(command)
         if m:
             return _call(cursor, original, state, m)
+        m = _COPY.match(command)
+        if m:
+            return _copy_into(cursor, original, state, m)
         m = _STREAM.match(command)
         if m:
             return _create_stream(cursor, original, state, m)

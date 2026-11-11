@@ -21,7 +21,14 @@ common = [
     click.option("--scale", default=0.001, show_default=True, help="Fraction of production volume to generate."),
     click.option("--history", default=60, show_default=True, help="Days of history present at the start."),
     click.option("--db-path", default=None, help="Keep data in DuckDB files here instead of memory (for large scales)."),
+    click.option("--keep", is_flag=True, help="Keep the warehouse in the project's .fauxflake/warehouse, for `fauxflake query`."),
 ]
+
+
+def _warehouse_dir(project_dir, db_path, keep):  # noqa: ANN001, ANN202
+    from pathlib import Path
+
+    return db_path or (str(Path(project_dir) / ".fauxflake" / "warehouse") if keep else None)
 
 
 def with_common(f):
@@ -39,8 +46,9 @@ def main() -> None:
 @main.command(context_settings={"ignore_unknown_options": True})
 @with_common
 @click.argument("dbt_args", nargs=-1, type=click.UNPROCESSED)
-def build(spec_path, project_dir, scale, history, db_path, dbt_args):
+def build(spec_path, project_dir, scale, history, db_path, keep, dbt_args):
     """Generate sources and run `dbt build` once. Extra args go to dbt."""
+    db_path = _warehouse_dir(project_dir, db_path, keep)
     from .dbt import DbtProject, emulator_output
     from .emulator import serve
     from .generate import Warehouse
@@ -56,6 +64,9 @@ def build(spec_path, project_dir, scale, history, db_path, dbt_args):
             click.echo(f"leaving out {len(expected)} test(s) listed under dbt.expected_failures in {spec_path}")
         project = DbtProject(project_dir, emulator_output(emu.port, spec.dbt.get("database", "ANALYTICS")))
         ok = project.invoke(["build", *dbt_args])
+    if not ok:
+        click.echo("\nto look at the data behind a failure: " + ("fauxflake query \"select ...\"" if keep else
+                   "run again with --keep, then fauxflake query \"select ...\" (or --model <name>)"), err=True)
     sys.exit(0 if ok else 1)
 
 
@@ -64,8 +75,9 @@ def build(spec_path, project_dir, scale, history, db_path, dbt_args):
 @click.option("--days", default=7, show_default=True, help="Simulated days to advance.")
 @click.option("--step-hours", default=24.0, show_default=True, help="Hours between dbt runs.")
 @click.argument("dbt_args", nargs=-1, type=click.UNPROCESSED)
-def simulate(spec_path, project_dir, scale, history, db_path, days, step_hours, dbt_args):
+def simulate(spec_path, project_dir, scale, history, db_path, keep, days, step_hours, dbt_args):
     """Advance the clock run by run, then compare incremental models to a full refresh."""
+    db_path = _warehouse_dir(project_dir, db_path, keep)
     from .dbt import DbtProject, emulator_output
     from .emulator import serve
     from .generate import Warehouse
@@ -93,8 +105,9 @@ def simulate(spec_path, project_dir, scale, history, db_path, days, step_hours, 
 @main.command()
 @with_common
 @click.option("--port", default=8765, show_default=True)
-def serve(spec_path, project_dir, scale, history, db_path, port):
+def serve(spec_path, project_dir, scale, history, db_path, keep, port):
     """Keep the emulator running with generated sources, for interactive dbt use."""
+    db_path = _warehouse_dir(project_dir, db_path, keep)
     from .dbt import DbtProject, emulator_output
     from .emulator import serve as start
     from .generate import Warehouse
@@ -137,8 +150,9 @@ def profile(spec_path, connection, days, sample_pct, k_anonymity, max_categories
 @with_common
 @click.option("--connection", required=True, help="Name in ~/.snowflake/connections.toml.")
 @click.option("--days", default=2, show_default=True, help="Simulated days of incremental runs on both engines.")
-def parity(spec_path, project_dir, scale, history, db_path, connection, days):
+def parity(spec_path, project_dir, scale, history, db_path, keep, connection, days):
     """Build on the emulator and on real Snowflake from identical synthetic data, and compare."""
+    db_path = _warehouse_dir(project_dir, db_path, keep)
     import snowflake.connector
 
     from .dbt import DbtProject, emulator_output, snowflake_output
@@ -190,22 +204,38 @@ def conformance(connection):
 
 @main.command()
 @click.option("--spec", "spec_path", default="fauxflake.yml", show_default=True)
-@click.option("--db-path", required=True, help="The directory a previous run kept its data in (--db-path).")
+@click.option("--project-dir", default=".", show_default=True)
+@click.option("--db-path", default=None, help="Where the run kept its data. Default: the project's .fauxflake/warehouse (see --keep).")
 @click.option("--schema", default="CI", show_default=True)
 @click.option("--limit", default=50, show_default=True, help="Rows to print.")
-@click.argument("sql")
-def query(spec_path, db_path, schema, limit, sql):
-    """Run Snowflake SQL against the warehouse a previous run left in --db-path."""
+@click.option("-f", "--file", "sql_file", default=None, help="Read the SQL from a file ('-' for standard input).")
+@click.option("-m", "--model", default=None, help="Run the compiled SQL of this model, as the last build wrote it.")
+@click.argument("sql", required=False)
+def query(spec_path, project_dir, db_path, schema, limit, sql_file, model, sql):
+    """Run Snowflake SQL against the warehouse a previous run kept (`build --keep` or --db-path).
+
+    The clock stands where that run left it, so CURRENT_DATE means what it meant to the models."""
     import os
     from pathlib import Path
 
     import snowflake.connector
 
+    from . import emulator
     from .emulator import define_udfs
     from .emulator import serve as serve_emulator
 
+    db_path = db_path or str(Path(project_dir) / ".fauxflake" / "warehouse")
     if not list(Path(db_path).glob("*.db")):
-        raise click.ClickException(f"no warehouse in {db_path}: run `fauxflake build --db-path {db_path}` first")
+        raise click.ClickException(f"no warehouse in {db_path}: run `fauxflake build --keep` first")
+    if model:
+        found = [p for p in (Path(project_dir) / "target" / "emulator" / "compiled").rglob(f"{model}.sql")]
+        if not found:
+            raise click.ClickException(f"no compiled SQL for model {model!r}: build the project first")
+        sql = found[0].read_text()
+    elif sql_file:
+        sql = sys.stdin.read() if sql_file == "-" else Path(sql_file).read_text()
+    if not sql or not sql.strip():
+        raise click.ClickException("nothing to run: pass SQL, --file or --model")
     spec = Spec.load(spec_path) if os.path.exists(spec_path) else None
     database = (spec.dbt.get("database") if spec else None) or "ANALYTICS"
     with serve_emulator(db_path=db_path, keep=True) as emu:
@@ -213,10 +243,13 @@ def query(spec_path, db_path, schema, limit, sql):
             define_udfs(emu, spec.udfs)
         for file in Path(db_path).glob("*.db"):
             emu.ensure_database(file.stem, schema)
+        state = Path(db_path) / "fauxflake.json"
+        if state.exists():  # the simulated time of the run that built this warehouse
+            emulator.FROZEN_NOW = datetime.fromisoformat(json.loads(state.read_text())["now"])
         conn = snowflake.connector.connect(**emu.connect_kwargs(database=database, schema=schema.upper()))
         cur = conn.cursor()
         try:
-            cur.execute(sql)
+            cur.execute(sql.strip().rstrip(";"))
         except snowflake.connector.errors.ProgrammingError as e:
             raise click.ClickException(str(e)) from e
         names = [d[0] for d in cur.description or []]
@@ -267,8 +300,9 @@ def init(spec_path, project_dir, database, force, fit):
 @click.option("--output", default=None, help="Also write the Markdown report to this file.")
 @click.option("--fail-on-change", is_flag=True, help="Exit 1 when any model output changed.")
 @click.argument("dbt_args", nargs=-1, type=click.UNPROCESSED)
-def diff(spec_path, project_dir, scale, history, db_path, base, output, fail_on_change, dbt_args):
+def diff(spec_path, project_dir, scale, history, db_path, keep, base, output, fail_on_change, dbt_args):
     """Build a base ref and the working tree on identical data and report what changed."""
+    db_path = _warehouse_dir(project_dir, db_path, keep)
     from pathlib import Path
 
     from .diff import markdown, run
@@ -294,8 +328,9 @@ def diff(spec_path, project_dir, scale, history, db_path, base, output, fail_on_
 @click.option("--days", default=7, show_default=True, help="Simulated days per scenario.")
 @click.option("--only", multiple=True, help="Scenario name; repeat to run several. Default: all.")
 @click.argument("dbt_args", nargs=-1, type=click.UNPROCESSED)
-def scenarios(spec_path, project_dir, scale, history, db_path, days, only, dbt_args):
+def scenarios(spec_path, project_dir, scale, history, db_path, keep, days, only, dbt_args):
     """Replay bad days (late data, duplicates, nulls, spikes, outages) and report what happens."""
+    db_path = _warehouse_dir(project_dir, db_path, keep)
     import contextlib
     import io
 
@@ -331,8 +366,9 @@ def scenarios(spec_path, project_dir, scale, history, db_path, days, only, dbt_a
 
 @main.command()
 @with_common
-def dev(spec_path, project_dir, scale, history, db_path):
+def dev(spec_path, project_dir, scale, history, db_path, keep):
     """Rebuild on save and show how the output differs from the last commit."""
+    db_path = _warehouse_dir(project_dir, db_path, keep)
     from pathlib import Path
 
     from .dev import DevSession

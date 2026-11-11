@@ -28,3 +28,7 @@ def test_dbt_utils_seeds_snapshots_and_ephemerals(emu):
     assert cur.execute("select sum(USERS) from ANALYTICS.CI.PLAN_SUMMARY").fetchone()[0] == \
         cur.execute("select count(*) from ANALYTICS.CI.DIM_USERS").fetchone()[0]  # a dynamic table
     assert cur.execute("select count(*) from ANALYTICS.CI.SECURE_USERS").fetchone()[0] > 0  # a secure view
+    # Python models: one written with Snowpark, one with pandas
+    users = cur.execute("select count(*) from ANALYTICS.CI.DIM_USERS").fetchone()[0]
+    assert cur.execute("select sum(USERS) from ANALYTICS.CI.PY_PLAN_TOTALS").fetchone()[0] == users
+    assert cur.execute("select count(*), count(*) filter (where HAS_EMAIL) from ANALYTICS.CI.PY_USER_FLAGS").fetchone() == (users, users)

@@ -426,7 +426,8 @@ def build_spec(manifest: dict, database: str) -> tuple[dict, list[str]]:
 def analyse(manifest: dict, database: str) -> Analysis:
     notes: list[str] = []
     src_nodes = manifest["sources"]
-    ids = {uid: f'{s["database"]}.{s["schema"]}.{s.get("identifier") or s["name"]}'.upper() for uid, s in src_nodes.items()}
+    ids = {uid: f'{s["database"]}.{s["schema"]}.{s.get("identifier") or s["name"]}'.upper().replace('"', "")
+           for uid, s in src_nodes.items()}
     uses = {name: SourceUse() for name in ids.values()}
     for uid, s in src_nodes.items():
         for col, meta in (s.get("columns") or {}).items():
@@ -583,14 +584,21 @@ def analyse(manifest: dict, database: str) -> Analysis:
         notes.append(f"{len(keyless)} source(s) have no `unique` test and no id-like column, so no key: "
                      f"{', '.join(keyless[:12])}{' ...' if len(keyless) > 12 else ''}.")
     # a column named like another table's key is almost always a reference to it
+    guessed: list[str] = []
     key_owner = {c: t for t, spec in tables.items() for c, d in spec["columns"].items() if d["gen"] in ("sequence", "hash_id")}
     for name, spec in tables.items():
         for col, d in spec["columns"].items():
             owner = key_owner.get(col)
             if owner and owner != name and d["gen"] not in ("sequence", "hash_id", "fk"):
                 spec["columns"][col] = {"gen": "fk", "ref": owner, "skew": 1.5}
-                notes.append(f"{name}.{col}: assumed to reference {owner} (same name as its key; no relationships test).")
-    _share_join_values(tables, joins, notes)
+                guessed.append(f"{name}.{col} -> {owner}")
+    if guessed:
+        notes.append(f"{len(guessed)} column(s) are named like another table's key and assumed to reference it (no relationships "
+                     f"test says so): {'; '.join(guessed[:6])}{' ...' if len(guessed) > 6 else ''}.")
+    joined: list[str] = []
+    _share_join_values(tables, joins, joined)
+    if joined:
+        notes.append(f"{len(joined)} group(s) of columns are joined in models and generated to match, for example: {' '.join(joined[:3])}")
     # a foreign key needs its parent to have a key
     for (child, col), (parent, pcol) in fks.items():
         if child in tables and parent in tables and tables[parent]["columns"].get(pcol, {}).get("gen") not in ("sequence", "hash_id"):
@@ -707,11 +715,18 @@ def _fit(project, path: Path, database: str, emu, manifest: dict, analysis: Anal
     log(f"trying the spec out on {len(models)} models")
     fitter.generate()
     project.invoke(["seed"], silent=True)
-    fitter.learn_from_models(manifest, database)
-    if any(not n.get("compiled_code") for n in models):
-        # some models only compile once the relations they inspect exist: they do now
+    failures = fitter.learn_from_models(manifest, database)
+    for _ in range(5):
+        if not failures and all(n.get("compiled_code") for n in models):
+            break
+        # models whose Jinja inspects the warehouse (dbt_utils.star, union_relations, get_column_values)
+        # compile differently, or only at all, once the relations they look at exist: they do now
+        before, known = len(failures), len(fitter.learned)
         manifest = project.compile()
-        fitter.learn_from_models(manifest, database)
+        models = [n for n in manifest["nodes"].values() if n["resource_type"] == "model"]
+        failures = fitter.learn_from_models(manifest, database)
+        if len(failures) >= before and len(fitter.learned) == known:
+            break
     fitter.drop_models(manifest)
     summary = fitter.learn_from_build(project, analysis)
     # a function the project creates itself (in a hook) needs no placeholder

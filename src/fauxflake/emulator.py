@@ -218,6 +218,21 @@ def _patch_fakesnow() -> None:
 
     server.describe_as_rowtype = describe_as_rowtype
 
+    # The endpoint parses a statement to classify it before running it. Statements handled in
+    # objects.py (anonymous procedures, Snowflake Scripting blocks) are not SQL sqlglot reads:
+    # classify those as commands and let execute() decide.
+    strict_parse = server.parse_one
+
+    def parse_one(sql):  # noqa: ANN001, ANN202
+        try:
+            return strict_parse(sql)
+        except Exception:  # noqa: BLE001
+            from sqlglot import exp
+
+            return exp.Command(this="CALL", expression=exp.Literal.string(sql))
+
+    server.parse_one = parse_one
+
     async def server_error(request, exc):  # noqa: ANN001
         return JSONResponse({"data": {"errorCode": "009996", "sqlState": "XX000"}, "code": "009996",
                              "message": f"fauxflake emulator: {exc.message}"[:2000], "success": False})
@@ -278,6 +293,7 @@ class Emulator:
     port: int
     duck: duckdb.DuckDBPyConnection
     _fs: object
+    db_path: object = None  # where the databases are kept on disk, if anywhere
 
     def cursor(self) -> duckdb.DuckDBPyConnection:
         """A native DuckDB cursor on the emulated warehouse."""
@@ -376,7 +392,7 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
     if not server.started:
         raise RuntimeError(f"emulator failed to start on port {port}")
     global CURRENT
-    emu = Emulator(port=port, duck=fs.duck_conn, _fs=fs)
+    emu = Emulator(port=port, duck=fs.duck_conn, _fs=fs, db_path=db_path)
     outer, CURRENT = CURRENT, emu
     try:
         yield emu

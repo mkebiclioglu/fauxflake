@@ -774,3 +774,52 @@ class Session:
 
     def get_current_schema(self):  # noqa: ANN201
         return self._run("select current_schema()")[1][0][0]
+
+
+# ---------------------------------------------------------------- real Snowpark
+
+class _Quiet:
+    """Stands in for the connector's telemetry client: every call is accepted and dropped."""
+
+    def __getattr__(self, name: str):  # noqa: ANN204
+        return lambda *args, **kwargs: None
+
+
+_snowpark_ready = False
+
+
+def snowpark_session(connection):  # noqa: ANN001, ANN201
+    """A Snowpark session whose SQL runs on the emulator, or None when Snowpark is not installed.
+    Snowpark builds Snowflake SQL from DataFrame operations and sends it through the connection,
+    so a Python model runs here the way its SQL would."""
+    global _snowpark_ready
+    try:
+        import fakesnow.fakes
+        import snowflake.snowpark.session as snowpark
+        from fakesnow.cursor import FakeSnowflakeCursor
+    except ImportError:
+        return None
+    if not _snowpark_ready:
+        # the parts of a real connection Snowpark touches that the emulator's connection lacks
+        FakeSnowflakeCursor._request_id = None
+        FakeSnowflakeCursor.query = property(lambda self: self._last_sql)
+        FakeSnowflakeCursor._describe_internal = lambda self, query, params=None: self.describe(query, params)
+        snowpark.write_pandas = fakesnow.fakes.write_pandas  # pandas -> table directly, without a stage upload
+        _snowpark_ready = True
+    connection._session_parameters = {}
+    connection._telemetry = _Quiet()
+    connection.session_id = id(connection)
+    connection.expired = False
+    return snowpark.Session.builder.configs({"connection": connection}).create()
+
+
+def release(session) -> None:  # noqa: ANN001
+    """Forget a Snowpark session without closing the connection it borrowed."""
+    if isinstance(session, Session):
+        return
+    try:
+        import snowflake.snowpark.session as snowpark
+
+        snowpark._remove_session(session)
+    except Exception:  # noqa: BLE001, S110
+        pass

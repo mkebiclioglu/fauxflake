@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import os
 import random
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -26,7 +27,12 @@ class Table:
 
     @property
     def ident(self) -> str:
-        return self.name.replace(".", "_")
+        return re.sub(r"\W", "_", self.name)
+
+    @property
+    def sql(self) -> str:
+        """The name as SQL: every part quoted, so a table called GROUP or ORDER is no problem."""
+        return quoted(self.name)
 
     def role(self, gen: str) -> str | None:
         return next((c for c, d in self.columns.items() if d.get("gen") == gen), None)
@@ -79,6 +85,10 @@ class Table:
         return out
 
 
+def quoted(name: str) -> str:
+    return ".".join('"' + part.replace('"', '""') + '"' for part in name.split("."))
+
+
 @dataclass
 class Spec:
     seed: int
@@ -107,6 +117,10 @@ class Spec:
         spec.validate()
         for var, value in (spec.dbt.get("env") or {}).items():
             os.environ.setdefault(var, str(value))  # placeholders for env vars the project requires
+        from . import objects
+
+        # cloud storage read by COPY INTO, served from local directories: `locations: {"s3://bucket/x": ./fixtures/x}`
+        objects.LOCATIONS = {str(k): str((Path(path).parent / str(v)).resolve()) for k, v in (raw.get("locations") or {}).items()}
         # tests that state facts about production data the generated data does not share
         os.environ["FAUXFLAKE_EXPECTED_FAILURES"] = " ".join(spec.dbt.get("expected_failures") or [])
         if (raw.get("dbt") or {}).get("target"):

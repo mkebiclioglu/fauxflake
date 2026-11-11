@@ -32,6 +32,7 @@ from sqlglot import exp
 
 from . import emulator
 from .init import guess, within_bounds
+from .spec import quoted
 
 Log = Callable[[str], None]
 
@@ -90,6 +91,10 @@ class Fitter:
         self.existing: dict[str, dict] = self.spec.get("existing") or {}
         self.nodes: dict[str, dict] = {}
         self.project_relations: set[str] = set()
+        self.relation_owner: dict[str, str] = {}
+        self.uncompiled: dict[str, str] = {}  # model -> why it did not compile
+        self.pending: dict[str, dict[str, str]] = {}  # stand-ins for those models: relation -> columns read from it
+        self.stand_ins: set[str] = set()
         self.learned: list[str] = []
         self.dirty = False
         self.trees: dict[str, exp.Expression | None] = {}
@@ -120,7 +125,7 @@ class Fitter:
         if col in columns:
             return False
         columns[col] = guess(col, None)
-        self.emu.duck.execute(f'alter table {table} add column if not exists "{col}" {duck_type(columns[col])}')
+        self.emu.duck.execute(f'alter table {quoted(table)} add column if not exists "{col}" {duck_type(columns[col])}')
         self.learned.append(f"{table}.{col}: read by a model, added.")
         return True
 
@@ -142,6 +147,17 @@ class Fitter:
             fq = ".".join([(tb.catalog or node["database"]).upper(), (tb.db or node["schema"]).upper(), name])
             if fq in self.tables or fq in self.existing:
                 continue
+            owner = self.relation_owner.get(fq)
+            if owner and owner in self._ancestors(sql_key):
+                if owner in self.uncompiled and fq not in self.pending:
+                    # the parent could not even compile (its Jinja found nothing to work with). Stand in for
+                    # it, to learn which columns this model expects from it: see push_pending()
+                    self.emu.ensure_database(*fq.split(".")[:2])
+                    self.pending[fq] = {c: duck_type(guess(c, None)) for c in self.columns_read(t, tb)}
+                    self.stand_ins.add(fq)
+                    self.create_pending(fq)
+                    return True
+                return False  # a ref() to a model that did not build: that model's failure, not a missing table
             db, schema, _ = fq.split(".")
             self.emu.ensure_database(db, schema)
             read = self.columns_read(t, tb)
@@ -154,7 +170,7 @@ class Fitter:
                                    "lateness": {"p": [0, 0.5, 0.99, 1], "seconds": [1, 30, 3600, 86400]},
                                    "columns": {"_LOADED_AT": {"gen": "loaded_at"}, **{c: guess(c, None) for c in read if c != "_LOADED_AT"}}}
                 cols = ", ".join(f'"{c}" {duck_type(g)}' for c, g in self.tables[fq]["columns"].items())
-                self.emu.duck.execute(f"create table if not exists {fq} ({cols})")
+                self.emu.duck.execute(f"create table if not exists {quoted(fq)} ({cols})")
                 self.learned.append(f"{fq}: read by {node['name']} but not declared as a source; now generated.")
                 self.dirty = True
             return True
@@ -184,36 +200,118 @@ class Fitter:
         duck = self.emu.duck
         kind = duck.execute("select table_type from information_schema.tables where table_catalog = ? and table_schema = ? "
                             "and table_name = ?", fq.split(".")).fetchone()
-        duck.execute(f"drop {'view' if kind and kind[0] == 'VIEW' else 'table'} if exists {fq}")
+        duck.execute(f"drop {'view' if kind and kind[0] == 'VIEW' else 'table'} if exists {quoted(fq)}")
         duck.execute(f'alter table {built} rename to "{fq.split(".")[2]}"')
-        columns = {r[0]: r[1] for r in duck.execute(f"describe {fq}").fetchall()}
+        columns = {r[0]: r[1] for r in duck.execute(f"describe {quoted(fq)}").fetchall()}
         if self.existing[fq] != {"columns": columns, "as": "table"}:
             self.existing[fq] = {"columns": columns, "as": "table"}
             self.learned.append(f"{fq}: built once; later runs start from an empty table with its {len(columns)} columns.")
+
+    def _ancestors(self, uid: str) -> set[str]:
+        seen: set[str] = set()
+        stack = list(self.nodes.get(uid, {}).get("depends_on", {}).get("nodes", []))
+        while stack:
+            node = stack.pop()
+            if node not in seen:
+                seen.add(node)
+                stack += self.nodes.get(node, {}).get("depends_on", {}).get("nodes", [])
+        return seen
+
+    def create_pending(self, fq: str) -> None:
+        from .generate import existing_view
+
+        self.emu.duck.execute(existing_view(fq, self.pending[fq], replace=True))
+
+    def push_pending(self) -> None:
+        """Stand-ins for models that did not compile have collected the columns read from them."""
+        for fq, columns in self.pending.items():
+            self.give_union_columns(fq, self.uncompiled.get(self.relation_owner.get(fq, ""), ""), list(columns))
+        self.pending = {}
+
+    def give_union_columns(self, fq: str, message: str, columns: list[str]) -> bool:
+        """A model built with dbt_utils.union_relations over the tables it finds keeps only the columns
+        a macro lists, so no SQL names them for the sources. What the models downstream read from it
+        is what those tables must have: add the columns to the tables the failed compile looked at."""
+        m = re.search(r"no columns found to union for relations ([^\n]+)", message)
+        if not m or not columns:
+            return False
+        names = {n.strip().strip('"').upper() for n in m.group(1).split(",")}
+        by_schema: dict[str, list[str]] = {}
+        for table in self.tables:
+            if table.split(".")[-1] in names:
+                by_schema.setdefault(table.rsplit(".", 1)[0], []).append(table)
+        if not by_schema:
+            return False
+        most = max(len(v) for v in by_schema.values())
+        added = 0
+        for tables in by_schema.values():
+            if len(tables) < most:
+                continue
+            for table in tables:
+                for col in columns:
+                    if col not in self.tables[table].setdefault("columns", {}):
+                        self.tables[table]["columns"][col] = guess(col, None)
+                        added += 1
+        if added:
+            self.dirty = True
+            self.learned.append(f"{fq}: unions {len(names)} tables by a column list; gave them the {len(columns)} columns read from it.")
+        return bool(added)
+
+    def columns_children_read(self, uid: str) -> list[str]:
+        """Columns the models that depend on `uid` read from it, also through a `select *` CTE."""
+        fq = _fq(self.nodes[uid]["relation_name"])
+        name = fq.split(".")[-1]
+        out: list[str] = []
+        for child, node in self.nodes.items():
+            if uid not in node.get("depends_on", {}).get("nodes", []) or child not in self.sql_of:
+                continue
+            tree = self.tree(child)
+            if tree is None:
+                continue
+            for tb in tree.find_all(exp.Table):
+                if tb.name.upper() != name:
+                    continue
+                found = self.columns_read(tree, tb)
+                select = tb.find_ancestor(exp.Select)
+                cte = select.parent if select is not None and isinstance(select.parent, exp.CTE) else None
+                if cte is not None and select.find(exp.Star) and not select.args.get("joins"):
+                    for other in tree.find_all(exp.Table):  # `with t as (select * from it) select a, b from t`
+                        if other.name.upper() == cte.alias.upper() and not other.db:
+                            found += self.columns_read(tree, other)
+                out += [c for c in found if c not in out]
+        return out
 
     def create_existing(self, fq: str) -> None:
         from .generate import existing_view
 
         self.emu.duck.execute(existing_view(fq, self.existing[fq].get("columns") or {}, replace=True))
 
-    def retype(self, value: str, hint: str) -> bool:
-        """The generated text `value` was converted to `hint`: retype the column(s) that made it."""
-        name = value.rsplit("_", 1)[0].upper() if "_" in value else ""
+    def retype(self, value: str, hint: str, fmt: str | None = None) -> bool:
+        """The generated text `value` was converted to `hint`: retype the column(s) that made it.
+        Generated text starts with its column's name, which is how the column is found."""
+        tokens = value.split()
         changed = False
-        for table, t in self.tables.items():
-            gen = (t.get("columns") or {}).get(name)
-            if not gen or gen.get("gen") not in _FREE or gen.get("type"):
-                continue
-            fresh = guess(name, hint)
-            if fresh["gen"] in _FREE:
-                continue
-            for keep in ("follows",):
-                if keep in gen:
-                    fresh[keep] = gen[keep]
-            within_bounds(fresh, self.bounds.get((table, name)))
-            t["columns"][name] = fresh
-            self.learned.append(f"{table}.{name}: used as {hint}, retyped.")
-            changed = True
+        for position, token in enumerate(tokens):
+            name = token.rsplit("_", 1)[0].upper() if "_" in token else ""
+            for table, t in self.tables.items():
+                gen = (t.get("columns") or {}).get(name)
+                if not gen or gen.get("gen") not in _FREE or gen.get("type") or gen.get("format"):
+                    continue
+                if fmt:  # parsed with an explicit format: text in that format
+                    fresh = {"gen": "time_offset", "format": fmt, "p": [0, 0.5, 1], "seconds": [0, 86400, 604800]}
+                elif hint == "TIMESTAMP" and len(tokens) > 1 and position > 0:
+                    # `date_col || ' ' || time_col` read as a timestamp: this one is the time of day
+                    fresh = {"gen": "time_offset", "format": "%H:%M:%S", "p": [0, 0.5, 1], "seconds": [0, 86400, 604800]}
+                else:
+                    fresh = guess(name, hint)
+                if fresh["gen"] in _FREE:
+                    continue
+                if "follows" in gen:
+                    fresh["follows"] = gen["follows"]
+                within_bounds(fresh, self.bounds.get((table, name)))
+                t["columns"][name] = fresh
+                self.learned.append(f"{table}.{name}: used as {fresh.get('format') or hint}, retyped.")
+                changed = True
         self.dirty |= changed
         return changed
 
@@ -262,7 +360,7 @@ class Fitter:
         return next(iter(tables)) if len(tables) == 1 else None
 
     def blameable(self, fq: str, depth: int = 0) -> bool:
-        if fq in self.tables or fq in self.existing:
+        if fq in self.tables or fq in self.existing or fq in self.pending:
             return True
         parent = self.passthrough(fq) if depth <= 8 else None
         return bool(parent) and self.blameable(parent, depth + 1)
@@ -270,6 +368,12 @@ class Fitter:
     def blame(self, fq: str, col: str, depth: int = 0) -> bool:
         if fq in self.tables:
             return self.add_column(fq, col)
+        if fq in self.pending:
+            if col in self.pending[fq]:
+                return False
+            self.pending[fq][col] = duck_type(guess(col, None))
+            self.create_pending(fq)
+            return True
         if fq in self.existing:
             columns = self.existing[fq].setdefault("columns", {})
             if col in columns:
@@ -280,7 +384,7 @@ class Fitter:
         parent = self.passthrough(fq) if depth <= 8 else None
         if parent and self.blame(parent, col, depth + 1):
             try:  # the model was already built without the column: give it one so the pass can go on
-                self.emu.duck.execute(f'alter table {fq} add column if not exists "{col}" varchar')
+                self.emu.duck.execute(f'alter table {quoted(fq)} add column if not exists "{col}" varchar')
             except Exception:  # noqa: BLE001, S110
                 pass
             return True
@@ -292,7 +396,9 @@ class Fitter:
         if t is None:
             return False
         ctes = {c.alias.upper(): c.this for c in t.find_all(exp.CTE)}
-        col = m.group("col").upper().split(".")[-1]
+        col = m.group("col").upper().split(".")[-1].strip('"')
+        if not re.fullmatch(r"[\w$ ]+", col):
+            return False
         candidates: set[str] = set()
         alias = (m.groupdict().get("table") or "").upper()
         if alias:
@@ -328,7 +434,8 @@ class Fitter:
             m = pattern.search(message)
             if m:
                 hint = fixed or _HINTS.get(m.group("type").upper())
-                return bool(hint) and self.retype(m.group("value"), hint)
+                fmt = re.search(r'according to format specifier "([^"]+)"', message)
+                return bool(hint) and self.retype(m.group("value"), hint, fmt.group(1) if fmt else None)
         m = _NOT_STRUCT.search(message)
         if m:
             return self.make_variant(m.group("col"), m.group("field"))
@@ -339,6 +446,9 @@ class Fitter:
     def load(self, manifest: dict) -> list[str]:
         nodes = self.nodes = manifest["nodes"]
         self.project_relations = {_fq(n["relation_name"]) for n in nodes.values() if n.get("relation_name")}
+        self.relation_owner = {_fq(n["relation_name"]): uid for uid, n in nodes.items() if n.get("relation_name")}
+        self.uncompiled = {uid: n.get("compile_error") or "" for uid, n in nodes.items()
+                           if n["resource_type"] == "model" and not n.get("compiled_code")}
         self.sql_of = {uid: n["compiled_code"].strip().rstrip(";") for uid, n in nodes.items()
                        if n["resource_type"] in ("model", "snapshot") and n.get("compiled_code") and n.get("language", "sql") == "sql"
                        and n.get("relation_name") and n["config"].get("materialized") != "ephemeral"}
@@ -381,6 +491,10 @@ class Fitter:
                 if broken:  # its input is wrong, so its errors would teach nothing true
                     failures[uid] = f"upstream failed: {broken}"
                     continue
+                if fq in self.stand_ins:  # it compiles now: the stand-in has done its job
+                    self.emu.duck.execute(f"drop view if exists {quoted(fq)}")
+                    self.stand_ins.discard(fq)
+                    self.pending.pop(fq, None)
                 target = f'{db}.{schema}."__FX_BOOT"' if fq in self.existing else fq
                 statement = f"create or replace table {target} as (\n{self.sql_of[uid]}\n)"
                 for _ in range(400):
@@ -400,6 +514,7 @@ class Fitter:
                     finally:
                         cur.close()
             conn.close()
+            self.push_pending()
             roots = sum(1 for m in failures.values() if not m.startswith("upstream failed"))
             self.log(f"  pass {n_pass}: {len(order) - len(failures)}/{len(order)} models run ({roots} fail on their own), "
                      f"{len(self.learned) - before} thing(s) learned")
@@ -416,7 +531,7 @@ class Fitter:
             fq = _fq(manifest["nodes"][uid]["relation_name"])
             if fq.count(".") == 2:
                 try:
-                    self.emu.duck.execute(f"drop table if exists {fq}")
+                    self.emu.duck.execute(f"drop table if exists {quoted(fq)}")
                 except Exception:  # noqa: BLE001, S110
                     pass
 
@@ -438,6 +553,7 @@ class Fitter:
             manifest = json.loads((project.target_path / "manifest.json").read_text())
             nodes = self.nodes = manifest["nodes"]
             self.project_relations = {_fq(n["relation_name"]) for n in nodes.values() if n.get("relation_name")}
+            self.relation_owner = {_fq(n["relation_name"]): uid for uid, n in nodes.items() if n.get("relation_name")}
             failed = [r for r in results if r["status"] in ("error", "fail")]
             expected = self.spec.setdefault("dbt", {}).setdefault("expected_failures", [])
             accepted = 0
@@ -452,6 +568,9 @@ class Fitter:
                     if r["status"] == "fail" and not self.learn_from_test(node, analysis) and node["name"] not in expected:
                         expected.append(node["name"])
                         accepted += 1
+                    continue
+                if "no columns found to union" in message and node.get("relation_name"):
+                    self.give_union_columns(_fq(node["relation_name"]), message, self.columns_children_read(node["unique_id"]))
                     continue
                 compiled = self._compiled(project, node)
                 if compiled:
