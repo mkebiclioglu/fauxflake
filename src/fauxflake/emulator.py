@@ -378,6 +378,10 @@ def _patch_fakesnow() -> None:
             try:
                 original_execute(self, transformed, params)
             except ProgrammingError as e:
+                as_times = semantics.numbers_as_times(transformed, str(e)) or semantics.offsets_as_written(transformed, str(e))
+                if as_times is not None:
+                    original_execute(self, as_times, params)
+                    return
                 if "No function matches" not in str(e) and "Could not choose a best candidate" not in str(e):
                     raise
                 repaired = semantics.repair_types(transformed, self._duck_conn, params)

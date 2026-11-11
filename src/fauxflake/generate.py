@@ -326,22 +326,27 @@ class Warehouse:
         self.cur: duckdb.DuckDBPyConnection = emu.cursor()
         self.now: datetime | None = None
 
-    def _calendars(self, until: datetime) -> dict[str, list[tuple[date, int, int]]]:
+    def _calendars(self, until: datetime, only: set[str] | None = None) -> dict[str, list[tuple[date, int, int]]]:
         cals = {}
         for t in self.spec.tables.values():
+            if only is not None and t.name not in only:
+                continue
             cal = t.calendar(self.spec.start, until.date(), self.spec.seed, self.scale, self.scenario)
             self.cur.execute(f"create or replace temp table cal_{t.ident} (day date, cum bigint, n bigint)")
             self.cur.executemany(f"insert into cal_{t.ident} values (?, ?, ?)", cal)
             cals[t.name] = cal
         return cals
 
-    def advance_to(self, until: datetime) -> dict[str, int]:
-        """Move the clock forward, loading every row that arrives in (now, until]."""
+    def advance_to(self, until: datetime, only: set[str] | None = None) -> dict[str, int]:
+        """Move the clock forward, loading every row that arrives in (now, until].
+        `only` limits a first load to those tables (the rest are already there)."""
         if self.now and until <= self.now:
             raise ValueError("the clock only moves forward")
-        cals = self._calendars(until)
+        cals = self._calendars(until, only)
         counts = {}
         for t in self.spec.ordered():
+            if only is not None and t.name not in only:
+                continue
             db, schema, _ = t.name.split(".")
             cal = cals[t.name]
             if self.now is None:

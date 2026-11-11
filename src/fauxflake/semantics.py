@@ -193,6 +193,9 @@ MACROS = [
           when abs(x::varchar::bigint) < 31536000000000 then to_timestamp(x::varchar::bigint / 1000.0)
           when abs(x::varchar::bigint) < 31536000000000000 then to_timestamp(x::varchar::bigint / 1000000.0)
           else to_timestamp(x::varchar::bigint / 1000000000.0) end""",
+    # a cast (unlike TO_TIMESTAMP) always counts a number as seconds
+    f"""create or replace macro {_NS}_sf_seconds(x) as coalesce(
+          try_cast(x::varchar as timestamp), timezone('UTC', to_timestamp(try_cast(x::varchar as double))))""",
     f"""create or replace macro {_NS}_sf_try_timestamp(x) as coalesce(
           try_cast(x::varchar as timestamp),
           try_strptime(x::varchar, ['%m/%d/%Y %H:%M:%S', '%m/%d/%Y %H:%M', '%m/%d/%Y', '%d-%b-%Y %H:%M:%S', '%d-%b-%Y']),
@@ -522,7 +525,7 @@ def _fix(node: exp.Expression) -> exp.Expression:
             return exp.Anonymous(this="date_trunc", expressions=[exp.Literal.string("second"), node])
         if to.is_type("timestamp", "timestampntz", "timestampltz", "timestamptz") and isinstance(inner, exp.Cast) \
                 and inner.to.is_type("int", "bigint", "decimal", "double", "float"):
-            return _fn("_sf_epoch", inner)  # x::number::timestamp: seconds (or ms, us, ns) since 1970
+            return exp.Cast(this=_fn("_sf_seconds", inner), to=to)  # x::number::timestamp: seconds since 1970
         if to.is_type("boolean") and not isinstance(inner, (*_VARIANT_ACCESS, exp.Boolean, exp.Null)):
             return _fn("_sf_bool", inner)
         if to.is_type("date") and not isinstance(inner, (*_VARIANT_ACCESS, exp.Null, exp.Cast, exp.Anonymous)) \
@@ -1471,6 +1474,44 @@ def _cte_prefix(node: exp.Expression) -> str:
         return ""
     recursive = any(w.args.get("recursive") for w in withs)
     return "with " + ("recursive " if recursive else "") + ", ".join(c.sql(dialect="duckdb") for c in ctes) + " "
+
+
+_NUMBER_TO_TIME = re.compile(r"Unimplemented type for cast \((?:U?(?:TINY|SMALL|BIG|HUGE)?INT(?:EGER)?|DECIMAL\([\d,]+\)|DOUBLE|FLOAT) -> (?:TIMESTAMP|DATE)")
+
+
+def numbers_as_times(transformed: exp.Expression, message: str) -> exp.Expression | None:
+    """`number_column::timestamp` counts seconds since 1970 in Snowflake; DuckDB has
+    no such cast. Run again with those casts written out, after DuckDB named the problem."""
+    if not _NUMBER_TO_TIME.search(message):
+        return None
+    named = re.search(r"when casting from source column (\S+)", message)
+    changed = False
+    for cast in list(transformed.find_all(exp.Cast)):
+        if not cast.to.is_type("timestamp", "timestampntz", "timestampltz", "timestamptz", "date", "datetime"):
+            continue
+        operand = cast.this
+        if not isinstance(operand, exp.Column) or (named and operand.name.upper() != named.group(1).upper().strip('"')):
+            continue
+        cast.set("this", _fn("_sf_seconds", operand.copy()))
+        changed = True
+    return transformed if changed else None
+
+
+_OFFSET_LITERAL = re.compile(r"^(\d{4}-\d\d-\d\d[ T]\d\d:\d\d(?::\d\d(?:\.\d+)?)?) ?([+-]\d\d):?(\d\d)$")
+
+
+def offsets_as_written(transformed: exp.Expression, message: str) -> exp.Expression | None:
+    """'2024-01-01 00:00:00.000 +0000' is a timestamp with an offset to Snowflake. DuckDB wants it
+    as +00:00, without the space: write such literals that way once it has refused one."""
+    if "Unknown TimeZone" not in message:
+        return None
+    changed = False
+    for literal in list(transformed.find_all(exp.Literal)):
+        m = _OFFSET_LITERAL.match(literal.name) if literal.is_string else None
+        if m and literal.name != f"{m.group(1)}{m.group(2)}:{m.group(3)}":
+            literal.replace(exp.Literal.string(f"{m.group(1)}{m.group(2)}:{m.group(3)}"))
+            changed = True
+    return transformed if changed else None
 
 
 def resolve_equalities(transformed: exp.Expression, conn) -> exp.Expression:  # noqa: ANN001

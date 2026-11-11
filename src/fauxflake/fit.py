@@ -130,7 +130,7 @@ class Fitter:
             self.spec["existing"] = self.existing
         self.path.write_text(self.header + yaml.safe_dump(self.spec, sort_keys=False, default_flow_style=None, width=110))
 
-    def generate(self, scale: float | None = None, history: int = 3):  # noqa: ANN201
+    def generate(self, scale: float | None = None, history: int = 3, only: set[str] | None = None):  # noqa: ANN201
         from .generate import Warehouse
         from .spec import Spec
 
@@ -142,7 +142,8 @@ class Fitter:
             smallest = min((float((t.raw.get("volume") or {}).get("rows_per_day", 1000)) for t in spec.tables.values()), default=1000.0)
             scale = min(1.0, max(1e-5, 100.0 / max(smallest, 1.0)))
         wh = Warehouse(self.emu, spec, scale)
-        wh.advance_to(datetime.combine(spec.start, datetime.min.time()) + timedelta(days=history))
+        wh.advance_to(datetime.combine(spec.start, datetime.min.time()) + timedelta(days=history),
+                      only={t for t in only if t in spec.tables} if only is not None else None)
         self.dirty = False
         return wh
 
@@ -346,16 +347,38 @@ class Fitter:
     def columns_used(self, uid: str, how: str, fmt: str | None = None) -> list[str]:
         """Columns the model's SQL uses in a way that says what they hold, for errors that name no column:
         compared with the empty string, parsed with a date format, or read as an array."""
-        tree = self.tree(uid)
+        out = self._columns_used(self.tree(uid), how, fmt)
+        if not out:  # a view upstream may hold the expression that fails when this model reads it
+            for dep in self._ancestors(uid):
+                if dep.startswith("model.") or dep.startswith("snapshot."):
+                    out += self._columns_used(self.tree(dep), how, fmt)
+        return list(dict.fromkeys(out))
+
+    @staticmethod
+    def _columns_used(tree, how: str, fmt: str | None = None) -> list[str]:  # noqa: ANN001
         out: list[str] = []
         if tree is None:
             return out
-        if how == "empty":
+        if how == "time_of_day":  # date || ' ' || time, read as a timestamp: the last column is a time of day
+            for node in tree.find_all(exp.DPipe, exp.Concat):
+                if isinstance(node.parent, (exp.DPipe, exp.Concat)):
+                    continue
+                parts = [c for c in node.find_all(exp.Column)]
+                if len(parts) >= 2 and node.find_ancestor(exp.Cast, exp.TryCast, exp.StrToTime, exp.TsOrDsToTimestamp, exp.Anonymous):
+                    out.append(parts[-1].name.upper())
+        elif how == "empty":
             for node in tree.find_all(exp.Nullif, exp.EQ, exp.NEQ):
                 a, b = node.this, node.expression
                 for col, other in ((a, b), (b, a)):
                     if isinstance(col, exp.Column) and isinstance(other, exp.Literal) and other.is_string and other.name == "":
                         out.append(col.name.upper())
+        elif how == "literal":
+            for node in tree.find_all(exp.EQ, exp.NEQ, exp.Nullif, exp.In, exp.Like, exp.ILike):
+                others = [node.expression] if not isinstance(node, exp.In) else list(node.expressions)
+                if isinstance(node.this, exp.Column) and any(isinstance(o, exp.Literal) and o.is_string and o.name == fmt for o in others):
+                    out.append(node.this.name.upper())
+                elif isinstance(node.expression, exp.Column) and isinstance(node.this, exp.Literal) and node.this.is_string and node.this.name == fmt:
+                    out.append(node.expression.name.upper())
         elif how == "format":
             for node in tree.find_all(exp.StrToTime, exp.StrToDate, exp.TsOrDsToDate, exp.TsOrDsToTimestamp):
                 arg = node.this
@@ -382,6 +405,9 @@ class Fitter:
             kind = gen.get("gen")
             numeric = hint in ("BIGINT", "DOUBLE")
             fresh = None
+            as_text = str(gen.get("type", "")).upper() in ("VARCHAR", "TEXT", "STRING") and kind not in _FREE
+            if as_text and hint != "TEXT" and not fmt:
+                continue  # already holds numbers, dates or booleans as text: a cast reads them
             if kind in ("lifecycle", "loaded_at"):
                 continue
             if numeric and kind == "hash_id":
@@ -409,9 +435,13 @@ class Fitter:
                     continue
                 fresh = {"gen": "categorical", "type": "BOOLEAN", "values": {True: 0.5, False: 0.5}}
             elif hint == "TEXT":
-                if kind in ("sequence", "hash_id", "fk", "template", "pool", "categorical"):
+                # the SQL treats it as text (compares it with '', or with a word) and may still cast it:
+                # keep what it generates and hold it as text
+                if kind in ("hash_id", "fk", "template", "pool", "object", "array") or str(gen.get("type", "")).upper() in ("VARCHAR", "TEXT", "STRING"):
                     continue
-                fresh = {"gen": "template", "template": f"{name.lower()}_{{hex}}"}
+                if kind == "categorical" and str(gen.get("type", "")).upper() != "BOOLEAN":
+                    continue
+                fresh = {**gen, "type": "VARCHAR"}
             elif hint == "ARRAY":
                 if kind == "array":
                     continue
@@ -562,8 +592,25 @@ class Fitter:
         tables = self.real_tables(t, {c.alias.upper(): c.this for c in t.find_all(exp.CTE)})
         return next(iter(tables)) if len(tables) == 1 else None
 
+    def _union_members(self, fq: str) -> bool:
+        """Is `fq` a model that only stacks generated tables (dbt_utils.union_relations)? Remember which."""
+        if fq in self.unions:
+            return True
+        uid = self.by_rel.get(fq)
+        if not uid or "union_relations" not in (self.nodes.get(uid, {}).get("raw_code") or ""):
+            return False
+        tree = self.tree(uid)
+        if tree is None or not isinstance(tree.unnest() if isinstance(tree, exp.Subquery) else tree, (exp.SetOperation, exp.Select)):
+            return False
+        members = [f"{t.catalog.upper()}.{t.db.upper()}.{t.name.upper()}" for t in tree.find_all(exp.Table) if t.catalog and t.db]
+        members = [m for m in dict.fromkeys(members) if m in self.tables]
+        if len(members) < 2:
+            return False
+        self.unions[fq] = members
+        return True
+
     def blameable(self, fq: str, depth: int = 0) -> bool:
-        if fq in self.tables or fq in self.existing or fq in self.pending or fq in self.unions:
+        if fq in self.tables or fq in self.existing or fq in self.pending or self._union_members(fq):
             return True
         parent = self.passthrough(fq) if depth <= 8 else None
         return bool(parent) and self.blameable(parent, depth + 1)
@@ -571,7 +618,7 @@ class Fitter:
     def blame(self, fq: str, col: str, depth: int = 0) -> bool:
         if fq in self.tables:
             return self.add_column(fq, col)
-        if fq in self.unions:  # a model that unions tables by a column list: the tables need the column
+        if self._union_members(fq):  # a model that unions tables by a column list: the tables need the column
             added = [t for t in self.unions[fq] if col not in self.tables[t].setdefault("columns", {})]
             for table in added:
                 self.tables[table]["columns"][col] = guess(col, None)
@@ -661,9 +708,66 @@ class Fitter:
                 return True
         return False
 
+    def _source_behind(self, fq: str, depth: int = 0) -> str | None:
+        """The generated table a relation is a `select *` of, however many models lie between."""
+        if fq in self.tables:
+            return fq
+        parent = self.passthrough(fq) if depth <= 8 else None
+        return self._source_behind(parent, depth + 1) if parent else None
+
+    def _columns_of(self, fq: str) -> list[str]:
+        db, schema, name = fq.split(".")
+        rows = self.emu.duck.execute("select column_name from information_schema.columns where table_catalog = ? and table_schema = ? "
+                                     "and table_name = ? order by ordinal_position", [db, schema, name]).fetchall()
+        return [r[0] for r in rows]
+
+    def union_widths(self, sql_key: str, message: str) -> bool:
+        """`select * from a union all select * from b` with branches of different widths: a branch that
+        is a source read with `select *` (its columns were never stated) has the other branch's columns."""
+        tree = self.tree(sql_key)
+        if "same number of result columns" not in message or tree is None:
+            return False
+        ctes = {c.alias.upper(): c.this for c in tree.find_all(exp.CTE)}
+        changed = False
+        for union in tree.find_all(exp.SetOperation):
+            if isinstance(union.parent, exp.SetOperation):
+                continue
+            relations: list[str] = []
+            pile = [union]
+            while pile:
+                node = pile.pop().unnest()
+                if isinstance(node, exp.SetOperation):
+                    pile += [node.left, node.right]
+                    continue
+                tables = self.real_tables(node, ctes) if isinstance(node, exp.Select) and node.is_star and len(node.expressions) == 1 else set()
+                if len(tables) != 1:
+                    relations = []
+                    break
+                relations.append(next(iter(tables)))
+            shapes = {r: self._columns_of(r) for r in relations}
+            fixed = [cols for r, cols in shapes.items() if cols and self._source_behind(r) is None]
+            target = fixed[0] if fixed else max(shapes.values(), key=len, default=[])
+            for relation, cols in shapes.items():
+                source = self._source_behind(relation)
+                if source is None or cols == target or not target:
+                    continue
+                old = self.tables[source].get("columns") or {}
+                extra = [c for c in old if c not in target and old[c].get("gen") != "loaded_at"]
+                if extra and fixed:
+                    continue  # it has columns the other branch does not: not ours to remove
+                fresh = {c: old.get(c) or guess(c, None) for c in [*target, *extra]}
+                if list(fresh) == list(old):
+                    continue
+                self.tables[source]["columns"] = fresh
+                self.retyped.add(source)
+                self.learned.append(f"{source}: unioned with {len(target)} named columns, given the same ones.")
+                changed = True
+        self.dirty |= changed
+        return changed
+
     def learn(self, sql_key: str, message: str) -> bool:
         """Apply whatever one error message teaches. True when the spec changed."""
-        if self.missing_column(sql_key, message) or self.missing_relation(sql_key, message):
+        if self.missing_column(sql_key, message) or self.missing_relation(sql_key, message) or self.union_widths(sql_key, message):
             return True
         named = _FROM_COLUMN.search(message)
         bad = _BAD_CAST.search(message)
@@ -680,9 +784,19 @@ class Fitter:
                     return False
                 if named and self.retype_column(sql_key, named.group(1).upper(), hint, fmt):
                     return True  # DuckDB named the column it was reading
-                if m.group("value") == "" and hint in ("BIGINT", "DOUBLE"):
-                    # `nullif(col, '')` on a column generated as a number: the SQL treats it as text
+                if hint == "TIMESTAMP" and re.fullmatch(r"\d{4}-\d\d-\d\d \d{4}-\d\d-\d\d[ T][\d:.]+", m.group("value")):
+                    return any([self.retype_column(sql_key, c, "TIMESTAMP", "%H:%M:%S") for c in self.columns_used(sql_key, "time_of_day")])
+                if m.group("value") == "" and hint in ("BIGINT", "DOUBLE", "DATE", "TIMESTAMP", "BOOLEAN"):
+                    # `nullif(col, '')` on a column generated as a number or a date: the SQL treats it as text
                     return any([self.retype_column(sql_key, c, "TEXT") for c in self.columns_used(sql_key, "empty")])
+                compared = self.columns_used(sql_key, "literal", m.group("value"))
+                if compared and hint in ("BIGINT", "DOUBLE", "DATE", "TIMESTAMP", "BOOLEAN") and \
+                        any([self.retype_column(sql_key, c, "TEXT") for c in compared]):
+                    return True  # the value is a word the SQL compares a column with: that column is text
+                if hint == "VARIANT":  # text pasted into JSON ('[' || ids || ']'): numbers fit, words do not
+                    pasted = [t.rsplit("_", 1)[0].upper() for t in re.findall(r"[a-z][a-z0-9_]*_[0-9a-f]{12}", m.group("value"))]
+                    if pasted and any([self.retype_column(sql_key, c, "BIGINT") for c in dict.fromkeys(pasted)]):
+                        return True
                 if fmt and any([self.retype_column(sql_key, c, hint, fmt) for c in self.columns_used(sql_key, "format", fmt)]):
                     return True
                 if hint == "ARRAY" and any([self.retype_column(sql_key, c, "ARRAY") for c in self.columns_used(sql_key, "array")]):
@@ -819,6 +933,7 @@ class Fitter:
         statement = f"create or replace table {target} as (\n{self.sql_of[uid]}\n)"
         fast: list[str] | None = None  # the statement as DuckDB SQL, to retry without transpiling again
         fallbacks = 0
+        seen: set[str] = set()
         began = time.time()
         failure = None
         for _ in range(400):
@@ -850,7 +965,19 @@ class Fitter:
                 if "INTERRUPT" in message.upper() or "statement stopped after" in message or isinstance(e, TimeoutError):
                     message = f"stopped after {self.model_timeout:.0f}s: the query runs away on the generated data"
                 else:
-                    self.learn(uid, message)
+                    known, self.retyped = self.retyped, set()
+                    learned = self.learn(uid, message)
+                    fresh, self.retyped = self.retyped, known | self.retyped
+                    if learned and fresh and message not in seen and len(seen) < 25:
+                        # its own source was generated wrongly: make those tables again and run it again,
+                        # so a model with ten mistyped columns costs one pass and not ten
+                        seen.add(message)
+                        try:
+                            self.generate(only=fresh)
+                            fast = None
+                            continue
+                        except Exception:  # noqa: BLE001, S110 - the next full generation will say why
+                            pass
                 failure = message
                 break
             finally:
@@ -859,7 +986,7 @@ class Fitter:
             self.log(f"    slow: {self.nodes[uid]['name']} took {time.time() - began:.0f}s")
         return failure
 
-    def learn_from_models(self, manifest: dict, database: str, passes: int = 4) -> dict[str, str]:
+    def learn_from_models(self, manifest: dict, database: str, passes: int = 6) -> dict[str, str]:
         """Returns {model: error} for the models that still fail after the spec stopped changing."""
         order = [uid for uid in self.load(manifest)]
         if self.deferred:
@@ -870,6 +997,11 @@ class Fitter:
                    for uid, n in manifest.get("sources", {}).items()}
         failures: dict[str, str] = {}
         todo = set(order)
+        if os.environ.get("FAUXFLAKE_FIT_ONLY"):  # for working on the fitter: these models and what they read
+            wanted = set(Path(os.environ["FAUXFLAKE_FIT_ONLY"]).read_text().split())
+            picked = {uid for uid in order if nodes[uid]["name"] in wanted}
+            todo = picked | {a for uid in picked for a in self._ancestors(uid) if a in todo}
+            order = [uid for uid in order if uid in todo]
         for n_pass in range(1, passes + 1):
             self.generate()
             before = len(self.learned)
