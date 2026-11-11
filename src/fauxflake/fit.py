@@ -907,6 +907,14 @@ class Fitter:
                     candidates.add(f"{tb.catalog.upper()}.{tb.db.upper()}.{tb.name.upper()}")
             if not candidates and alias in ctes:
                 candidates = self.real_tables(ctes[alias], ctes)
+            for sub in t.find_all(exp.Subquery):  # `(select * from t where ...) so ... so.col`
+                if not candidates and sub.alias.upper() == alias:
+                    candidates = self.real_tables(sub.this, ctes)
+            if alias in ("DBT_INTERNAL_SOURCE", "DBT_INTERNAL_DEST"):
+                # dbt's own merge on the model's unique key: what the model selects lacks the key, and so
+                # does the empty table that stands for the model before its first build
+                owners = {c for c in self.real_tables(t, ctes) if self.blameable(c)}
+                return any([self.blame(c, col) for c in sorted(owners)])
         if not candidates:
             candidates = self.real_tables(t, ctes)
         candidates = {c for c in candidates if self.blameable(c)}
@@ -1190,8 +1198,12 @@ class Fitter:
                     continue
                 database = (table.catalog or self.nodes[sql_key].get("database") or "").upper()
                 wanted: dict[str, list[str]] = {"TABLE_SCHEMA": [], "TABLE_NAME": []}
+                excluded: set[str] = set()
                 for test in select.args["where"].find_all(exp.EQ, exp.In, exp.ILike, exp.Like):
                     if test.find_ancestor(exp.Not) is not None:
+                        column = test.this.this if isinstance(test.this, (exp.Lower, exp.Upper)) else test.this
+                        if isinstance(test, exp.In) and isinstance(column, exp.Column) and column.name.upper() == "TABLE_NAME":
+                            excluded |= {v.name.upper() for v in test.expressions if isinstance(v, exp.Literal)}
                         continue
                     column = test.this.this if isinstance(test.this, (exp.Lower, exp.Upper)) else test.this
                     if not isinstance(column, exp.Column) or column.name.upper() not in wanted:
@@ -1201,7 +1213,8 @@ class Fitter:
                                                     if isinstance(v, exp.Literal) and v.is_string and "%" not in v.name]
                 for schema in wanted["TABLE_SCHEMA"]:
                     names = wanted["TABLE_NAME"]
-                    if not names and database and not any(t.startswith(f"{database}.{schema}.") for t in self.tables):
+                    held = [t for t in self.tables if t.startswith(f"{database}.{schema}.") and t.rsplit(".", 1)[1] not in excluded]
+                    if not names and database and not held:
                         names = ["EVENT"]  # it takes whatever tables the schema holds: one stands for them
                     for found in names:
                         fq = f"{database}.{schema}.{found}"
@@ -1269,8 +1282,13 @@ class Fitter:
         if len(keep) != 1:
             # neither is named with it: a CTE whose SELECT writes the column out has it for certain
             wrote = {c.alias.upper(): c.this for c in tree.find_all(exp.CTE)}
-            keep = [a for a in aliases if isinstance(wrote.get(a), exp.Select)
-                    and any(e.alias_or_name.upper() == col for e in wrote[a].expressions if not isinstance(e, exp.Star))]
+            keep = [a for a in aliases if a in wrote and any(e.alias.upper() == col for e in wrote[a].find_all(exp.Alias))]
+        if len(keep) != 1:
+            # no other evidence: the column is read from the table in FROM, not from one joined to it
+            firsts = {s.args["from_"].this.alias_or_name.upper() for c in tree.find_all(exp.Column)
+                      if c.name.upper() == col and not c.table
+                      for s in [c.find_ancestor(exp.Select)] if s is not None and s.args.get("from_") is not None}
+            keep = [a for a in aliases if a in firsts]
         if len(keep) != 1:
             return False
         drop = next(a for a in aliases if a != keep[0])
