@@ -514,6 +514,12 @@ def _fix(node: exp.Expression) -> exp.Expression:
     if isinstance(node, (exp.Mul, exp.Add, exp.Sub)) and all(
             isinstance(side, exp.Literal) and side.is_int for side in (node.this, node.expression)):
         node.set("this", exp.cast(node.this, "bigint"))  # 86400 * 30000 does not overflow a NUMBER
+    if isinstance(node, exp.Coalesce):
+        args = [node.this, *node.expressions]
+        if any(isinstance(a, exp.Literal) and a.is_string for a in args) and any(isinstance(a, _VARIANT_ACCESS) for a in args):
+            # coalesce(v:name, 'none') is text in Snowflake: the VARIANT gives its value, without quotes
+            node.set("this", _fn("_sf_text", node.this) if isinstance(node.this, _VARIANT_ACCESS) else node.this)
+            node.set("expressions", [_fn("_sf_text", a) if isinstance(a, _VARIANT_ACCESS) else a for a in node.expressions])
     if isinstance(node, exp.Cast) and not isinstance(node, exp.TryCast):
         to, inner = node.to, node.this
         if to.is_type("timestamp", "timestampntz") and isinstance(inner, exp.Cast) and inner.to.is_type("timestamptz") \

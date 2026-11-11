@@ -618,6 +618,26 @@
    ]
   ]
  },
+ "coalesce_variant_with_text": {
+  "rows": [
+   [
+    false,
+    "run",
+    "dflt",
+    "run",
+    "5",
+    "\"run\""
+   ],
+   [
+    true,
+    "compile",
+    "dflt",
+    "x",
+    "zero",
+    null
+   ]
+  ]
+ },
  "concat_nulls": {
   "rows": [
    [
