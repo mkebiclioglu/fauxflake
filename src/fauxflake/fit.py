@@ -209,7 +209,8 @@ class Fitter:
                 self.create_existing(fq)
                 self.learned.append(f"{fq}: read by {node['name']} before the project builds it; starts as an empty relation.")
             else:
-                self.tables[fq] = {"volume": {"rows_per_day": 100_000, "weekly": [1] * 7},
+                usual = max((float((t.get("volume") or {}).get("rows_per_day", 0)) for t in self.tables.values()), default=0) or 100_000
+                self.tables[fq] = {"volume": {"rows_per_day": int(usual), "weekly": [1] * 7},
                                    "lateness": {"p": [0, 0.5, 0.99, 1], "seconds": [1, 30, 3600, 86400]},
                                    "columns": {"_LOADED_AT": {"gen": "loaded_at"}, **{c: guess(c, None) for c in read if c != "_LOADED_AT"}}}
                 cols = ", ".join(f'"{c}" {duck_type(g)}' for c, g in self.tables[fq]["columns"].items())

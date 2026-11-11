@@ -637,6 +637,13 @@ def analyse(manifest: dict, database: str) -> Analysis:
         if child in tables and parent in tables and tables[parent]["columns"].get(pcol, {}).get("gen") not in ("sequence", "hash_id"):
             notes.append(f"{child}.{col}: references {parent}.{pcol}, which is not that table's key; generated as a plain column.")
             tables[child]["columns"][col] = guess(col, None)
+    if len(tables) > 200:
+        # hundreds of sources: a smaller placeholder keeps a build to minutes and a few gigabytes
+        rows = 20_000 if len(tables) <= 600 else 10_000
+        for table in tables.values():
+            table["volume"]["rows_per_day"] = rows
+        notes.append(f"{len(tables)} source tables: placeholder volumes are {rows} rows a day ({rows // 1000} at the default scale) "
+                     "to keep builds quick. `fauxflake profile` replaces them with what production has.")
     analysis = Analysis({"seed": 42, "start": "2025-01-01", "dbt": {"database": database}, "tables": tables}, notes, locate)
     analysis.bounds = {(name, col): numbers for name, use in uses.items() for col, numbers in use.bounds.items()}
     return analysis
