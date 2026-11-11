@@ -730,12 +730,37 @@ class Fitter:
 
     def passthrough(self, fq: str):  # noqa: ANN201
         """The single relation a model is a `select *` of, if that is what it is."""
-        uid = self.by_rel.get(fq)
+        uid = self.by_rel.get(fq) or self.relation_owner.get(fq)
+        if uid and uid not in self.sql_of and (self.nodes.get(uid) or {}).get("compiled_code"):
+            self.sql_of[uid] = self.nodes[uid]["compiled_code"].strip().rstrip(";")
         t = self.tree(uid) if uid else None
         if t is None or not t.find(exp.Star):
             return None
-        tables = self.real_tables(t, {c.alias.upper(): c.this for c in t.find_all(exp.CTE)})
-        return next(iter(tables)) if len(tables) == 1 else None
+        ctes = {c.alias.upper(): c.this for c in t.find_all(exp.CTE)}
+        tables = self.real_tables(t, ctes)
+        if len(tables) == 1:
+            return next(iter(tables))
+        # `select s.*, p.sku from a s join b p ...`: the columns nobody lists are those of `s`
+        node = t
+        for _ in range(8):
+            node = node.unnest()
+            if not isinstance(node, exp.Select) or node.args.get("from_") is None:
+                return None
+            stars = [e for e in node.expressions if isinstance(e, exp.Star) or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star))]
+            if not stars:
+                return None
+            owner = next((e.table.upper() for e in stars if isinstance(e, exp.Column) and e.table), None)
+            relations = [node.args["from_"].this, *[j.this for j in node.args.get("joins") or []]]
+            chosen = next((r for r in relations if owner and r.alias_or_name.upper() == owner), None) if owner else relations[0]
+            if isinstance(chosen, exp.Subquery):
+                node = chosen.this
+            elif isinstance(chosen, exp.Table) and not chosen.db and chosen.name.upper() in ctes:
+                node = ctes[chosen.name.upper()]
+            elif isinstance(chosen, exp.Table) and chosen.catalog and chosen.db:
+                return f"{chosen.catalog.upper()}.{chosen.db.upper()}.{chosen.name.upper()}"
+            else:
+                return None
+        return None
 
     def _union_members(self, fq: str) -> bool:
         """Is `fq` a model that only stacks generated tables (dbt_utils.union_relations, directly or
@@ -850,6 +875,19 @@ class Fitter:
             direct = {f"{tb.catalog.upper()}.{tb.db.upper()}.{tb.name.upper()}" for tb in t.find_all(exp.Table) if tb.catalog and tb.db}
             if len(candidates & direct) == 1:
                 candidates &= direct
+        if len(candidates) > 1 and not alias:
+            # the model names the column with a table elsewhere (`opp.end_date`): that table owns it
+            owners: set[str] = set()
+            for c in t.find_all(exp.Column):
+                if c.name.upper() != col or not c.table:
+                    continue
+                for tb in t.find_all(exp.Table):
+                    if tb.alias_or_name.upper() != c.table.upper():
+                        continue
+                    owners |= {f"{tb.catalog.upper()}.{tb.db.upper()}.{tb.name.upper()}"} if tb.catalog and tb.db \
+                        else self.real_tables(ctes.get(tb.name.upper(), tb), ctes)
+            if len(owners & candidates) == 1:
+                candidates &= owners
         if len(candidates) > 1 and not alias:
             # an unqualified column belongs to the table in its SELECT's FROM
             mains: set[str] = set()
@@ -1166,6 +1204,37 @@ class Fitter:
         self.dirty |= changed
         return changed
 
+    def ambiguous_column(self, sql_key: str, message: str) -> bool:
+        """Two joined tables both have a column the model reads without saying from which. In the real
+        warehouse only one has it: the one the model also names it with (`opp.end_date`). The other
+        got it from an earlier guess; take it back."""
+        m = re.search(r"Ambiguous reference to column name \"([^\"]+)\" \(use: '([^']+)' or '([^']+)'\)", message)
+        tree = self.tree(sql_key) if m else None
+        if tree is None:
+            return False
+        col = m.group(1).upper()
+        aliases = [m.group(i).rsplit(".", 1)[0].strip('"').upper() for i in (2, 3)]
+        named = {a: sum(1 for c in tree.find_all(exp.Column) if c.name.upper() == col and c.table.upper() == a) for a in aliases}
+        keep = [a for a in aliases if named[a]]
+        if len(keep) != 1:
+            return False
+        drop = next(a for a in aliases if a != keep[0])
+        ctes = {c.alias.upper(): c.this for c in tree.find_all(exp.CTE)}
+        changed = False
+        for tb in tree.find_all(exp.Table):
+            if tb.alias_or_name.upper() != drop:
+                continue
+            for fq in self.real_tables(tb, ctes) if tb.catalog and tb.db else self.real_tables(ctes.get(tb.name.upper(), tb), ctes):
+                source = self._source_behind(fq)
+                columns = (self.tables.get(source or "", {}).get("columns") or {})
+                if col in columns and columns[col].get("gen") in (*_FREE, "dist", "time_offset", "categorical"):
+                    del columns[col]
+                    self.retyped.add(source)
+                    self.learned.append(f"{source}.{col}: the model reads {col} unqualified next to {keep[0]}, which has it; removed here.")
+                    changed = True
+        self.dirty |= changed
+        return changed
+
     def few_values(self, sql_key: str) -> bool:
         """`dbt_utils.pivot('feature', get_column_values(...))` writes one column per value it finds.
         On made-up text that is one column per row; the column really holds a handful of values."""
@@ -1223,7 +1292,8 @@ class Fitter:
 
     def learn(self, sql_key: str, message: str) -> bool:
         """Apply whatever one error message teaches. True when the spec changed."""
-        if self.runaway(sql_key, message) or self.looked_for(sql_key) or self.jinja_columns(sql_key, message):
+        if self.runaway(sql_key, message) or self.looked_for(sql_key) or self.jinja_columns(sql_key, message) \
+                or self.ambiguous_column(sql_key, message):
             return True
         if self.udf_input(sql_key, message) or self.pivot_values(sql_key, message) or self.missing_column(sql_key, message) or self.missing_relation(sql_key, message) \
                 or self.union_widths(sql_key, message):
