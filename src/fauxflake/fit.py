@@ -648,10 +648,19 @@ class Fitter:
 
     def tree(self, uid: str):  # noqa: ANN201
         if uid not in self.trees:
-            try:
-                self.trees[uid] = sqlglot.parse_one(self.sql_of[uid] if uid in self.sql_of else self.sketch(uid), read="snowflake")
-            except Exception:  # noqa: BLE001
-                self.trees[uid] = None
+            box: dict = {}
+
+            def parse() -> None:
+                try:
+                    box["tree"] = sqlglot.parse_one(self.sql_of[uid] if uid in self.sql_of else self.sketch(uid), read="snowflake")
+                except BaseException:  # noqa: BLE001 - also RecursionError on SQL nested thousands deep
+                    box["tree"] = None
+
+            # in a thread of its own: generated SQL can nest deeper than the main thread's stack allows
+            worker = threading.Thread(target=parse, name="fauxflake-parse")
+            worker.start()
+            worker.join()
+            self.trees[uid] = box.get("tree")
         return self.trees[uid]
 
     def sketch(self, uid: str) -> str:

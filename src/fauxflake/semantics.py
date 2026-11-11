@@ -1058,8 +1058,35 @@ def reserved_words(conn) -> None:  # noqa: ANN001
 _RESERVED: set[str] = set()
 
 
+def _balanced(kind: type, operands: list[exp.Expression]) -> exp.Expression:
+    if len(operands) == 1:
+        return operands[0]
+    half = len(operands) // 2
+    return exp.paren(kind(this=_balanced(kind, operands[:half]), expression=_balanced(kind, operands[half:])))
+
+
+def balance_chains(transformed: exp.Expression) -> exp.Expression:
+    """`a or b or c or ...` with thousands of terms (a pivot, a generated filter) is a tree as deep
+    as it is long, and DuckDB stops at a depth of 1000. The same terms as a balanced tree."""
+    for kind in (exp.Or, exp.And, exp.DPipe, exp.Add):
+        for node in list(transformed.find_all(kind)):
+            if isinstance(node.parent, kind) and node.parent.this is node:
+                continue  # not the top of its chain
+            operands, cursor, steps = [], node, 0
+            while type(cursor) is kind:
+                operands.append(cursor.expression)
+                cursor, steps = cursor.this, steps + 1
+            if steps < 400:
+                continue
+            operands.append(cursor)
+            operands.reverse()
+            node.replace(_balanced(kind, operands))
+    return transformed
+
+
 def finish(transformed: exp.Expression) -> exp.Expression:
     """Fix-ups on the DuckDB side of the translation."""
+    transformed = balance_chains(transformed)
     for ident in transformed.find_all(exp.Identifier):
         # `end`, `overlaps`... are ordinary names in Snowflake and reserved words in DuckDB
         if not ident.args.get("quoted") and ident.name.upper() in _RESERVED \
