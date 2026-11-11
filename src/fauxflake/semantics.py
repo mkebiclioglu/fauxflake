@@ -1442,6 +1442,9 @@ def _convert(node: exp.Expression, to: str) -> None:
     node.replace(exp.cast(node.copy(), to))
 
 
+_TEXT_CALLS = {"substring", "substr", "left", "right"}
+
+
 def _repair(tree: exp.Expression, text: str, details: dict) -> bool:
     """Add the one conversion DuckDB asked for. False when the complaint is not one we understand."""
     name, call, pos = details.get("name"), details.get("call"), int(details.get("position") or -1)
@@ -1459,6 +1462,25 @@ def _repair(tree: exp.Expression, text: str, details: dict) -> bool:
             args = list(node.iter_expressions())
             if sql.lower().startswith("to_timestamp(") and text.startswith(sql, pos) and len(args) == 1:
                 node.replace(exp.cast(args[0].copy(), "timestamp"))
+                return True
+        return False
+    if name.lower() in _TEXT_CALLS and any(t != "VARCHAR" for t in types):
+        # SUBSTRING(number_column, REGEXP_INSTR(...), ...): Snowflake reads the number as text, and
+        # takes any whole number for a position
+        for node in tree.find_all(exp.Func):
+            sql = node.sql(dialect="duckdb")
+            if not sql.lower().startswith(name.lower() + "(") or not text.startswith(sql, pos):
+                continue
+            children = list(node.iter_expressions())  # in the order they are written
+            if len(children) != len(types):
+                continue
+            done = False
+            for i, (child, kind) in enumerate(zip(children, types)):
+                wanted = "varchar" if i == 0 else "bigint"
+                if kind != wanted.upper() and not (i > 0 and kind in ("INTEGER", "SMALLINT", "TINYINT")):
+                    child.replace(exp.cast(child.copy(), wanted))
+                    done = True
+            if done:
                 return True
         return False
     if "VARCHAR" not in types:

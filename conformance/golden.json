@@ -3561,6 +3561,15 @@
    ]
   ]
  },
+ "substring_of_number_with_regexp_instr": {
+  "rows": [
+   [
+    "34.5",
+    "98",
+    "65"
+   ]
+  ]
+ },
  "sum_ratio": {
   "rows": [
    [

@@ -391,6 +391,8 @@ def _patch_fakesnow() -> None:
             route.app = request_response(query_request)
 
     # a SUM over integers is a HUGEINT in DuckDB and a NUMBER in Snowflake: describe it as one
+    from string import Template
+
     import fakesnow.info_schema as info
 
     whole = "('BIGINT', 'HUGEINT', 'INTEGER', 'SMALLINT', 'TINYINT', 'UBIGINT', 'UINTEGER', 'USMALLINT', 'UTINYINT', 'UHUGEINT')"
@@ -398,11 +400,30 @@ def _patch_fakesnow() -> None:
         .replace("columns.data_type='BIGINT'", f"columns.data_type in {whole}").replace("columns.data_type='DOUBLE'", "columns.data_type in ('DOUBLE', 'FLOAT')") \
         .replace("then NULL else columns.numeric_scale end", f"then NULL when columns.data_type in {whole} then 0 else columns.numeric_scale end")
 
+    # the columns Snowflake's views have beyond those: precision of times, and the rest as Snowflake
+    # reports them for an ordinary column
+    nulls = ["CHARACTER_SET_CATALOG", "CHARACTER_SET_SCHEMA", "CHARACTER_SET_NAME", "COLLATION_CATALOG", "COLLATION_SCHEMA",
+             "DOMAIN_CATALOG", "DOMAIN_SCHEMA", "DOMAIN_NAME", "UDT_CATALOG", "UDT_SCHEMA", "UDT_NAME", "SCOPE_CATALOG",
+             "SCOPE_SCHEMA", "SCOPE_NAME", "MAXIMUM_CARDINALITY", "DTD_IDENTIFIER", "INTERVAL_TYPE", "INTERVAL_PRECISION",
+             "IDENTITY_MAXIMUM", "IDENTITY_MINIMUM", "EXPRESSION", "SCHEMA_EVOLUTION_RECORD"]
+    more = (",\n    case when columns.data_type like 'TIME%' then least(coalesce(columns.datetime_precision, 9), 9) end as DATETIME_PRECISION,"
+            "\n    'COLUMN' as KIND, 'NO' as IS_SELF_REFERENCING, " + ", ".join(f"null::VARCHAR as {c}" for c in nulls))
+    if "as DATETIME_PRECISION" not in info.SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW:
+        info.SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW = info.SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW.replace(
+            "null::VARCHAR as DATA_TYPE_ALIAS", "null::VARCHAR as DATA_TYPE_ALIAS" + more)
+    tables_view = info.SQL_CREATE_INFORMATION_SCHEMA_TABLES_VIEW.template
+    if '"ERROR_LOGGING"' not in tables_view:
+        info.SQL_CREATE_INFORMATION_SCHEMA_TABLES_VIEW = Template(tables_view.replace(
+            "'NO' AS \"IS_HYBRID\"", "'NO' AS \"IS_HYBRID\", 'NO' AS \"ERROR_LOGGING\", 'NO' AS \"IS_INTERACTIVE\", 'NO' AS \"ROW_TIMESTAMP_ON\""))
+    databases_view = info.SQL_CREATE_INFORMATION_SCHEMA_DATABASES_VIEW.template
+    if "OWNER_ROLE_TYPE" not in databases_view:
+        info.SQL_CREATE_INFORMATION_SCHEMA_DATABASES_VIEW = Template(databases_view.replace(
+            "'STANDARD' as TYPE", "'STANDARD' as TYPE, 'ROLE' as OWNER_ROLE_TYPE, 'NO' as REPLICABLE_WITH_FAILOVER_GROUPS"))
+
     # DESCRIBE TABLE reads the current database's column view, so a table in another database (a
     # source in RAW, described while connected to ANALYTICS) came back with no columns. dbt_utils.star
     # on such a source then expanded to nothing. Read the view that covers every database.
     import fakesnow.transforms.transforms as upstream
-    from string import Template
 
     if "_fs_global._fs_information_schema._fs_columns" not in upstream.SQL_DESCRIBE_TABLE.template:
         upstream.SQL_DESCRIBE_TABLE = Template(upstream.SQL_DESCRIBE_TABLE.template.replace(
