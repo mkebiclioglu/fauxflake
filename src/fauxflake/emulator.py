@@ -115,15 +115,16 @@ def _transaction(cursor, command: str, original):  # noqa: ANN001, ANN202
     is_open = getattr(conn, "_fauxflake_txn", False)
     trailing = objects._TRAILING_COMMENT.sub("", command)
     if _TXN_BEGIN.match(trailing):
-        if not is_open:
-            cursor._duck_conn.execute("begin transaction")
-            conn._fauxflake_txn, conn._fauxflake_journal = True, []
+        if is_open:  # one left open (a failed run that never said ROLLBACK): Snowflake would carry on in it
+            _end_transaction(cursor)
+        cursor._duck_conn.execute("begin transaction")
+        conn._fauxflake_txn, conn._fauxflake_journal = True, []
         return original(cursor, "select 'Statement executed successfully.' as \"status\"")
     end = _TXN_END.match(trailing)
     if end:
         _drop_scratch(cursor)
         if is_open:
-            conn._fauxflake_txn = False
+            conn._fauxflake_txn, conn._fauxflake_journal = False, []
             try:
                 cursor._duck_conn.execute(end.group(1))
             except Exception:  # noqa: BLE001 - DuckDB already ended it (a failed statement aborts its transaction)
@@ -163,7 +164,7 @@ def _drop_scratch(cursor) -> None:  # noqa: ANN001
 
 
 def _end_transaction(cursor) -> None:  # noqa: ANN001
-    cursor._conn._fauxflake_txn = False
+    cursor._conn._fauxflake_txn, cursor._conn._fauxflake_journal = False, []
     _drop_scratch(cursor)
     try:
         cursor._duck_conn.execute("commit")
@@ -488,6 +489,12 @@ def _patch_fakesnow() -> None:
             self._duck_conn.execute("begin transaction")
             for tree, values in list(getattr(conn, "_fauxflake_journal", [])):
                 original_execute(self, tree.copy(), values)
+        except Exception:  # noqa: BLE001 - what it had done cannot be repeated: the transaction is over, rolled back
+            conn._fauxflake_txn, conn._fauxflake_journal = False, []
+            try:
+                self._duck_conn.execute("rollback")
+            except Exception:  # noqa: BLE001, S110
+                pass
         finally:
             conn._fauxflake_healing = False
 
