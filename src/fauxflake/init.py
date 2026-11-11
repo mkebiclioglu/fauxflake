@@ -234,7 +234,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                                 use.bounds.setdefault(hit[1], set()).add(-float(number.name) if negative else float(number.name))
                             except ValueError:
                                 pass
-                if isinstance(parent, exp.Anonymous) and parent.name.upper() == "PARSE_IP" and parent.expressions[0] is col:
+                if (isinstance(parent, exp.ParseIp) and parent.this is col) or (
+                        isinstance(parent, exp.Anonymous) and parent.name.upper() == "PARSE_IP" and parent.expressions[0] is col):
                     use.ips.add(hit[1])
                 if isinstance(parent, exp.ParseJSON):
                     use.json_text.add(hit[1])  # parse_json(col):a.b  ->  col is text holding {"a": {"b": ...}}

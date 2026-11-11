@@ -205,9 +205,14 @@ class Fitter:
             return []
         alias = table.alias_or_name.upper()
         alone = not select.args.get("joins") and select.args.get("from_") is not None and select.args["from_"].this is table
+        # `cast(ts as date) as day ... group by day`: `day` is the SELECT's own alias, not a column of the table
+        own = {p.alias.upper() for p in select.expressions if isinstance(p, exp.Alias)
+               and not any(c.name.upper() == p.alias.upper() for c in p.this.find_all(exp.Column))}
         out: list[str] = []
         for col in select.find_all(exp.Column):
             if isinstance(col.this, exp.Star) or col.find_ancestor(exp.Select) is not select:
+                continue
+            if not col.table and col.name.upper() in own:
                 continue
             if (col.table.upper() == alias if col.table else alone) and col.name.upper() not in out:
                 out.append(col.name.upper())
