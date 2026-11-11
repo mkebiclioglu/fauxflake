@@ -251,3 +251,12 @@ def test_scheduled_tasks_run_as_simulated_time_passes(run):
     assert objects.run_due_tasks(emu, "ANALYTICS") == ["LOAD_SEEN"]
     assert run("select id from seen") == [(3,)]
     assert objects.run_due_tasks(emu, "ANALYTICS") == []  # consumed
+
+
+def test_describe_reaches_tables_in_other_databases(run):
+    # a source lives in RAW while dbt is connected to ANALYTICS: dbt_utils.star(source(...)) depends on this
+    run("create database if not exists raw")
+    run("create schema if not exists raw.app")
+    run("create or replace table raw.app.event (id string, received_at timestamp)")
+    run("use schema analytics.ci")
+    assert [r[0] for r in run("describe table raw.app.event")] == ["ID", "RECEIVED_AT"]

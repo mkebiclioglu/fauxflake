@@ -287,6 +287,16 @@ def _patch_fakesnow() -> None:
         .replace("columns.data_type='BIGINT'", f"columns.data_type in {whole}").replace("columns.data_type='DOUBLE'", "columns.data_type in ('DOUBLE', 'FLOAT')") \
         .replace("then NULL else columns.numeric_scale end", f"then NULL when columns.data_type in {whole} then 0 else columns.numeric_scale end")
 
+    # DESCRIBE TABLE reads the current database's column view, so a table in another database (a
+    # source in RAW, described while connected to ANALYTICS) came back with no columns. dbt_utils.star
+    # on such a source then expanded to nothing. Read the view that covers every database.
+    import fakesnow.transforms.transforms as upstream
+    from string import Template
+
+    if "_fs_global._fs_information_schema._fs_columns" not in upstream.SQL_DESCRIBE_TABLE.template:
+        upstream.SQL_DESCRIBE_TABLE = Template(upstream.SQL_DESCRIBE_TABLE.template.replace(
+            "FROM _fs_information_schema._fs_columns", "FROM _fs_global._fs_information_schema._fs_columns"))
+
     semantics.patch_upstream()
     original_transform = FakeSnowflakeCursor._transform
 
