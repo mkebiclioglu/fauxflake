@@ -220,3 +220,16 @@ def test_objects_maps_and_empty_keys(run):
                         map_cat({'a': 1}::map(varchar, number), {'a': 2, 'c': 3}::map(varchar, number)),
                         parse_json('{"": 5, "a": {"": 7}}'):a:""::int""")
     assert [json.loads(v) if isinstance(v, str) else v for v in row[0]] == [{"b": 2}, {"a": 1, "b": "x"}, {"a": 1}, {"a": 2, "c": 3}, 7]
+
+
+def test_external_tables_account_objects_and_schema_clone(run):
+    run("create view v as select id from t")
+    run("""create or replace external table ext_orders (order_id int as (value:order_id::int))
+           location = @my_stage/orders file_format = (type = parquet) auto_refresh = false""")
+    assert run("select count(*), max(order_id) from ext_orders") == [(0, None)]
+    run("create or replace external table t (x int as (value:x::int)) location = @s file_format = (type = csv)")
+    assert run("select count(*) from t") == [(2,)]  # a table that already holds rows keeps them
+    assert run("show warehouses") == [] and run("show grants to role sysadmin") == []
+    run("rollback")
+    run("create or replace schema analytics.backup clone analytics.ci")
+    assert run("select (select count(*) from analytics.backup.t), (select count(*) from analytics.backup.v)") == [(2, 2)]

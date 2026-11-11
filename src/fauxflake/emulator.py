@@ -97,7 +97,7 @@ def _qualify_merge_insert(sql: str) -> str:
 # databases in one transaction, so explicit transactions run as autocommit.
 _LEAD = r"(?s)^(\s|--[^\n]*\n|/\*.*?\*/)*"
 NOPS = [
-    _LEAD + r"(begin|commit)\b",
+    _LEAD + r"(begin|commit|rollback|start\s+transaction)\b",
     # documentation, access control and warehouse settings have nothing to act on locally
     _LEAD + r"comment\s+(if\s+exists\s+)?on\s",
     _LEAD + r"alter\s+(table|view|materialized\s+view|dynamic\s+table)\s+\S+\s+(alter|modify)\s.*\bcomment\b",

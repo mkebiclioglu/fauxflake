@@ -712,6 +712,14 @@ _SIMPLE = [  # (pattern, handler name)
     (re.compile(_LEAD + r"alter\s+(?:stream|alert|pipe|function|procedure|masking\s+policy|row\s+access\s+policy)\s"), "nothing"),
     (re.compile(_LEAD + r"alter\s+table\s+(?:if\s+exists\s+)?(?P<a>" + _NAME + r")\s+swap\s+with\s+(?P<b>" + _NAME + r")"), "swap"),
     (re.compile(_LEAD + r"use\s+role\s+(?P<name>" + _NAME + r")"), "use_role"),
+    (re.compile(_LEAD + r"create\s+(?:or\s+replace\s+)?external\s+table\s+(?:if\s+not\s+exists\s+)?(?P<name>" + _NAME + r")\s*(?P<rest>.*)$"), "external_table"),
+    (re.compile(_LEAD + r"alter\s+external\s+table\s"), "nothing"),
+    (re.compile(_LEAD + r"create\s+(?P<replace>or\s+replace\s+)?(?:transient\s+)?schema\s+(?:if\s+not\s+exists\s+)?(?P<name>" + _NAME + r")\s+clone\s+(?P<source>" + _NAME + r")"), "clone_schema"),
+    (re.compile(_LEAD + r"show\s+(?:terse\s+)?(?P<kind>warehouses|roles|users|shares|integrations|(?:api|security|storage|notification|external\s+access|catalog)\s+integrations|"
+                        r"network\s+policies|network\s+rules|resource\s+monitors|tags|secrets|dynamic\s+tables|materialized\s+views|external\s+tables|"
+                        r"event\s+tables|iceberg\s+tables|managed\s+accounts|replication\s+\w+|failover\s+groups|password\s+policies|session\s+policies|"
+                        r"packages\s+policies|external\s+functions|compute\s+pools|services|image\s+repositories|streamlits|notebooks|models|datasets|"
+                        r"git\s+repositories|cortex\s+search\s+services|semantic\s+views|grants)\b"), "show_nothing"),
     (re.compile(_LEAD + r"execute\s+immediate\s+(?P<rest>.*)$"), "execute_immediate"),
     (re.compile(_LEAD + r"(?P<rest>(?:declare\b|begin\s+(?!transaction\b|work\b|name\b)\S).*\bend\b[\s;]*)$"), "block"),
 ]
@@ -812,6 +820,53 @@ def set_role(duck, role: str) -> None:  # noqa: ANN001
 def _use_role(cursor, original, state, m):  # noqa: ANN001, ANN202
     set_role(cursor._duck_conn, bare(m.group("name")))
     return _status(cursor, original, "Statement executed successfully.")
+
+
+def _show_nothing(cursor, original, state, m):  # noqa: ANN001, ANN202
+    """Account-level objects (warehouses, roles, integrations...) have nothing behind them locally: none exist."""
+    columns = ["created_on", "name", "database_name", "schema_name", "kind", "owner", "comment"]
+    return original(cursor, "select " + ", ".join(f'null::varchar as "{c}"' for c in columns) + " where false")
+
+
+def _external_table(cursor, original, state, m):  # noqa: ANN001, ANN202
+    """An external table that the spec already generates keeps its rows. Otherwise it starts empty,
+    with VALUE, METADATA$FILENAME and the columns the statement declares."""
+    fq = qualified(cursor, m.group("name"))
+    duck = cursor._duck_conn
+    exists = duck.execute("select 1 from information_schema.tables where table_catalog = ? and table_schema = ? and table_name = ?",
+                          list(fq)).fetchone()
+    if not exists:
+        rest = m.group("rest")
+        declared = []
+        if rest.startswith("("):
+            for part in split_top(rest[1:_close_paren(rest, 0)]):
+                words = part.split(None, 2)
+                if len(words) >= 2:
+                    declared.append(f'"{_unquote(words[0])}" {duck_type(re.split(r"(?i)\s+as\b", " ".join(words[1:]))[0])}')
+        cols = ['"VALUE" JSON', '"METADATA$FILENAME" VARCHAR', *declared]
+        duck.execute(f"create table {_sql_name(fq)} ({', '.join(cols)})")
+    return _status(cursor, original, f"Table {fq[2]} successfully created.")
+
+
+def _clone_schema(cursor, original, state, m):  # noqa: ANN001, ANN202
+    """`CREATE SCHEMA b CLONE a`: every table copied, every view recreated."""
+    source, target = qualified(cursor, m.group("source") + ".X")[:2], qualified(cursor, m.group("name") + ".X")[:2]
+    duck = cursor._duck_conn
+    quote = lambda *parts: ".".join('"' + p + '"' for p in parts)  # noqa: E731
+    if m.group("replace"):
+        duck.execute(f"drop schema if exists {quote(*target)} cascade")
+    duck.execute(f"create schema if not exists {quote(*target)}")
+    for (name,) in duck.execute("select table_name from duckdb_tables() where database_name = ? and schema_name = ?", list(source)).fetchall():
+        duck.execute(f"create table {quote(*target, name)} as select * from {quote(*source, name)}")
+    views = duck.execute("select view_name, sql from duckdb_views() where database_name = ? and schema_name = ? and not internal", list(source)).fetchall()
+    for name, sql in views:
+        body = re.split(r"(?is)\bas\b", sql, maxsplit=1)
+        if len(body) == 2:
+            try:
+                duck.execute(f"create view {quote(*target, name)} as {body[1]}")
+            except Exception:  # noqa: BLE001, S110 - a view over something outside the schema
+                pass
+    return _status(cursor, original, f"Schema {target[1]} successfully created.")
 
 
 def _nothing(cursor, original, state, m):  # noqa: ANN001, ANN202
