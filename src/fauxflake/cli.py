@@ -319,7 +319,10 @@ def init(spec_path, project_dir, database, force, fit):
     path = Path(spec_path)
     if path.exists() and not force:
         raise click.ClickException(f"{path} already exists (use --force to overwrite)")
-    with serve() as emu:
+    import tempfile
+
+    # on disk, so that a project with thousands of models is bounded by DuckDB's buffer pool, not by RAM
+    with tempfile.TemporaryDirectory(prefix="fauxflake-") as scratch, serve(db_path=scratch if fit else None) as emu:
         notes = write_spec(DbtProject(project_dir, emulator_output(emu.port, database)), path, database, emu,
                            fit=fit, log=click.echo)
     spec = Spec.load(path)
@@ -347,8 +350,10 @@ def fit(spec_path, project_dir):
     path = Path(spec_path)
     if not path.exists():
         raise click.ClickException(f"{path} does not exist: run `fauxflake init` first")
+    import tempfile
+
     database = Spec.load(path).dbt.get("database", "ANALYTICS")
-    with serve() as emu:
+    with tempfile.TemporaryDirectory(prefix="fauxflake-") as scratch, serve(db_path=scratch) as emu:
         notes = update_spec(DbtProject(project_dir, emulator_output(emu.port, database)), path, database, emu, log=click.echo)
     spec = Spec.load(path)
     click.echo(f"updated {path}: {len(spec.tables)} source tables, {sum(len(t.columns) for t in spec.tables.values())} columns")
