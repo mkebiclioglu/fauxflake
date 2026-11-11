@@ -21,5 +21,8 @@ def test_query_reads_a_kept_warehouse(tmp_path):
     assert clock.exit_code == 0 and clock.output.strip().splitlines()[-2].strip() in ("0", "1"), clock.output
     by_model = runner.invoke(main, ["query", *args, "--project-dir", str(EXAMPLE), "--model", "fct_orders", "--limit", "1"])
     assert by_model.exit_code == 0 and "more not shown" in by_model.output, by_model.output
+    # any dbt command runs against the kept warehouse, without regenerating or rebuilding
+    one = runner.invoke(main, ["dbt", *args, "--project-dir", str(EXAMPLE), "test", "-s", "fct_orders"])
+    assert one.exit_code == 0 and "generated" not in one.output, one.output
     missing = runner.invoke(main, ["query", "--db-path", str(tmp_path / "nothing"), "select 1"])
     assert missing.exit_code != 0 and "no warehouse" in missing.output

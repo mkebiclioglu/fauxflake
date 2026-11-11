@@ -70,6 +70,42 @@ def build(spec_path, project_dir, scale, history, db_path, keep, dbt_args):
     sys.exit(0 if ok else 1)
 
 
+@main.command(name="dbt", context_settings={"ignore_unknown_options": True})
+@with_common
+@click.argument("dbt_args", nargs=-1, type=click.UNPROCESSED)
+def dbt_command(spec_path, project_dir, scale, history, db_path, keep, dbt_args):
+    """Run any dbt command against the kept warehouse: `fauxflake dbt test -s my_model`.
+
+    The warehouse of the last `build --keep` is reused as it is, so one model or one test runs in
+    the time it takes itself. Without a kept warehouse, sources are generated first."""
+    from pathlib import Path
+
+    from . import emulator
+    from .dbt import DbtProject, emulator_output
+    from .emulator import define_udfs, serve
+    from .generate import Warehouse
+
+    if not dbt_args:
+        raise click.ClickException("which dbt command? For example: fauxflake dbt test -s my_model")
+    spec = Spec.load(spec_path)
+    db_path = _warehouse_dir(project_dir, db_path, True)
+    kept = bool(list(Path(db_path).glob("*.db")))
+    with serve(db_path=db_path, keep=kept) as emu:
+        if kept:
+            define_udfs(emu, spec.udfs)
+            for file in Path(db_path).glob("*.db"):
+                emu.ensure_database(file.stem, "CI")
+            state = Path(db_path) / "fauxflake.json"
+            if state.exists():
+                emulator.FROZEN_NOW = datetime.fromisoformat(json.loads(state.read_text())["now"])
+        else:
+            counts = Warehouse(emu, spec, scale).advance_to(_start(spec, history))
+            click.echo(f"generated {sum(counts.values()):,} rows")
+        project = DbtProject(project_dir, emulator_output(emu.port, spec.dbt.get("database", "ANALYTICS")))
+        ok = project.invoke(list(dbt_args))
+    sys.exit(0 if ok else 1)
+
+
 @main.command(context_settings={"ignore_unknown_options": True})
 @with_common
 @click.option("--days", default=7, show_default=True, help="Simulated days to advance.")
