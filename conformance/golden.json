@@ -3158,6 +3158,14 @@
    ]
   ]
  },
+ "select_star_without_from": {
+  "rows": [
+   [
+    null,
+    "1"
+   ]
+  ]
+ },
  "sequence_seq4": {
   "rows": [
    [

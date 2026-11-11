@@ -514,6 +514,10 @@ def _fix(node: exp.Expression) -> exp.Expression:
     if isinstance(node, (exp.Mul, exp.Add, exp.Sub)) and all(
             isinstance(side, exp.Literal) and side.is_int for side in (node.this, node.expression)):
         node.set("this", exp.cast(node.this, "bigint"))  # 86400 * 30000 does not overflow a NUMBER
+    if isinstance(node, exp.Select) and node.args.get("from_") is None and any(isinstance(e, exp.Star) for e in node.expressions):
+        # `select *` with nothing to select from is one row with one NULL column, COLUMN1, in Snowflake
+        node.set("expressions", [exp.alias_(exp.cast(exp.Null(), "varchar"), "COLUMN1") if isinstance(e, exp.Star) else e
+                                 for e in node.expressions])
     if isinstance(node, exp.Coalesce):
         args = [node.this, *node.expressions]
         if any(isinstance(a, exp.Literal) and a.is_string for a in args) and any(isinstance(a, _VARIANT_ACCESS) for a in args):
