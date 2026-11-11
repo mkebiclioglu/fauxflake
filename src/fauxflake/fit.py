@@ -1695,8 +1695,14 @@ class Fitter:
                 for uid, node in self.nodes.items():
                     kind = node.get("resource_type"), (node.get("config") or {}).get("materialized")
                     if (kind[0] == "snapshot" or kind[1] == "incremental") and node.get("relation_name") and (chosen is None or uid in chosen):
+                        fq = _fq(node["relation_name"])
                         try:
-                            self.emu.duck.execute(f"drop table if exists {quoted(_fq(node['relation_name']))}")
+                            self.emu.duck.execute(f"drop table if exists {quoted(fq)}")
+                            if fq in self.existing:  # a model that reads its own table: empty again, as before its first build
+                                from .generate import existing_view
+
+                                rel = self.existing[fq]
+                                self.emu.duck.execute(existing_view(fq, rel.get("columns") or {}, table=rel.get("as") == "table"))
                         except Exception:  # noqa: BLE001, S110
                             pass
             project.invoke(["build", *selected], silent=True)
