@@ -172,12 +172,43 @@ class Fitter:
         self.learned.append(f"{table}.{col}: read by a model, added.")
         return True
 
+    def undeclared_in(self, sql_key: str, database: str) -> bool:
+        """Generate the three-part relations of `database` a model names and nothing provides."""
+        from . import catalog
+
+        t, node = self.tree(sql_key), self.nodes.get(sql_key)
+        if t is None or node is None:
+            return False
+        changed = False
+        for tb in t.find_all(exp.Table):
+            if tb.catalog.upper() != database or not tb.db:
+                continue
+            fq = f"{database}.{tb.db.upper()}.{tb.name.upper()}"
+            if fq in self.tables or fq in self.existing or fq in self.project_relations or tb.db.upper() == "INFORMATION_SCHEMA":
+                continue
+            usual = max((float((x.get("volume") or {}).get("rows_per_day", 0)) for x in self.tables.values()), default=0) or 100_000
+            read = [c for c in self.columns_read(t, tb) if c != "_LOADED_AT"]
+            known = catalog.view(fq, tuple(read))
+            columns = {"_LOADED_AT": {"gen": "loaded_at"}, **{c: guess(c, known.get(c)) for c in dict.fromkeys([*known, *read])}}
+            self.tables[fq] = {"volume": {"rows_per_day": int(usual), "weekly": [1] * 7},
+                               "lateness": {"p": [0, 0.5, 0.99, 1], "seconds": [1, 30, 3600, 86400]}, "columns": columns}
+            self.retyped.add(fq)
+            self.learned.append(f"{fq}: read by {node['name']} but not declared as a source; now generated.")
+            changed = True
+        self.dirty |= changed
+        return changed
+
     def missing_relation(self, sql_key: str, message: str) -> bool:
         """A model reads a relation that nothing has created. If the project builds it later (a
         hard-coded name instead of ref(), as in a model that looks at its own previous output), it
         starts out as an empty view, like a first run after the table was created by hand. Anything
         else is a source nobody declared: it becomes a generated table."""
         m = _NO_TABLE.search(message)
+        vague = re.search(r'Ambiguous reference to catalog or schema "([\w$]+)"', message)
+        if vague and not m:
+            # `snowflake.account_usage.query_history` when no database SNOWFLAKE exists and schemas of
+            # that name do: the relation is one nobody declared, in that database
+            return self.undeclared_in(sql_key, vague.group(1).upper())
         t = self.tree(sql_key) if m else None
         node = self.nodes.get(sql_key)
         if t is None or node is None:
