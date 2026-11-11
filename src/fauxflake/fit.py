@@ -1185,7 +1185,10 @@ class Fitter:
                     wanted[column.name.upper()] += [v.name.upper() for v in values
                                                     if isinstance(v, exp.Literal) and v.is_string and "%" not in v.name]
                 for schema in wanted["TABLE_SCHEMA"]:
-                    for found in wanted["TABLE_NAME"]:
+                    names = wanted["TABLE_NAME"]
+                    if not names and database and not any(t.startswith(f"{database}.{schema}.") for t in self.tables):
+                        names = ["EVENT"]  # it takes whatever tables the schema holds: one stands for them
+                    for found in names:
                         fq = f"{database}.{schema}.{found}"
                         if not database or fq in self.tables or not re.fullmatch(r"[\w$]+", schema + found):
                             continue
