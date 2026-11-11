@@ -132,6 +132,7 @@ class Fitter:
         from .generate import Warehouse
         from .spec import Spec
 
+        self.repair()
         self.save()
         spec = Spec.load(self.path)
         if scale is None:
@@ -352,9 +353,7 @@ class Fitter:
             fresh = None
             if kind in ("lifecycle", "loaded_at"):
                 continue
-            if fmt and kind not in ("sequence", "hash_id", "fk"):
-                fresh = {"gen": "time_offset", "format": fmt, "p": [0, 0.5, 1], "seconds": [0, 86400, 604800]}
-            elif numeric and kind == "hash_id":
+            if numeric and kind == "hash_id":
                 fresh = {**gen, "gen": "sequence"}  # a text key read as a number: count instead of hashing
             elif numeric and kind == "fk":
                 parent = self.tables.get(str(gen.get("ref", "")).upper(), {}).get("columns") or {}
@@ -368,6 +367,8 @@ class Fitter:
                 continue
             elif numeric and kind in ("sequence", "dist"):
                 continue
+            elif fmt:
+                fresh = {"gen": "time_offset", "format": fmt, "p": [0, 0.5, 1], "seconds": [0, 86400, 604800]}
             elif hint == "EPOCH":
                 if gen.get("epoch"):
                     continue
@@ -380,12 +381,12 @@ class Fitter:
                 if kind in ("time_offset", "event_time", "updated_at") and not gen.get("format") and not gen.get("epoch"):
                     continue
                 fresh = {"gen": "time_offset", **({"type": "DATE"} if hint == "DATE" else {}), "p": [0, 0.5, 1], "seconds": [0, 86400, 604800]}
-            elif kind in ("sequence", "hash_id", "fk"):
-                continue  # a key or a reference keeps its meaning
             else:
                 fresh = guess(name, hint)
                 if fresh["gen"] in _FREE:
                     continue
+            if kind in ("sequence", "hash_id") and fresh.get("gen") not in ("sequence", "hash_id"):
+                self._unkey(table)  # it was the table's key and is not one any more
             if "follows" in gen and fresh.get("gen") != "sequence":
                 fresh["follows"] = gen["follows"]
             within_bounds(fresh, self.bounds.get((table, name)))
@@ -397,6 +398,23 @@ class Fitter:
             changed = True
         self.dirty |= changed
         return changed
+
+    def _unkey(self, table: str) -> None:
+        """A table lost its key column: what referenced it becomes an ordinary column."""
+        for other, spec in self.tables.items():
+            for col, gen in list((spec.get("columns") or {}).items()):
+                if gen.get("gen") == "fk" and str(gen.get("ref", "")).upper() == table:
+                    spec["columns"][col] = guess(col, None)
+                    self.retyped.add(other)
+
+    def repair(self) -> None:
+        """Keep the spec loadable whatever was learned: a reference needs a parent with a key."""
+        keyed = {t for t, spec in self.tables.items()
+                 if any(d.get("gen") in ("sequence", "hash_id") for d in (spec.get("columns") or {}).values())}
+        for table, spec in self.tables.items():
+            for col, gen in list((spec.get("columns") or {}).items()):
+                if gen.get("gen") == "fk" and str(gen.get("ref", "")).upper() not in keyed:
+                    spec["columns"][col] = guess(col, None)
 
     def retype(self, value: str, hint: str, fmt: str | None = None) -> bool:
         """The generated text `value` was converted to `hint`: retype the column(s) that made it.
@@ -871,11 +889,12 @@ class Fitter:
             # at the scale and history `fauxflake build` uses, so that what is reported here is what a build gives
             self.generate(scale=0.001, history=60)
             before = len(self.learned)
-            project.invoke(["build", *selected], silent=True)
             results_path = project.target_path / "run_results.json"
+            results_path.unlink(missing_ok=True)  # what is there is from the compile step
+            project.invoke(["build", *selected], silent=True)
             if not results_path.exists():
-                self.log(f"  dbt build did not run: {project.last_error[:400]}")
-                return {"error": project.last_error}
+                self.log(f"  dbt build did not run: {project.last_error[:600] or 'no results were written'}")
+                return {"error": project.last_error or "dbt build wrote no results"}
             results = json.loads(results_path.read_text())["results"]
             manifest = json.loads((project.target_path / "manifest.json").read_text())
             nodes = self.nodes = manifest["nodes"]
