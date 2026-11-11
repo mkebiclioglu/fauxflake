@@ -184,9 +184,12 @@ class Fitter:
             return False
         ctes = {c.alias.upper() for c in t.find_all(exp.CTE)}
         name = m.group("name").upper()
+        within = re.search(r'Table with name "?(?:[\w$]+\.)*([\w$]+)\.[\w$]+"? does not exist', message)
         for tb in t.find_all(exp.Table):
             if tb.name.upper() != name or (not tb.db and name in ctes):
                 continue
+            if within and tb.db and tb.db.upper() != within.group(1).upper():
+                continue  # the same name in another schema: not the one DuckDB missed
             fq = ".".join([(tb.catalog or node["database"]).upper(), (tb.db or node["schema"]).upper(), name])
             if fq in self.tables or fq in self.existing or fq.split(".")[1] == "INFORMATION_SCHEMA":
                 continue
@@ -200,7 +203,7 @@ class Fitter:
                     self.stand_ins.add(fq)
                     self.create_pending(fq)
                     return True
-                return False  # a ref() to a model that did not build: that model's failure, not a missing table
+                continue  # a ref() to a model that did not build: that model's failure, not a missing table
             db, schema, _ = fq.split(".")
             self.emu.ensure_database(db, schema)
             read = self.columns_read(t, tb)
@@ -826,6 +829,18 @@ class Fitter:
                     mains |= self.real_tables(source, ctes)
             if len(candidates & mains) == 1:
                 candidates &= mains
+            else:
+                # `where updated_at >= (select max(updated_at) from <its own table>)`: each SELECT reads
+                # the column from its own FROM table, and each of those tables lacks it
+                singles: set[str] = set()
+                for c in t.find_all(exp.Column):
+                    select = c.find_ancestor(exp.Select)
+                    source = select.args.get("from_") if select is not None and not c.table and c.name.upper() == col else None
+                    if source is not None and not select.args.get("joins"):
+                        owners = self.real_tables(source, ctes) & candidates
+                        singles |= owners if len(owners) == 1 else set()
+                if len(singles) > 1:
+                    return any([self.blame(c, col) for c in sorted(singles)])
         if len(candidates) > 1 and self._unioned(t, ctes, candidates):
             # `select * from a union all select * from b`: the branches line up, so every one of them has it
             return any([self.blame(c, col) for c in sorted(candidates)])
