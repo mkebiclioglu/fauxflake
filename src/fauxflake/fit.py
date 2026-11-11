@@ -1057,6 +1057,50 @@ class Fitter:
         self.dirty |= changed
         return changed
 
+    def looked_for(self, sql_key: str) -> bool:
+        """The model's Jinja asked the warehouse which tables a schema holds (and for which names),
+        found none, and compiled to nothing. Give it the tables it asked for by name."""
+        name = self.nodes.get(sql_key, {}).get("name")
+        if not name:
+            return False
+        changed = False
+        for command in [c for c in emulator.EMPTY_LOOKUPS if f'"node_id": "{sql_key}"' in c or f".{name}\"" in c]:
+            try:
+                tree = sqlglot.parse_one(emulator.objects._TRAILING_COMMENT.sub("", command), read="snowflake")
+            except Exception:  # noqa: BLE001
+                continue
+            for select in tree.find_all(exp.Select):
+                source = select.args.get("from_")
+                table = source.this if source is not None else None
+                if not isinstance(table, exp.Table) or table.db.upper() != "INFORMATION_SCHEMA" or select.args.get("where") is None:
+                    continue
+                database = (table.catalog or self.nodes[sql_key].get("database") or "").upper()
+                wanted: dict[str, list[str]] = {"TABLE_SCHEMA": [], "TABLE_NAME": []}
+                for test in select.args["where"].find_all(exp.EQ, exp.In, exp.ILike, exp.Like):
+                    if test.find_ancestor(exp.Not) is not None:
+                        continue
+                    column = test.this.this if isinstance(test.this, (exp.Lower, exp.Upper)) else test.this
+                    if not isinstance(column, exp.Column) or column.name.upper() not in wanted:
+                        continue
+                    values = test.expressions if isinstance(test, exp.In) else [test.expression]
+                    wanted[column.name.upper()] += [v.name.upper() for v in values
+                                                    if isinstance(v, exp.Literal) and v.is_string and "%" not in v.name]
+                for schema in wanted["TABLE_SCHEMA"]:
+                    for found in wanted["TABLE_NAME"]:
+                        fq = f"{database}.{schema}.{found}"
+                        if not database or fq in self.tables or not re.fullmatch(r"[\w$]+", schema + found):
+                            continue
+                        usual = max((float((t.get("volume") or {}).get("rows_per_day", 0)) for t in self.tables.values()), default=0) or 100_000
+                        columns = {"_LOADED_AT": {"gen": "loaded_at"},
+                                   **{c: guess(c, None) for c in self.columns_children_read(sql_key) if c != "_LOADED_AT"}}
+                        self.tables[fq] = {"volume": {"rows_per_day": int(usual), "weekly": [1] * 7},
+                                           "lateness": {"p": [0, 0.5, 0.99, 1], "seconds": [1, 30, 3600, 86400]}, "columns": columns}
+                        self.retyped.add(fq)
+                        self.learned.append(f"{fq}: {name} looks for it in INFORMATION_SCHEMA and found nothing; now generated.")
+                        changed = True
+        self.dirty |= changed
+        return changed
+
     def few_values(self, sql_key: str) -> bool:
         """`dbt_utils.pivot('feature', get_column_values(...))` writes one column per value it finds.
         On made-up text that is one column per row; the column really holds a handful of values."""
@@ -1114,7 +1158,7 @@ class Fitter:
 
     def learn(self, sql_key: str, message: str) -> bool:
         """Apply whatever one error message teaches. True when the spec changed."""
-        if self.runaway(sql_key, message):
+        if self.runaway(sql_key, message) or self.looked_for(sql_key):
             return True
         if self.udf_input(sql_key, message) or self.pivot_values(sql_key, message) or self.missing_column(sql_key, message) or self.missing_relation(sql_key, message) \
                 or self.union_widths(sql_key, message):

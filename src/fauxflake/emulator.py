@@ -135,6 +135,23 @@ def _transaction(cursor, command: str, original):  # noqa: ANN001, ANN202
     return None
 
 
+EMPTY_LOOKUPS: list[str] = []  # INFORMATION_SCHEMA queries that found nothing: what a project's macros looked for
+_LOOKUP = re.compile(r"(?i)information_schema\s*\.\s*(tables|columns)\b")
+
+
+def _note_empty_lookup(cursor, command: str) -> None:  # noqa: ANN001
+    """Projects find their inputs by asking the warehouse (`get_relations_by_pattern` and the like).
+    When such a query comes back empty, `fauxflake init` wants to know what it asked for."""
+    if not _LOOKUP.search(command) or len(EMPTY_LOOKUPS) >= 5000:
+        return
+    try:
+        table = getattr(cursor, "_arrow_table", None)
+        if table is not None and table.num_rows == 0:
+            EMPTY_LOOKUPS.append(command)
+    except Exception:  # noqa: BLE001, S110 - bookkeeping only
+        pass
+
+
 def _drop_scratch(cursor) -> None:  # noqa: ANN001
     scratch = getattr(cursor._conn, "_fauxflake_scratch", None)
     if scratch:
@@ -279,6 +296,7 @@ def _patch_fakesnow() -> None:
                     done = original(self, rewrite(command), *args, **kwargs)
                     objects.consume_streams(self, command)
                     objects.remember(self)
+                    _note_empty_lookup(self, command)
                     return done
                 except ProgrammingError as e:
                     # constructs DuckDB will not plan as written: say how to rewrite them, then run again
