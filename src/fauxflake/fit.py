@@ -437,7 +437,7 @@ class Fitter:
         elif how == "format":
             for node in tree.find_all(exp.StrToTime, exp.StrToDate, exp.TsOrDsToDate, exp.TsOrDsToTimestamp):
                 arg = node.this
-                while isinstance(arg, (exp.Cast, exp.TryCast, exp.Paren, exp.Trim, exp.Nullif, exp.SplitPart)):
+                while isinstance(arg, (exp.Cast, exp.TryCast, exp.Paren, exp.Trim, exp.Nullif, exp.SplitPart, exp.Right, exp.Left)):
                     arg = arg.this
                 written = node.args.get("format")
                 if isinstance(arg, exp.Column) and isinstance(written, exp.Literal) and (fmt is None or _same_format(written.name, fmt)):
@@ -527,11 +527,15 @@ class Fitter:
         tree = self.tree(uid)
         for node in (tree.find_all(exp.StrToTime, exp.StrToDate, exp.TsOrDsToDate, exp.TsOrDsToTimestamp) if tree is not None else []):
             arg, out = node.this, fmt
-            while isinstance(arg, (exp.Cast, exp.TryCast, exp.Paren, exp.Trim, exp.Nullif, exp.SplitPart)):
+            while isinstance(arg, (exp.Cast, exp.TryCast, exp.Paren, exp.Trim, exp.Nullif, exp.SplitPart, exp.Right, exp.Left)):
                 if isinstance(arg, exp.SplitPart):
                     delimiter, part = arg.args.get("delimiter"), arg.args.get("part_index")
                     if isinstance(delimiter, exp.Literal) and isinstance(part, exp.Literal) and part.is_int:
                         out = delimiter.name.join([out] * max(2, int(part.name)))
+                elif isinstance(arg, exp.Right):
+                    out = "run_" + out  # right(task_instance, 8): the date is how the text ends
+                elif isinstance(arg, exp.Left):
+                    out = out + "_run"
                 arg = arg.this
             if isinstance(arg, exp.Column) and arg.name.upper() == column and out != fmt:
                 return out
