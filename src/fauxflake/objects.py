@@ -508,11 +508,35 @@ def _unquoted(value: str | None) -> str | None:
     return value[1:-1].replace("''", "'") if value and value.startswith("'") and value.endswith("'") else value
 
 
+def strip_comments(text: str) -> str:
+    """The statement without `--` and `/* */` comments, leaving string literals alone."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "'":
+            j = i + 1
+            while j < n and (text[j] != "'" or text[j + 1:j + 2] == "'"):
+                j += 2 if text[j] in "'\\" else 1
+            out.append(text[i:j + 1])
+            i = j + 1
+        elif text.startswith("--", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i)
+            i = n if j < 0 else j + 2
+            out.append(" ")
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
 def _copy_into(cursor, original, state: State, m: re.Match):  # noqa: ANN001, ANN202
     """`COPY INTO t FROM s3://bucket/prefix FILE_FORMAT = (...) PATTERN = '...'`: DuckDB reads the files.
     A public bucket needs nothing; a private one uses the AWS credentials in the environment. A prefix
     listed under `locations:` in the spec is read from a local directory instead."""
-    duck, rest = cursor._duck_conn, m.group("rest")
+    duck, rest = cursor._duck_conn, strip_comments(m.group("rest"))
     url = m.group("url").rstrip("/")
     local = next((path for prefix, path in LOCATIONS.items() if url.startswith(prefix.rstrip("/"))), None)
     if local is not None:

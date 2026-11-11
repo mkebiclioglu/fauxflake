@@ -199,7 +199,9 @@ def test_copy_into_from_cloud_storage_served_locally(run, tmp_path):
         run("create or replace table codes (label string, n int, note string)")
         loaded = run("""copy into codes from s3://my-bucket/sets/v1
             file_format = (type = CSV compression = 'GZIP' empty_field_as_null = true field_optionally_enclosed_by = '"'
-                           escape_unenclosed_field = NONE null_if = ('__NULL__'))
+                           escape_unenclosed_field = NONE
+                           /* a comment with an apostrophe: Snowflake's default \\N marker */
+                           null_if = ('__NULL__'))
             pattern = '.*\\/codes.csv.*';""")
         assert [(r[1], r[3]) for r in loaded] == [("LOADED", 2)]
         assert run("select label, n, note from codes order by n") == [("A, with comma", 1, None), ("B", 2, None)]
