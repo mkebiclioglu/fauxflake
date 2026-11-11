@@ -34,7 +34,7 @@ them, and every other test is enforced.
 
 | measured | result |
 | --- | --- |
-| 306 queries whose answers were recorded on real Snowflake | 306 match |
+| 309 queries whose answers were recorded on real Snowflake | 309 match |
 | 14 third-party packages (973 models) built here and on Snowflake, compared row for row | 944 identical, 22 differ only because they read the clock, 7 differ in an order Snowflake leaves undefined or hold `RANDOM()` values |
 | dbt-utils, dbt-expectations, dbt-date, dbt_artifacts and Snowplow run against their own test suites | all 849 models and tests pass |
 
@@ -217,7 +217,7 @@ When the emulator does not know a statement it fails at once with a message that
 Everything here was run; the commands are in this repo.
 
 **1. Answers recorded from Snowflake.** [`conformance/cases.yml`](conformance/cases.yml) holds
-306 small queries. `fauxflake conformance --connection <name>` runs them on real Snowflake
+309 small queries. `fauxflake conformance --connection <name>` runs them on real Snowflake
 and stores the answers; CI replays them against the emulator with no Snowflake access. A case
 that stops matching fails CI.
 

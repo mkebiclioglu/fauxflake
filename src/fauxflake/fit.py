@@ -1553,7 +1553,7 @@ class Fitter:
 
     # --- loop 2: the real dbt build
 
-    def learn_from_build(self, project, analysis, rounds: int = 8) -> dict:  # noqa: ANN001
+    def learn_from_build(self, project, analysis, rounds: int = 14) -> dict:  # noqa: ANN001
         """Run `dbt build`, read the results, fix what the spec can fix. Returns the last summary."""
         summary: dict = {}
         selected: list[str] = []
