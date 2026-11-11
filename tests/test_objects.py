@@ -18,6 +18,7 @@ def run():
             cur.execute(sql)
             return cur.fetchall()
 
+        run.emu = emu
         run("create or replace table t (id int, name string, amt number(10,2))")
         run("insert into t values (1, 'a', 10), (2, 'b', 20)")
         yield run
@@ -233,3 +234,20 @@ def test_external_tables_account_objects_and_schema_clone(run):
     run("rollback")
     run("create or replace schema analytics.backup clone analytics.ci")
     assert run("select (select count(*) from analytics.backup.t), (select count(*) from analytics.backup.v)") == [(2, 2)]
+
+
+def test_scheduled_tasks_run_as_simulated_time_passes(run):
+    from fauxflake import objects
+
+    run("create or replace stream s on table t append_only = true")
+    run("create or replace table seen (id int)")
+    run("create or replace task load_seen warehouse = wh schedule = '60 minute' when system$stream_has_data('s') as insert into seen select id from s")
+    run("create or replace task never_resumed schedule = '60 minute' as insert into seen values (-1)")
+    run("alter task load_seen resume")
+
+    emu = run.emu
+    assert objects.run_due_tasks(emu, "ANALYTICS") == []  # the stream is empty: the WHEN condition holds it back
+    run("insert into t values (3, 'c', 30)")
+    assert objects.run_due_tasks(emu, "ANALYTICS") == ["LOAD_SEEN"]
+    assert run("select id from seen") == [(3,)]
+    assert objects.run_due_tasks(emu, "ANALYTICS") == []  # consumed

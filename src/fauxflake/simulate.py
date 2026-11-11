@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+from . import objects
 from .dbt import DbtProject
 from .emulator import Emulator
 from .generate import Warehouse
@@ -80,6 +81,10 @@ def simulate(wh: Warehouse, project: DbtProject, start: datetime, days: int, ste
         now = start + timedelta(hours=step_hours * i)
         t0 = time.time()
         counts = wh.advance_to(now)
+        # Snowflake's scheduler would have fired every resumed task by now: run each once per step
+        ran = objects.run_due_tasks(wh.emu, wh.spec.dbt.get("database", "ANALYTICS"))
+        if ran:
+            log(f"{now:%Y-%m-%d %H:%M}  ran task(s): {', '.join(ran)}")
         t1 = time.time()
         if not project.invoke(["build", *dbt_args], quiet=True):
             if failures is None:

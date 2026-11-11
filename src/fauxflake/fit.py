@@ -67,9 +67,11 @@ _HINTS = {"INT8": "BIGINT", "INT16": "BIGINT", "INT32": "BIGINT", "INT64": "BIGI
           "DOUBLE": "DOUBLE", "FLOAT": "DOUBLE", "DECIMAL": "DOUBLE", "BOOL": "BOOLEAN", "BOOLEAN": "BOOLEAN", "DATE": "DATE",
           "TIMESTAMP": "TIMESTAMP", "TIME": "TIMESTAMP", "VARIANT": "VARIANT", "ARRAY": "ARRAY", "OBJECT": "VARIANT"}
 _FREE = ("template", "pool")  # generators that only make up text: safe to retype
-_INSPECTS = re.compile(r"run_query\(|statement\(|load_result\(|get_columns_in_relation\(|get_relation\(|get_relations_by|"
-                       r"get_filtered_columns_in_relation|list_relations")
-_HARMLESS = {"macro.dbt.is_incremental", "macro.dbt.should_full_refresh"}  # ask only whether the model's own table exists
+# Jinja whose output depends on the columns or the list of relations it finds in the warehouse. (Asking
+# whether the model's own table exists, as is_incremental() does, gives the first-run answer and is fine.)
+_INSPECTS = re.compile(r"get_columns_in_relation|get_filtered_columns_in_relation|get_relations_by|list_relations|"
+                       r"information_schema|get_column_values")
+_HARMLESS = {"macro.dbt.is_incremental", "macro.dbt.should_full_refresh"}
 
 
 def duck_type(gen: dict) -> str:
@@ -549,8 +551,12 @@ class Fitter:
                 inspects(m, depth + 1) for m in (body.get("depends_on") or {}).get("macros", []))
             return verdict[macro]
 
+        def called(uid: str) -> list[str]:  # the macros the model's own SQL calls (not its hooks)
+            raw = nodes[uid].get("raw_code") or ""
+            return [m for m in nodes[uid]["depends_on"].get("macros", []) if re.search(r"\b" + re.escape(m.split(".")[-1]) + r"\s*\(", raw)]
+
         self.deferred = {uid for uid in graph if _INSPECTS.search(nodes[uid].get("raw_code") or "")
-                         or any(inspects(m) for m in nodes[uid]["depends_on"].get("macros", []))}
+                         or any(inspects(m) for m in called(uid))}
         try:
             order = list(graphlib.TopologicalSorter(graph).static_order())
         except graphlib.CycleError:
