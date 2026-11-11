@@ -286,6 +286,44 @@ def _patch_fakesnow() -> None:
     server.app.exception_handlers[server.ServerError] = server_error
     server.app.middleware_stack = None
 
+    # The connector gives up waiting on a statement after about a minute and sends the same request
+    # again, with the same requestId. Snowflake answers the repeat with the first run's result. Do
+    # the same: a second execution would collide with the first on the connection, or run an INSERT twice.
+    import asyncio
+
+    from starlette.routing import Route, request_response
+
+    in_flight: dict[tuple[str, str], asyncio.Future] = {}
+    handle = server.query_request
+
+    async def query_request(request):  # noqa: ANN001, ANN202
+        request_id = request.query_params.get("requestId")
+        key = (request.headers.get("Authorization", ""), request_id or "")
+        if not request_id:
+            return await handle(request)
+        running = in_flight.get(key)
+        if running is not None:
+            return await asyncio.shield(running)
+        loop = asyncio.get_running_loop()
+        future = in_flight[key] = loop.create_future()
+        try:
+            response = await handle(request)
+        except BaseException as e:
+            future.set_exception(e)
+            future.exception()  # marked as retrieved: a repeat may never come
+            raise
+        else:
+            future.set_result(response)
+            return response
+        finally:
+            loop.call_later(600, in_flight.pop, key, None)  # long enough for every repeat of this request
+
+    server.query_request = query_request
+    for route in server.app.routes:
+        if isinstance(route, Route) and route.path == "/queries/v1/query-request":
+            route.endpoint = query_request
+            route.app = request_response(query_request)
+
     # a SUM over integers is a HUGEINT in DuckDB and a NUMBER in Snowflake: describe it as one
     import fakesnow.info_schema as info
 
