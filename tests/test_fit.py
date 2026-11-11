@@ -38,3 +38,19 @@ def test_init_learns_the_spec_by_running_the_project(tmp_path):
     rows = runner.invoke(main, ["query", "--project-dir", str(PROJECT), "--spec", str(spec_path),
                                 "select count(*) as n, count(distinct size) as sizes from fct_events"])
     assert rows.exit_code == 0 and int(rows.output.strip().splitlines()[-2].split()[0]) > 0, rows.output
+
+
+def test_fit_updates_a_spec_without_losing_edits(tmp_path):
+    spec_path = tmp_path / "fauxflake.yml"
+    runner = CliRunner()
+    assert runner.invoke(main, ["init", "--project-dir", str(PROJECT), "--spec", str(spec_path)]).exit_code == 0
+    spec = yaml.safe_load(spec_path.read_text())
+    table = spec["tables"]["RAW.APP.EVENTS"]
+    del table["columns"]["REGION_CODE"]  # as if a model started reading this column after the spec was written
+    table["volume"]["rows_per_day"] = 123  # an edit the user made
+    spec_path.write_text(yaml.safe_dump(spec, sort_keys=False))
+    out = runner.invoke(main, ["fit", "--project-dir", str(PROJECT), "--spec", str(spec_path)])
+    assert out.exit_code == 0, out.output
+    after = yaml.safe_load(spec_path.read_text())["tables"]["RAW.APP.EVENTS"]
+    assert after["columns"]["REGION_CODE"]["v"] == [40, 60] and after["volume"]["rows_per_day"] == 123
+    assert "RAW.APP.EVENTS.REGION_CODE" in out.output

@@ -294,6 +294,32 @@ def init(spec_path, project_dir, database, force, fit):
     click.echo("next: fauxflake build")
 
 
+@main.command()
+@click.option("--spec", "spec_path", default="fauxflake.yml", show_default=True)
+@click.option("--project-dir", default=".", show_default=True)
+def fit(spec_path, project_dir):
+    """Bring the spec up to date with the project. Keeps what you edited.
+
+    New sources and columns the models read are added, then the project is run on generated
+    data and the spec learns from what fails, as `init` does the first time."""
+    from pathlib import Path
+
+    from .dbt import DbtProject, emulator_output
+    from .emulator import serve
+    from .init import update_spec
+
+    path = Path(spec_path)
+    if not path.exists():
+        raise click.ClickException(f"{path} does not exist: run `fauxflake init` first")
+    database = Spec.load(path).dbt.get("database", "ANALYTICS")
+    with serve() as emu:
+        notes = update_spec(DbtProject(project_dir, emulator_output(emu.port, database)), path, database, emu, log=click.echo)
+    spec = Spec.load(path)
+    click.echo(f"updated {path}: {len(spec.tables)} source tables, {sum(len(t.columns) for t in spec.tables.values())} columns")
+    for note in notes:
+        click.echo(f"  note: {note}")
+
+
 @main.command(context_settings={"ignore_unknown_options": True})
 @with_common
 @click.option("--base", default="origin/main", show_default=True, help="Git ref to compare the working tree against.")

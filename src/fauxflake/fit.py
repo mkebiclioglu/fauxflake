@@ -111,12 +111,16 @@ class Fitter:
             self.spec["existing"] = self.existing
         self.path.write_text(self.header + yaml.safe_dump(self.spec, sort_keys=False, default_flow_style=None, width=110))
 
-    def generate(self, scale: float = 1e-5, history: int = 3):  # noqa: ANN201
+    def generate(self, scale: float | None = None, history: int = 3):  # noqa: ANN201
         from .generate import Warehouse
         from .spec import Spec
 
         self.save()
         spec = Spec.load(self.path)
+        if scale is None:
+            # a few hundred rows per table: enough for filters to let some through, little enough to be quick
+            smallest = min((float((t.raw.get("volume") or {}).get("rows_per_day", 1000)) for t in spec.tables.values()), default=1000.0)
+            scale = min(1.0, max(1e-5, 100.0 / max(smallest, 1.0)))
         wh = Warehouse(self.emu, spec, scale)
         wh.advance_to(datetime.combine(spec.start, datetime.min.time()) + timedelta(days=history))
         self.dirty = False

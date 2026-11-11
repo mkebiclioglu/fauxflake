@@ -544,6 +544,9 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 hint = "VARCHAR"
             if col in use.numbers and not hint and col not in use.texts:
                 hint = "BIGINT"
+            if use.bounds.get(col) and not hint and col not in use.texts:
+                # compared with numbers (`between 40 and 60`, `> 0.5`): a number
+                hint = "BIGINT" if all(float(b).is_integer() for b in use.bounds[col]) else "DOUBLE"
             if col == key:
                 numeric = (hint or "").upper().startswith(("BIGINT", "INT", "DECIMAL", "NUMBER")) or (not hint and col.endswith("ID"))
                 out[col] = {"gen": "sequence" if numeric else "hash_id"}
@@ -720,6 +723,36 @@ def write_spec(project, path: Path, database: str, emu=None, fit: bool = True, l
     elif stubs:
         notes.insert(0, _stub_note(stubs))
     return notes
+
+
+def update_spec(project, path: Path, database: str, emu, log=print) -> list[str]:  # noqa: ANN001
+    """Bring an existing spec up to date with the project, keeping everything already in it:
+    sources and columns the models have started to read are added, then the spec is fitted again."""
+    text = path.read_text()
+    header = "".join(line + "\n" for line in text.splitlines() if line.startswith("#"))
+    spec = yaml.safe_load(text)
+    provide_env(project)
+    manifest = project.compile()
+    analysis = analyse(manifest, database)
+    added: list[str] = []
+    tables = spec.setdefault("tables", {})
+    for name, table in analysis.spec["tables"].items():
+        if name not in tables:
+            tables[name] = table
+            added.append(name)
+            continue
+        columns = tables[name].setdefault("columns", {})
+        for col, gen in table["columns"].items():
+            if col not in columns:
+                columns[col] = gen
+                added.append(f"{name}.{col}")
+    known = spec.get("udfs") or {}
+    stubs = {k: v for k, v in udf_stubs(unknown_functions(manifest, emu)).items() if k not in known}
+    if stubs:
+        spec["udfs"] = {**known, **stubs}
+    path.write_text(header + yaml.safe_dump(spec, sort_keys=False, default_flow_style=None, width=110))
+    notes = [f"added from the project's SQL: {', '.join(added[:12])}{' ...' if len(added) > 12 else ''}."] if added else []
+    return notes + _fit(project, path, database, emu, manifest, analysis, log)
 
 
 def _stub_note(stubs) -> str:  # noqa: ANN001
