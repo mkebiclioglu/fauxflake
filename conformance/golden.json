@@ -146,6 +146,18 @@
    ]
   ]
  },
+ "array_agg_distinct_flattened": {
+  "rows": [
+   [
+    "1",
+    [
+     "a",
+     "b"
+    ],
+    "2"
+   ]
+  ]
+ },
  "array_agg_empty": {
   "rows": [
    [
@@ -1114,6 +1126,15 @@
    [
     "1",
     "2"
+   ]
+  ]
+ },
+ "empty_key_path": {
+  "rows": [
+   [
+    "5",
+    "7",
+    "9"
    ]
   ]
  },
@@ -2151,6 +2172,32 @@
    ]
   ]
  },
+ "map_functions": {
+  "rows": [
+   [
+    {
+     "a": 2,
+     "c": 3
+    },
+    [
+     "a",
+     "b"
+    ],
+    "1",
+    true,
+    {
+     "b": 2
+    },
+    {
+     "a": 1,
+     "b": 2
+    },
+    {
+     "b": 2
+    }
+   ]
+  ]
+ },
  "math": {
   "rows": [
    [
@@ -2561,6 +2608,26 @@
    ]
   ]
  },
+ "object_delete_insert_pick": {
+  "rows": [
+   [
+    {
+     "c": 3
+    },
+    {
+     "a": 1,
+     "b": "x"
+    },
+    {
+     "a": 1
+    },
+    {
+     "b": 2
+    },
+    true
+   ]
+  ]
+ },
  "object_functions": {
   "rows": [
    [
@@ -2928,6 +2995,20 @@
    ]
   ]
  },
+ "select_alias_in_join_condition": {
+  "rows": [
+   [
+    "A",
+    "first",
+    "1.5"
+   ],
+   [
+    "B",
+    "B",
+    "2.5"
+   ]
+  ]
+ },
  "select_exclude_rename": {
   "rows": [
    [
@@ -3214,6 +3295,22 @@
    ]
   ]
  },
+ "string_functions_on_variants": {
+  "rows": [
+   [
+    "3",
+    "XYZ",
+    "3",
+    "xyz-z",
+    "xyz1",
+    "xy",
+    "qyz",
+    "y",
+    "x",
+    "5"
+   ]
+  ]
+ },
  "string_order": {
   "rows": [
    [
@@ -3432,6 +3529,15 @@
     "30",
     "90",
     "2025-01-01 01:30:00.000"
+   ]
+  ]
+ },
+ "timestamp_from_json_text": {
+  "rows": [
+   [
+    "2025-03-07 08:05:35.787",
+    "2025-01-01 00:00:00.000",
+    null
    ]
   ]
  },
