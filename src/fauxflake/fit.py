@@ -57,6 +57,8 @@ _CONVERT = [
     (re.compile(r"""Failed to cast value: Could not convert string '(?P<value>[^']*)' to (?P<type>[A-Z0-9]+)"""), None),
 ]
 _NO_TABLE = re.compile(r'Table with name "?(?:[\w$]+\.)*(?P<name>[\w$]+)"? does not exist')
+_FROM_COLUMN = re.compile(r"when casting from source column \"?([\w$]+)\"?")
+_BAD_CAST = re.compile(r"Unimplemented type for cast \((?P<from>[\w ]+?) -> (?P<to>[\w(), ]+?)\)")
 _NO_FUNCTION = re.compile(r"No function matches the given name and argument types '(?P<name>\w+)\((?P<types>[^']*)\)'")
 _TEMPORAL = {"epoch", "epoch_ms", "date_part", "datepart", "extract", "year", "month", "day", "hour", "minute", "second",
              "dayofweek", "dayofyear", "week", "quarter", "last_day", "dayname", "monthname"}
@@ -104,6 +106,7 @@ class Fitter:
         self.nodes: dict[str, dict] = {}
         self.project_relations: set[str] = set()
         self.relation_owner: dict[str, str] = {}
+        self.source_names: dict[str, str] = {}  # source node -> generated table
         self.uncompiled: dict[str, str] = {}  # model -> why it did not compile
         self.pending: dict[str, dict[str, str]] = {}  # stand-ins for those models: relation -> columns read from it
         self.stand_ins: set[str] = set()
@@ -328,6 +331,73 @@ class Fitter:
         if kind is None or kind[0] == "VIEW":  # once the project has built the real thing, leave it alone
             self.emu.duck.execute(existing_view(fq, self.existing[fq].get("columns") or {}, replace=True))
 
+    def sources_of(self, uid: str) -> list[str]:
+        """The generated tables a model reads, directly or through the models before it."""
+        out = [self.source_names[dep] for dep in self._ancestors(uid) if dep in self.source_names]
+        tree = self.tree(uid)
+        if tree is not None:  # and tables it names without source()
+            out += [t for t in self.real_tables(tree, {c.alias.upper(): c.this for c in tree.find_all(exp.CTE)}) if t in self.tables]
+        return [t for t in dict.fromkeys(out) if t in self.tables]
+
+    def retype_column(self, uid: str, name: str, hint: str, fmt: str | None = None) -> bool:
+        """The model converts column `name` to `hint`: make the sources it reads generate that."""
+        changed = False
+        for table in self.sources_of(uid):
+            columns = self.tables[table].get("columns") or {}
+            gen = columns.get(name)
+            if gen is None:
+                continue
+            kind = gen.get("gen")
+            numeric = hint in ("BIGINT", "DOUBLE")
+            fresh = None
+            if kind in ("lifecycle", "loaded_at"):
+                continue
+            if fmt and kind not in ("sequence", "hash_id", "fk"):
+                fresh = {"gen": "time_offset", "format": fmt, "p": [0, 0.5, 1], "seconds": [0, 86400, 604800]}
+            elif numeric and kind == "hash_id":
+                fresh = {**gen, "gen": "sequence"}  # a text key read as a number: count instead of hashing
+            elif numeric and kind == "fk":
+                parent = self.tables.get(str(gen.get("ref", "")).upper(), {}).get("columns") or {}
+                key = next((c for c, d in parent.items() if d.get("gen") == "hash_id"), None)
+                if key is None:
+                    continue
+                parent[key] = {**parent[key], "gen": "sequence"}  # the reference follows its parent's key
+                self.retyped.add(str(gen["ref"]).upper())
+                self.learned.append(f"{gen['ref']}.{key}: read as a number through {table}.{name}, now a sequence.")
+                changed = True
+                continue
+            elif numeric and kind in ("sequence", "dist"):
+                continue
+            elif hint == "EPOCH":
+                if gen.get("epoch"):
+                    continue
+                fresh = {"gen": "time_offset", "epoch": True, "p": [0, 0.5, 1], "seconds": [0, 86400, 604800]}
+            elif hint == "BOOLEAN":
+                if str(gen.get("type", "")).upper() == "BOOLEAN":
+                    continue
+                fresh = {"gen": "categorical", "type": "BOOLEAN", "values": {True: 0.5, False: 0.5}}
+            elif hint in ("DATE", "TIMESTAMP"):
+                if kind in ("time_offset", "event_time", "updated_at") and not gen.get("format") and not gen.get("epoch"):
+                    continue
+                fresh = {"gen": "time_offset", **({"type": "DATE"} if hint == "DATE" else {}), "p": [0, 0.5, 1], "seconds": [0, 86400, 604800]}
+            elif kind in ("sequence", "hash_id", "fk"):
+                continue  # a key or a reference keeps its meaning
+            else:
+                fresh = guess(name, hint)
+                if fresh["gen"] in _FREE:
+                    continue
+            if "follows" in gen and fresh.get("gen") != "sequence":
+                fresh["follows"] = gen["follows"]
+            within_bounds(fresh, self.bounds.get((table, name)))
+            if fresh == gen:
+                continue
+            columns[name] = fresh
+            self.retyped.add(table)
+            self.learned.append(f"{table}.{name}: used as {fresh.get('format') or hint}, retyped.")
+            changed = True
+        self.dirty |= changed
+        return changed
+
     def retype(self, value: str, hint: str, fmt: str | None = None) -> bool:
         """The generated text `value` was converted to `hint`: retype the column(s) that made it.
         Generated text starts with its column's name, which is how the column is found."""
@@ -506,12 +576,25 @@ class Fitter:
         """Apply whatever one error message teaches. True when the spec changed."""
         if self.missing_column(sql_key, message) or self.missing_relation(sql_key, message):
             return True
+        named = _FROM_COLUMN.search(message)
+        bad = _BAD_CAST.search(message)
+        if bad and named and bad.group("from").startswith("TIMESTAMP") and re.match(r"DECIMAL|DOUBLE|BIGINT|INTEGER|HUGEINT", bad.group("to")):
+            # a column the SQL casts to a number before reading it as a time holds epoch numbers
+            return self.retype_column(sql_key, named.group(1).upper(), "EPOCH")
         for pattern, fixed in _CONVERT:
             m = pattern.search(message)
             if m:
                 hint = fixed or _HINTS.get(m.group("type").upper())
                 fmt = re.search(r'according to format specifier "([^"]+)"', message)
-                return bool(hint) and self.retype(m.group("value"), hint, fmt.group(1) if fmt else None)
+                fmt = fmt.group(1) if fmt else None
+                if not hint:
+                    return False
+                if named and self.retype_column(sql_key, named.group(1).upper(), hint, fmt):
+                    return True  # DuckDB named the column it was reading
+                for token in m.group("value").split():  # generated text starts with its column's name
+                    if "_" in token and self.retype_column(sql_key, token.rsplit("_", 1)[0].upper(), hint, fmt):
+                        return True
+                return self.retype(m.group("value"), hint, fmt)
         m = _NOT_STRUCT.search(message)
         if m:
             return self.make_variant(m.group("col"), m.group("field"))
@@ -553,6 +636,8 @@ class Fitter:
         nodes = self.nodes = manifest["nodes"]
         self.project_relations = {_fq(n["relation_name"]) for n in nodes.values() if n.get("relation_name")}
         self.relation_owner = {_fq(n["relation_name"]): uid for uid, n in nodes.items() if n.get("relation_name")}
+        self.source_names = {uid: _fq(f'{n["database"]}.{n["schema"]}.{n.get("identifier") or n["name"]}')
+                             for uid, n in manifest.get("sources", {}).items()}
         self.uncompiled = {uid: n.get("compile_error") or "" for uid, n in nodes.items()
                            if n["resource_type"] == "model" and not n.get("compiled_code")}
         self.sql_of = {uid: n["compiled_code"].strip().rstrip(";") for uid, n in nodes.items()
@@ -773,6 +858,8 @@ class Fitter:
             nodes = self.nodes = manifest["nodes"]
             self.project_relations = {_fq(n["relation_name"]) for n in nodes.values() if n.get("relation_name")}
             self.relation_owner = {_fq(n["relation_name"]): uid for uid, n in nodes.items() if n.get("relation_name")}
+            self.source_names = {uid: _fq(f'{n["database"]}.{n["schema"]}.{n.get("identifier") or n["name"]}')
+                                 for uid, n in manifest.get("sources", {}).items()}
             failed = [r for r in results if r["status"] in ("error", "fail")]
             expected = self.spec.setdefault("dbt", {}).setdefault("expected_failures", [])
             accepted = 0
