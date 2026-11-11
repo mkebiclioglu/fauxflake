@@ -170,6 +170,7 @@ class Fitter:
         columns[col] = guess(col, None)
         self.emu.duck.execute(f'alter table {quoted(table)} add column if not exists "{col}" {duck_type(columns[col])}')
         self.learned.append(f"{table}.{col}: read by a model, added.")
+        self.retyped.add(table)  # what was built from it (a view over `select *` keeps its old columns) is built again
         return True
 
     def undeclared_in(self, sql_key: str, database: str) -> bool:
@@ -820,6 +821,7 @@ class Fitter:
         if not isinstance(top, exp.SetOperation):
             return False
         members: list[str] = []
+        ctes = {c.alias.upper(): c.this for c in tree.find_all(exp.CTE)}
         pile = [top]
         while pile:
             node = pile.pop().unnest()
@@ -827,10 +829,10 @@ class Fitter:
                 pile += [node.left, node.right]
                 continue
             source = node.args.get("from_") if isinstance(node, exp.Select) and not node.args.get("joins") else None
-            table = source.this if source is not None else None
-            if not isinstance(table, exp.Table) or not (table.catalog and table.db):
+            behind = self.real_tables(source, ctes) if source is not None else set()  # also through `with a as (select ... from t)`
+            if len(behind) != 1:
                 return False
-            members.append(f"{table.catalog.upper()}.{table.db.upper()}.{table.name.upper()}")
+            members.append(next(iter(behind)))
         members = [m for m in dict.fromkeys(members) if m in self.tables]
         if not members:
             return False
@@ -1205,6 +1207,8 @@ class Fitter:
                         fq = f"{database}.{schema}.{found}"
                         if not database or fq in self.tables or not re.fullmatch(r"[\w$]+", schema + found):
                             continue
+                        if fq in self.project_relations or fq in self.existing:
+                            continue  # it asked whether its own table is there yet: the project builds that one
                         usual = max((float((t.get("volume") or {}).get("rows_per_day", 0)) for t in self.tables.values()), default=0) or 100_000
                         columns = {"_LOADED_AT": {"gen": "loaded_at"},
                                    **{c: guess(c, None) for c in self.columns_children_read(sql_key) if c != "_LOADED_AT"}}
@@ -1262,6 +1266,11 @@ class Fitter:
         aliases = [m.group(i).rsplit(".", 1)[0].strip('"').upper() for i in (2, 3)]
         named = {a: sum(1 for c in tree.find_all(exp.Column) if c.name.upper() == col and c.table.upper() == a) for a in aliases}
         keep = [a for a in aliases if named[a]]
+        if len(keep) != 1:
+            # neither is named with it: a CTE whose SELECT writes the column out has it for certain
+            wrote = {c.alias.upper(): c.this for c in tree.find_all(exp.CTE)}
+            keep = [a for a in aliases if isinstance(wrote.get(a), exp.Select)
+                    and any(e.alias_or_name.upper() == col for e in wrote[a].expressions if not isinstance(e, exp.Star))]
         if len(keep) != 1:
             return False
         drop = next(a for a in aliases if a != keep[0])

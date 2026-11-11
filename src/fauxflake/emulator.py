@@ -143,11 +143,11 @@ _LOOKUP = re.compile(r"(?i)information_schema\s*\.\s*(tables|columns)\b")
 def _note_empty_lookup(cursor, command: str) -> None:  # noqa: ANN001
     """Projects find their inputs by asking the warehouse (`get_relations_by_pattern` and the like).
     When such a query comes back empty, `fauxflake init` wants to know what it asked for."""
-    if not _LOOKUP.search(command) or len(EMPTY_LOOKUPS) >= 5000:
-        return
+    if '"node_id": "model.' not in command or not _LOOKUP.search(command) or len(EMPTY_LOOKUPS) >= 20000:
+        return  # dbt's own bookkeeping queries carry no model
     try:
         table = getattr(cursor, "_arrow_table", None)
-        if table is not None and table.num_rows == 0:
+        if table is not None and table.num_rows == 0 and command not in EMPTY_LOOKUPS:
             EMPTY_LOOKUPS.append(command)
     except Exception:  # noqa: BLE001, S110 - bookkeeping only
         pass

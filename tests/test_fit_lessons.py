@@ -69,7 +69,7 @@ def test_unlisted_columns_of_a_model_come_from_the_table_whose_star_it_selects()
 
 def test_tables_a_model_looks_up_by_name_and_does_not_find_are_generated():
     f = fitter(nodes={"model.p.focal": {"name": "focal", "database": "ANALYTICS", "relation_name": "ANALYTICS.E.FOCAL",
-                                        "depends_on": {"nodes": []}}})
+                                        "depends_on": {"nodes": []}}}, project_relations=set(), existing={})
     emulator.EMPTY_LOOKUPS.append(
         'select distinct table_schema as "table_schema", table_name as "table_name" from RAW.information_schema.tables '
         "where table_schema ilike 'board_prod' and table_name not in ('TRACKS', 'USERS') and lower(table_name) in ('event', 'pages')\n"
