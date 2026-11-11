@@ -110,6 +110,7 @@ class Fitter:
         self.uncompiled: dict[str, str] = {}  # model -> why it did not compile
         self.pending: dict[str, dict[str, str]] = {}  # stand-ins for those models: relation -> columns read from it
         self.stand_ins: set[str] = set()
+        self.unions: dict[str, list[str]] = {}  # model built by union_relations -> the tables it unions
         self.deferred: set[str] = set()  # models whose SQL only exists during a build
         self.retyped: set[str] = set()  # sources whose generated values changed since the last pass
         self.model_timeout = float(os.environ.get("FAUXFLAKE_FIT_TIMEOUT", "90"))  # seconds one model may take while fitting
@@ -280,6 +281,7 @@ class Fitter:
             return False
         most = max(len(v) for v in by_schema.values())
         added = 0
+        self.unions[fq] = [t for tables in by_schema.values() if len(tables) == most for t in tables]
         for tables in by_schema.values():
             if len(tables) < most:
                 continue
@@ -524,7 +526,7 @@ class Fitter:
         return next(iter(tables)) if len(tables) == 1 else None
 
     def blameable(self, fq: str, depth: int = 0) -> bool:
-        if fq in self.tables or fq in self.existing or fq in self.pending:
+        if fq in self.tables or fq in self.existing or fq in self.pending or fq in self.unions:
             return True
         parent = self.passthrough(fq) if depth <= 8 else None
         return bool(parent) and self.blameable(parent, depth + 1)
@@ -532,6 +534,15 @@ class Fitter:
     def blame(self, fq: str, col: str, depth: int = 0) -> bool:
         if fq in self.tables:
             return self.add_column(fq, col)
+        if fq in self.unions:  # a model that unions tables by a column list: the tables need the column
+            added = [t for t in self.unions[fq] if col not in self.tables[t].setdefault("columns", {})]
+            for table in added:
+                self.tables[table]["columns"][col] = guess(col, None)
+                self.retyped.add(table)
+            if added:
+                self.learned.append(f"{fq}: {col} is read from it, added to the {len(added)} tables it unions.")
+                self.dirty = True
+            return bool(added)
         if fq in self.pending:
             if col in self.pending[fq]:
                 return False
@@ -885,6 +896,7 @@ class Fitter:
         summary: dict = {}
         selected: list[str] = []
         outcome: dict[str, tuple[str, str, str]] = {}  # node -> (kind, status, message), across rounds
+        os.environ["FAUXFLAKE_STATEMENT_TIMEOUT"] = "900"  # a real build, at build scale: give statements room
         for n_round in range(1, rounds + 1):
             # at the scale and history `fauxflake build` uses, so that what is reported here is what a build gives
             self.generate(scale=0.001, history=60)
@@ -914,6 +926,12 @@ class Fitter:
                 if node["resource_type"] == "test":
                     # a failing test either teaches the spec something, or states a fact about production
                     # data that invented data does not share: that one goes on the list of expected failures
+                    if r["status"] == "error":  # the test's own SQL failed: the same lessons as for a model
+                        compiled = self._compiled(project, node)
+                        if compiled:
+                            self.sql_of[node["unique_id"]] = compiled
+                            self.trees.pop(node["unique_id"], None)
+                            self.learn(node["unique_id"], message)
                     if r["status"] == "fail" and not self.learn_from_test(node, analysis) and node["name"] not in expected:
                         expected.append(node["name"])
                         accepted += 1
