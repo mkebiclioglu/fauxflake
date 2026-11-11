@@ -143,6 +143,45 @@ _AMBIGUOUS_ERROR = re.compile(r"""Ambiguous reference to column name "+([^"]+)"+
 _patched = False
 
 
+def run_guarded(cursor, work, limit: float | None = None) -> None:  # noqa: ANN001
+    """Run one statement with a time limit, as STATEMENT_TIMEOUT_IN_SECONDS does on Snowflake.
+
+    A query can run away on invented data (a date spine between two random dates), and DuckDB's
+    planner can take unbounded time on a few shapes. Execution is interrupted; planning cannot be,
+    so a statement that will not stop is left behind on its own DuckDB connection and the session
+    carries on with a fresh one."""
+    from snowflake.connector.errors import ProgrammingError
+
+    limit = float(os.environ.get("FAUXFLAKE_STATEMENT_TIMEOUT", "1800")) if limit is None else limit
+    outcome: dict = {}
+
+    def target() -> None:
+        try:
+            work()
+        except BaseException as e:  # noqa: BLE001 - re-raised in the calling thread
+            outcome["error"] = e
+
+    worker = threading.Thread(target=target, name="fauxflake-statement", daemon=True)
+    worker.start()
+    worker.join(limit)
+    if worker.is_alive():
+        duck = cursor._duck_conn
+        duck.interrupt()
+        worker.join(10)
+        if worker.is_alive() and CURRENT is not None:
+            fresh = CURRENT.duck.cursor()
+            conn = cursor._conn
+            if conn.database and conn.schema:
+                fresh.execute(f"SET schema='{conn.database}.{conn.schema}'")
+            conn._duck_conn = cursor._duck_conn = fresh
+        raise ProgrammingError(
+            msg=f"fauxflake emulator: statement stopped after {limit:.0f}s (FAUXFLAKE_STATEMENT_TIMEOUT). On generated data "
+                "this is usually a join or a date spine that explodes; look at the values the model reads.",
+            errno=604, sqlstate="57014")
+    if "error" in outcome:
+        raise outcome["error"]
+
+
 def _patch_fakesnow() -> None:
     global _patched
     if _patched:
@@ -273,19 +312,7 @@ def _patch_fakesnow() -> None:
     original_execute = FakeSnowflakeCursor._execute
 
     def _execute(self, transformed, params=None):  # noqa: ANN001
-        # Snowflake stops a statement after STATEMENT_TIMEOUT_IN_SECONDS. Here a query can run away
-        # on invented data (a date spine between two random dates, say): stop it and say so.
-        limit = float(os.environ.get("FAUXFLAKE_STATEMENT_TIMEOUT", "1800"))
-        expired = threading.Event()
-
-        def stop() -> None:
-            expired.set()
-            self._duck_conn.interrupt()
-
-        watchdog = threading.Timer(limit, stop)
-        watchdog.daemon = True
-        watchdog.start()
-        try:
+        def attempt() -> None:
             try:
                 original_execute(self, transformed, params)
             except ProgrammingError as e:
@@ -295,15 +322,8 @@ def _patch_fakesnow() -> None:
                 if repaired is None:
                     raise
                 original_execute(self, repaired, params)
-        except Exception as e:  # noqa: BLE001
-            if expired.is_set():
-                raise ProgrammingError(msg=f"fauxflake emulator: statement stopped after {limit:.0f}s "
-                                           "(FAUXFLAKE_STATEMENT_TIMEOUT). On generated data this is usually a join or a "
-                                           "date spine that explodes; look at the values the model reads.",
-                                       errno=604, sqlstate="57014") from e
-            raise
-        finally:
-            watchdog.cancel()
+
+        run_guarded(self, attempt)
         semantics.coerce_result(self)
 
     FakeSnowflakeCursor._execute = _execute

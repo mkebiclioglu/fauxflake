@@ -110,6 +110,7 @@ class Fitter:
         self.deferred: set[str] = set()  # models whose SQL only exists during a build
         self.retyped: set[str] = set()  # sources whose generated values changed since the last pass
         self.model_timeout = float(os.environ.get("FAUXFLAKE_FIT_TIMEOUT", "90"))  # seconds one model may take while fitting
+        os.environ.setdefault("FAUXFLAKE_STATEMENT_TIMEOUT", str(self.model_timeout))  # the same limit inside the emulator
         self.learned: list[str] = []
         self.dirty = False
         self.trees: dict[str, exp.Expression | None] = {}
@@ -206,13 +207,19 @@ class Fitter:
         alias = table.alias_or_name.upper()
         alone = not select.args.get("joins") and select.args.get("from_") is not None and select.args["from_"].this is table
         # `cast(ts as date) as day ... group by day`: `day` is the SELECT's own alias, not a column of the table
-        own = {p.alias.upper() for p in select.expressions if isinstance(p, exp.Alias)
-               and not any(c.name.upper() == p.alias.upper() for c in p.this.find_all(exp.Column))}
+        own = [p.alias.upper() if isinstance(p, exp.Alias) and not any(
+            c.name.upper() == p.alias.upper() for c in p.this.find_all(exp.Column)) else None for p in select.expressions]
+        position = {id(p): i for i, p in enumerate(select.expressions)}
         out: list[str] = []
         for col in select.find_all(exp.Column):
             if isinstance(col.this, exp.Star) or col.find_ancestor(exp.Select) is not select:
                 continue
-            if not col.table and col.name.upper() in own:
+            top = col
+            while top.parent is not select and top.parent is not None:
+                top = top.parent
+            # inside a projection only the aliases defined before it are visible; elsewhere all of them
+            visible = own[:position[id(top)]] if id(top) in position else own
+            if not col.table and col.name.upper() in visible:
                 continue
             if (col.table.upper() == alias if col.table else alone) and col.name.upper() not in out:
                 out.append(col.name.upper())
@@ -289,7 +296,7 @@ class Fitter:
         name = fq.split(".")[-1]
         out: list[str] = []
         for child, node in self.nodes.items():
-            if uid not in node.get("depends_on", {}).get("nodes", []) or child not in self.sql_of:
+            if uid not in node.get("depends_on", {}).get("nodes", []) or node.get("resource_type") != "model":
                 continue
             tree = self.tree(child)
             if tree is None:
@@ -377,10 +384,30 @@ class Fitter:
     def tree(self, uid: str):  # noqa: ANN201
         if uid not in self.trees:
             try:
-                self.trees[uid] = sqlglot.parse_one(self.sql_of[uid], read="snowflake")
+                self.trees[uid] = sqlglot.parse_one(self.sql_of[uid] if uid in self.sql_of else self.sketch(uid), read="snowflake")
             except Exception:  # noqa: BLE001
                 self.trees[uid] = None
         return self.trees[uid]
+
+    def sketch(self, uid: str) -> str:
+        """A model that never compiled still says which columns it reads. Its Jinja, with ref() and
+        source() replaced by relation names, star() by `*` and everything else dropped, is close
+        enough to SQL to read them from."""
+        raw = self.nodes[uid].get("raw_code") or ""
+        by_name = {n["name"]: n.get("relation_name") for n in self.nodes.values() if n.get("relation_name")}
+
+        def expression(m: re.Match) -> str:
+            inner = m.group(1)
+            if re.search(r"\bstar\s*\(", inner):
+                return "*"
+            ref = re.search(r"\bref\s*\(\s*(?:'[^']*'\s*,\s*)?'([^']+)'", inner)
+            if ref and by_name.get(ref.group(1)):
+                return by_name[ref.group(1)]
+            return "NULL"
+
+        text = re.sub(r"\{#.*?#\}", "", raw, flags=re.S)
+        text = re.sub(r"\{%.*?%\}", "", text, flags=re.S)
+        return re.sub(r"\{\{(.*?)\}\}", expression, text, flags=re.S)
 
     def real_tables(self, node: exp.Expression, ctes: dict[str, exp.Expression], depth: int = 0) -> set[str]:
         out: set[str] = set()
@@ -609,9 +636,6 @@ class Fitter:
         failure = None
         for _ in range(400):
             cur = conn.cursor()
-            watchdog = threading.Timer(self.model_timeout, cur._duck_conn.interrupt)
-            watchdog.daemon = True
-            watchdog.start()
             try:
                 if time.time() - began > self.model_timeout:
                     raise TimeoutError
@@ -619,7 +643,7 @@ class Fitter:
                     cur.execute(statement)  # the path dbt takes
                 else:
                     for part in fast:
-                        cur._duck_conn.execute(part)
+                        emulator.run_guarded(cur, lambda part=part: cur._duck_conn.execute(part))
                 if target != fq:
                     self.bootstrap(fq, target)
                 break
@@ -636,14 +660,13 @@ class Fitter:
                 if fast is not None and fallbacks < 3:
                     fast, fallbacks = None, fallbacks + 1  # something else: the full path can rewrite the statement
                     continue
-                if "INTERRUPT" in message.upper() or isinstance(e, TimeoutError):
+                if "INTERRUPT" in message.upper() or "statement stopped after" in message or isinstance(e, TimeoutError):
                     message = f"stopped after {self.model_timeout:.0f}s: the query runs away on the generated data"
                 else:
                     self.learn(uid, message)
                 failure = message
                 break
             finally:
-                watchdog.cancel()
                 cur.close()
         if time.time() - began > 20:
             self.log(f"    slow: {self.nodes[uid]['name']} took {time.time() - began:.0f}s")
@@ -667,6 +690,7 @@ class Fitter:
             failures = {uid: m for uid, m in failures.items() if uid not in todo}
             conn = self.emu._fs.connect(database=database, schema="CI")
             started, done = time.time(), 0
+            trace = open(os.environ["FAUXFLAKE_FIT_TRACE"], "a") if os.environ.get("FAUXFLAKE_FIT_TRACE") else None  # noqa: SIM115
             for uid in order:
                 if uid not in todo:
                     continue
@@ -684,6 +708,9 @@ class Fitter:
                     self.emu.duck.execute(f"drop view if exists {quoted(fq)}")
                     self.stand_ins.discard(fq)
                     self.pending.pop(fq, None)
+                if trace:
+                    trace.write(f"{nodes[uid]['name']}\n")
+                    trace.flush()
                 error = self.run_model(conn, uid, fq)
                 if error:
                     failures[uid] = error
