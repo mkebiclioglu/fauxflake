@@ -22,6 +22,7 @@ import graphlib
 import json
 import os
 import re
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -51,16 +52,24 @@ _CONVERT = [
     (re.compile(r"Could not convert string '(?P<value>[^']*)' to (?P<type>[A-Z0-9]+)"), None),
     (re.compile(r'(?P<type>date|timestamp|time) field (?:format|value out of range): "(?P<value>[^"]*)"'), None),
     (re.compile(r"""Malformed JSON.*?Input: "?(?P<value>[^"\n]*)""", re.S), "VARIANT"),
+    (re.compile(r'Expected (?P<type>ARRAY|OBJECT), but got VARCHAR: "(?P<value>[^"]*)"'), None),
     (re.compile(r'''Could not parse string "(?P<value>[^"]*)" according to format'''), "TIMESTAMP"),
     (re.compile(r"""Failed to cast value: Could not convert string '(?P<value>[^']*)' to (?P<type>[A-Z0-9]+)"""), None),
 ]
 _NO_TABLE = re.compile(r'Table with name "?(?:[\w$]+\.)*(?P<name>[\w$]+)"? does not exist')
+_NO_FUNCTION = re.compile(r"No function matches the given name and argument types '(?P<name>\w+)\((?P<types>[^']*)\)'")
+_TEMPORAL = {"epoch", "epoch_ms", "date_part", "datepart", "extract", "year", "month", "day", "hour", "minute", "second",
+             "dayofweek", "dayofyear", "week", "quarter", "last_day", "dayname", "monthname"}
+_NUMERIC = {"abs", "round", "floor", "ceil", "sqrt", "ln", "log", "exp", "power", "sign"}
 _NOT_STRUCT = re.compile(r"""Cannot extract field '(?P<field>[^']+)' from expression "(?P<col>[^"]+)" because it is not a struct""")
 _HINTS = {"INT8": "BIGINT", "INT16": "BIGINT", "INT32": "BIGINT", "INT64": "BIGINT", "INT128": "BIGINT", "UINT8": "BIGINT",
           "UINT16": "BIGINT", "UINT32": "BIGINT", "UINT64": "BIGINT", "HUGEINT": "BIGINT", "BIGINT": "BIGINT", "INTEGER": "BIGINT",
           "DOUBLE": "DOUBLE", "FLOAT": "DOUBLE", "DECIMAL": "DOUBLE", "BOOL": "BOOLEAN", "BOOLEAN": "BOOLEAN", "DATE": "DATE",
-          "TIMESTAMP": "TIMESTAMP", "TIME": "TIMESTAMP", "VARIANT": "VARIANT"}
+          "TIMESTAMP": "TIMESTAMP", "TIME": "TIMESTAMP", "VARIANT": "VARIANT", "ARRAY": "ARRAY", "OBJECT": "VARIANT"}
 _FREE = ("template", "pool")  # generators that only make up text: safe to retype
+_INSPECTS = re.compile(r"run_query\(|statement\(|load_result\(|get_columns_in_relation\(|get_relation\(|get_relations_by|"
+                       r"get_filtered_columns_in_relation|list_relations")
+_HARMLESS = {"macro.dbt.is_incremental", "macro.dbt.should_full_refresh"}  # ask only whether the model's own table exists
 
 
 def duck_type(gen: dict) -> str:
@@ -96,7 +105,9 @@ class Fitter:
         self.uncompiled: dict[str, str] = {}  # model -> why it did not compile
         self.pending: dict[str, dict[str, str]] = {}  # stand-ins for those models: relation -> columns read from it
         self.stand_ins: set[str] = set()
+        self.deferred: set[str] = set()  # models whose SQL only exists during a build
         self.retyped: set[str] = set()  # sources whose generated values changed since the last pass
+        self.model_timeout = float(os.environ.get("FAUXFLAKE_FIT_TIMEOUT", "90"))  # seconds one model may take while fitting
         self.learned: list[str] = []
         self.dirty = False
         self.trees: dict[str, exp.Expression | None] = {}
@@ -464,7 +475,37 @@ class Fitter:
         m = _NOT_STRUCT.search(message)
         if m:
             return self.make_variant(m.group("col"), m.group("field"))
+        m = _NO_FUNCTION.search(message)
+        if m and "VARCHAR" in m.group("types"):
+            return self.wrong_type(sql_key, m.group("name").lower())
         return False
+
+    def wrong_type(self, sql_key: str, function: str) -> bool:
+        """Snowflake does not read text as a date in DATE_PART or EXTRACT, or as a number in a few
+        other places: a text column handed to one of them is really a timestamp or a number."""
+        hint = "TIMESTAMP" if function in _TEMPORAL else "DOUBLE" if function in _NUMERIC else None
+        tree = self.tree(sql_key)
+        if hint is None or tree is None:
+            return False
+        classes = (exp.Extract, exp.TimeToUnix, exp.UnixToTime) if hint == "TIMESTAMP" else (exp.Func,)
+        names = set()
+        for node in tree.find_all(*classes):
+            if hint == "DOUBLE" and node.sql_name().lower() != function and getattr(node, "name", "").lower() != function:
+                continue
+            for arg in ([node.expression] if isinstance(node, exp.Extract) else list(node.iter_expressions())):
+                if isinstance(arg, exp.Column):
+                    names.add(arg.name.upper())
+        changed = False
+        for name in names:
+            for table, t in self.tables.items():
+                gen = (t.get("columns") or {}).get(name)
+                if gen and gen.get("gen") in _FREE and not gen.get("type") and not gen.get("format"):
+                    t["columns"][name] = guess(name, hint)
+                    self.retyped.add(table)
+                    self.learned.append(f"{table}.{name}: passed to {function}(), which takes no text; retyped as {hint}.")
+                    changed = True
+        self.dirty |= changed
+        return changed
 
     # --- loop 1: compiled models straight on the emulator
 
@@ -493,10 +534,31 @@ class Fitter:
 
         graph = {uid: deps(uid) - {uid} for uid in self.sql_of if rel[uid].count(".") == 2}
         self.parents = graph
+        # Models whose Jinja looks at the warehouse while compiling (dbt_utils.star, union_relations,
+        # get_column_values, run_query) compile to a placeholder when nothing is there yet. Their real
+        # SQL only exists during a build, so they and everything downstream are left to the build.
+        macros = manifest.get("macros", {})
+        verdict: dict[str, bool] = {}
+
+        def inspects(macro: str, depth: int = 0) -> bool:
+            if macro in verdict or macro in _HARMLESS or depth > 12:
+                return verdict.get(macro, False)
+            verdict[macro] = False
+            body = macros.get(macro, {})
+            verdict[macro] = bool(_INSPECTS.search(body.get("macro_sql") or "")) or any(
+                inspects(m, depth + 1) for m in (body.get("depends_on") or {}).get("macros", []))
+            return verdict[macro]
+
+        self.deferred = {uid for uid in graph if _INSPECTS.search(nodes[uid].get("raw_code") or "")
+                         or any(inspects(m) for m in nodes[uid]["depends_on"].get("macros", []))}
         try:
-            return list(graphlib.TopologicalSorter(graph).static_order())
+            order = list(graphlib.TopologicalSorter(graph).static_order())
         except graphlib.CycleError:
-            return list(graph)
+            order = list(graph)
+        for uid in order:  # parents come first, so one sweep carries it downstream
+            if any(p in self.deferred for p in graph.get(uid, ())):
+                self.deferred.add(uid)
+        return [uid for uid in order if uid not in self.deferred]
 
     def hidden_dependencies(self) -> None:
         """A model that names another model's table without ref() depends on it in a way dbt cannot
@@ -524,9 +586,63 @@ class Fitter:
                 self.create_existing(fq)
                 self.learned.append(f"{fq}: read by {node['name']} by name, not through ref(); starts as an empty relation.")
 
+    def run_model(self, conn, uid: str, fq: str) -> str | None:  # noqa: ANN001
+        """Build one model straight on the emulator. Whenever the error names something the spec can
+        supply (a column, a relation), supply it and bind again. Returns the error that remains, if any."""
+        db, schema, _ = fq.split(".")
+        target = f'{db}.{schema}."__FX_BOOT"' if fq in self.existing else fq
+        statement = f"create or replace table {target} as (\n{self.sql_of[uid]}\n)"
+        fast: list[str] | None = None  # the statement as DuckDB SQL, to retry without transpiling again
+        fallbacks = 0
+        began = time.time()
+        failure = None
+        for _ in range(400):
+            cur = conn.cursor()
+            watchdog = threading.Timer(self.model_timeout, cur._duck_conn.interrupt)
+            watchdog.daemon = True
+            watchdog.start()
+            try:
+                if time.time() - began > self.model_timeout:
+                    raise TimeoutError
+                if fast is None:
+                    cur.execute(statement)  # the path dbt takes
+                else:
+                    for part in fast:
+                        cur._duck_conn.execute(part)
+                if target != fq:
+                    self.bootstrap(fq, target)
+                break
+            except Exception as e:  # noqa: BLE001
+                message = str(e)
+                if self.missing_column(uid, message) or self.missing_relation(uid, message):
+                    if fast is None:  # the column or relation now exists (empty): bind again
+                        try:
+                            parsed = sqlglot.parse_one(emulator.rewrite(statement), read="snowflake")
+                            fast = [cur._transform(part, None).sql(dialect="duckdb") for part in cur._transform_explode(parsed)]
+                        except Exception:  # noqa: BLE001
+                            fast = None
+                    continue
+                if fast is not None and fallbacks < 3:
+                    fast, fallbacks = None, fallbacks + 1  # something else: the full path can rewrite the statement
+                    continue
+                if "INTERRUPT" in message.upper() or isinstance(e, TimeoutError):
+                    message = f"stopped after {self.model_timeout:.0f}s: the query runs away on the generated data"
+                else:
+                    self.learn(uid, message)
+                failure = message
+                break
+            finally:
+                watchdog.cancel()
+                cur.close()
+        if time.time() - began > 20:
+            self.log(f"    slow: {self.nodes[uid]['name']} took {time.time() - began:.0f}s")
+        return failure
+
     def learn_from_models(self, manifest: dict, database: str, passes: int = 4) -> dict[str, str]:
         """Returns {model: error} for the models that still fail after the spec stopped changing."""
         order = [uid for uid in self.load(manifest)]
+        if self.deferred:
+            self.log(f"  {len(self.deferred)} model(s) inspect the warehouse while compiling, or read one that does: left to the build")
         self.hidden_dependencies()
         nodes = manifest["nodes"]
         sources = {uid: _fq(f'{n["database"]}.{n["schema"]}.{n.get("identifier") or n["name"]}')
@@ -557,39 +673,9 @@ class Fitter:
                     self.emu.duck.execute(f"drop view if exists {quoted(fq)}")
                     self.stand_ins.discard(fq)
                     self.pending.pop(fq, None)
-                target = f'{db}.{schema}."__FX_BOOT"' if fq in self.existing else fq
-                statement = f"create or replace table {target} as (\n{self.sql_of[uid]}\n)"
-                fast: list[str] | None = None  # the statement as DuckDB SQL, to retry without transpiling again
-                fallbacks = 0
-                for _ in range(400):
-                    cur = conn.cursor()
-                    try:
-                        if fast is None:
-                            cur.execute(statement)  # the path dbt takes
-                        else:
-                            for part in fast:
-                                cur._duck_conn.execute(part)
-                        if target != fq:
-                            self.bootstrap(fq, target)
-                        break
-                    except Exception as e:  # noqa: BLE001
-                        message = str(e)
-                        if self.missing_column(uid, message) or self.missing_relation(uid, message):
-                            if fast is None:  # the column or relation now exists (empty): bind again
-                                try:
-                                    parsed = sqlglot.parse_one(emulator.rewrite(statement), read="snowflake")
-                                    fast = [cur._transform(part, None).sql(dialect="duckdb") for part in cur._transform_explode(parsed)]
-                                except Exception:  # noqa: BLE001
-                                    fast = None
-                            continue
-                        if fast is not None and fallbacks < 3:
-                            fast, fallbacks = None, fallbacks + 1  # something else: the full path can rewrite the statement
-                            continue
-                        self.learn(uid, message)
-                        failures[uid] = message
-                        break
-                    finally:
-                        cur.close()
+                error = self.run_model(conn, uid, fq)
+                if error:
+                    failures[uid] = error
             conn.close()
             self.push_pending()
             roots = sum(1 for m in failures.values() if not m.startswith("upstream failed"))
@@ -668,11 +754,20 @@ class Fitter:
                     self.give_union_columns(_fq(node["relation_name"]), message, self.columns_children_read(node["unique_id"]))
                     continue
                 compiled = self._compiled(project, node)
-                if compiled:
-                    self.sql_of[node["unique_id"]] = compiled
-                    self.trees.pop(node["unique_id"], None)
-                    self.by_rel[_fq(node["relation_name"])] = node["unique_id"]
-                    self.learn(node["unique_id"], message)
+                if compiled and node.get("relation_name") and _fq(node["relation_name"]).count(".") == 2:
+                    uid, fq = node["unique_id"], _fq(node["relation_name"])
+                    self.sql_of[uid] = compiled
+                    self.trees.pop(uid, None)
+                    self.by_rel[fq] = uid
+                    if not self.learn(uid, message):
+                        continue
+                    # the error taught something: keep going on this model, as loop 1 does, so that one
+                    # round finds every column it is missing instead of one per round
+                    conn = self.emu._fs.connect(database=node["database"], schema=node["schema"])
+                    try:
+                        self.run_model(conn, uid, fq)
+                    finally:
+                        conn.close()
             for r in results:
                 node = nodes.get(r["unique_id"], {})
                 if node.get("resource_type") == "test" and node.get("name") in expected:

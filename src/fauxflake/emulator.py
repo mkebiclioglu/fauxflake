@@ -273,15 +273,37 @@ def _patch_fakesnow() -> None:
     original_execute = FakeSnowflakeCursor._execute
 
     def _execute(self, transformed, params=None):  # noqa: ANN001
+        # Snowflake stops a statement after STATEMENT_TIMEOUT_IN_SECONDS. Here a query can run away
+        # on invented data (a date spine between two random dates, say): stop it and say so.
+        limit = float(os.environ.get("FAUXFLAKE_STATEMENT_TIMEOUT", "1800"))
+        expired = threading.Event()
+
+        def stop() -> None:
+            expired.set()
+            self._duck_conn.interrupt()
+
+        watchdog = threading.Timer(limit, stop)
+        watchdog.daemon = True
+        watchdog.start()
         try:
-            original_execute(self, transformed, params)
-        except ProgrammingError as e:
-            if "No function matches" not in str(e) and "Could not choose a best candidate" not in str(e):
-                raise
-            repaired = semantics.repair_types(transformed, self._duck_conn, params)
-            if repaired is None:
-                raise
-            original_execute(self, repaired, params)
+            try:
+                original_execute(self, transformed, params)
+            except ProgrammingError as e:
+                if "No function matches" not in str(e) and "Could not choose a best candidate" not in str(e):
+                    raise
+                repaired = semantics.repair_types(transformed, self._duck_conn, params)
+                if repaired is None:
+                    raise
+                original_execute(self, repaired, params)
+        except Exception as e:  # noqa: BLE001
+            if expired.is_set():
+                raise ProgrammingError(msg=f"fauxflake emulator: statement stopped after {limit:.0f}s "
+                                           "(FAUXFLAKE_STATEMENT_TIMEOUT). On generated data this is usually a join or a "
+                                           "date spine that explodes; look at the values the model reads.",
+                                       errno=604, sqlstate="57014") from e
+            raise
+        finally:
+            watchdog.cancel()
         semantics.coerce_result(self)
 
     FakeSnowflakeCursor._execute = _execute
