@@ -83,6 +83,12 @@ def _qualify_merge_insert(sql: str) -> str:
     source = merge.args["using"]
     alias = source.alias_or_name
     changed = False
+    if isinstance(source, exp.Table) and source.alias and source.alias.upper() != source.name.upper():
+        # `using src as s`: the clauses name the source by its alias. A subquery carries one the same way
+        plain = source.copy()
+        plain.set("alias", None)
+        merge.set("using", exp.select("*").from_(plain).subquery(source.alias))
+        changed = True
     for when in merge.find_all(exp.When):
         then = when.args.get("then")
         if when.args.get("matched") or not isinstance(then, exp.Insert) or then.expression is None:
@@ -115,9 +121,9 @@ def _transaction(cursor, command: str, original):  # noqa: ANN001, ANN202
         return original(cursor, "select 'Statement executed successfully.' as \"status\"")
     end = _TXN_END.match(trailing)
     if end:
+        _drop_scratch(cursor)
         if is_open:
             conn._fauxflake_txn = False
-            _drop_scratch(cursor)
             try:
                 cursor._duck_conn.execute(end.group(1))
             except Exception:  # noqa: BLE001 - DuckDB already ended it (a failed statement aborts its transaction)
@@ -134,7 +140,7 @@ def _drop_scratch(cursor) -> None:  # noqa: ANN001
     if scratch:
         cursor._conn._fauxflake_scratch = None
         try:
-            cursor._duck_conn.execute(f"drop table if exists {scratch}")
+            cursor._duck_conn.execute("drop table if exists " + ".".join(f'"{part}"' for part in scratch))
         except Exception:  # noqa: BLE001, S110 - the transaction is already gone, and the table with it
             pass
 
@@ -449,26 +455,32 @@ def _patch_fakesnow() -> None:
     def _execute(self, transformed, params=None):  # noqa: ANN001
         def run(tree) -> None:  # noqa: ANN001
             conn = self._conn
-            if getattr(conn, "_fauxflake_txn", False) and conn.database and conn.schema:
-                # MERGE works through a temporary table, which DuckDB counts as a second database.
-                # Inside a transaction it is an ordinary table next to the target, dropped at the end.
-                scratch = [t for t in tree.find_all(exp.Table) if t.name.upper() == "MERGE_CANDIDATES" and not t.db]
-                if scratch:
-                    name = f"__FX_MERGE_{id(conn):X}"
-                    for t in scratch:
-                        t.set("this", exp.to_identifier(name, quoted=True))
-                        t.set("db", exp.to_identifier(conn.schema, quoted=True))
-                        t.set("catalog", exp.to_identifier(conn.database, quoted=True))
-                    if isinstance(tree, exp.Create):
-                        properties = tree.args.get("properties")
-                        if properties:
-                            properties.set("expressions", [p for p in properties.expressions if not isinstance(p, exp.TemporaryProperty)])
-                        conn._fauxflake_scratch = f'"{conn.database}"."{conn.schema}"."{name}"'
-                        # straight to DuckDB: fakesnow's bookkeeping for a new table lives in another database
-                        self._duck_conn.execute(tree.sql(dialect="duckdb"))
-                        if not getattr(conn, "_fauxflake_healing", False):
-                            conn.__dict__.setdefault("_fauxflake_journal", []).append((tree.copy(), params))
-                        return
+            # MERGE works through a temporary table, which DuckDB counts as a second database. Inside a
+            # transaction it is an ordinary table next to the target, dropped when the transaction ends.
+            scratch = [t for t in tree.find_all(exp.Table) if t.name.upper() == "MERGE_CANDIDATES" and not t.db]
+            if scratch and isinstance(tree, exp.Create):
+                _drop_scratch(self)  # of an earlier MERGE
+                source = tree.find(exp.From)
+                target = source.this if source is not None and isinstance(source.this, exp.Table) else None
+                home = ((target.catalog if target is not None else "") or conn.database,
+                        (target.db if target is not None else "") or conn.schema)
+                if getattr(conn, "_fauxflake_txn", False) and all(home):
+                    conn._fauxflake_scratch = (home[0], home[1], f"__FX_MERGE_{id(conn):X}")
+            where = getattr(conn, "_fauxflake_scratch", None)
+            if scratch and where:
+                for t in scratch:
+                    t.set("this", exp.to_identifier(where[2], quoted=True))
+                    t.set("db", exp.to_identifier(where[1], quoted=True))
+                    t.set("catalog", exp.to_identifier(where[0], quoted=True))
+                if isinstance(tree, exp.Create):
+                    properties = tree.args.get("properties")
+                    if properties:
+                        properties.set("expressions", [p for p in properties.expressions if not isinstance(p, exp.TemporaryProperty)])
+                    # straight to DuckDB: fakesnow's bookkeeping for a new table lives in another database
+                    self._duck_conn.execute(tree.sql(dialect="duckdb"))
+                    if not getattr(conn, "_fauxflake_healing", False):
+                        conn.__dict__.setdefault("_fauxflake_journal", []).append((tree.copy(), params))
+                    return
             journaled = getattr(self._conn, "_fauxflake_txn", False) and not isinstance(tree, (exp.Query, exp.Describe, exp.Show))
             kept = tree.copy() if journaled else None
             try:
@@ -490,7 +502,6 @@ def _patch_fakesnow() -> None:
                         conn._fauxflake_healing = False
                     conn._fauxflake_journal = []
                     original_execute(self, kept, params)
-                    _drop_scratch(self)
                     return
                 _heal(self)
                 raise

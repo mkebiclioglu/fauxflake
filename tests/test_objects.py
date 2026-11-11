@@ -326,3 +326,24 @@ def test_transactions_roll_back_and_survive_a_failed_statement(run):
     run("insert into t values (5, 'e', 50)")
     run("commit")
     assert run("select count(*) from t") == [(2,)]
+
+
+def test_merge_in_a_transaction_into_another_database(run):
+    run("create database if not exists OTHERDB")
+    run("create schema if not exists OTHERDB.S")
+    run("create or replace table OTHERDB.S.tgt (id int, v varchar)")
+    run("insert into OTHERDB.S.tgt values (1, 'a'), (2, 'b')")
+    run("create or replace table src2 as select 2 as id, 'B' as v union all select 3, 'C'")
+    merge = ("merge into OTHERDB.S.tgt t using src2 s on t.id = s.id when matched then update set v = s.v "
+             "when not matched then insert (id, v) values (s.id, s.v)")
+    run("begin")  # what dbt sends around an incremental model's merge
+    assert run(merge) == [(1, 1)]
+    run("commit")
+    assert run("select id, v from OTHERDB.S.tgt order by id") == [(1, "a"), (2, "B"), (3, "C")]
+    run("begin")
+    run("merge into OTHERDB.S.tgt t using src2 s on t.id = s.id when matched then update set v = 'x'")
+    run("rollback")
+    assert run("select id, v from OTHERDB.S.tgt order by id") == [(1, "a"), (2, "B"), (3, "C")]
+    run("merge into OTHERDB.S.tgt t using src2 s on t.id = s.id when matched then update set v = 'y'")  # no transaction
+    assert run("select id, v from OTHERDB.S.tgt order by id") == [(1, "a"), (2, "y"), (3, "y")]
+    assert run("show tables like '__FX%' in schema OTHERDB.S") == []
