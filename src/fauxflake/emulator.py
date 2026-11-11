@@ -638,12 +638,16 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
+TEMP_DIRS: list[str] = []  # removed when the process is told to stop and cannot leave normally
+
+
 def _spill_directory(duck: duckdb.DuckDBPyConnection) -> str:
     """Where DuckDB writes what does not fit in memory. Its default is `.tmp` in the working directory,
     which is the user's dbt repository: use a private directory outside it, removed on exit."""
     import tempfile
 
     path = tempfile.mkdtemp(prefix="fauxflake-spill-")
+    TEMP_DIRS.append(path)
     duck.execute("set temp_directory = '" + path.replace("'", "''") + "'")
     # A query that explodes on generated data (a join on a key that is always the same) would
     # otherwise write until the disk is full. Stop it at a bound, and never past a quarter of what is free.

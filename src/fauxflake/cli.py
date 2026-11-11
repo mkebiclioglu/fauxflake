@@ -5,6 +5,8 @@ import sys
 import time
 from datetime import datetime, timedelta
 
+from pathlib import Path
+
 import click
 
 from . import __version__
@@ -37,6 +39,13 @@ def with_common(f):
     return f
 
 
+def emulator_temp(path: str) -> None:
+    """A scratch warehouse to remove even when the run is cut short."""
+    from . import emulator
+
+    emulator.TEMP_DIRS.append(path)
+
+
 @click.group()
 @click.version_option(__version__)
 def main() -> None:
@@ -45,6 +54,20 @@ def main() -> None:
     import sys
 
     def stop(*_: object) -> None:  # a cancelled CI job: leave through the normal exit, so temporary files go
+        import os
+        import shutil
+        import threading
+        import time
+
+        def give_up() -> None:  # a statement that will not return must not keep the process alive
+            from . import emulator
+
+            time.sleep(20)
+            for path in emulator.TEMP_DIRS:
+                shutil.rmtree(path, ignore_errors=True)
+            os._exit(143)
+
+        threading.Thread(target=give_up, daemon=True).start()
         sys.exit(143)
 
     try:
@@ -333,6 +356,7 @@ def init(spec_path, project_dir, database, force, fit):
 
     # on disk, so that a project with thousands of models is bounded by DuckDB's buffer pool, not by RAM
     with tempfile.TemporaryDirectory(prefix="fauxflake-") as scratch, serve(db_path=scratch if fit else None) as emu:
+        emulator_temp(scratch)
         notes = write_spec(DbtProject(project_dir, emulator_output(emu.port, database)), path, database, emu,
                            fit=fit, log=click.echo)
     spec = Spec.load(path)
@@ -364,6 +388,7 @@ def fit(spec_path, project_dir):
 
     database = Spec.load(path).dbt.get("database", "ANALYTICS")
     with tempfile.TemporaryDirectory(prefix="fauxflake-") as scratch, serve(db_path=scratch) as emu:
+        emulator_temp(scratch)
         notes = update_spec(DbtProject(project_dir, emulator_output(emu.port, database)), path, database, emu, log=click.echo)
     spec = Spec.load(path)
     click.echo(f"updated {path}: {len(spec.tables)} source tables, {sum(len(t.columns) for t in spec.tables.values())} columns")
