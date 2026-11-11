@@ -220,7 +220,11 @@ class TableSQL:
             expr = self._object(col, d["fields"], d.get("keyed_by"))
         elif gen == "array":
             n = f"floor({self.u(col)} * 4)::bigint"
-            expr = f"to_json(list_transform(range({n}), lambda i: concat({lit(col.lower() + '_')}, i)))::JSON"
+            if d.get("values"):  # elements drawn from a known list
+                known = "[" + ", ".join(lit(v) for v in d["values"]) + "]"
+                expr = f"to_json(list_slice({known}, 1, {n}))::JSON"
+            else:
+                expr = f"to_json(list_transform(range({n}), lambda i: concat({lit(col.lower() + '_')}, i)))::JSON"
         elif gen == "event_time":
             expr = "_ev"
         elif gen == "updated_at":

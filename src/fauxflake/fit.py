@@ -386,7 +386,7 @@ class Fitter:
         elif how == "format":
             for node in tree.find_all(exp.StrToTime, exp.StrToDate, exp.TsOrDsToDate, exp.TsOrDsToTimestamp):
                 arg = node.this
-                while isinstance(arg, (exp.Cast, exp.TryCast, exp.Paren, exp.Trim, exp.Nullif)):
+                while isinstance(arg, (exp.Cast, exp.TryCast, exp.Paren, exp.Trim, exp.Nullif, exp.SplitPart)):
                     arg = arg.this
                 if isinstance(arg, exp.Column) and isinstance(node.args.get("format"), exp.Literal):
                     out.append(arg.name.upper())
@@ -396,12 +396,52 @@ class Fitter:
                     out.append(node.this.name.upper())
             for node in tree.find_all(exp.Explode, exp.Lateral, exp.Unnest):
                 out += [c.name.upper() for c in node.find_all(exp.Column) if c.name.upper() not in ("VALUE", "THIS", "INDEX", "KEY")]
+            for node in tree.find_all(exp.Func):  # array_except(col, [...]), array_contains(x, col), arrays_overlap(...)
+                if node.sql_name().upper().startswith("ARRAY") or (isinstance(node, exp.Anonymous) and node.name.upper().startswith("ARRAY")):
+                    out += [a.name.upper() for a in node.iter_expressions() if isinstance(a, exp.Column)]
         return list(dict.fromkeys(out))
+
+    def array_values(self, uid: str) -> None:
+        """`array_except(skus, ['a', 'b'])`: the array column holds elements of that list."""
+        tree = self.tree(uid)
+        for node in (tree.find_all(exp.Func) if tree is not None else []):
+            args = list(node.iter_expressions())
+            lists = [a for a in args if isinstance(a, exp.Array) and a.expressions and all(isinstance(e, exp.Literal) and e.is_string for e in a.expressions)]
+            columns = [a for a in args if isinstance(a, exp.Column)]
+            if len(lists) != 1 or len(columns) != 1:
+                continue
+            for name in self.origins(uid, columns[0].name.upper()):
+                for table in self.sources_of(uid):
+                    gen = (self.tables[table].get("columns") or {}).get(name)
+                    if gen and gen.get("gen") == "array" and not gen.get("values"):
+                        gen["values"] = [e.name for e in lists[0].expressions]
+                        self.retyped.add(table)
+                        self.dirty = True
+
+    def split_format(self, uid: str, column: str, fmt: str) -> str:
+        """`to_date(split_part(col, ' - ', 2), fmt)`: the column holds several dates in that format,
+        joined by the delimiter. The format that makes every part parse."""
+        tree = self.tree(uid)
+        for node in (tree.find_all(exp.StrToTime, exp.StrToDate, exp.TsOrDsToDate, exp.TsOrDsToTimestamp) if tree is not None else []):
+            arg, out = node.this, fmt
+            while isinstance(arg, (exp.Cast, exp.TryCast, exp.Paren, exp.Trim, exp.Nullif, exp.SplitPart)):
+                if isinstance(arg, exp.SplitPart):
+                    delimiter, part = arg.args.get("delimiter"), arg.args.get("part_index")
+                    if isinstance(delimiter, exp.Literal) and isinstance(part, exp.Literal) and part.is_int:
+                        out = delimiter.name.join([out] * max(2, int(part.name)))
+                arg = arg.this
+            if isinstance(arg, exp.Column) and arg.name.upper() == column and out != fmt:
+                return out
+        return fmt
 
     def retype_column(self, uid: str, name: str, hint: str, fmt: str | None = None) -> bool:
         """The model converts column `name` to `hint`: make the sources it reads generate that."""
         changed = False
-        for table in self.sources_of(uid):
+        tables = self.sources_of(uid)
+        names = [name]
+        if not any(name in (self.tables[t].get("columns") or {}) for t in tables):
+            names = self.origins(uid, name)  # an output column: the source columns it is made from
+        for table, name in [(t, n) for t in tables for n in names]:
             columns = self.tables[table].get("columns") or {}
             gen = columns.get(name)
             if gen is None:
@@ -608,7 +648,7 @@ class Fitter:
             return False
         members = [f"{t.catalog.upper()}.{t.db.upper()}.{t.name.upper()}" for t in tree.find_all(exp.Table) if t.catalog and t.db]
         members = [m for m in dict.fromkeys(members) if m in self.tables]
-        if len(members) < 2:
+        if not members:
             return False
         self.unions[fq] = members
         return True
@@ -743,7 +783,10 @@ class Fitter:
                 if isinstance(node, exp.SetOperation):
                     pile += [node.left, node.right]
                     continue
-                tables = self.real_tables(node, ctes) if isinstance(node, exp.Select) and node.is_star and len(node.expressions) == 1 else set()
+                plain = isinstance(node, exp.Select) and node.expressions and all(
+                    isinstance(e, (exp.Star, exp.Column)) for e in node.expressions)  # `select *`, or dbt_utils.star written out
+                source = node.args.get("from_") if plain and not node.args.get("joins") else None
+                tables = self.real_tables(source, ctes) if source is not None else set()  # not what a WHERE subquery reads
                 if len(tables) != 1:
                     relations = []
                     break
@@ -895,9 +938,11 @@ class Fitter:
                     pasted = [t.rsplit("_", 1)[0].upper() for t in re.findall(r"[a-z][a-z0-9_]*_[0-9a-f]{12}", m.group("value"))]
                     if pasted and any([self.retype_column(sql_key, c, "BIGINT") for c in dict.fromkeys(pasted)]):
                         return True
-                if fmt and any([self.retype_column(sql_key, c, hint, fmt) for c in self.columns_used(sql_key, "format", fmt)]):
+                if fmt and any([self.retype_column(sql_key, c, hint, self.split_format(sql_key, c, fmt))
+                                for c in self.columns_used(sql_key, "format", fmt)]):
                     return True
                 if hint == "ARRAY" and any([self.retype_column(sql_key, c, "ARRAY") for c in self.columns_used(sql_key, "array")]):
+                    self.array_values(sql_key)
                     return True
                 for token in m.group("value").split():  # generated text starts with its column's name
                     if "_" in token and self.retype_column(sql_key, token.rsplit("_", 1)[0].upper(), hint, fmt):
@@ -1176,6 +1221,7 @@ class Fitter:
             # at the scale and history `fauxflake build` uses, so that what is reported here is what a build gives
             self.generate(scale=0.001, history=60)
             before = len(self.learned)
+            self.retyped = set()
             results_path = project.target_path / "run_results.json"
             results_path.unlink(missing_ok=True)  # what is there is from the compile step
             project.invoke(["build", *selected], silent=True)
@@ -1247,12 +1293,21 @@ class Fitter:
                                                     if status in ("error", "fail")]}
             self.log(f"  build {n_round}: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
                      + f"; {len(self.learned) - before} thing(s) learned")
+            if os.environ.get("FAUXFLAKE_FIT_DEBUG"):
+                Path(os.environ["FAUXFLAKE_FIT_DEBUG"] + f".build{n_round}.json").write_text(json.dumps(
+                    {"failed": {r["unique_id"]: (r.get("message") or "")[:2000] for r in failed},
+                     "slow": sorted(((round(r.get("execution_time") or 0), r["unique_id"]) for r in results), reverse=True)[:15],
+                     "learned": self.learned[before:]}, indent=1))
             if not failed or (len(self.learned) == before and not accepted):
                 break
-            if len(self.learned) > before or not again or len(again) > 300:
-                selected = []  # the data changed: build everything again
+            # next round: what failed, what reads a source whose values changed, and everything downstream
+            changed = [f"source:{n['source_name']}.{n['name']}+" for uid, n in manifest.get("sources", {}).items()
+                       if self.source_names.get(uid) in self.retyped]
+            others = len(self.learned) - before - len(self.retyped)  # lessons about something else than a source's values
+            if not again or len(again) + len(changed) > 300 or (others > 0 and not changed and not again):
+                selected = []
             else:
-                selected = ["--select", *[f"{name}+" for name in sorted(again)]]  # only what the excluded tests held back
+                selected = ["--select", *[f"{name}+" for name in sorted(again)], *sorted(changed)]
         if not self.spec["dbt"].get("expected_failures"):
             self.spec["dbt"].pop("expected_failures", None)
         self.save()
