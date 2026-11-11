@@ -118,13 +118,20 @@ _CLOCK = re.compile(
 )
 
 
+_QUOTED_TEXT = re.compile(r"""('(?:[^'\\]|''|\\.)*'|"(?:[^"]|"")*"|\$\$.*?\$\$)""", re.DOTALL)
+
+
 def _freeze_clock(sql: str) -> str:
     def sub(m: re.Match[str]) -> str:
         if m.group(0).lower().startswith("current_date"):
             return f"'{FROZEN_NOW:%Y-%m-%d}'::date"
         return f"'{FROZEN_NOW:%Y-%m-%d %H:%M:%S}'::timestamp"
 
-    return _CLOCK.sub(sub, sql)
+    if "'" not in sql and '"' not in sql and "$$" not in sql:
+        return _CLOCK.sub(sub, sql)
+    # only outside string literals, quoted names and $$ bodies: 'macro.dbt.current_timestamp' is text
+    parts = _QUOTED_TEXT.split(sql)
+    return "".join(part if i % 2 else _CLOCK.sub(sub, part) for i, part in enumerate(parts))
 
 
 def rewrite(sql: str) -> str:

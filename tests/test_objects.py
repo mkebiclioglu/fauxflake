@@ -260,3 +260,16 @@ def test_describe_reaches_tables_in_other_databases(run):
     run("create or replace table raw.app.event (id string, received_at timestamp)")
     run("use schema analytics.ci")
     assert [r[0] for r in run("describe table raw.app.event")] == ["ID", "RECEIVED_AT"]
+
+
+def test_frozen_clock_leaves_text_alone(run):
+    from datetime import datetime
+
+    from fauxflake import emulator
+
+    emulator.FROZEN_NOW = datetime(2025, 3, 2)
+    try:
+        assert run("""select 'macro.dbt.current_timestamp' as name, "current_date" as quoted, current_date() as today
+                      from (select 1 as "current_date")""") == [("macro.dbt.current_timestamp", 1, datetime(2025, 3, 2).date())]
+    finally:
+        emulator.FROZEN_NOW = None
