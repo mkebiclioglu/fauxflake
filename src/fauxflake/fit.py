@@ -284,7 +284,10 @@ class Fitter:
     def create_existing(self, fq: str) -> None:
         from .generate import existing_view
 
-        self.emu.duck.execute(existing_view(fq, self.existing[fq].get("columns") or {}, replace=True))
+        kind = self.emu.duck.execute("select table_type from information_schema.tables where table_catalog = ? and "
+                                     "table_schema = ? and table_name = ?", fq.split(".")).fetchone()
+        if kind is None or kind[0] == "VIEW":  # once the project has built the real thing, leave it alone
+            self.emu.duck.execute(existing_view(fq, self.existing[fq].get("columns") or {}, replace=True))
 
     def retype(self, value: str, hint: str, fmt: str | None = None) -> bool:
         """The generated text `value` was converted to `hint`: retype the column(s) that made it.
@@ -473,9 +476,36 @@ class Fitter:
         except graphlib.CycleError:
             return list(graph)
 
+    def hidden_dependencies(self) -> None:
+        """A model that names another model's table without ref() depends on it in a way dbt cannot
+        see: on a first run the table may not be there yet, and with several threads that is a matter
+        of luck. Production has the table from an earlier run; give this warehouse one too."""
+        for uid in self.sql_of:
+            tree, node = self.tree(uid), self.nodes[uid]
+            if tree is None:
+                continue
+            ctes = {c.alias.upper() for c in tree.find_all(exp.CTE)}
+            ancestors = None
+            for tb in tree.find_all(exp.Table):
+                name = tb.name.upper()
+                if not isinstance(tb.this, exp.Identifier) or (not tb.db and name in ctes):
+                    continue
+                fq = ".".join([(tb.catalog or node["database"]).upper(), (tb.db or node["schema"]).upper(), name])
+                owner = self.relation_owner.get(fq)
+                if owner is None or fq in self.existing or self.nodes[owner]["resource_type"] not in ("model", "snapshot"):
+                    continue
+                ancestors = self._ancestors(uid) if ancestors is None else ancestors
+                if owner in ancestors:
+                    continue
+                self.emu.ensure_database(*fq.split(".")[:2])
+                self.existing[fq] = {"columns": {c: duck_type(guess(c, None)) for c in self.columns_read(tree, tb)}}
+                self.create_existing(fq)
+                self.learned.append(f"{fq}: read by {node['name']} by name, not through ref(); starts as an empty relation.")
+
     def learn_from_models(self, manifest: dict, database: str, passes: int = 4) -> dict[str, str]:
         """Returns {model: error} for the models that still fail after the spec stopped changing."""
         order = [uid for uid in self.load(manifest)]
+        self.hidden_dependencies()
         nodes = manifest["nodes"]
         failures: dict[str, str] = {}
         for n_pass in range(1, passes + 1):

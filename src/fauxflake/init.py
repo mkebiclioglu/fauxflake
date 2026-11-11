@@ -156,6 +156,11 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 elif node.name.upper() in passthrough:
                     direct[alias.upper()] = passthrough[node.name.upper()]
                     added[alias.upper()] = computed.get(node.name.upper(), set())
+                elif models and _table_id(node) in models and "*" in models[_table_id(node)]:
+                    # a model that is `select * from source`: reading it is reading the source
+                    through, computed_there = models[_table_id(node)]["*"]
+                    direct[alias.upper()] = through
+                    added[alias.upper()] = set(computed_there.split("|")) - {""}
                 elif models and _table_id(node) in models:  # another model: follow its lineage
                     renames[alias.upper()] = models[_table_id(node)]
             else:  # a CTE or subquery scope
@@ -282,6 +287,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     | added.get(next(iter(direct)), set())
             else:
                 sources[only].star = True
+                extra = {p.alias_or_name.upper() for p in select.expressions if p not in stars} | added.get(next(iter(direct)), set())
+                outputs["*"] = (only, "|".join(sorted(extra)))  # the whole model passes the source through
         if stars and len(renames) == 1 and len(selected) == 1:
             outputs = {**next(iter(renames.values())), **outputs}
         if stars and len(select.expressions) == 1 and len(selected) == 1:
@@ -472,7 +479,10 @@ def analyse(manifest: dict, database: str) -> Analysis:
     def locate(node_id: str, column: str) -> tuple[str, str] | None:
         if node_id in ids:
             return ids[node_id], column.upper()
-        return outputs.get(node_id, {}).get(column.upper())
+        known = outputs.get(node_id, {})
+        if column.upper() not in known and "*" in known and column.upper() not in known["*"][1].split("|"):
+            return known["*"][0], column.upper()  # a pass-through model: the column is the source's
+        return known.get(column.upper())
 
     keys: dict[str, str] = {}
     fks: dict[tuple[str, str], tuple[str, str]] = {}

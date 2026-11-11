@@ -1,0 +1,12 @@
+version: 2
+sources:
+  - name: raw
+    database: RAW
+    schema: APP
+    tables:
+      - name: events   # no columns declared, and only ever read with `select *`
+models:
+  - name: fct_events
+    columns:
+      - name: event_id
+        data_tests: [unique, not_null]
