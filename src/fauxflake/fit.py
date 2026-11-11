@@ -22,6 +22,7 @@ import graphlib
 import json
 import os
 import re
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
@@ -95,6 +96,7 @@ class Fitter:
         self.uncompiled: dict[str, str] = {}  # model -> why it did not compile
         self.pending: dict[str, dict[str, str]] = {}  # stand-ins for those models: relation -> columns read from it
         self.stand_ins: set[str] = set()
+        self.retyped: set[str] = set()  # sources whose generated values changed since the last pass
         self.learned: list[str] = []
         self.dirty = False
         self.trees: dict[str, exp.Expression | None] = {}
@@ -172,6 +174,7 @@ class Fitter:
                 cols = ", ".join(f'"{c}" {duck_type(g)}' for c, g in self.tables[fq]["columns"].items())
                 self.emu.duck.execute(f"create table if not exists {quoted(fq)} ({cols})")
                 self.learned.append(f"{fq}: read by {node['name']} but not declared as a source; now generated.")
+                self.retyped.add(fq)
                 self.dirty = True
             return True
         return False
@@ -251,6 +254,7 @@ class Fitter:
                 for col in columns:
                     if col not in self.tables[table].setdefault("columns", {}):
                         self.tables[table]["columns"][col] = guess(col, None)
+                        self.retyped.add(table)
                         added += 1
         if added:
             self.dirty = True
@@ -298,6 +302,17 @@ class Fitter:
             name = token.rsplit("_", 1)[0].upper() if "_" in token else ""
             for table, t in self.tables.items():
                 gen = (t.get("columns") or {}).get(name)
+                for holder in (t.get("columns") or {}).values():  # the same, for a field inside an object column
+                    fields = holder.get("fields") if holder.get("gen") == "object" else None
+                    for path, field in list((fields or {}).items()):
+                        if path.split(".")[-1].upper() == name and field.get("gen") in _FREE and not field.get("format"):
+                            fresh = {"gen": "time_offset", "format": fmt, "p": [0, 0.5, 1], "seconds": [0, 86400, 604800]} if fmt \
+                                else guess(name, hint)
+                            if fresh["gen"] not in _FREE:
+                                fields[path] = fresh
+                                self.retyped.add(table)
+                                self.learned.append(f"{table}: field {path} used as {fresh.get('format') or hint}, retyped.")
+                                changed = True
                 if not gen or gen.get("gen") not in _FREE or gen.get("type") or gen.get("format"):
                     continue
                 if fmt:  # parsed with an explicit format: text in that format
@@ -313,6 +328,7 @@ class Fitter:
                     fresh["follows"] = gen["follows"]
                 within_bounds(fresh, self.bounds.get((table, name)))
                 t["columns"][name] = fresh
+                self.retyped.add(table)
                 self.learned.append(f"{table}.{name}: used as {fresh.get('format') or hint}, retyped.")
                 changed = True
         self.dirty |= changed
@@ -324,10 +340,12 @@ class Fitter:
             gen = (t.get("columns") or {}).get(col.upper())
             if gen and gen.get("gen") in _FREE and not gen.get("type"):
                 t["columns"][col.upper()] = {"gen": "object", "fields": {field.lower(): guess(field, None)}}
+                self.retyped.add(table)
                 self.learned.append(f"{table}.{col.upper()}: read as an object ({field}), retyped.")
                 changed = True
             elif gen and gen.get("gen") == "object" and field.lower() not in gen.get("fields", {}) and field.upper() not in gen.get("fields", {}):
                 gen.setdefault("fields", {})[field.lower()] = guess(field, None)
+                self.retyped.add(table)
                 changed = True
         self.dirty |= changed
         return changed
@@ -507,13 +525,23 @@ class Fitter:
         order = [uid for uid in self.load(manifest)]
         self.hidden_dependencies()
         nodes = manifest["nodes"]
+        sources = {uid: _fq(f'{n["database"]}.{n["schema"]}.{n.get("identifier") or n["name"]}')
+                   for uid, n in manifest.get("sources", {}).items()}
         failures: dict[str, str] = {}
+        todo = set(order)
         for n_pass in range(1, passes + 1):
             self.generate()
             before = len(self.learned)
-            failures = {}
+            self.retyped = set()
+            failures = {uid: m for uid, m in failures.items() if uid not in todo}
             conn = self.emu._fs.connect(database=database, schema="CI")
+            started, done = time.time(), 0
             for uid in order:
+                if uid not in todo:
+                    continue
+                done += 1
+                if done % 250 == 0:
+                    self.log(f"    {done}/{len(todo)} models, {time.time() - started:.0f}s")
                 fq = _fq(nodes[uid]["relation_name"])
                 db, schema, _ = fq.split(".")
                 self.emu.ensure_database(db, schema)
@@ -527,17 +555,32 @@ class Fitter:
                     self.pending.pop(fq, None)
                 target = f'{db}.{schema}."__FX_BOOT"' if fq in self.existing else fq
                 statement = f"create or replace table {target} as (\n{self.sql_of[uid]}\n)"
+                fast: list[str] | None = None  # the statement as DuckDB SQL, to retry without transpiling again
+                fallbacks = 0
                 for _ in range(400):
                     cur = conn.cursor()
                     try:
-                        cur.execute(statement)
+                        if fast is None:
+                            cur.execute(statement)  # the path dbt takes
+                        else:
+                            for part in fast:
+                                cur._duck_conn.execute(part)
                         if target != fq:
                             self.bootstrap(fq, target)
                         break
                     except Exception as e:  # noqa: BLE001
                         message = str(e)
                         if self.missing_column(uid, message) or self.missing_relation(uid, message):
-                            continue  # the column or relation now exists (empty): bind again
+                            if fast is None:  # the column or relation now exists (empty): bind again
+                                try:
+                                    parsed = sqlglot.parse_one(emulator.rewrite(statement), read="snowflake")
+                                    fast = [cur._transform(part, None).sql(dialect="duckdb") for part in cur._transform_explode(parsed)]
+                                except Exception:  # noqa: BLE001
+                                    fast = None
+                            continue
+                        if fast is not None and fallbacks < 3:
+                            fast, fallbacks = None, fallbacks + 1  # something else: the full path can rewrite the statement
+                            continue
                         self.learn(uid, message)
                         failures[uid] = message
                         break
@@ -550,6 +593,16 @@ class Fitter:
                      f"{len(self.learned) - before} thing(s) learned")
             if len(self.learned) == before:
                 break
+            # next pass: what failed, what reads a source whose values changed, and everything downstream of those
+            again = set(failures)
+            if self.retyped:
+                for uid in order:
+                    if any(sources.get(dep) in self.retyped for dep in self._ancestors(uid) if dep in sources):
+                        again.add(uid)
+            for uid in order:  # parents come first in `order`, so one sweep carries it downstream
+                if uid not in again and any(p in again for p in self.parents.get(uid, ())):
+                    again.add(uid)
+            todo = again
         self.save()
         if os.environ.get("FAUXFLAKE_FIT_DEBUG"):  # why each model did not run, for working on the emulator
             Path(os.environ["FAUXFLAKE_FIT_DEBUG"]).write_text(json.dumps(failures, indent=1))
@@ -571,6 +624,7 @@ class Fitter:
         """Run `dbt build`, read the results, fix what the spec can fix. Returns the last summary."""
         summary: dict = {}
         selected: list[str] = []
+        outcome: dict[str, tuple[str, str, str]] = {}  # node -> (kind, status, message), across rounds
         for n_round in range(1, rounds + 1):
             self.generate()
             before = len(self.learned)
@@ -587,6 +641,7 @@ class Fitter:
             failed = [r for r in results if r["status"] in ("error", "fail")]
             expected = self.spec.setdefault("dbt", {}).setdefault("expected_failures", [])
             accepted = 0
+            again: set[str] = set()  # models to build in the next round, with everything downstream
             for r in failed:
                 node = nodes.get(r["unique_id"])
                 if node is None:
@@ -598,7 +653,13 @@ class Fitter:
                     if r["status"] == "fail" and not self.learn_from_test(node, analysis) and node["name"] not in expected:
                         expected.append(node["name"])
                         accepted += 1
+                        outcome.pop(r["unique_id"], None)
+                        tested = nodes.get(node.get("attached_node") or "") or next(
+                            (nodes[d] for d in node["depends_on"]["nodes"] if d in nodes), None)
+                        if tested:
+                            again.add(tested["name"])  # what dbt skipped because this test failed
                     continue
+                again.add(node["name"])
                 if "no columns found to union" in message and node.get("relation_name"):
                     self.give_union_columns(_fq(node["relation_name"]), message, self.columns_children_read(node["unique_id"]))
                     continue
@@ -608,16 +669,24 @@ class Fitter:
                     self.trees.pop(node["unique_id"], None)
                     self.by_rel[_fq(node["relation_name"])] = node["unique_id"]
                     self.learn(node["unique_id"], message)
-            counts: dict[str, int] = {}
             for r in results:
-                kind = nodes.get(r["unique_id"], {}).get("resource_type", "other")
-                counts[f"{kind}:{r['status']}"] = counts.get(f"{kind}:{r['status']}", 0) + 1
-            summary = {"counts": counts, "failed": [(r["unique_id"], r["status"], (r.get("message") or "").strip()) for r in failed]}
+                node = nodes.get(r["unique_id"], {})
+                if node.get("resource_type") == "test" and node.get("name") in expected:
+                    continue
+                outcome[r["unique_id"]] = (node.get("resource_type", "other"), r["status"], (r.get("message") or "").strip())
+            counts: dict[str, int] = {}
+            for kind, status, _ in outcome.values():
+                counts[f"{kind}:{status}"] = counts.get(f"{kind}:{status}", 0) + 1
+            summary = {"counts": counts, "failed": [(uid, status, message) for uid, (_, status, message) in outcome.items()
+                                                    if status in ("error", "fail")]}
             self.log(f"  build {n_round}: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
                      + f"; {len(self.learned) - before} thing(s) learned")
             if not failed or (len(self.learned) == before and not accepted):
                 break
-            selected = []  # a fix can change anything downstream: build everything again
+            if len(self.learned) > before or not again or len(again) > 300:
+                selected = []  # the data changed: build everything again
+            else:
+                selected = ["--select", *[f"{name}+" for name in sorted(again)]]  # only what the excluded tests held back
         if not self.spec["dbt"].get("expected_failures"):
             self.spec["dbt"].pop("expected_failures", None)
         self.save()

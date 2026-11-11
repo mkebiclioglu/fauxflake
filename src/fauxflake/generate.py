@@ -208,9 +208,14 @@ class TableSQL:
                 f"case {pick} {' '.join(f'when {i} then {fill(t)}' for i, t in enumerate(shapes))} end"
         elif gen == "time_offset":
             expr = f"_ev + {ms(piecewise(self.u(col), d['p'], d['seconds']))}"
+            if d.get("epoch"):  # the moment as seconds since 1970, the way APIs often send it
+                expr = f"epoch({expr})::bigint"
             if d.get("format"):  # a text column holding dates in this format
                 # nanoseconds are written as microseconds and three zeros: DuckDB's strftime pads %n with NUL bytes
                 expr = f"strftime({expr}, {lit(d['format'].replace('%n', '%f000'))})"
+        elif gen == "ip":
+            octet = lambda salt: f"(floor({self.u(col + ':' + salt)} * 250)::bigint + 1)"  # noqa: E731
+            expr = f"concat({octet('a')}, '.', {octet('b')}, '.', {octet('c')}, {lit('.0/24') if d.get('cidr') else f'concat(chr(46), {octet(chr(100))})'})"
         elif gen == "object":
             expr = self._object(col, d["fields"], d.get("keyed_by"))
         elif gen == "array":

@@ -49,6 +49,7 @@ class SourceUse:
         self.formats: dict[str, str] = {}  # text column -> strftime format it is parsed with
         self.json_text: set[str] = set()  # text columns holding JSON (passed to PARSE_JSON)
         self.texts: set[str] = set()  # columns compared with string literals
+        self.ips: set[str] = set()  # text columns handed to PARSE_IP
         self.bounds: dict[str, set[float]] = {}  # column -> numbers the SQL compares it with
         self.splits: dict[str, dict] = {}  # text column -> {"seps": {"/": {0: "BIGINT"}}, "digits": False} from split()[i]::type
         self.numbers: set[str] = set()  # columns that are summed, averaged or used in arithmetic
@@ -233,6 +234,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                                 use.bounds.setdefault(hit[1], set()).add(-float(number.name) if negative else float(number.name))
                             except ValueError:
                                 pass
+                if isinstance(parent, exp.Anonymous) and parent.name.upper() == "PARSE_IP" and parent.expressions[0] is col:
+                    use.ips.add(hit[1])
                 if isinstance(parent, exp.ParseJSON):
                     use.json_text.add(hit[1])  # parse_json(col):a.b  ->  col is text holding {"a": {"b": ...}}
                     col, parent = parent, parent.parent
@@ -257,7 +260,12 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     hint = outer.to.sql(dialect="duckdb") if isinstance(outer, (exp.Cast, exp.TryCast)) else None
                     hint = _parsed_as(parent) or hint
                     if keys:
-                        use.paths.setdefault(hit[1], {})[".".join(keys)] = hint
+                        known = use.paths.setdefault(hit[1], {})
+                        previous = known.get(".".join(keys))
+                        if previous and hint and {hint_is_number(previous), hint_is_number(hint)} == {True, False} \
+                                and (hint if hint_is_number(previous) else previous).upper().startswith(("TIMESTAMP", "DATE", "EPOCH")):
+                            hint = "EPOCH"  # cast to a number here, read as a point in time there: seconds since 1970
+                        known[".".join(keys)] = "EPOCH" if previous == "EPOCH" else (hint or previous)
                     else:
                         use.arrays.add(hit[1])
                 elif isinstance(parent, (exp.Split, exp.SplitPart)) and parent.this is col and _split_use(use, hit[1], parent):
@@ -377,6 +385,8 @@ def guess(column: str, hint: str | None) -> dict:
         return {"gen": "dist", "type": h, **AMOUNT}
     if h in ("DOUBLE", "FLOAT", "REAL"):
         return {"gen": "dist", "type": "DOUBLE", **AMOUNT}
+    if h == "EPOCH":
+        return {"gen": "time_offset", "epoch": True, **WEEK}
     if h in ("BIGINT", "INTEGER", "INT", "SMALLINT", "NUMBER") or h.endswith(",0)"):  # an explicit type beats a name
         return {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000]}
     if h == "BOOLEAN" or (not h and re.match(r"^(IS|HAS|WAS)_", c)):
@@ -551,6 +561,8 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 # `where name like 'tap-%'` should keep some rows: make values that fit each pattern
                 shapes = sorted(p.replace("\\", "").replace("%", "{hex}").replace("_", "x") for p in use.patterns[col])
                 out[col] = {"gen": "template", "templates": [*shapes, f"{col.lower()}_{{hex}}"]}
+            elif col in use.ips and not hint_is_number(hint):
+                out[col] = {"gen": "ip", "cidr": "/" in (use.splits.get(col) or {}).get("seps", {})}  # parse_ip(network, 'INET')
             elif col in use.splits and not hint_is_number(hint):
                 # the SQL takes this text apart: give every part it reads the type it is cast to
                 found = use.splits[col]

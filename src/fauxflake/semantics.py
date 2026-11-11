@@ -981,8 +981,71 @@ _BARE = {"CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "CURRENT_USER", "L
 _FLATTEN_OUTPUT = {"SEQ", "KEY", "PATH", "INDEX", "VALUE", "THIS"}
 
 
+_hierarchies = 0
+
+
+def hierarchical(select: exp.Select) -> None:
+    """`START WITH ... CONNECT BY ... PRIOR ...` as the recursive CTE it describes. LEVEL,
+    CONNECT_BY_ROOT and SYS_CONNECT_BY_PATH are carried along each path."""
+    global _hierarchies
+    connect, source = select.args["connect"], select.args["from_"].this
+    _hierarchies += 1
+    name = f"__CB_{_hierarchies}"
+    alias = source.alias_or_name
+    plain = source.copy()
+    plain.set("alias", None)
+
+    def qualified(expr: exp.Expression, row: str) -> exp.Expression:
+        expr = expr.copy()
+        for col in ([expr] if isinstance(expr, exp.Column) else []) + list(expr.find_all(exp.Column)):
+            if not col.table or col.table.upper() == alias.upper():
+                col.set("table", exp.to_identifier(row))
+        return expr
+
+    def sql(expr: exp.Expression) -> str:
+        return expr.sql(dialect="snowflake")
+
+    carried: list[tuple[str, str, str]] = []  # (column, value on the first row, value on each next row)
+    scope = [n for n in select.walk() if n.find_ancestor(exp.Select) is select or n is select]
+    for node in scope:
+        if isinstance(node, exp.ConnectByRoot):
+            col = f"__CB_ROOT_{len(carried)}"
+            carried.append((col, sql(qualified(node.this, "__S")), f'__P."{col}"'))
+            node.replace(exp.column(col, quoted=True))
+        elif isinstance(node, exp.Anonymous) and node.name.upper() == "SYS_CONNECT_BY_PATH" and len(node.expressions) == 2:
+            col = f"__CB_PATH_{len(carried)}"
+            value, sep = sql(qualified(node.expressions[0], "__S")), sql(node.expressions[1])
+            carried.append((col, f"{sep} || ({value})::varchar", f'__P."{col}" || {sep} || ({value})::varchar'))
+            node.replace(exp.column(col, quoted=True))
+    condition = connect.args["connect"].copy()
+    for prior in list(condition.find_all(exp.Prior)):
+        prior.replace(exp.paren(qualified(prior.this, "__P")))
+    for col in condition.find_all(exp.Column):
+        if not col.table or col.table.upper() == alias.upper():
+            col.set("table", exp.to_identifier("__S"))
+    start = sql(qualified(connect.args["start"], "__S")) if connect.args.get("start") is not None else "true"
+    first = "".join(f', {value} as "{col}"' for col, value, _ in carried)
+    following = "".join(f', {value} as "{col}"' for col, _, value in carried)
+    body = (f'select __S.*, 1 as "LEVEL"{first} from {sql(plain)} as __S where {start} union all '
+            f'select __S.*, __P."LEVEL" + 1{following} from {sql(plain)} as __S join "{name}" as __P on {sql(condition)} '
+            f'where __P."LEVEL" < 500')
+    cte = exp.CTE(this=sqlglot.parse_one(body, read="snowflake"), alias=exp.TableAlias(this=exp.to_identifier(name, quoted=True)))
+    existing = select.args.get("with_")
+    if existing is not None:
+        existing.append("expressions", cte)
+        existing.set("recursive", True)
+    else:
+        select.set("with_", exp.With(expressions=[cte], recursive=True))
+    select.args["from_"].set("this", exp.Table(this=exp.to_identifier(name, quoted=True),
+                                              alias=exp.TableAlias(this=exp.to_identifier(alias))))
+    select.set("connect", None)
+
+
 def rewrite(node: exp.Expression) -> exp.Expression:
     """Apply the fixes bottom-up, so nested cases (a ratio of averages) all get rewritten."""
+    if isinstance(node, exp.Select) and node.args.get("connect") is not None and node.args.get("from_") is not None \
+            and not node.args.get("joins"):
+        hierarchical(node)
     if isinstance(node, exp.With) and not node.args.get("recursive") and any(
             isinstance(c.this, exp.SetOperation) and _self_referencing(c) for c in node.expressions):
         node.set("recursive", True)  # the keyword is optional in Snowflake
