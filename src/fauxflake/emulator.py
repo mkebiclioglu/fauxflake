@@ -243,6 +243,13 @@ def _patch_fakesnow() -> None:
     global _patched
     if _patched:
         return
+    # generated SQL can nest thousands deep (a pivot over many values, a long OR chain): give the
+    # parser and the rewrites room, in the threads started from here on
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), 50_000))
+    try:
+        threading.stack_size(512 * 1024 * 1024)
+    except (ValueError, RuntimeError):
+        pass
     from fakesnow.cursor import FakeSnowflakeCursor
     from snowflake.connector.errors import ProgrammingError
 
@@ -594,6 +601,7 @@ def engine() -> Iterator[Emulator]:
         fs.duck_conn.execute(macro)
     semantics.reserved_words(fs.duck_conn)
     fs.duck_conn.execute("set global old_implicit_casting = true")  # text compares with numbers and dates, as in Snowflake
+    fs.duck_conn.execute("set global max_expression_depth = 20000")  # a pivot over hundreds of values nests that deep
     spill = _spill_directory(fs.duck_conn)
     fs.results_cache.setdefault(objects._KEY, objects.State()).root = fs.duck_conn
     try:
@@ -634,6 +642,7 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
         fs.duck_conn.execute(macro)
     semantics.reserved_words(fs.duck_conn)
     fs.duck_conn.execute("set global old_implicit_casting = true")  # text compares with numbers and dates, as in Snowflake
+    fs.duck_conn.execute("set global max_expression_depth = 20000")  # a pivot over hundreds of values nests that deep
     spill = _spill_directory(fs.duck_conn)
     fs.results_cache.setdefault(objects._KEY, objects.State()).root = fs.duck_conn
     previous = fakesnow.server.shared_fs

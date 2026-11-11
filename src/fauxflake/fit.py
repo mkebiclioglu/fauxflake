@@ -54,7 +54,7 @@ _CONVERT = [
     (re.compile(r'Could not convert string "(?P<value>[^"]*)" to (?P<type>[A-Z0-9]+)'), None),
     (re.compile(r'(?P<type>date|timestamp|time) field (?:format|value out of range): "(?P<value>[^"]*)"'), None),
     (re.compile(r"""Malformed JSON.*?Input: "?(?P<value>[^"\n]*)""", re.S), "VARIANT"),
-    (re.compile(r'Expected (?P<type>ARRAY|OBJECT), but got (?:VARCHAR|OBJECT|ARRAY): "?(?P<value>[^"\n]*)"?'), None),
+    (re.compile(r'Expected (?P<type>ARRAY|OBJECT), but got \w+: "?(?P<value>[^"\n]*)"?'), None),
     (re.compile(r'''Could not parse string "(?P<value>[^"]*)" according to format'''), "TIMESTAMP"),
     (re.compile(r"""Failed to cast value: Could not convert string '(?P<value>[^']*)' to (?P<type>[A-Z0-9]+)"""), None),
 ]
@@ -695,18 +695,31 @@ class Fitter:
         return next(iter(tables)) if len(tables) == 1 else None
 
     def _union_members(self, fq: str) -> bool:
-        """Is `fq` a model that only stacks generated tables (dbt_utils.union_relations)? Remember which."""
+        """Is `fq` a model that only stacks generated tables (dbt_utils.union_relations, directly or
+        through a macro of the project)? Remember which."""
         if fq in self.unions:
             return True
         uid = self.by_rel.get(fq) or self.relation_owner.get(fq)
-        if not uid or "union_relations" not in (self.nodes.get(uid, {}).get("raw_code") or ""):
+        if not uid or uid not in self.nodes:
             return False
         if uid not in self.sql_of and self.nodes[uid].get("compiled_code"):
             self.sql_of[uid] = self.nodes[uid]["compiled_code"].strip().rstrip(";")
         tree = self.tree(uid)
-        if tree is None or not isinstance(tree.unnest() if isinstance(tree, exp.Subquery) else tree, (exp.SetOperation, exp.Select)):
+        top = tree.unnest() if tree is not None else None
+        if not isinstance(top, exp.SetOperation):
             return False
-        members = [f"{t.catalog.upper()}.{t.db.upper()}.{t.name.upper()}" for t in tree.find_all(exp.Table) if t.catalog and t.db]
+        members: list[str] = []
+        pile = [top]
+        while pile:
+            node = pile.pop().unnest()
+            if isinstance(node, exp.SetOperation):
+                pile += [node.left, node.right]
+                continue
+            source = node.args.get("from_") if isinstance(node, exp.Select) and not node.args.get("joins") else None
+            table = source.this if source is not None else None
+            if not isinstance(table, exp.Table) or not (table.catalog and table.db):
+                return False
+            members.append(f"{table.catalog.upper()}.{table.db.upper()}.{table.name.upper()}")
         members = [m for m in dict.fromkeys(members) if m in self.tables]
         if not members:
             return False
@@ -1362,7 +1375,16 @@ class Fitter:
             self.retyped = set()
             results_path = project.target_path / "run_results.json"
             results_path.unlink(missing_ok=True)  # what is there is from the compile step
-            project.invoke(["build", *selected], silent=True)
+            if n_round > 1:
+                # incremental models and snapshots keep the rows of the round before, made from values the
+                # spec has since corrected: every round starts them again, as the first build of a project does
+                for node in self.nodes.values():
+                    if node.get("resource_type") == "snapshot" and node.get("relation_name"):
+                        try:
+                            self.emu.duck.execute(f"drop table if exists {quoted(_fq(node['relation_name']))}")
+                        except Exception:  # noqa: BLE001, S110
+                            pass
+            project.invoke(["build", *(["--full-refresh"] if n_round > 1 else []), *selected], silent=True)
             if not results_path.exists():
                 self.log(f"  dbt build did not run: {project.last_error[:600] or 'no results were written'}")
                 return {"error": project.last_error or "dbt build wrote no results"}
