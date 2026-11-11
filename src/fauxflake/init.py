@@ -788,7 +788,7 @@ def _fit(project, path: Path, database: str, emu, manifest: dict, analysis: Anal
     fitter.generate()
     project.invoke(["seed"], silent=True)
     failures = fitter.learn_from_models(manifest, database)
-    for _ in range(5):
+    for _ in range(3):
         if not failures and all(n.get("compiled_code") for n in models):
             break
         # models whose Jinja inspects the warehouse (dbt_utils.star, union_relations, get_column_values)
@@ -797,8 +797,8 @@ def _fit(project, path: Path, database: str, emu, manifest: dict, analysis: Anal
         manifest = project.compile()
         models = [n for n in manifest["nodes"].values() if n["resource_type"] == "model"]
         failures = fitter.learn_from_models(manifest, database)
-        if len(failures) >= before and len(fitter.learned) == known:
-            break
+        if len(failures) > before * 0.9 and (len(fitter.learned) == known or before - len(failures) < 3):
+            break  # compiling again changes little now: the build takes it from here
     fitter.drop_models(manifest)
     summary = {} if os.environ.get("FAUXFLAKE_FIT_NO_BUILD") else fitter.learn_from_build(project, analysis)
     # a function the project creates itself (in a hook) needs no placeholder
