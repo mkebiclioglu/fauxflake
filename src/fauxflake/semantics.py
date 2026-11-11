@@ -1672,6 +1672,43 @@ def coerce_union_literals(transformed: exp.Expression, conn) -> exp.Expression: 
     return transformed
 
 
+def _repair_by_types(tree: exp.Expression, conn, details: dict) -> bool:  # noqa: ANN001
+    """`(a + b) * text_column * .01` inside an aggregate: DuckDB names the operator and not the place.
+    Ask for the type of each operand of that operator and convert the text ones, as Snowflake does."""
+    sign = re.search(r"argument types '([-+*/%])\(", details.get("exception_message", ""))
+    if not sign or sign.group(1) not in _OPERATORS_BY_SIGN:
+        return False
+    kinds, done = _OPERATORS_BY_SIGN[sign.group(1)], False
+    for select in list(tree.find_all(exp.Select)):
+        # innermost first: `(a * text) * 2` cannot be asked about until `a * text` is repaired
+        nodes = [n for n in select.find_all(kinds) if n.find_ancestor(exp.Select) is select and not isinstance(n, exp.Neg)
+                 and not n.find(exp.AggFunc, exp.Window, exp.Subquery)
+                 and n.this.find(kinds) is None and n.expression.find(kinds) is None]
+        if not nodes or select.args.get("from_") is None:
+            continue
+        probe = exp.Select(expressions=[exp.alias_(side.copy(), f"_k{2 * i + j}") for i, n in enumerate(nodes)
+                                        for j, side in enumerate((n.this, n.expression))])
+        probe.set("from_", select.args["from_"].copy())
+        if select.args.get("joins"):
+            probe.set("joins", [j.copy() for j in select.args["joins"]])
+        conn.execute("set errors_as_json = false")
+        try:
+            described = conn.execute("describe " + _cte_prefix(select) + probe.sql(dialect="duckdb")).fetchall()
+        except Exception:  # noqa: BLE001 - some operand is itself the problem: nothing to learn here
+            continue
+        finally:
+            conn.execute("set errors_as_json = true")
+        if len(described) != 2 * len(nodes):
+            continue
+        for i, n in enumerate(nodes):
+            left, right = described[2 * i][1], described[2 * i + 1][1]
+            for side, kind, other in ((n.this, left, right), (n.expression, right, left)):
+                if kind == "VARCHAR" and other != "VARCHAR":
+                    _convert(side, "timestamp" if other.startswith(_DATE_TYPES) else "double")
+                    done = True
+    return done
+
+
 def repair_types(transformed: exp.Expression, conn, params=None) -> exp.Expression | None:  # noqa: ANN001
     """The statement with Snowflake's implicit text conversions made explicit, or None."""
     tree, fixed = transformed.copy(), 0
@@ -1686,6 +1723,9 @@ def repair_types(transformed: exp.Expression, conn, params=None) -> exp.Expressi
                 details = _error_details(str(e))
                 if details and details.get("position"):
                     details["position"] = int(details["position"]) - len("explain ")
+                elif details and _repair_by_types(tree, conn, details):
+                    fixed += 1  # DuckDB did not say where: the operands were asked for their types instead
+                    continue
                 if not details or not _repair(tree, text, details):
                     return tree if fixed else None  # keep what was fixed: the remaining error is the one to report
                 fixed += 1

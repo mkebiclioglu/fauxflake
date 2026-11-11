@@ -86,6 +86,14 @@
    ]
   ]
  },
+ "arithmetic_on_text_inside_aggregate": {
+  "rows": [
+   [
+    "6.375",
+    "1"
+   ]
+  ]
+ },
  "arithmetic_scale": {
   "rows": [
    [
