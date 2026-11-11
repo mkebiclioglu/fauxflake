@@ -520,6 +520,9 @@ def _fix(node: exp.Expression) -> exp.Expression:
         if to.is_type("timestamp", "timestampntz", "timestampltz", "timestamptz") and to.expressions \
                 and to.expressions[0].name == "0":
             return exp.Anonymous(this="date_trunc", expressions=[exp.Literal.string("second"), node])
+        if to.is_type("timestamp", "timestampntz", "timestampltz", "timestamptz") and isinstance(inner, exp.Cast) \
+                and inner.to.is_type("int", "bigint", "decimal", "double", "float"):
+            return _fn("_sf_epoch", inner)  # x::number::timestamp: seconds (or ms, us, ns) since 1970
         if to.is_type("boolean") and not isinstance(inner, (*_VARIANT_ACCESS, exp.Boolean, exp.Null)):
             return _fn("_sf_bool", inner)
         if to.is_type("date") and not isinstance(inner, (*_VARIANT_ACCESS, exp.Null, exp.Cast, exp.Anonymous)) \

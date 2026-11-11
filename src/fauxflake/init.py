@@ -237,6 +237,12 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 if (isinstance(parent, exp.ParseIp) and parent.this is col) or (
                         isinstance(parent, exp.Anonymous) and parent.name.upper() == "PARSE_IP" and parent.expressions[0] is col):
                     use.ips.add(hit[1])
+                if isinstance(parent, exp.Nullif) and parent.this is col and isinstance(parent.expression, exp.Literal) \
+                        and parent.expression.is_string and not cast:
+                    use.texts.add(hit[1])  # nullif(col, ''): text that can be empty
+                if isinstance(parent, exp.ConvertTimezone) and col in (parent.args.get("source_tz"), parent.args.get("target_tz")):
+                    use.literals.setdefault(hit[1], set()).update({"UTC", "America/Los_Angeles", "Europe/Berlin"})  # a time zone name
+                    use.texts.add(hit[1])
                 if isinstance(parent, exp.ParseJSON):
                     use.json_text.add(hit[1])  # parse_json(col):a.b  ->  col is text holding {"a": {"b": ...}}
                     col, parent = parent, parent.parent

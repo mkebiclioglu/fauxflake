@@ -50,6 +50,7 @@ _MISSING = [
 ]
 _CONVERT = [
     (re.compile(r"Could not convert string '(?P<value>[^']*)' to (?P<type>[A-Z0-9]+)"), None),
+    (re.compile(r'Could not convert string "(?P<value>[^"]*)" to (?P<type>[A-Z0-9]+)'), None),
     (re.compile(r'(?P<type>date|timestamp|time) field (?:format|value out of range): "(?P<value>[^"]*)"'), None),
     (re.compile(r"""Malformed JSON.*?Input: "?(?P<value>[^"\n]*)""", re.S), "VARIANT"),
     (re.compile(r'Expected (?P<type>ARRAY|OBJECT), but got VARCHAR: "(?P<value>[^"]*)"'), None),
@@ -342,6 +343,34 @@ class Fitter:
             out += [t for t in self.real_tables(tree, {c.alias.upper(): c.this for c in tree.find_all(exp.CTE)}) if t in self.tables]
         return [t for t in dict.fromkeys(out) if t in self.tables]
 
+    def columns_used(self, uid: str, how: str, fmt: str | None = None) -> list[str]:
+        """Columns the model's SQL uses in a way that says what they hold, for errors that name no column:
+        compared with the empty string, parsed with a date format, or read as an array."""
+        tree = self.tree(uid)
+        out: list[str] = []
+        if tree is None:
+            return out
+        if how == "empty":
+            for node in tree.find_all(exp.Nullif, exp.EQ, exp.NEQ):
+                a, b = node.this, node.expression
+                for col, other in ((a, b), (b, a)):
+                    if isinstance(col, exp.Column) and isinstance(other, exp.Literal) and other.is_string and other.name == "":
+                        out.append(col.name.upper())
+        elif how == "format":
+            for node in tree.find_all(exp.StrToTime, exp.StrToDate, exp.TsOrDsToDate, exp.TsOrDsToTimestamp):
+                arg = node.this
+                while isinstance(arg, (exp.Cast, exp.TryCast, exp.Paren, exp.Trim, exp.Nullif)):
+                    arg = arg.this
+                if isinstance(arg, exp.Column) and isinstance(node.args.get("format"), exp.Literal):
+                    out.append(arg.name.upper())
+        elif how == "array":
+            for node in tree.find_all(exp.Cast, exp.TryCast):
+                if node.to.is_type("array") and isinstance(node.this, exp.Column):
+                    out.append(node.this.name.upper())
+            for node in tree.find_all(exp.Explode, exp.Lateral, exp.Unnest):
+                out += [c.name.upper() for c in node.find_all(exp.Column) if c.name.upper() not in ("VALUE", "THIS", "INDEX", "KEY")]
+        return list(dict.fromkeys(out))
+
     def retype_column(self, uid: str, name: str, hint: str, fmt: str | None = None) -> bool:
         """The model converts column `name` to `hint`: make the sources it reads generate that."""
         changed = False
@@ -379,6 +408,14 @@ class Fitter:
                 if str(gen.get("type", "")).upper() == "BOOLEAN":
                     continue
                 fresh = {"gen": "categorical", "type": "BOOLEAN", "values": {True: 0.5, False: 0.5}}
+            elif hint == "TEXT":
+                if kind in ("sequence", "hash_id", "fk", "template", "pool", "categorical"):
+                    continue
+                fresh = {"gen": "template", "template": f"{name.lower()}_{{hex}}"}
+            elif hint == "ARRAY":
+                if kind == "array":
+                    continue
+                fresh = {"gen": "array"}
             elif hint in ("DATE", "TIMESTAMP"):
                 if kind in ("time_offset", "event_time", "updated_at") and not gen.get("format") and not gen.get("epoch"):
                     continue
@@ -643,6 +680,13 @@ class Fitter:
                     return False
                 if named and self.retype_column(sql_key, named.group(1).upper(), hint, fmt):
                     return True  # DuckDB named the column it was reading
+                if m.group("value") == "" and hint in ("BIGINT", "DOUBLE"):
+                    # `nullif(col, '')` on a column generated as a number: the SQL treats it as text
+                    return any([self.retype_column(sql_key, c, "TEXT") for c in self.columns_used(sql_key, "empty")])
+                if fmt and any([self.retype_column(sql_key, c, hint, fmt) for c in self.columns_used(sql_key, "format", fmt)]):
+                    return True
+                if hint == "ARRAY" and any([self.retype_column(sql_key, c, "ARRAY") for c in self.columns_used(sql_key, "array")]):
+                    return True
                 for token in m.group("value").split():  # generated text starts with its column's name
                     if "_" in token and self.retype_column(sql_key, token.rsplit("_", 1)[0].upper(), hint, fmt):
                         return True
