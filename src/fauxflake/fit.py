@@ -1004,6 +1004,25 @@ class Fitter:
         self.dirty |= changed
         return changed
 
+    def few_values(self, sql_key: str) -> bool:
+        """`dbt_utils.pivot('feature', get_column_values(...))` writes one column per value it finds.
+        On made-up text that is one column per row; the column really holds a handful of values."""
+        raw = self.nodes.get(sql_key, {}).get("raw_code") or ""
+        names = re.findall(r"get_column_values\([^,]+,\s*['\"](\w+)['\"]", raw) + re.findall(r"pivot\(\s*['\"](\w+)['\"]", raw)
+        changed = False
+        for column in dict.fromkeys(n.upper() for n in names):
+            for table, name in [(t, n) for t in self.sources_of(sql_key) for n in self.origins(sql_key, column)]:
+                gen = (self.tables[table].get("columns") or {}).get(name)
+                if gen is None or gen.get("gen") not in _FREE:
+                    continue
+                values = [f"{name.lower()}_{i}" for i in range(1, 7)]
+                self.tables[table]["columns"][name] = {"gen": "categorical", "values": {v: round(1 / len(values), 4) for v in values}}
+                self.retyped.add(table)
+                self.learned.append(f"{table}.{name}: pivoted into one column per value; generated with {len(values)} values.")
+                changed = True
+        self.dirty |= changed
+        return changed
+
     def runaway(self, sql_key: str, message: str) -> bool:
         """The model did not finish, or filled the disk: on generated data that is a join that pairs
         every row with every row. Tables joined on a range (`a.day between b.start and b.finish`) are
@@ -1011,9 +1030,10 @@ class Fitter:
         if not re.search(r"statement stopped after|stopped after \d+s|No space left on device|max_temp_directory_size|"
                          r"Out of Memory|could not allocate|exceeds the limit", message, re.I):
             return False
+        changed = self.few_values(sql_key)
         tree = self.tree(sql_key)
         if tree is None:
-            return False
+            return changed
         ctes = {c.alias.upper(): c.this for c in tree.find_all(exp.CTE)}
         targets: set[str] = set()
         for join in tree.find_all(exp.Join):
@@ -1026,7 +1046,6 @@ class Fitter:
                 source = self._source_behind(fq) or (fq if fq in self.tables else None)
                 owner = self.by_rel.get(fq) or self.relation_owner.get(fq) or ""
                 targets |= {source} if source else {t for t in self.sources_of(owner) if t in self.tables}
-        changed = False
         for table in sorted(targets):
             volume = self.tables[table].setdefault("volume", {})
             rows = float(volume.get("rows_per_day", 1000))
