@@ -102,7 +102,11 @@ class Spec:
 
     @classmethod
     def load(cls, path: str | Path) -> "Spec":
-        raw = yaml.safe_load(Path(path).read_text())
+        return cls.from_raw(yaml.safe_load(Path(path).read_text()), path)
+
+    @classmethod
+    def from_raw(cls, raw: dict, path: str | Path) -> "Spec":
+        """A spec from its parsed YAML; `path` is where relative paths in it start from."""
         tables = {}
         for name, t in (raw.get("tables") or {}).items():
             name = name.upper()

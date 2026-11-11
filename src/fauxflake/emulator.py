@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Iterator
 
 import duckdb
+from sqlglot import exp
 
 from . import objects, semantics
 
@@ -93,10 +94,58 @@ def _qualify_merge_insert(sql: str) -> str:
     return merge.sql(dialect="snowflake") if changed else sql
 
 
-# Statements acknowledged without being executed. The emulator keeps catalog
-# metadata in a separate DuckDB database, and DuckDB cannot write to two
-# databases in one transaction, so explicit transactions run as autocommit.
+# Statements acknowledged without being executed (transactions are handled in `_transaction` first).
 _LEAD = r"(?s)^(\s|--[^\n]*\n|/\*.*?\*/)*"
+_TXN_BEGIN = re.compile(r"(?is)^(?:\s|--[^\n]*\n|/\*.*?\*/)*(?:begin(?:\s+(?:work|transaction))?(?:\s+name\s+\S+)?|start\s+transaction(?:\s+name\s+\S+)?)\s*;?\s*$")
+_TXN_END = re.compile(r"(?is)^(?:\s|--[^\n]*\n|/\*.*?\*/)*(commit|rollback)(?:\s+work)?\s*;?\s*$")
+_TXN_KEEPS = re.compile(r"(?is)^(?:\s|--[^\n]*\n|/\*.*?\*/)*(insert|update|delete|merge|select|with|call|show|desc|describe|set|unset|use|copy|execute|explain|\()\b")
+_TWO_DATABASES = "a single transaction can only write to a single attached database"
+
+
+def _transaction(cursor, command: str, original):  # noqa: ANN001, ANN202
+    """BEGIN, COMMIT and ROLLBACK, as a DuckDB transaction on the session. As in Snowflake, a DDL
+    statement commits the transaction that is open. Returns the reply, or None for other statements."""
+    conn = cursor._conn
+    is_open = getattr(conn, "_fauxflake_txn", False)
+    trailing = objects._TRAILING_COMMENT.sub("", command)
+    if _TXN_BEGIN.match(trailing):
+        if not is_open:
+            cursor._duck_conn.execute("begin transaction")
+            conn._fauxflake_txn, conn._fauxflake_journal = True, []
+        return original(cursor, "select 'Statement executed successfully.' as \"status\"")
+    end = _TXN_END.match(trailing)
+    if end:
+        if is_open:
+            conn._fauxflake_txn = False
+            _drop_scratch(cursor)
+            try:
+                cursor._duck_conn.execute(end.group(1))
+            except Exception:  # noqa: BLE001 - DuckDB already ended it (a failed statement aborts its transaction)
+                if end.group(1).lower() == "commit":
+                    raise
+        return original(cursor, "select 'Statement executed successfully.' as \"status\"")
+    if is_open and not _TXN_KEEPS.match(trailing):
+        _end_transaction(cursor)  # DDL commits
+    return None
+
+
+def _drop_scratch(cursor) -> None:  # noqa: ANN001
+    scratch = getattr(cursor._conn, "_fauxflake_scratch", None)
+    if scratch:
+        cursor._conn._fauxflake_scratch = None
+        try:
+            cursor._duck_conn.execute(f"drop table if exists {scratch}")
+        except Exception:  # noqa: BLE001, S110 - the transaction is already gone, and the table with it
+            pass
+
+
+def _end_transaction(cursor) -> None:  # noqa: ANN001
+    cursor._conn._fauxflake_txn = False
+    _drop_scratch(cursor)
+    try:
+        cursor._duck_conn.execute("commit")
+    except Exception:  # noqa: BLE001, S110 - nothing open any more
+        pass
 NOPS = [
     _LEAD + r"(begin|commit|rollback|start\s+transaction)\b",
     # documentation, access control and warehouse settings have nothing to act on locally
@@ -206,6 +255,9 @@ def _patch_fakesnow() -> None:
             self._fauxflake_layer, self._fauxflake_inline, self._fauxflake_owners = False, set(), {}
             self._fauxflake_qualify = False
             command = objects.session_functions(self, command)
+            handled = _transaction(self, command, original)
+            if handled is not None:
+                return handled
             handled = objects.intercept(self, command, original)  # functions, procedures, streams, tasks, policies
             if handled is not None:
                 return handled
@@ -367,7 +419,78 @@ def _patch_fakesnow() -> None:
 
     original_execute = FakeSnowflakeCursor._execute
 
+    def _heal(self) -> None:  # noqa: ANN001
+        """In Snowflake a statement that fails leaves its transaction open. DuckDB aborts the whole
+        transaction, so start another and repeat what the transaction had done so far."""
+        conn = self._conn
+        if not getattr(conn, "_fauxflake_txn", False) or getattr(conn, "_fauxflake_healing", False):
+            return
+        try:
+            self._duck_conn.execute("select 1")
+            return
+        except Exception:  # noqa: BLE001, S110 - aborted
+            pass
+        conn._fauxflake_healing = True
+        try:
+            self._duck_conn.execute("rollback")
+            self._duck_conn.execute("begin transaction")
+            for tree, values in list(getattr(conn, "_fauxflake_journal", [])):
+                original_execute(self, tree.copy(), values)
+        finally:
+            conn._fauxflake_healing = False
+
     def _execute(self, transformed, params=None):  # noqa: ANN001
+        def run(tree) -> None:  # noqa: ANN001
+            conn = self._conn
+            if getattr(conn, "_fauxflake_txn", False) and conn.database and conn.schema:
+                # MERGE works through a temporary table, which DuckDB counts as a second database.
+                # Inside a transaction it is an ordinary table next to the target, dropped at the end.
+                scratch = [t for t in tree.find_all(exp.Table) if t.name.upper() == "MERGE_CANDIDATES" and not t.db]
+                if scratch:
+                    name = f"__FX_MERGE_{id(conn):X}"
+                    for t in scratch:
+                        t.set("this", exp.to_identifier(name, quoted=True))
+                        t.set("db", exp.to_identifier(conn.schema, quoted=True))
+                        t.set("catalog", exp.to_identifier(conn.database, quoted=True))
+                    if isinstance(tree, exp.Create):
+                        properties = tree.args.get("properties")
+                        if properties:
+                            properties.set("expressions", [p for p in properties.expressions if not isinstance(p, exp.TemporaryProperty)])
+                        conn._fauxflake_scratch = f'"{conn.database}"."{conn.schema}"."{name}"'
+                        # straight to DuckDB: fakesnow's bookkeeping for a new table lives in another database
+                        self._duck_conn.execute(tree.sql(dialect="duckdb"))
+                        if not getattr(conn, "_fauxflake_healing", False):
+                            conn.__dict__.setdefault("_fauxflake_journal", []).append((tree.copy(), params))
+                        return
+            journaled = getattr(self._conn, "_fauxflake_txn", False) and not isinstance(tree, (exp.Query, exp.Describe, exp.Show))
+            kept = tree.copy() if journaled else None
+            try:
+                original_execute(self, tree, params)
+            except Exception as e:
+                if kept is not None and _TWO_DATABASES in str(e) and not getattr(self._conn, "_fauxflake_healing", False):
+                    # DuckDB keeps a transaction to one database, and this statement needs a second
+                    # (MERGE works through a temporary table): what the transaction did so far is
+                    # committed here, and the rest of it runs in autocommit
+                    conn = self._conn
+                    if os.environ.get("FAUXFLAKE_TXN_DEBUG"):
+                        print("txn degraded by:", kept.sql(dialect="duckdb")[:300], "|", str(e)[:200], file=sys.stderr)
+                    conn._fauxflake_txn, conn._fauxflake_healing = False, True
+                    try:
+                        self._duck_conn.execute("rollback")
+                        for done, values in list(getattr(conn, "_fauxflake_journal", [])):
+                            original_execute(self, done.copy(), values)
+                    finally:
+                        conn._fauxflake_healing = False
+                    conn._fauxflake_journal = []
+                    original_execute(self, kept, params)
+                    _drop_scratch(self)
+                    return
+                _heal(self)
+                raise
+            conn = self._conn
+            if kept is not None and getattr(conn, "_fauxflake_txn", False) and not getattr(conn, "_fauxflake_healing", False):
+                conn.__dict__.setdefault("_fauxflake_journal", []).append((kept, params))
+
         def attempt() -> None:
             nonlocal transformed
             for adjust in (semantics.coerce_union_literals, semantics.resolve_equalities):
@@ -375,19 +498,21 @@ def _patch_fakesnow() -> None:
                     transformed = adjust(transformed, self._duck_conn)
                 except Exception:  # noqa: BLE001, S110 - an optional adjustment: the statement runs as written
                     pass
+            _heal(self)  # a probe that failed inside a transaction aborted it
             try:
-                original_execute(self, transformed, params)
+                run(transformed)
             except ProgrammingError as e:
                 as_times = semantics.numbers_as_times(transformed, str(e)) or semantics.offsets_as_written(transformed, str(e))
                 if as_times is not None:
-                    original_execute(self, as_times, params)
+                    run(as_times)
                     return
                 if "No function matches" not in str(e) and "Could not choose a best candidate" not in str(e):
                     raise
                 repaired = semantics.repair_types(transformed, self._duck_conn, params)
+                _heal(self)
                 if repaired is None:
                     raise
-                original_execute(self, repaired, params)
+                run(repaired)
 
         run_guarded(self, attempt)
         semantics.coerce_result(self)

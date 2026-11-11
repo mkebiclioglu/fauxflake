@@ -303,3 +303,26 @@ def test_tags_are_set_inherited_and_read_back(run):
         run("alter table t set tag cost_center = 'sales'")
     run("alter table t unset tag cost_center")
     assert run("select tag_name from table(information_schema.tag_references('t', 'table'))") == [("PII",)]
+
+
+def test_transactions_roll_back_and_survive_a_failed_statement(run):
+    run("create or replace table src (id int)")
+    run("insert into src values (2), (9)")
+    run("begin")
+    run("insert into t values (3, 'c', 30)")
+    with pytest.raises(Exception, match="NOPE"):
+        run("select nope from t")  # a failed statement leaves the transaction open, as in Snowflake
+    run("merge into t using src on t.id = src.id when matched then update set name = 'merged' "
+        "when not matched then insert (id, name, amt) values (src.id, 'new', 0)")
+    assert run("select id, name from t order by id") == [(1, "a"), (2, "merged"), (3, "c"), (9, "new")]
+    run("rollback")
+    assert run("select id, name from t order by id") == [(1, "a"), (2, "b")]
+    run("begin transaction")
+    run("delete from t where id = 1")
+    run("create or replace table other (x int)")  # DDL commits the open transaction
+    run("rollback")
+    assert run("select count(*) from t") == [(1,)]
+    run("start transaction")
+    run("insert into t values (5, 'e', 50)")
+    run("commit")
+    assert run("select count(*) from t") == [(2,)]

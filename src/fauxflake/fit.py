@@ -18,6 +18,7 @@ Nothing here hides a failure: what cannot be fixed by editing the spec is report
 
 from __future__ import annotations
 
+import copy
 import graphlib
 import json
 import os
@@ -53,7 +54,7 @@ _CONVERT = [
     (re.compile(r'Could not convert string "(?P<value>[^"]*)" to (?P<type>[A-Z0-9]+)'), None),
     (re.compile(r'(?P<type>date|timestamp|time) field (?:format|value out of range): "(?P<value>[^"]*)"'), None),
     (re.compile(r"""Malformed JSON.*?Input: "?(?P<value>[^"\n]*)""", re.S), "VARIANT"),
-    (re.compile(r'Expected (?P<type>ARRAY|OBJECT), but got VARCHAR: "(?P<value>[^"]*)"'), None),
+    (re.compile(r'Expected (?P<type>ARRAY|OBJECT), but got (?:VARCHAR|OBJECT|ARRAY): "?(?P<value>[^"\n]*)"?'), None),
     (re.compile(r'''Could not parse string "(?P<value>[^"]*)" according to format'''), "TIMESTAMP"),
     (re.compile(r"""Failed to cast value: Could not convert string '(?P<value>[^']*)' to (?P<type>[A-Z0-9]+)"""), None),
 ]
@@ -135,8 +136,11 @@ class Fitter:
         from .spec import Spec
 
         self.repair()
-        self.save()
-        spec = Spec.load(self.path)
+        if only is None:
+            self.save()
+            spec = Spec.load(self.path)
+        else:  # a few tables again, mid-pass: no need to write and read the whole file
+            spec = Spec.from_raw(copy.deepcopy(self.spec), self.path)
         if scale is None:
             # a few hundred rows per table: enough for filters to let some through, little enough to be quick
             smallest = min((float((t.raw.get("volume") or {}).get("rows_per_day", 1000)) for t in spec.tables.values()), default=1000.0)
@@ -765,9 +769,103 @@ class Fitter:
         self.dirty |= changed
         return changed
 
+    def origins(self, uid: str, name: str, depth: int = 0) -> list[str]:
+        """Source column names behind an output column: follows `x as name`, and the bare columns a
+        CASE or COALESCE falls back to, through the models upstream."""
+        out = [name]
+        if depth > 4:
+            return out
+        for node_id in [uid, *sorted(self._ancestors(uid))]:
+            tree = self.tree(node_id) if node_id == uid or node_id.startswith(("model.", "snapshot.")) else None
+            if tree is None:
+                continue
+            for alias in tree.find_all(exp.Alias):
+                if alias.alias.upper() != name:
+                    continue
+                inner = alias.this
+                found = [inner] if isinstance(inner, exp.Column) else []
+                if isinstance(inner, exp.Case):
+                    found += [e for e in [*(i.args.get("true") for i in inner.args.get("ifs") or []), inner.args.get("default")]
+                              if isinstance(e, exp.Column)]
+                elif isinstance(inner, (exp.Coalesce, exp.Cast, exp.TryCast)):
+                    found += [e for e in inner.iter_expressions() if isinstance(e, exp.Column)]
+                for col in found:
+                    if col.name.upper() != name:
+                        out += self.origins(node_id, col.name.upper(), depth + 1)
+        return list(dict.fromkeys(out))
+
+    def udf_input(self, sql_key: str, message: str) -> bool:
+        """A Python function of the project raised on generated text. What it failed to decode says
+        what the column holds: base64 of JSON, or JSON."""
+        if "Python exception occurred while executing the UDF" not in message:
+            return False
+        if re.search(r"Incorrect padding|base64|Invalid base64", message):
+            value = "e30="  # base64 of {}
+        elif re.search(r"Expecting value|JSONDecodeError|Extra data", message):
+            value = "{}"
+        else:
+            return False
+        from . import objects
+
+        state = self.emu._fs.results_cache.get(objects._KEY)
+        functions = set(state.functions) if state else set()
+        names: list[str] = []
+        for node_id in [sql_key, *sorted(self._ancestors(sql_key))]:
+            tree = self.tree(node_id) if node_id == sql_key or node_id.startswith(("model.", "snapshot.")) else None
+            for call in (tree.find_all(exp.Anonymous) if tree is not None else []):
+                if call.name.upper() in functions or call.name.lower() in functions:
+                    for arg in call.expressions:
+                        names += [n for c in arg.find_all(exp.Column) for n in self.origins(node_id, c.name.upper())]
+        changed = False
+        for name in dict.fromkeys(names):
+            for table in self.sources_of(sql_key):
+                gen = (self.tables[table].get("columns") or {}).get(name)
+                if gen is None or gen.get("gen") not in _FREE:
+                    continue
+                self.tables[table]["columns"][name] = {"gen": "constant", "value": value}
+                self.retyped.add(table)
+                self.learned.append(f"{table}.{name}: a Python function decodes it; holds {value!r} instead of made-up text.")
+                changed = True
+        self.dirty |= changed
+        return changed
+
+    def pivot_values(self, sql_key: str, message: str) -> bool:
+        """`dbt_utils.pivot('role', get_column_values(...), prefix='count_', suffix='_daily')` makes one
+        column per value found, and the model then names some of them (count_admin_daily): those
+        are values the column must hold."""
+        m = next((m for m in (p.search(message) for p in _MISSING) if m), None)
+        raw = self.nodes.get(sql_key, {}).get("raw_code") or ""
+        if not m or "pivot(" not in raw:
+            return False
+        compiled = self.sql_of.get(sql_key) or ""
+        changed = False
+        for call in re.finditer(r"pivot\(\s*['\"](\w+)['\"](.*?)\)\s*\}\}", raw, re.S):
+            column, rest = call.group(1).upper(), call.group(2)
+            prefix = re.search(r"prefix\s*=\s*['\"]([^'\"]*)['\"]", rest)
+            suffix = re.search(r"suffix\s*=\s*['\"]([^'\"]*)['\"]", rest)
+            prefix, suffix = (prefix.group(1) if prefix else ""), (suffix.group(1) if suffix else "")
+            if not prefix and not suffix:
+                continue
+            named = re.findall(r"(?i)\.\s*" + re.escape(prefix) + r"(\w+?)" + re.escape(suffix) + r"\b", compiled)
+            values = [v.lower() for v in dict.fromkeys(named) if not re.search(r"_[0-9a-f]{12}$", v)]
+            if not values:
+                continue
+            for table in self.sources_of(sql_key):
+                columns = self.tables[table].get("columns") or {}
+                gen = columns.get(column)
+                if gen is None or (gen.get("gen") == "categorical" and set(values) <= {str(v) for v in gen.get("values") or {}}):
+                    continue
+                columns[column] = {"gen": "categorical", "values": {v: round(1 / len(values), 4) for v in values}}
+                self.retyped.add(table)
+                self.learned.append(f"{table}.{column}: pivoted into columns the model names; holds {', '.join(values)}.")
+                changed = True
+        self.dirty |= changed
+        return changed
+
     def learn(self, sql_key: str, message: str) -> bool:
         """Apply whatever one error message teaches. True when the spec changed."""
-        if self.missing_column(sql_key, message) or self.missing_relation(sql_key, message) or self.union_widths(sql_key, message):
+        if self.udf_input(sql_key, message) or self.pivot_values(sql_key, message) or self.missing_column(sql_key, message) or self.missing_relation(sql_key, message) \
+                or self.union_widths(sql_key, message):
             return True
         named = _FROM_COLUMN.search(message)
         bad = _BAD_CAST.search(message)
@@ -827,7 +925,7 @@ class Fitter:
                 continue
             for arg in ([node.expression] if isinstance(node, exp.Extract) else list(node.iter_expressions())):
                 if isinstance(arg, exp.Column):
-                    names.add(arg.name.upper())
+                    names.update(self.origins(sql_key, arg.name.upper()))
         changed = False
         for name in names:
             for table, t in self.tables.items():
