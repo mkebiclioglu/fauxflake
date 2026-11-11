@@ -778,10 +778,17 @@ class Fitter:
         if uid and uid not in self.sql_of and (self.nodes.get(uid) or {}).get("compiled_code"):
             self.sql_of[uid] = self.nodes[uid]["compiled_code"].strip().rstrip(";")
         t = self.tree(uid) if uid else None
-        if t is None or not t.find(exp.Star):
+        if t is None:
             return None
         ctes = {c.alias.upper(): c.this for c in t.find_all(exp.CTE)}
         tables = self.real_tables(t, ctes)
+        if not t.find(exp.Star):
+            # a macro wrote out the columns it found (`select "A", "B" from source`): still everything of that table
+            top = t.unnest()
+            listed = isinstance(top, exp.Select) and top.expressions and all(
+                isinstance(e, exp.Column) or (isinstance(e, exp.Alias) and isinstance(e.this, exp.Column) and e.alias.upper() == e.this.name.upper())
+                for e in top.expressions) and not top.args.get("joins") and not top.args.get("group")
+            return next(iter(tables)) if listed and len(tables) == 1 else None
         if len(tables) == 1:
             return next(iter(tables))
         # `select s.*, p.sku from a s join b p ...`: the columns nobody lists are those of `s`
@@ -928,6 +935,16 @@ class Fitter:
             direct = {f"{tb.catalog.upper()}.{tb.db.upper()}.{tb.name.upper()}" for tb in t.find_all(exp.Table) if tb.catalog and tb.db}
             if len(candidates & direct) == 1:
                 candidates &= direct
+        if len(candidates) > 1 and not alias:
+            # read bare in a SELECT with one table and no join: that table's, whatever else the model reads
+            certain: set[str] = set()
+            for c in t.find_all(exp.Column):
+                select = c.find_ancestor(exp.Select)
+                if c.table or c.name.upper() != col or select is None or select.args.get("from_") is None or select.args.get("joins"):
+                    continue
+                certain |= self.real_tables(select.args["from_"], ctes) & candidates
+            if certain:
+                return any([self.blame(c, col) for c in sorted(certain)])
         if len(candidates) > 1 and not alias:
             # the model names the column with a table elsewhere (`opp.end_date`): that table owns it
             owners: set[str] = set()
