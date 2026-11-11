@@ -36,7 +36,7 @@ them, and every other test is enforced.
 | --- | --- |
 | 309 queries whose answers were recorded on real Snowflake | 309 match |
 | 14 third-party packages (973 models) built here and on Snowflake, compared row for row | 944 identical, 22 differ only because they read the clock, 7 differ in an order Snowflake leaves undefined or hold `RANDOM()` values |
-| dbt-utils, dbt-expectations, dbt-date, dbt_artifacts and Snowplow run against their own test suites | all 849 models and tests pass |
+| dbt-utils, dbt-expectations, dbt-date, dbt_artifacts, Snowplow and The Tuva Project run against their own test suites | all 2,098 models and tests pass |
 
 **It is fast.** Fifteen builds of the example project over two simulated weeks take under 20
 seconds. Generating 281 million rows takes 102 seconds on an 8 GB laptop.
@@ -243,7 +243,8 @@ for row (`scripts/selftest.py <project> --snowflake <connection>`):
 | Mixpanel | 7 | 7 | | |
 
 **3. Packages that test themselves.** dbt-utils (237), dbt-expectations (169), dbt-date (73),
-dbt_artifacts (136) and Snowplow (234) pass in full here.
+dbt_artifacts (136), Snowplow (234) and The Tuva Project's integration project (1,249: its seeds
+load from S3 with `COPY INTO`) pass in full here.
 
 **4. Public projects from a zero-config `init`.** The table at the top. These projects were
 chosen because they are large and were written for Snowflake alone: hooks that create
