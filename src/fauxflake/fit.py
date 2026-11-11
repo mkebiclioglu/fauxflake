@@ -808,12 +808,12 @@ class Fitter:
             if len(candidates & direct) == 1:
                 candidates &= direct
         if len(candidates) > 1 and not alias:
-            # an unqualified column in a SELECT that joins: it belongs to the table in FROM, not to a joined one
+            # an unqualified column belongs to the table in its SELECT's FROM
             mains: set[str] = set()
             for c in t.find_all(exp.Column):
                 select = c.find_ancestor(exp.Select)
                 source = select.args.get("from_") if select is not None and not c.table and c.name.upper() == col else None
-                if source is not None and select.args.get("joins"):
+                if source is not None:  # not a table joined to it, nor one a subquery in its WHERE reads
                     mains |= self.real_tables(source, ctes)
             if len(candidates & mains) == 1:
                 candidates &= mains
