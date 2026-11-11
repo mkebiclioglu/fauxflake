@@ -637,6 +637,8 @@ def analyse(manifest: dict, database: str) -> Analysis:
         if child in tables and parent in tables and tables[parent]["columns"].get(pcol, {}).get("gen") not in ("sequence", "hash_id"):
             notes.append(f"{child}.{col}: references {parent}.{pcol}, which is not that table's key; generated as a plain column.")
             tables[child]["columns"][col] = guess(col, None)
+    # INFORMATION_SCHEMA is the warehouse describing itself: the emulator answers it, nothing to generate
+    tables = {name: t for name, t in tables.items() if name.split(".")[1] != "INFORMATION_SCHEMA"}
     if len(tables) > 200:
         # hundreds of sources: a smaller placeholder keeps a build to minutes and a few gigabytes
         rows = 20_000 if len(tables) <= 600 else 10_000

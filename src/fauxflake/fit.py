@@ -188,7 +188,7 @@ class Fitter:
             if tb.name.upper() != name or (not tb.db and name in ctes):
                 continue
             fq = ".".join([(tb.catalog or node["database"]).upper(), (tb.db or node["schema"]).upper(), name])
-            if fq in self.tables or fq in self.existing:
+            if fq in self.tables or fq in self.existing or fq.split(".")[1] == "INFORMATION_SCHEMA":
                 continue
             owner = self.relation_owner.get(fq)
             if owner and owner in self._ancestors(sql_key):
