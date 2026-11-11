@@ -4414,6 +4414,28 @@
    ]
   ]
  },
+ "window_over_lateral_alias_layered": {
+  "rows": [
+   [
+    "1",
+    "x-y",
+    "",
+    "1"
+   ],
+   [
+    "1",
+    "x-z",
+    "x-y",
+    "2"
+   ],
+   [
+    "1",
+    "x-z",
+    "x-z",
+    "2"
+   ]
+  ]
+ },
  "window_range_frame": {
   "rows": [
    [

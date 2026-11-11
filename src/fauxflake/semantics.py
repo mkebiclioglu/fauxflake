@@ -958,7 +958,28 @@ def layer_windows(tree: exp.Expression) -> exp.Expression:
             if not nested:
                 continue
             hidden = {name: f"_la_{i}_{name}" for i, name in enumerate(sorted(nested))}
-            inner = exp.select("*", *[exp.alias_(windowed[n].this.copy(), hidden[n]) for n in sorted(nested)])
+            # the windows move one level down, where the other aliases of this SELECT do not exist:
+            # write those out (`a || b as k, lag(k) over (...) as prev, count_if(k != prev) over (...)`)
+            plain = {p.alias.lower(): p.this for p in select.expressions if isinstance(p, exp.Alias) and not p.find(exp.Window)
+                     and not (isinstance(p.this, exp.Column) and p.this.name.lower() == p.alias.lower())}
+
+            def moved(expression: exp.Expression) -> exp.Expression:
+                out = expression.copy()
+                for _ in range(4):
+                    again = False
+                    for col in list(out.find_all(exp.Column)):
+                        if not col.table and col.name.lower() in plain:
+                            replacement = exp.paren(plain[col.name.lower()].copy())
+                            if col is out:
+                                out = replacement
+                            else:
+                                col.replace(replacement)
+                            again = True
+                    if not again:
+                        break
+                return out
+
+            inner = exp.select("*", *[exp.alias_(moved(windowed[n].this), hidden[n]) for n in sorted(nested)])
             inner.set("from_", source.copy())
             if select.args.get("where"):
                 inner.set("where", select.args.pop("where"))

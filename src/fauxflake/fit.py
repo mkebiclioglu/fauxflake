@@ -59,7 +59,7 @@ _CONVERT = [
     (re.compile(r"""Failed to cast value: Could not convert string '(?P<value>[^']*)' to (?P<type>[A-Z0-9]+)"""), None),
 ]
 _NO_TABLE = re.compile(r'Table with name "?(?:[\w$]+\.)*(?P<name>[\w$]+)"? does not exist')
-_FROM_COLUMN = re.compile(r"when casting from source column \"?([\w$]+)\"?")
+_FROM_COLUMN = re.compile(r"when casting from source column \"?([\w$][\w$ ()/.#%&-]*?)\"?\s*(?:$|\n)")
 _BAD_CAST = re.compile(r"Unimplemented type for cast \((?P<from>[\w ]+?) -> (?P<to>[\w(), ]+?)\)")
 _NO_FUNCTION = re.compile(r"No function matches the given name and argument types '(?P<name>\w+)\((?P<types>[^']*)\)'")
 _TEMPORAL = {"epoch", "epoch_ms", "date_part", "datepart", "extract", "year", "month", "day", "hour", "minute", "second",
@@ -76,6 +76,18 @@ _FREE = ("template", "pool")  # generators that only make up text: safe to retyp
 _INSPECTS = re.compile(r"get_columns_in_relation|get_filtered_columns_in_relation|get_relations_by|list_relations|"
                        r"information_schema|get_column_values")
 _HARMLESS = {"macro.dbt.is_incremental", "macro.dbt.should_full_refresh"}
+
+
+def _same_format(written: str, failed: str) -> bool:
+    """Is the format a node carries (strftime, or still Snowflake's) the one DuckDB reported?"""
+    if written == failed:
+        return True
+    try:
+        from sqlglot.dialects.snowflake import Snowflake
+
+        return sqlglot.time.format_time(written, Snowflake.TIME_MAPPING, Snowflake.TIME_TRIE) == failed
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def duck_type(gen: dict) -> str:
@@ -367,7 +379,8 @@ class Fitter:
             for node in tree.find_all(exp.DPipe, exp.Concat):
                 if isinstance(node.parent, (exp.DPipe, exp.Concat)):
                     continue
-                parts = [c for c in node.find_all(exp.Column)]
+                text = node.sql()
+                parts = sorted(node.find_all(exp.Column), key=lambda c: text.find(c.sql()))  # left to right
                 if len(parts) >= 2 and node.find_ancestor(exp.Cast, exp.TryCast, exp.StrToTime, exp.TsOrDsToTimestamp, exp.Anonymous):
                     out.append(parts[-1].name.upper())
         elif how == "empty":
@@ -388,7 +401,8 @@ class Fitter:
                 arg = node.this
                 while isinstance(arg, (exp.Cast, exp.TryCast, exp.Paren, exp.Trim, exp.Nullif, exp.SplitPart)):
                     arg = arg.this
-                if isinstance(arg, exp.Column) and isinstance(node.args.get("format"), exp.Literal):
+                written = node.args.get("format")
+                if isinstance(arg, exp.Column) and isinstance(written, exp.Literal) and (fmt is None or _same_format(written.name, fmt)):
                     out.append(arg.name.upper())
         elif how == "array":
             for node in tree.find_all(exp.Cast, exp.TryCast):
@@ -400,6 +414,27 @@ class Fitter:
                 if node.sql_name().upper().startswith("ARRAY") or (isinstance(node, exp.Anonymous) and node.name.upper().startswith("ARRAY")):
                     out += [a.name.upper() for a in node.iter_expressions() if isinstance(a, exp.Column)]
         return list(dict.fromkeys(out))
+
+    def bound(self, uid: str, kind: str, top: int) -> bool:
+        """Columns the model casts to `kind` hold numbers up to `top`."""
+        tree = self.tree(uid)
+        target = exp.DataType.build(kind, dialect="snowflake")
+        names = [c.name.upper() for cast in (tree.find_all(exp.Cast, exp.TryCast) if tree is not None else [])
+                 if cast.to == target for c in cast.this.find_all(exp.Column)]
+        changed = False
+        for name in dict.fromkeys(n for c in names for n in [c, *self.origins(uid, c)]):
+            for table in self.sources_of(uid):
+                gen = (self.tables[table].get("columns") or {}).get(name)
+                if not gen or gen.get("gen") != "dist" or max(gen.get("v") or [0]) <= top:
+                    continue
+                points = len(gen.get("p") or [0, 1])
+                gen["v"] = [round(top * i / max(points - 1, 1), 4) for i in range(points)]
+                gen.setdefault("p", [0, 1])
+                self.retyped.add(table)
+                self.learned.append(f"{table}.{name}: cast to {kind}, bounded at {top}.")
+                changed = True
+        self.dirty |= changed
+        return changed
 
     def array_values(self, uid: str) -> None:
         """`array_except(skus, ['a', 'b'])`: the array column holds elements of that list."""
@@ -438,9 +473,7 @@ class Fitter:
         """The model converts column `name` to `hint`: make the sources it reads generate that."""
         changed = False
         tables = self.sources_of(uid)
-        names = [name]
-        if not any(name in (self.tables[t].get("columns") or {}) for t in tables):
-            names = self.origins(uid, name)  # an output column: the source columns it is made from
+        names = list(dict.fromkeys([name, *self.origins(uid, name)]))  # and the source columns an output column is made from
         for table, name in [(t, n) for t in tables for n in names]:
             columns = self.tables[table].get("columns") or {}
             gen = columns.get(name)
@@ -449,7 +482,8 @@ class Fitter:
             kind = gen.get("gen")
             numeric = hint in ("BIGINT", "DOUBLE")
             fresh = None
-            as_text = str(gen.get("type", "")).upper() in ("VARCHAR", "TEXT", "STRING") and kind not in _FREE
+            as_text = str(gen.get("type", "")).upper() in ("VARCHAR", "TEXT", "STRING") and kind in (
+                "sequence", "dist", "fk", "time_offset", "event_time", "updated_at", "categorical")
             if as_text and hint != "TEXT" and not fmt:
                 continue  # already holds numbers, dates or booleans as text: a cast reads them
             if kind in ("lifecycle", "loaded_at"):
@@ -481,7 +515,7 @@ class Fitter:
             elif hint == "TEXT":
                 # the SQL treats it as text (compares it with '', or with a word) and may still cast it:
                 # keep what it generates and hold it as text
-                if kind in ("hash_id", "fk", "template", "pool", "object", "array") or str(gen.get("type", "")).upper() in ("VARCHAR", "TEXT", "STRING"):
+                if kind in ("hash_id", "template", "pool", "object", "array") or str(gen.get("type", "")).upper() in ("VARCHAR", "TEXT", "STRING"):
                     continue
                 if kind == "categorical" and str(gen.get("type", "")).upper() != "BOOLEAN":
                     continue
@@ -509,6 +543,23 @@ class Fitter:
             self.retyped.add(table)
             self.learned.append(f"{table}.{name}: used as {fresh.get('format') or hint}, retyped.")
             changed = True
+        # relations that start out empty (read before they are built, or stand-ins): the declared type
+        wanted = {"TEXT": "VARCHAR", "BIGINT": "BIGINT", "DOUBLE": "DOUBLE", "BOOLEAN": "BOOLEAN", "DATE": "DATE",
+                  "TIMESTAMP": "TIMESTAMP", "ARRAY": "JSON", "VARIANT": "JSON"}.get(hint)
+        tree = self.tree(uid)
+        if wanted and tree is not None and not changed:
+            for fq in self.real_tables(tree, {c.alias.upper(): c.this for c in tree.find_all(exp.CTE)}):
+                for name in names:
+                    if fq in self.existing and (self.existing[fq].get("columns") or {}).get(name) not in (None, wanted):
+                        self.existing[fq]["columns"][name] = wanted
+                        self.create_existing(fq)
+                    elif fq in self.pending and self.pending[fq].get(name) not in (None, wanted):
+                        self.pending[fq][name] = wanted
+                        self.create_pending(fq)
+                    else:
+                        continue
+                    self.learned.append(f"{fq}.{name}: used as {hint}, declared {wanted}.")
+                    changed = True
         self.dirty |= changed
         return changed
 
@@ -663,12 +714,19 @@ class Fitter:
         if fq in self.tables:
             return self.add_column(fq, col)
         if self._union_members(fq):  # a model that unions tables by a column list: the tables need the column
-            added = [t for t in self.unions[fq] if col not in self.tables[t].setdefault("columns", {})]
-            for table in added:
-                self.tables[table]["columns"][col] = guess(col, None)
-                self.retyped.add(table)
+            # and the other columns its children read, in one go: each round of a build shows only one
+            owner = self.by_rel.get(fq) or self.relation_owner.get(fq)
+            wanted = [col, *[c for c in (self.columns_children_read(owner) if owner in self.nodes else []) if c != col]]
+            added = 0
+            for name in wanted:
+                for table in self.unions[fq]:
+                    if name not in self.tables[table].setdefault("columns", {}):
+                        self.tables[table]["columns"][name] = guess(name, None)
+                        self.retyped.add(table)
+                        added += 1
             if added:
-                self.learned.append(f"{fq}: {col} is read from it, added to the {len(added)} tables it unions.")
+                self.learned.append(f"{fq}: {', '.join(wanted[:6])}{' ...' if len(wanted) > 6 else ''} read from it, "
+                                    f"added to the {len(self.unions[fq])} tables it unions.")
                 self.dirty = True
             return bool(added)
         if fq in self.pending:
@@ -727,6 +785,16 @@ class Fitter:
             direct = {f"{tb.catalog.upper()}.{tb.db.upper()}.{tb.name.upper()}" for tb in t.find_all(exp.Table) if tb.catalog and tb.db}
             if len(candidates & direct) == 1:
                 candidates &= direct
+        if len(candidates) > 1 and not alias:
+            # an unqualified column in a SELECT that joins: it belongs to the table in FROM, not to a joined one
+            mains: set[str] = set()
+            for c in t.find_all(exp.Column):
+                select = c.find_ancestor(exp.Select)
+                source = select.args.get("from_") if select is not None and not c.table and c.name.upper() == col else None
+                if source is not None and select.args.get("joins"):
+                    mains |= self.real_tables(source, ctes)
+            if len(candidates & mains) == 1:
+                candidates &= mains
         if len(candidates) > 1 and self._unioned(t, ctes, candidates):
             # `select * from a union all select * from b`: the branches line up, so every one of them has it
             return any([self.blame(c, col) for c in sorted(candidates)])
@@ -893,14 +961,14 @@ class Fitter:
             values = [v.lower() for v in dict.fromkeys(named) if not re.search(r"_[0-9a-f]{12}$", v)]
             if not values:
                 continue
-            for table in self.sources_of(sql_key):
+            for table, name in [(t, n) for t in self.sources_of(sql_key) for n in self.origins(sql_key, column)]:
                 columns = self.tables[table].get("columns") or {}
-                gen = columns.get(column)
+                gen = columns.get(name)
                 if gen is None or (gen.get("gen") == "categorical" and set(values) <= {str(v) for v in gen.get("values") or {}}):
                     continue
-                columns[column] = {"gen": "categorical", "values": {v: round(1 / len(values), 4) for v in values}}
+                columns[name] = {"gen": "categorical", "values": {v: round(1 / len(values), 4) for v in values}}
                 self.retyped.add(table)
-                self.learned.append(f"{table}.{column}: pivoted into columns the model names; holds {', '.join(values)}.")
+                self.learned.append(f"{table}.{name}: pivoted into columns the model names; holds {', '.join(values)}.")
                 changed = True
         self.dirty |= changed
         return changed
@@ -925,6 +993,16 @@ class Fitter:
                     return False
                 if named and self.retype_column(sql_key, named.group(1).upper(), hint, fmt):
                     return True  # DuckDB named the column it was reading
+                precision = re.search(r"to DECIMAL\((\d+),\s*(\d+)\)", message)
+                if precision and re.fullmatch(r"-?[\d.]+", m.group("value")):
+                    # a number that does not fit NUMBER(p, s): the column holds smaller ones
+                    top = 10 ** (int(precision.group(1)) - int(precision.group(2))) - 1
+                    return self.bound(sql_key, f"DECIMAL({precision.group(1)}, {precision.group(2)})", top)
+                if hint in ("DATE", "TIMESTAMP") and named and re.fullmatch(r".{6,}01", m.group("value")) and \
+                        not re.fullmatch(r"\d{4}-\d\d-\d\d", m.group("value")):
+                    # period || '01' read as a date: the column holds a year and a month
+                    if self.retype_column(sql_key, named.group(1).upper(), "DATE", "%Y%m"):
+                        return True
                 if hint == "TIMESTAMP" and re.fullmatch(r"\d{4}-\d\d-\d\d \d{4}-\d\d-\d\d[ T][\d:.]+", m.group("value")):
                     return any([self.retype_column(sql_key, c, "TIMESTAMP", "%H:%M:%S") for c in self.columns_used(sql_key, "time_of_day")])
                 if m.group("value") == "" and hint in ("BIGINT", "DOUBLE", "DATE", "TIMESTAMP", "BOOLEAN"):
@@ -948,6 +1026,13 @@ class Fitter:
                     if "_" in token and self.retype_column(sql_key, token.rsplit("_", 1)[0].upper(), hint, fmt):
                         return True
                 return self.retype(m.group("value"), hint, fmt)
+        if "Failed to cast value to numerical" in message:
+            # coalesce(payload['minutes'], minutes)::float where `minutes` was generated as an object
+            tree = self.tree(sql_key)
+            names = [c.name.upper() for cast in (tree.find_all(exp.Cast, exp.TryCast) if tree is not None else [])
+                     if cast.to.is_type("float", "double", "decimal", "int", "bigint") for c in cast.this.find_all(exp.Column)
+                     if not isinstance(c.parent, (exp.Bracket, exp.JSONExtract, exp.Dot))]
+            return any([self.retype_column(sql_key, c, "DOUBLE") for c in dict.fromkeys(names)])
         m = _NOT_STRUCT.search(message)
         if m:
             return self.make_variant(m.group("col"), m.group("field"))
@@ -1073,7 +1158,12 @@ class Fitter:
         supply (a column, a relation), supply it and bind again. Returns the error that remains, if any."""
         db, schema, _ = fq.split(".")
         target = f'{db}.{schema}."__FX_BOOT"' if fq in self.existing else fq
-        statement = f"create or replace table {target} as (\n{self.sql_of[uid]}\n)"
+        body = self.sql_of[uid]
+        if self.nodes.get(uid, {}).get("resource_type") == "snapshot":
+            # what `dbt snapshot` adds to the query's columns, so the models that read the snapshot bind
+            body = ("select _s.*, 'x' as dbt_scd_id, current_timestamp::timestamp_ntz as dbt_updated_at, "
+                    f"current_timestamp::timestamp_ntz as dbt_valid_from, null::timestamp_ntz as dbt_valid_to from (\n{body}\n) as _s")
+        statement = f"create or replace table {target} as (\n{body}\n)"
         fast: list[str] | None = None  # the statement as DuckDB SQL, to retry without transpiling again
         fallbacks = 0
         seen: set[str] = set()

@@ -321,3 +321,4 @@
 - {id: number_cast_to_timestamp, sql: "select x::number::timestamp, x::number::timestamp::date, y::number::timestamp_ntz from (select 1735689600 as x, '1735689600' as y)"}
 - {id: number_column_cast_to_timestamp, sql: "select up::timestamp, up::timestamp::date, ok::timestamp from (select 1735689600 as up, '2025-01-01 00:00:00'::timestamp as ok)"}
 - {id: to_timestamp_ntz_of_int_cast, sql: "select TO_TIMESTAMP_NTZ(CAST(u AS INT))::TIMESTAMP, TO_TIMESTAMP_NTZ(CAST(t AS INT))::TIMESTAMP, to_timestamp(u), to_timestamp_ntz(t::int)::date from (select 1735689600 as u, '1735689600' as t)"}
+- {id: window_over_lateral_alias_layered, sql: "select id, a || '-' || b as k, lag(k, 1, '') over (partition by id order by ts) as prev, conditional_true_event(k != prev) over (partition by id order by ts) as grp from (select 1 as id, 'x' as a, 'y' as b, 1 as ts union all select 1, 'x', 'z', 2 union all select 1, 'x', 'z', 3) order by ts"}
