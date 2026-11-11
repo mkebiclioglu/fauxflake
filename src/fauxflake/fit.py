@@ -417,10 +417,19 @@ class Fitter:
             for node in tree.find_all(exp.DPipe, exp.Concat):
                 if isinstance(node.parent, (exp.DPipe, exp.Concat)):
                     continue
-                text = node.sql()
-                parts = sorted(node.find_all(exp.Column), key=lambda c: text.find(c.sql()))  # left to right
-                if len(parts) >= 2 and node.find_ancestor(exp.Cast, exp.TryCast, exp.StrToTime, exp.TsOrDsToTimestamp, exp.Anonymous):
-                    out.append(parts[-1].name.upper())
+                # only `date || ' ' || time` handed straight to a timestamp cast or TO_TIMESTAMP: a surrogate
+                # key is also a concatenation inside a cast
+                reader = node.parent
+                while isinstance(reader, exp.Paren):
+                    reader = reader.parent
+                timed = (isinstance(reader, (exp.Cast, exp.TryCast)) and reader.to.is_type("timestamp", "timestampntz", "timestampltz", "timestamptz", "datetime")) \
+                    or isinstance(reader, (exp.StrToTime, exp.TsOrDsToTimestamp)) \
+                    or (isinstance(reader, exp.Anonymous) and "to_timestamp" in reader.name.lower())
+                operands = [o for o in node.flatten()] if isinstance(node, exp.DPipe) else list(node.expressions)
+                columns = [o for o in operands if isinstance(o, exp.Column)]
+                spaced = any(isinstance(o, exp.Literal) and o.is_string and o.name in (" ", "T") for o in operands)
+                if timed and spaced and len(columns) == 2 and len(operands) == 3:
+                    out.append(columns[-1].name.upper())
         elif how == "empty":
             for node in tree.find_all(exp.Nullif, exp.EQ, exp.NEQ):
                 a, b = node.this, node.expression
@@ -1680,14 +1689,17 @@ class Fitter:
             results_path.unlink(missing_ok=True)  # what is there is from the compile step
             if n_round > 1:
                 # incremental models and snapshots keep the rows of the round before, made from values the
-                # spec has since corrected: every round starts them again, as the first build of a project does
-                for node in self.nodes.values():
-                    if node.get("resource_type") == "snapshot" and node.get("relation_name"):
+                # spec has since corrected. Those this round builds start again, as on a project's first
+                # build (not with --full-refresh: some projects forbid it for a model)
+                chosen = self._selected(selected)
+                for uid, node in self.nodes.items():
+                    kind = node.get("resource_type"), (node.get("config") or {}).get("materialized")
+                    if (kind[0] == "snapshot" or kind[1] == "incremental") and node.get("relation_name") and (chosen is None or uid in chosen):
                         try:
                             self.emu.duck.execute(f"drop table if exists {quoted(_fq(node['relation_name']))}")
                         except Exception:  # noqa: BLE001, S110
                             pass
-            project.invoke(["build", *(["--full-refresh"] if n_round > 1 else []), *selected], silent=True)
+            project.invoke(["build", *selected], silent=True)
             if not results_path.exists():
                 self.log(f"  dbt build did not run: {project.last_error[:600] or 'no results were written'}")
                 return {"error": project.last_error or "dbt build wrote no results"}
@@ -1794,6 +1806,25 @@ class Fitter:
             self.spec["dbt"].pop("expected_failures", None)
         self.save()
         return summary
+
+    def _selected(self, selected: list[str]) -> set[str] | None:
+        """The nodes `--select name+ source:x.y+ ...` covers; None when everything is built."""
+        if not selected:
+            return None
+        children: dict[str, list[str]] = {}
+        for uid, node in self.nodes.items():
+            for parent in node.get("depends_on", {}).get("nodes", []):
+                children.setdefault(parent, []).append(uid)
+        by_name = {node["name"]: uid for uid, node in self.nodes.items() if node.get("resource_type") in ("model", "snapshot", "seed")}
+        sources = {f"source:{uid.split('.', 2)[2]}": uid for uid in self.source_names}
+        pile = [by_name.get(s.rstrip("+")) or sources.get(s.rstrip("+")) for s in selected if not s.startswith("--")]
+        chosen: set[str] = set()
+        while pile:
+            uid = pile.pop()
+            if uid and uid not in chosen:
+                chosen.add(uid)
+                pile += children.get(uid, [])
+        return chosen
 
     def _compiled(self, project, node: dict) -> str | None:  # noqa: ANN001
         if node.get("compiled_code"):
