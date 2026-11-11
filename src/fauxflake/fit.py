@@ -1151,6 +1151,7 @@ class Fitter:
         self.save()
         if os.environ.get("FAUXFLAKE_FIT_DEBUG"):  # why each model did not run, for working on the emulator
             Path(os.environ["FAUXFLAKE_FIT_DEBUG"]).write_text(json.dumps(failures, indent=1))
+            Path(os.environ["FAUXFLAKE_FIT_DEBUG"] + ".learned.txt").write_text("\n".join(self.learned))
         return failures
 
     def drop_models(self, manifest: dict) -> None:

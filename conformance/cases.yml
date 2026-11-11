@@ -320,3 +320,4 @@
 - {id: to_timestamp_of_a_timestamp, sql: "select to_timestamp(convert_timezone('UTC', 'America/New_York', ts))::timestamp, to_timestamp(ts), to_timestamp(d), to_timestamp(ts)::date from (select '2025-01-02 03:04:05'::timestamp_ntz ts, '2025-01-02'::date d)"}
 - {id: number_cast_to_timestamp, sql: "select x::number::timestamp, x::number::timestamp::date, y::number::timestamp_ntz from (select 1735689600 as x, '1735689600' as y)"}
 - {id: number_column_cast_to_timestamp, sql: "select up::timestamp, up::timestamp::date, ok::timestamp from (select 1735689600 as up, '2025-01-01 00:00:00'::timestamp as ok)"}
+- {id: to_timestamp_ntz_of_int_cast, sql: "select TO_TIMESTAMP_NTZ(CAST(u AS INT))::TIMESTAMP, TO_TIMESTAMP_NTZ(CAST(t AS INT))::TIMESTAMP, to_timestamp(u), to_timestamp_ntz(t::int)::date from (select 1735689600 as u, '1735689600' as t)"}

@@ -523,8 +523,8 @@ def _fix(node: exp.Expression) -> exp.Expression:
         if to.is_type("timestamp", "timestampntz", "timestampltz", "timestamptz") and to.expressions \
                 and to.expressions[0].name == "0":
             return exp.Anonymous(this="date_trunc", expressions=[exp.Literal.string("second"), node])
-        if to.is_type("timestamp", "timestampntz", "timestampltz", "timestamptz") and isinstance(inner, exp.Cast) \
-                and inner.to.is_type("int", "bigint", "decimal", "double", "float"):
+        if to.is_type("timestamp", "timestampntz", "timestampltz", "timestamptz") and (_is(inner, "_sf_int") or (
+                isinstance(inner, exp.Cast) and inner.to.is_type("int", "bigint", "decimal", "double", "float"))):
             return exp.Cast(this=_fn("_sf_seconds", inner), to=to)  # x::number::timestamp: seconds since 1970
         if to.is_type("boolean") and not isinstance(inner, (*_VARIANT_ACCESS, exp.Boolean, exp.Null)):
             return _fn("_sf_bool", inner)
@@ -767,8 +767,12 @@ def _fix(node: exp.Expression) -> exp.Expression:
         return _fn("_sf_array_size", node.this)
     if isinstance(node, exp.Anonymous) and node.name.lower() in _TIMESTAMP_PARSERS and len(node.expressions) == 1:
         # TRY_TO_TIMESTAMP_NTZ(column): the one-argument forms on a non-literal
-        return _fn("_sf_try_timestamp", node.expressions[0]) if node.name.lower().startswith("try_") \
-            else exp.cast(node.expressions[0], "timestamp")
+        arg = node.expressions[0]
+        if node.name.lower().startswith("try_"):
+            return _fn("_sf_try_timestamp", arg)
+        if _is(arg, "_sf_int") or (isinstance(arg, exp.Cast) and arg.to.is_type("int", "bigint", "decimal", "double", "float")):
+            return exp.cast(_fn("_sf_seconds", arg), "timestamp")  # a number: seconds since 1970
+        return exp.cast(arg, "timestamp")
     if isinstance(node, exp.ToNumber) and isinstance(node.args.get("format"), exp.Literal) \
             and re.fullmatch(r"[09,.$]+", node.args["format"].name.strip()):
         declared = node.args.get("scale")  # the format only guides parsing; the result scale is 0 unless given

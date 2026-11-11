@@ -472,8 +472,8 @@ def _patch_fakesnow() -> None:
                     # (MERGE works through a temporary table): what the transaction did so far is
                     # committed here, and the rest of it runs in autocommit
                     conn = self._conn
-                    if os.environ.get("FAUXFLAKE_TXN_DEBUG"):
-                        print("txn degraded by:", kept.sql(dialect="duckdb")[:300], "|", str(e)[:200], file=sys.stderr)
+                    print("fauxflake: a transaction wrote to a second database; it was committed at that point and "
+                          "the rest of it runs in autocommit.", file=sys.stderr)
                     conn._fauxflake_txn, conn._fauxflake_healing = False, True
                     try:
                         self._duck_conn.execute("rollback")
@@ -570,6 +570,16 @@ def _spill_directory(duck: duckdb.DuckDBPyConnection) -> str:
 
     path = tempfile.mkdtemp(prefix="fauxflake-spill-")
     duck.execute("set temp_directory = '" + path.replace("'", "''") + "'")
+    # A query that explodes on generated data (a join on a key that is always the same) would
+    # otherwise write until the disk is full. Stop it at a bound, and never past a quarter of what is free.
+    limit = os.environ.get("FAUXFLAKE_MAX_SPILL")
+    if not limit:
+        free = shutil.disk_usage(path).free
+        limit = f"{max(256, min(8192, free // 4 // 2**20))}MiB"
+    duck.execute(f"set max_temp_directory_size = '{limit}'")
+    import atexit
+
+    atexit.register(shutil.rmtree, path, ignore_errors=True)  # also when the run is interrupted
     return path
 
 
