@@ -13,7 +13,7 @@ jobs:
         with:
           fetch-depth: 0   # the diff needs the base branch
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-      - run: uv tool install git+https://github.com/mkebiclioglu/fauxflake@v0.2.0
+      - run: uv tool install git+https://github.com/mkebiclioglu/fauxflake@v0.3.0
       - run: fauxflake check              # the spec covers every source column the project reads
       - run: fauxflake build              # dbt build on synthetic data
       - run: fauxflake simulate --days 14 # incrementals and snapshots stay correct as time passes
