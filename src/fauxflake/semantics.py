@@ -136,7 +136,15 @@ MACROS = [
           'ipv4_range_start', {_NS}_sf_ipv4(split_part(ip, '/', 1)) & (4294967295 - ((1::bigint << (32 - {_NS}_sf_ip_bits(ip))) - 1)),
           'netmask_prefix_length', try_cast(nullif(split_part(ip, '/', 2), '') as integer),
           'snowflake$type', 'ip_address') end,
-          (ip, kind, permissive) as case when ip is null then null else json_object(
+          (ip, kind, permissive) as case when ip is null then null
+          when ip = '' then json_object('family', null, 'host', null, 'ip_fields', null, 'ip_type', lower(kind),
+                                        'netmask_prefix_length', null, 'snowflake$type', 'ip_address')
+          when not regexp_matches(ip, '^[0-9./]*$') then json_object('error', 'invalid decimal string with non-digital input')
+          when len(string_split(split_part(ip, '/', 1), '.')) < 4 then json_object('error', 'Invalid IPv4 address. IP address includes too few fields.')
+          when len(string_split(split_part(ip, '/', 1), '.')) > 4 then json_object('error', 'Invalid IPv4 address. IP address includes too many fields.')
+          when list_bool_or(list_transform(string_split(split_part(ip, '/', 1), '.'), lambda f: f = '' or try_cast(f as integer) is null or try_cast(f as integer) > 255))
+            then json_object('error', 'Invalid IPv4 address. One or more fields is higher than 255.')
+          else json_object(
           'family', 4,
           'host', split_part(ip, '/', 1),
           'ip_fields', [{_NS}_sf_ipv4(split_part(ip, '/', 1)), 0, 0, 0],

@@ -2732,6 +2732,32 @@
    ]
   ]
  },
+ "parse_ip_permissive": {
+  "rows": [
+   [
+    {
+     "error": "invalid decimal string with non-digital input"
+    },
+    {
+     "family": null,
+     "host": null,
+     "ip_fields": null,
+     "ip_type": "inet",
+     "netmask_prefix_length": null,
+     "snowflake$type": "ip_address"
+    },
+    {
+     "error": "Invalid IPv4 address. IP address includes too few fields."
+    },
+    null,
+    {
+     "error": "Invalid IPv4 address. One or more fields is higher than 255."
+    },
+    "167772160",
+    true
+   ]
+  ]
+ },
  "parse_json_empty_text": {
   "rows": [
    [
