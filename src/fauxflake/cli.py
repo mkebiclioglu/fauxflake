@@ -68,6 +68,9 @@ def main() -> None:
             os._exit(143)
 
         threading.Thread(target=give_up, daemon=True).start()
+        if hasattr(signal, "SIGALRM"):  # and should the interpreter itself hang while shutting down, the kernel ends it
+            signal.signal(signal.SIGALRM, signal.SIG_DFL)
+            signal.alarm(45)
         sys.exit(143)
 
     try:
