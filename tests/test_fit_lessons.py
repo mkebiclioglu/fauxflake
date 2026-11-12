@@ -80,3 +80,47 @@ def test_tables_a_model_looks_up_by_name_and_does_not_find_are_generated():
         assert not f.looked_for("model.p.focal")  # nothing more to add the second time
     finally:
         emulator.EMPTY_LOOKUPS.clear()
+
+
+def test_a_cast_teaches_only_about_what_it_reads_as_it_is():
+    tree = parse("select split_part(regexp_substr(q, 'auc=[0-9]+'), '=', 2)::int, coalesce(o.f:at_risk, false)::boolean, "
+                 "coalesce(o.f:n::int, m), (a + b)::float from o")
+    reads = [leaf.sql(dialect="snowflake") for cast in tree.find_all(sqlglot.exp.Cast) for leaf in Fitter._cast_reads(cast.this)]
+    assert "q" not in reads
+    assert {"a", "b"} <= set(reads)
+    assert any("at_risk" in r for r in reads)
+
+
+def test_a_field_cast_to_a_number_or_a_boolean_is_generated_as_one():
+    tables = {"RAW.Z.O": {"columns": {"F": {"gen": "object", "fields": {
+        "at_risk": {"gen": "template", "template": "at_risk_{hex}"}, "n": {"gen": "template", "template": "n_{hex}"}}}}}}
+    f = fitter(tables=tables)
+    f.sources_of = lambda uid: ["RAW.Z.O"]
+    tree = parse("select coalesce(o.f:at_risk, false)::boolean, o.f:n::int from RAW.Z.O o")
+    for cast in tree.find_all(sqlglot.exp.Cast):
+        hint = "BOOLEAN" if cast.to.is_type("boolean") else "DOUBLE"
+        for leaf in Fitter._cast_reads(cast.this):
+            assert f.retype_field("m", leaf, hint)
+    fields = tables["RAW.Z.O"]["columns"]["F"]["fields"]
+    assert fields["at_risk"]["type"] == "BOOLEAN" and fields["n"]["type"] == "BIGINT"
+
+
+def test_a_column_missing_from_a_subquery_belongs_to_the_table_whose_star_it_selects():
+    tree = parse("""with mt as (select user_id, max(ts) as mx from "RAW".a.cfg group by 1)
+        select coalesce(r.installation, null) from (select s.* from "RAW".a.cfg s join mt on s.user_id = mt.user_id) s
+        full outer join (select r.* from "RAW".b.cfg r join mt on r.user_id = mt.user_id) r on r.user_id = s.user_id""")
+    tables = {"RAW.A.CFG": {"columns": {}}, "RAW.B.CFG": {"columns": {}}}
+    f = fitter(trees={"m": tree}, tables=tables, existing={}, pending={}, unions={})
+    f.add_column = lambda table, col: tables[table]["columns"].setdefault(col, {}) is not None
+    assert f.missing_column("m", 'Values list "R" does not have a column named "INSTALLATION"')
+    assert "INSTALLATION" in tables["RAW.B.CFG"]["columns"] and "INSTALLATION" not in tables["RAW.A.CFG"]["columns"]
+
+
+def test_an_ambiguous_column_stays_with_the_table_a_model_names_it_with():
+    freemium = parse('select s.*, charge as stripe_charge_id from "RAW".blapi.subs s left join "RAW".stripe.invoices on invoices.sub = s.id')
+    invoices = parse('select invoices.charge, invoices.id from "RAW".stripe.invoices')
+    free = {"gen": "template", "template": "charge_{hex}"}
+    tables = {"RAW.BLAPI.SUBS": {"columns": {"CHARGE": dict(free)}}, "RAW.STRIPE.INVOICES": {"columns": {"CHARGE": dict(free)}}}
+    f = fitter(trees={"a": freemium, "b": invoices}, sql_of={"a": freemium.sql().upper(), "b": invoices.sql().upper()}, tables=tables)
+    assert f.ambiguous_column("a", "Ambiguous reference to column name \"CHARGE\" (use: 'S.CHARGE' or 'INVOICES.CHARGE')")
+    assert "CHARGE" in tables["RAW.STRIPE.INVOICES"]["columns"] and "CHARGE" not in tables["RAW.BLAPI.SUBS"]["columns"]

@@ -587,7 +587,10 @@ class Fitter:
             fresh = None
             as_text = str(gen.get("type", "")).upper() in ("VARCHAR", "TEXT", "STRING") and kind in (
                 "sequence", "dist", "fk", "time_offset", "event_time", "updated_at", "categorical")
-            if as_text and hint != "TEXT" and not fmt:
+            reads = {"BIGINT": ("sequence", "dist", "fk"), "DOUBLE": ("sequence", "dist", "fk"),
+                     "DATE": ("time_offset", "event_time", "updated_at"), "TIMESTAMP": ("time_offset", "event_time", "updated_at"),
+                     "EPOCH": ("sequence", "dist"), "BOOLEAN": ("categorical",)}.get(hint)
+            if as_text and hint != "TEXT" and not fmt and (reads is None or kind in reads):
                 continue  # already holds numbers, dates or booleans as text: a cast reads them
             if kind in ("lifecycle", "loaded_at"):
                 continue
@@ -809,8 +812,10 @@ class Fitter:
             return next(iter(tables)) if listed and len(tables) == 1 else None
         if len(tables) == 1:
             return next(iter(tables))
-        # `select s.*, p.sku from a s join b p ...`: the columns nobody lists are those of `s`
-        node = t
+        return self._star_owner(t, ctes)
+
+    def _star_owner(self, node: exp.Expression, ctes: dict[str, exp.Expression]) -> str | None:
+        """`select s.*, p.sku from a s join b p ...`: the columns nobody lists are those of `s`."""
         for _ in range(8):
             node = node.unnest()
             if not isinstance(node, exp.Select) or node.args.get("from_") is None:
@@ -897,11 +902,15 @@ class Fitter:
             return True
         if fq in self.existing:
             columns = self.existing[fq].setdefault("columns", {})
-            if col in columns:
-                return False
-            columns[col] = duck_type(guess(col, None))
-            self.create_existing(fq)
-            return True
+            added = col not in columns
+            if added:
+                columns[col] = duck_type(guess(col, None))
+                self.create_existing(fq)
+            # the stand-in is replaced when the model builds: what the model selects from needs it too
+            parent = self.passthrough(fq) if depth <= 8 else None
+            if parent and parent != fq and self.blameable(parent, depth + 1) and self.blame(parent, col, depth + 1):
+                added = True
+            return added
         parent = self.passthrough(fq) if depth <= 8 else None
         if parent and self.blame(parent, col, depth + 1):
             try:  # the model was already built without the column: give it one so the pass can go on
@@ -933,9 +942,11 @@ class Fitter:
                     if isinstance(rel, exp.Table) and rel.catalog and rel.db:
                         candidates.add(f"{rel.catalog.upper()}.{rel.db.upper()}.{rel.name.upper()}")
                     elif isinstance(rel, exp.Table) and rel.name.upper() in ctes:
-                        candidates |= self.real_tables(ctes[rel.name.upper()], ctes)
+                        owner = self._star_owner(ctes[rel.name.upper()], ctes)
+                        candidates |= {owner} if owner else self.real_tables(ctes[rel.name.upper()], ctes)
                     elif isinstance(rel, exp.Subquery):
-                        candidates |= self.real_tables(rel.this, ctes)
+                        owner = self._star_owner(rel.this, ctes)
+                        candidates |= {owner} if owner else self.real_tables(rel.this, ctes)
         if alias and not candidates:
             for tb in t.find_all(exp.Table):
                 if tb.alias_or_name.upper() != alias:
@@ -1355,12 +1366,52 @@ class Fitter:
             for fq in self.real_tables(tb, ctes) if tb.catalog and tb.db else self.real_tables(ctes.get(tb.name.upper(), tb), ctes):
                 source = self._source_behind(fq)
                 columns = (self.tables.get(source or "", {}).get("columns") or {})
+                if source and col in columns and self.named_with(source, col):
+                    # another model reads `<this table>.<col>`: it is the other side that guessed
+                    changed |= self._take_back(tree, ctes, keep[0], col, drop)
+                    continue
                 if col in columns and columns[col].get("gen") in (*_FREE, "dist", "time_offset", "categorical"):
                     del columns[col]
                     self.retyped.add(source)
                     self.learned.append(f"{source}.{col}: the model reads {col} unqualified next to {keep[0]}, which has it; removed here.")
                     changed = True
         self.dirty |= changed
+        return changed
+
+    def named_with(self, fq: str, col: str) -> bool:
+        """Does some model read `col` from `fq` by the table's name or alias (`invoices.charge`)?"""
+        short = fq.rsplit(".", 1)[-1]
+        for uid, sql in list(self.sql_of.items()):
+            text = sql.upper()
+            if col not in text or short not in text:
+                continue
+            tree = self.tree(uid)
+            if tree is None:
+                continue
+            for c in tree.find_all(exp.Column):
+                select = c.find_ancestor(exp.Select)
+                if c.name.upper() != col or not c.table or select is None or select.args.get("from_") is None:
+                    continue
+                for rel in [select.args["from_"].this, *[j.this for j in select.args.get("joins") or []]]:
+                    if isinstance(rel, exp.Table) and rel.catalog and rel.db and rel.alias_or_name.upper() == c.table.upper() \
+                            and f"{rel.catalog.upper()}.{rel.db.upper()}.{rel.name.upper()}" == fq:
+                        return True
+        return False
+
+    def _take_back(self, tree, ctes: dict, alias: str, col: str, other: str) -> bool:  # noqa: ANN001
+        changed = False
+        for tb in tree.find_all(exp.Table):
+            if tb.alias_or_name.upper() != alias:
+                continue
+            for fq in self.real_tables(tb, ctes) if tb.catalog and tb.db else self.real_tables(ctes.get(tb.name.upper(), tb), ctes):
+                source = self._source_behind(fq)
+                columns = (self.tables.get(source or "", {}).get("columns") or {})
+                if col in columns and columns[col].get("gen") in (*_FREE, "dist", "time_offset", "categorical") \
+                        and not self.named_with(source, col):
+                    del columns[col]
+                    self.retyped.add(source)
+                    self.learned.append(f"{source}.{col}: the model reads {col} unqualified next to {other}, which has it; removed here.")
+                    changed = True
         return changed
 
     def few_values(self, sql_key: str) -> bool:
@@ -1462,6 +1513,13 @@ class Fitter:
                 if m.group("value") == "" and hint in ("BIGINT", "DOUBLE", "DATE", "TIMESTAMP", "BOOLEAN"):
                     # `nullif(col, '')` on a column generated as a number or a date: the SQL treats it as text
                     return any([self.retype_column(sql_key, c, "TEXT") for c in self.columns_used(sql_key, "empty")])
+                if hint in ("DATE", "TIMESTAMP") and re.fullmatch(r"-?\d+(\.\d+)?", m.group("value")):
+                    tree = self.tree(sql_key)
+                    direct = [c.this.name.upper() for c in (tree.find_all(exp.Cast, exp.TryCast) if tree is not None else [])
+                              if c.to.is_type("date", "timestamp", "timestampntz", "timestampltz", "timestamptz")
+                              and isinstance(c.this, exp.Column)]
+                    if any([self.retype_column(sql_key, c, hint) for c in dict.fromkeys(direct)]):
+                        return True
                 compared = self.columns_used(sql_key, "literal", m.group("value"))
                 if compared and hint in ("BIGINT", "DOUBLE", "DATE", "TIMESTAMP", "BOOLEAN") and \
                         any([self.retype_column(sql_key, c, "TEXT") for c in compared]):
@@ -1483,10 +1541,16 @@ class Fitter:
         if "Failed to cast value to numerical" in message:
             # coalesce(payload['minutes'], minutes)::float where `minutes` was generated as an object
             tree = self.tree(sql_key)
-            names = [c.name.upper() for cast in (tree.find_all(exp.Cast, exp.TryCast) if tree is not None else [])
-                     if cast.to.is_type("float", "double", "decimal", "int", "bigint") for c in cast.this.find_all(exp.Column)
-                     if not isinstance(c.parent, (exp.Bracket, exp.JSONExtract, exp.Dot))]
-            return any([self.retype_column(sql_key, c, "DOUBLE") for c in dict.fromkeys(names)])
+            names, changed = [], False
+            for cast in (tree.find_all(exp.Cast, exp.TryCast) if tree is not None else []):
+                hint = "DOUBLE" if cast.to.is_type("float", "double", "decimal", "int", "bigint") else \
+                    "BOOLEAN" if cast.to.is_type("boolean") else None
+                for leaf in self._cast_reads(cast.this) if hint else []:
+                    if isinstance(leaf, exp.Column) and hint == "DOUBLE":
+                        names.append(leaf.name.upper())
+                    elif isinstance(leaf, exp.JSONExtract) and isinstance(leaf.this, exp.Column):
+                        changed |= self.retype_field(sql_key, leaf, hint)
+            return any([self.retype_column(sql_key, c, "DOUBLE") for c in dict.fromkeys(names)]) or changed
         m = _NOT_STRUCT.search(message)
         if m:
             return self.make_variant(m.group("col"), m.group("field"))
@@ -1494,6 +1558,45 @@ class Fitter:
         if m and "VARCHAR" in m.group("types"):
             return self.wrong_type(sql_key, m.group("name").lower())
         return False
+
+    @staticmethod
+    def _cast_reads(node: exp.Expression) -> list[exp.Expression]:
+        """The columns and object fields whose value a cast converts as it is: through COALESCE, IFF,
+        CASE and arithmetic, not through a function that makes new text (SPLIT_PART, REGEXP_SUBSTR)."""
+        if isinstance(node, (exp.Column, exp.JSONExtract)):
+            return [node]
+        if isinstance(node, (exp.Paren, exp.Cast, exp.TryCast, exp.Neg)):
+            return Fitter._cast_reads(node.this)
+        if isinstance(node, (exp.Coalesce, exp.Nullif, exp.Binary)) and not isinstance(node, (exp.DPipe, exp.Predicate, exp.Connector)):
+            return [leaf for arg in node.iter_expressions() for leaf in Fitter._cast_reads(arg)]
+        if isinstance(node, exp.If):
+            return [leaf for arg in (node.args.get("true"), node.args.get("false")) if arg is not None for leaf in Fitter._cast_reads(arg)]
+        if isinstance(node, exp.Case):
+            results = [i.args.get("true") for i in node.args.get("ifs") or []] + [node.args.get("default")]
+            return [leaf for arg in results if arg is not None for leaf in Fitter._cast_reads(arg)]
+        return []
+
+    def retype_field(self, uid: str, access: exp.JSONExtract, hint: str) -> bool:
+        """`col:field::int` on an object column whose field was generated as text."""
+        keys = [str(k.this) for k in access.expression.expressions if isinstance(k, exp.JSONPathKey)] \
+            if isinstance(access.expression, exp.JSONPath) else []
+        if not keys:
+            return False
+        col, changed = access.this.name.upper(), False
+        for table in self.sources_of(uid):
+            gen = (self.tables[table].get("columns") or {}).get(col)
+            fields = gen.get("fields") if gen and gen.get("gen") == "object" else None
+            for path, field in list((fields or {}).items()):
+                if path.lower() not in (".".join(keys).lower(), keys[-1].lower()) or field.get("gen") not in _FREE or field.get("format"):
+                    continue
+                fresh = {"gen": "categorical", "type": "BOOLEAN", "values": {True: 0.5, False: 0.5}} if hint == "BOOLEAN" \
+                    else {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000]}
+                fields[path] = fresh
+                self.retyped.add(table)
+                self.learned.append(f"{table}: field {col}:{path} used as {hint}, retyped.")
+                changed = True
+        self.dirty |= changed
+        return changed
 
     def wrong_type(self, sql_key: str, function: str) -> bool:
         """Snowflake does not read text as a date in DATE_PART or EXTRACT, or as a number in a few

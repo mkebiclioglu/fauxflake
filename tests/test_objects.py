@@ -347,3 +347,9 @@ def test_merge_in_a_transaction_into_another_database(run):
     run("merge into OTHERDB.S.tgt t using src2 s on t.id = s.id when matched then update set v = 'y'")  # no transaction
     assert run("select id, v from OTHERDB.S.tgt order by id") == [(1, "a"), (2, "y"), (3, "y")]
     assert run("show tables like '__FX%' in schema OTHERDB.S") == []
+
+
+def test_regexp_functions_read_a_number_as_text(run):
+    run("create or replace table rx as select 12345.5::double as q, 77::int as n")
+    assert run("select regexp_substr(q, '[0-9]+'), regexp_count(n, '7'), regexp_replace(n, '7', 'x'), regexp_like(n, '7+') from rx") == \
+        [("12345", 2, "xx", True)]

@@ -488,6 +488,7 @@ _STRING_FUNCTIONS = (exp.Right, exp.Left, exp.Substring, exp.Upper, exp.Lower, e
                      exp.RegexpExtract, exp.RegexpLike, exp.SplitPart, exp.Split, exp.StartsWith, exp.EndsWith, exp.Contains,
                      exp.Initcap, exp.Pad, exp.StrPosition, exp.Concat, exp.ConcatWs, exp.DPipe, exp.Reverse, exp.Repeat,
                      exp.RegexpExtractAll, exp.RegexpCount, exp.Replace)
+_REGEX_FUNCTIONS = (exp.RegexpExtract, exp.RegexpExtractAll, exp.RegexpCount, exp.RegexpLike, exp.RegexpReplace, exp.RegexpInstr)
 _MAPS = {"MAP_KEYS": "", "MAP_SIZE": "", "MAP_CONTAINS_KEY": "", "MAP_DELETE": "OBJECT_DELETE", "MAP_INSERT": "OBJECT_INSERT",
          "MAP_PICK": "OBJECT_PICK"}
 
@@ -581,6 +582,8 @@ def _fix(node: exp.Expression) -> exp.Expression:
                 node.set(key, _text(arg))
         if isinstance(node, (exp.Concat, exp.ConcatWs)):
             node.set("expressions", [_text(e) if isinstance(e, _VARIANT_ACCESS) else e for e in node.expressions])
+        if isinstance(node, _REGEX_FUNCTIONS) and isinstance(node.this, exp.Column):
+            node.set("this", exp.cast(node.this, "varchar"))  # REGEXP_SUBSTR(number_column, ...) reads the number as text
     if isinstance(node, exp.Randstr):
         # sqlglot writes RANDSTR as a correlated subquery, which the planner chokes on once it is repeated
         seed = node.args.get("generator") or exp.Rand()
