@@ -618,7 +618,8 @@ class Fitter:
         changed = False
         tables = self.sources_of(uid)
         # and the source columns an output column is made from
-        names = list(dict.fromkeys([name, *self.origins(uid, name, strict=hint == "DAY")]))
+        # a date to add days to, or text to compare with text: only the columns whose value it is
+        names = list(dict.fromkeys([name, *self.origins(uid, name, strict=hint in ("DAY", "TEXT"))]))
         for table, name in [(t, n) for t in tables for n in names]:
             columns = self.tables[table].get("columns") or {}
             if name not in columns:  # "Sum of Open Opportunities" is sum_of_open_opportunities in generated text
@@ -630,6 +631,9 @@ class Fitter:
             kind = gen.get("gen")
             numeric = hint in ("BIGINT", "DOUBLE")
             fresh = None
+            kept_text = self.__dict__.setdefault("kept_text", set())  # columns a comparison showed to be text
+            if hint == "TEXT":
+                kept_text.add((table, name))
             as_text = str(gen.get("type", "")).upper() in ("VARCHAR", "TEXT", "STRING") and kind in (
                 "sequence", "dist", "fk", "time_offset", "event_time", "updated_at", "categorical")
             reads = {"BIGINT": ("sequence", "dist", "fk"), "DOUBLE": ("sequence", "dist", "fk"),
@@ -687,6 +691,8 @@ class Fitter:
                 fresh = guess(name, hint)
                 if fresh["gen"] in _FREE:
                     continue
+            if numeric and (table, name) in kept_text and fresh.get("gen") not in _FREE:
+                fresh = {**fresh, "type": "VARCHAR"}  # read as a number here and compared with text there: numbers, held as text
             if kind in ("sequence", "hash_id") and fresh.get("gen") not in ("sequence", "hash_id"):
                 self._unkey(table)  # it was the table's key and is not one any more
             if "follows" in gen and fresh.get("gen") != "sequence":
@@ -778,7 +784,22 @@ class Fitter:
             self.learned.append(f"{own}: its merge key holds text, declared VARCHAR.")
         return changed
 
-    def compared_with_a_hash(self, uid: str, name: str) -> bool:
+    def cast_to_a_number(self, uid: str, name: str) -> bool:
+        """Whether the model itself reads column `name` as a number: `name::int`, `to_number(name)`, `name + 1`."""
+        tree = self.tree(uid)
+        if tree is None:
+            return False
+        for cast in tree.find_all(exp.Cast, exp.TryCast, exp.ToNumber):
+            if (isinstance(cast, exp.ToNumber) or cast.to.is_type("float", "double", "decimal", "int", "bigint")) and \
+                    any(c.name.upper() == name for c in self._cast_reads(cast.this) if isinstance(c, exp.Column)):
+                return True
+        for node in tree.find_all(exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Sum, exp.Avg):
+            sides = [x.unnest() for x in (node.this, node.args.get("expression")) if x is not None]
+            if any(isinstance(x, exp.Column) and x.name.upper() == name for x in sides):
+                return True
+        return False
+
+    def compared_with_a_hash(self, uid: str, name: str, what: str = "a hash") -> bool:
         """An MD5 would not convert to a number: column `name` holds hashes (a surrogate key), and what the
         model compares it with was generated, or declared, as a number. That side is text too."""
         changed = False
@@ -790,7 +811,7 @@ class Fitter:
                 if held and held.get(name) in ("BIGINT", "DOUBLE"):
                     held[name] = "VARCHAR"
                     self.create_existing(fq) if fq in self.existing else self.create_pending(fq)
-                    self.learned.append(f"{fq}.{name}: compared with a hash, declared VARCHAR.")
+                    self.learned.append(f"{fq}.{name}: compared with {what}, declared VARCHAR.")
                     changed = True
         # a hook that merges an MD5('-1') row into the model on this key: the key itself is text
         changed |= self.retype_column(uid, name, "TEXT")
@@ -1761,6 +1782,12 @@ class Fitter:
                     return True
                 if named and hint in ("BIGINT", "DOUBLE") and re.fullmatch(r"[0-9a-f]{32}", m.group("value")) \
                         and self.compared_with_a_hash(sql_key, named.group(1).upper()):
+                    return True
+                if named and hint in ("BIGINT", "DOUBLE") and re.fullmatch(r"[a-z][a-z0-9_]*_[0-9a-f]{12}", m.group("value")) \
+                        and not self.cast_to_a_number(sql_key, named.group(1).upper()) \
+                        and self.compared_with_a_hash(sql_key, named.group(1).upper(), "text"):
+                    # account_id = partner_account: an id generated as text met one generated as a number, and
+                    # nothing in the model reads it as a number. Ids are text on both sides.
                     return True
                 if named and self.retype_column(sql_key, named.group(1).upper(), hint, fmt):
                     tree = self.tree(sql_key)

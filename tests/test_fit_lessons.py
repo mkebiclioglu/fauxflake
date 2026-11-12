@@ -208,3 +208,19 @@ def test_a_column_read_as_an_address_is_generated_as_addresses():
     f.sources_of, f.origins = (lambda uid: ["RAW.V.PINGS"]), (lambda uid, name, depth=0, strict=False: [name])
     assert f.parsed_as_ip("m")
     assert tables["RAW.V.PINGS"]["columns"]["SOURCE_IP"] == {"gen": "ip"}
+
+
+def test_an_id_compared_with_a_text_id_is_text_too():
+    tree = parse("select o.id from opps o join accounts a on o.partner_account = a.dim_crm_account_id")
+    tables = {"RAW.S.OPPS": {"columns": {"PARTNER_ACCOUNT": {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 9]}}},
+              "RAW.S.ACCOUNTS": {"columns": {"DIM_CRM_ACCOUNT_ID": {"gen": "template", "template": "id_{hex}"}}}}
+    f = fitter(trees={"m": tree}, tables=tables, existing={}, pending={}, bounds={})
+    f.sources_of, f.origins = (lambda uid: list(tables)), (lambda uid, name, depth=0, strict=False: [name])
+    f.real_tables = lambda tree, ctes: set()
+    assert not f.cast_to_a_number("m", "DIM_CRM_ACCOUNT_ID")
+    assert f.compared_with_a_hash("m", "DIM_CRM_ACCOUNT_ID", "text")
+    assert tables["RAW.S.OPPS"]["columns"]["PARTNER_ACCOUNT"]["type"] == "VARCHAR"
+    assert tables["RAW.S.ACCOUNTS"]["columns"]["DIM_CRM_ACCOUNT_ID"]["gen"] == "template"
+    assert f.cast_to_a_number("n", "X") is False
+    f.trees["n"] = parse("select x::int + 1 from t")
+    assert f.cast_to_a_number("n", "X")
