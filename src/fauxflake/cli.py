@@ -89,8 +89,16 @@ def build(spec_path, project_dir, scale, history, db_path, keep, dbt_args):
     from .emulator import serve
     from .generate import Warehouse
 
+    import contextlib
+    import tempfile
+
     spec = Spec.load(spec_path)
-    with serve(db_path=db_path) as emu:
+    with contextlib.ExitStack() as stack:
+        if db_path is None:
+            # on disk, as `init` fitted it: a model too large for memory spills instead of failing. Removed afterwards.
+            db_path = stack.enter_context(tempfile.TemporaryDirectory(prefix="fauxflake-"))
+            emulator_temp(db_path)
+        emu = stack.enter_context(serve(db_path=db_path))
         t0 = time.time()
         wh = Warehouse(emu, spec, scale)
         counts = wh.advance_to(_start(spec, history))
