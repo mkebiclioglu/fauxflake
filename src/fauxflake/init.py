@@ -640,6 +640,15 @@ def analyse(manifest: dict, database: str) -> Analysis:
             tables[child]["columns"][col] = guess(col, None)
     # INFORMATION_SCHEMA is the warehouse describing itself: the emulator answers it, nothing to generate
     tables = {name: t for name, t in tables.items() if name.split(".")[1] != "INFORMATION_SCHEMA"}
+    # a source that names what the project itself builds (a seed or a model, declared as a source so
+    # other models can read it): the project provides it
+    built = {(n.get("relation_name") or "").replace('"', "").upper() for n in manifest["nodes"].values()
+             if n.get("resource_type") in ("model", "seed", "snapshot")}
+    own = sorted(name for name in tables if name in built)
+    if own:
+        tables = {name: t for name, t in tables.items() if name not in built}
+        notes.append(f"{len(own)} declared source(s) are relations the project builds itself ({', '.join(own[:3])}"
+                     f"{' ...' if len(own) > 3 else ''}): left to the project, not generated.")
     if len(tables) > 200:
         # hundreds of sources: a smaller placeholder keeps a build to minutes and a few gigabytes
         rows = 20_000 if len(tables) <= 600 else 10_000
