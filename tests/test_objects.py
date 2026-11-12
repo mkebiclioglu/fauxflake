@@ -477,3 +477,10 @@ def test_unnamed_expressions_are_named_as_snowflake_names_them(run):
         ["NAME || 'X'", "CASE WHEN ID = 1 THEN 'Y' END", "ID::VARCHAR", "ID", "NAME", "AMT", "ID*2"]
     run("create or replace table counted as select count(*), id + 1 from t group by id")
     assert names("select * from counted") == ["COUNT(*)", "ID + 1"]
+
+
+def test_having_without_grouping_filters_rows_by_the_columns_just_defined(run):
+    rows = run("with first as (select 'k' || id as key from t where id = 1) "
+               "select 'k' || id as key, name from t where amt > 0 having key not in (select key from first) order by 1")
+    assert rows == [("k2", "b")]
+    assert run("select count(*) from t having count(*) > 1") == [(2,)]

@@ -1251,6 +1251,19 @@ def rewrite(node: exp.Expression) -> exp.Expression:
     if isinstance(node, exp.Select) and node.args.get("connect") is not None and node.args.get("from_") is not None \
             and not node.args.get("joins"):
         hierarchical(node)
+    if isinstance(node, exp.Select) and node.args.get("having") is not None and node.args.get("group") is None:
+        own = [a for e in [*node.expressions, node.args["having"]] for a in e.find_all(exp.AggFunc)
+               if a.find_ancestor(exp.Select) is node and a.find_ancestor(exp.Window) is None]
+        if not own:
+            # HAVING with nothing grouped and nothing aggregated is one more filter on the rows, and may name
+            # the columns just defined. DuckDB would aggregate the whole table.
+            condition = node.args["having"].this
+            node.set("having", None)
+            if node.args.get("qualify") is not None:
+                node.args["qualify"].set("this", exp.and_(exp.paren(node.args["qualify"].this), exp.paren(condition)))
+            else:
+                where = node.args.get("where")
+                node.set("where", exp.Where(this=exp.and_(exp.paren(where.this), exp.paren(condition)) if where else condition))
     if isinstance(node, exp.With) and not node.args.get("recursive") and any(
             isinstance(c.this, exp.SetOperation) and _self_referencing(c) for c in node.expressions):
         node.set("recursive", True)  # the keyword is optional in Snowflake
