@@ -22,6 +22,7 @@ public dbt projects with no configuration and no access to their data:
 | project | models, seeds and snapshots that build | tests that pass |
 | --- | --- | --- |
 | [Mattermost analytics](https://github.com/datoria-dev/mirror-mattermost-data-warehouse) (563 sources) | 274 of 274 | 430 of 430, and 30 listed as expected failures |
+| [Mattermost's older project](https://github.com/datoria-dev/mirror-mattermost-data-warehouse) in the same repository (646 sources) | 249 of 249 | 17 of 17, and 1 listed |
 | [Flipside NEAR](https://github.com/FlipsideCrypto/near-models-archive) | 64 of 64 | 448 of 448, and 21 listed |
 | [Meltano's own project](https://gitlab.com/meltano/squared) | 46 of 46 | 160 of 160, and 1 listed |
 | [dbt-snowflake-monitoring](https://github.com/get-select/dbt-snowflake-monitoring) | 28 of 28 | 4 of 4, and 1 listed |
