@@ -863,7 +863,7 @@ class Fitter:
             if len(behind) != 1:
                 return False
             members.append(next(iter(behind)))
-        members = [m for m in dict.fromkeys(members) if m in self.tables]
+        members = [m for m in dict.fromkeys(members) if m in self.tables or ((self.by_rel.get(m) or self.relation_owner.get(m)) and m != fq)]
         if not members:
             return False
         self.unions[fq] = members
@@ -885,6 +885,10 @@ class Fitter:
             added = 0
             for name in wanted:
                 for table in self.unions[fq]:
+                    if table not in self.tables:  # a model stacked with others: whatever it is made of
+                        if depth <= 8 and name == col and self.blameable(table, depth + 1) and self.blame(table, name, depth + 1):
+                            added += 1
+                        continue
                     if name not in self.tables[table].setdefault("columns", {}):
                         self.tables[table]["columns"][name] = guess(name, None)
                         self.retyped.add(table)
@@ -1393,8 +1397,10 @@ class Fitter:
                 if c.name.upper() != col or not c.table or select is None or select.args.get("from_") is None:
                     continue
                 for rel in [select.args["from_"].this, *[j.this for j in select.args.get("joins") or []]]:
-                    if isinstance(rel, exp.Table) and rel.catalog and rel.db and rel.alias_or_name.upper() == c.table.upper() \
-                            and f"{rel.catalog.upper()}.{rel.db.upper()}.{rel.name.upper()}" == fq:
+                    if not (isinstance(rel, exp.Table) and rel.catalog and rel.db and rel.alias_or_name.upper() == c.table.upper()):
+                        continue
+                    name = f"{rel.catalog.upper()}.{rel.db.upper()}.{rel.name.upper()}"
+                    if name == fq or (short in name and self._source_behind(name) == fq):
                         return True
         return False
 
@@ -1495,6 +1501,15 @@ class Fitter:
                 if not hint:
                     return False
                 if named and self.retype_column(sql_key, named.group(1).upper(), hint, fmt):
+                    if hint in ("DATE", "TIMESTAMP") and not fmt:
+                        # `a::date ... b::date ... c::date`: the error names one; the model casts the others the same way
+                        tree = self.tree(sql_key)
+                        for c in dict.fromkeys(c.this.name.upper() for c in (tree.find_all(exp.Cast, exp.TryCast) if tree is not None else [])
+                                               if c.to.is_type(hint.lower()) and isinstance(c.this, exp.Column)):
+                            learned = any((self.tables[t].get("columns") or {}).get(c, {}).keys() & {"format", "epoch"}
+                                          for t in self.sources_of(sql_key))
+                            if not learned:
+                                self.retype_column(sql_key, c, hint)
                     return True  # DuckDB named the column it was reading
                 precision = re.search(r"to DECIMAL\((\d+),\s*(\d+)\)", message)
                 if precision and re.fullmatch(r"-?[\d.]+", m.group("value")):
