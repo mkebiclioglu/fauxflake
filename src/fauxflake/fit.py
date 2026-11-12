@@ -1788,6 +1788,19 @@ class Fitter:
         m = _NOT_STRUCT.search(message)
         if m:
             return self.make_variant(m.group("col"), m.group("field"))
+        tree = self.tree(sql_key)
+        if tree is not None and re.search(r"argument types '[-+]\((?:BIGINT|INTEGER|HUGEINT|DOUBLE|DECIMAL\([\d, ]+\)), INTERVAL\)", message):
+            # `first_seen + INTERVAL '1 DAY'` on a column generated as a number: it is a time
+            names = [side.name.upper() for node in tree.find_all(exp.Add, exp.Sub) if isinstance(node.expression.unnest(), exp.Interval)
+                     for side in [node.this.unnest()] if isinstance(side, exp.Column)]
+            if any([self.retype_column(sql_key, c, "TIMESTAMP") for c in dict.fromkeys(names)]):
+                return True
+        if tree is not None and re.search(r"argument types '(?:sum|avg)\((?:DATE|TIMESTAMP[^)]*)\)'", message):
+            # SUM over a column generated as a date (`active_users_monthly`): it is a number
+            names = [leaf.name.upper() for node in tree.find_all(exp.Sum, exp.Avg) for leaf in self._cast_reads(node.this)
+                     if isinstance(leaf, exp.Column)]
+            if any([self.retype_column(sql_key, c, "DOUBLE") for c in dict.fromkeys(names)]):
+                return True
         m = _NO_FUNCTION.search(message)
         if m and "VARCHAR" in m.group("types"):
             return self.wrong_type(sql_key, m.group("name").lower())
