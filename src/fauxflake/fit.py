@@ -1167,10 +1167,14 @@ class Fitter:
         what the column holds: base64 of JSON, or JSON."""
         if "Python exception occurred while executing the UDF" not in message:
             return False
+        shape = None
         if re.search(r"Incorrect padding|base64|Invalid base64", message):
             value = "e30="  # base64 of {}
         elif re.search(r"Expecting value|JSONDecodeError|Extra data", message):
             value = "{}"
+        elif re.search(r"Symbol\.iterator|is not iterable", message):
+            # `for (const x of V)` in a JavaScript function: the argument is an array, here of {key, value}
+            value, shape = "an array", {"gen": "array", "fields": {"key": "text", "value": "text"}}
         else:
             return False
         from . import objects
@@ -1188,11 +1192,11 @@ class Fitter:
         for name in dict.fromkeys(names):
             for table in self.sources_of(sql_key):
                 gen = (self.tables[table].get("columns") or {}).get(name)
-                if gen is None or gen.get("gen") not in _FREE:
+                if gen is None or gen.get("gen") not in (_FREE if shape is None else (*_FREE, "object", "array")) or gen == shape:
                     continue
-                self.tables[table]["columns"][name] = {"gen": "constant", "value": value}
+                self.tables[table]["columns"][name] = dict(shape) if shape else {"gen": "constant", "value": value}
                 self.retyped.add(table)
-                self.learned.append(f"{table}.{name}: a Python function decodes it; holds {value!r} instead of made-up text.")
+                self.learned.append(f"{table}.{name}: a function of the project decodes it; holds {value!r} instead of made-up text.")
                 changed = True
         self.dirty |= changed
         return changed
@@ -1770,23 +1774,26 @@ class Fitter:
             results_path = project.target_path / "run_results.json"
             results_path.unlink(missing_ok=True)  # what is there is from the compile step
             if n_round > 1:
-                # incremental models and snapshots keep the rows of the round before, made from values the
-                # spec has since corrected. Those this round builds start again, as on a project's first
-                # build (not with --full-refresh: some projects forbid it for a model)
-                chosen = self._selected(selected)
-                for uid, node in self.nodes.items():
-                    kind = node.get("resource_type"), (node.get("config") or {}).get("materialized")
-                    if (kind[0] == "snapshot" or kind[1] == "incremental") and node.get("relation_name") and (chosen is None or uid in chosen):
-                        fq = _fq(node["relation_name"])
-                        try:
-                            self.emu.duck.execute(f"drop table if exists {quoted(fq)}")
-                            if fq in self.existing:  # a model that reads its own table: empty again, as before its first build
-                                from .generate import existing_view
+                # every round is the build a fresh warehouse gives (what `fauxflake build` will run): what the
+                # round before left behind goes, and relations the project reads before building them
+                # start empty again
+                from .generate import existing_view
 
-                                rel = self.existing[fq]
-                                self.emu.duck.execute(existing_view(fq, rel.get("columns") or {}, table=rel.get("as") == "table"))
-                        except Exception:  # noqa: BLE001, S110
-                            pass
+                for node in self.nodes.values():
+                    if node.get("resource_type") in ("model", "snapshot", "seed") and node.get("relation_name") \
+                            and _fq(node["relation_name"]).count(".") == 2:
+                        for kind in ("table", "view"):
+                            try:
+                                self.emu.duck.execute(f"drop {kind} if exists {quoted(_fq(node['relation_name']))}")
+                            except Exception:  # noqa: BLE001, S110 - it is the other kind
+                                pass
+                for fq, rel in self.existing.items():
+                    try:
+                        self.emu.ensure_database(*fq.split(".")[:2])
+                        self.emu.duck.execute(existing_view(fq, rel.get("columns") or {}, table=rel.get("as") == "table"))
+                    except Exception:  # noqa: BLE001, S110
+                        pass
+            selected = []
             project.invoke(["build", *selected], silent=True)
             if not results_path.exists():
                 self.log(f"  dbt build did not run: {project.last_error[:600] or 'no results were written'}")
