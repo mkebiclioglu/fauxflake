@@ -758,9 +758,13 @@ def _fix(node: exp.Expression) -> exp.Expression:
     if isinstance(node, exp.Add) and isinstance(node.expression, exp.Interval) \
             and (node.expression.unit and node.expression.unit.name.upper() in _DAY_UNITS):
         return _fn("_sf_like", node.this.copy(), node)
-    if isinstance(node, exp.DateAdd) and node.unit and node.unit.name.upper() == "QUARTER":
-        node.set("unit", exp.var("MONTH"))
-        node.set("expression", exp.Mul(this=exp.paren(node.expression), expression=exp.Literal.number(3)))
+    if isinstance(node, exp.DateAdd) and node.unit and node.unit.name.upper() in _DAY_UNITS \
+            and not (isinstance(node.parent, exp.Anonymous) and node.parent.name.lower().endswith("_sf_like")):
+        if node.unit.name.upper() == "QUARTER":
+            node.set("unit", exp.var("MONTH"))
+            node.set("expression", exp.Mul(this=exp.paren(node.expression), expression=exp.Literal.number(3)))
+        # DATEADD(day, 1, a_date) is a DATE on Snowflake; DuckDB's date + interval is a TIMESTAMP
+        return _fn("_sf_like", node.this.copy(), node)
     if isinstance(node, exp.MonthsBetween):
         return exp.func("round", node, exp.Literal.number(6))
     if isinstance(node, (exp.Variance, exp.VariancePop)) and not isinstance(node.parent, exp.Window):

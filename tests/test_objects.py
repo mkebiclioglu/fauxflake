@@ -385,3 +385,12 @@ def test_a_view_in_a_schema_named_like_another_database(run):
 def test_a_secure_temporary_view_in_a_named_schema(run):
     run("create or replace secure temporary view analytics.ci.sec__dbt_tmp as (select 1 as x)")
     assert run("select x from analytics.ci.sec__dbt_tmp") == [(1,)]
+
+
+def test_dateadd_on_a_date_stays_a_date_for_day_or_longer_units(run):
+    # recorded on Snowflake with SYSTEM$TYPEOF: DATE, DATE, TIMESTAMP_NTZ, DATE, TIMESTAMP_NTZ
+    run("create or replace table da as select dateadd(day, 1, to_date('11/01/2009', 'mm/dd/yyyy')) as a, dateadd(quarter, 1, current_date) as b, "
+        "dateadd(hour, 1, current_date) as c, dateadd(week, 1, date_trunc('month', current_date)) as d, dateadd(day, 1, '2020-01-01') as e")
+    kinds = [r[0] for r in run("select data_type from information_schema.columns where table_name = 'DA' order by ordinal_position")]
+    assert kinds == ["DATE", "DATE", "TIMESTAMP_NTZ", "DATE", "TIMESTAMP_NTZ"]
+    assert run("select a + 1 from da")[0][0].isoformat() == "2009-11-03"

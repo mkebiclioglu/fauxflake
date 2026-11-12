@@ -732,6 +732,8 @@ class Fitter:
                     self.create_existing(fq) if fq in self.existing else self.create_pending(fq)
                     self.learned.append(f"{fq}.{name}: compared with a hash, declared VARCHAR.")
                     changed = True
+        # a hook that merges an MD5('-1') row into the model on this key: the key itself is text
+        changed |= self.retype_column(uid, name, "TEXT")
         for eq in (tree.find_all(exp.EQ) if tree is not None else []):
             sides = [eq.this.unnest(), eq.expression.unnest()]
             if all(isinstance(x, exp.Column) for x in sides) and any(x.name.upper() == name for x in sides):
