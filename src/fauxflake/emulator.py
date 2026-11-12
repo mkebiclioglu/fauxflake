@@ -654,7 +654,7 @@ def _patch_fakesnow() -> None:
 
         def attempt() -> None:
             nonlocal transformed
-            for adjust in (semantics.coerce_union_literals, semantics.resolve_equalities):
+            for adjust in (semantics.coerce_union_literals, semantics.resolve_equalities, semantics.shared_aliases):
                 try:
                     transformed = adjust(transformed, self._duck_conn)
                 except Exception:  # noqa: BLE001, S110 - an optional adjustment: the statement runs as written

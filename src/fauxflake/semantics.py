@@ -1663,6 +1663,85 @@ def offsets_as_written(transformed: exp.Expression, message: str) -> exp.Express
     return transformed if changed else None
 
 
+def shared_aliases(transformed: exp.Expression, conn, limit: int = 20_000) -> exp.Expression:  # noqa: ANN001
+    """`a + 1 AS b, b * 2 AS c, b + c AS d`: Snowflake computes each column once. DuckDB writes every
+    reference out again, so a long chain of columns built on each other (scores made of weights
+    made of scores) grows until the statement never plans. Where a select would grow that large,
+    the columns others build on are computed once each, in nested subqueries, level by level."""
+    for select in list(transformed.find_all(exp.Select)):
+        if select.args.get("group") or select.args.get("distinct") or select.args.get("from_") is None \
+                or select.args.get("having") or select.args.get("windows"):
+            continue
+        index: dict[str, int] = {}
+        refs: list = []
+        for i, projection in enumerate(select.expressions):  # every use counts: each one is written out again
+            refs.append([index[c.name.upper()] for c in projection.find_all(exp.Column) if not c.table and c.name.upper() in index])
+            if isinstance(projection, exp.Alias):
+                index.setdefault(projection.alias.upper(), i)
+        if not any(refs):
+            continue
+        size = [0] * len(select.expressions)
+        for i, projection in enumerate(select.expressions):
+            size[i] = sum(1 for _ in projection.walk()) + sum(size[j] for j in refs[i])
+        if max(size) < limit:
+            continue
+        outside = [select.args[k] for k in ("qualify", "order") if select.args.get(k) is not None]
+        if any(p.find(exp.Star, exp.Select) for p in [*select.expressions, *outside]):
+            continue  # a star would show the helper columns; a subquery reads the tables by their names
+        probe = exp.Select(expressions=[exp.Star()])
+        probe.set("from_", select.args["from_"].copy())
+        if select.args.get("joins"):
+            probe.set("joins", [j.copy() for j in select.args["joins"]])
+        try:
+            real = {row[0].upper() for row in conn.execute("describe " + _cte_prefix(select) + probe.sql(dialect="duckdb")).fetchall()}
+        except Exception:  # noqa: BLE001 - binds only in its context: leave it as it is
+            continue
+        where = select.args.get("where")
+        if where is not None and any(not c.table and c.name.upper() in index and c.name.upper() not in real for c in where.find_all(exp.Column)):
+            continue  # filtered on a computed column
+        # a table's column wins over an alias of the same name
+        refs = [{index[c.name.upper()] for c in projection.find_all(exp.Column)
+                 if not c.table and c.name.upper() in index and c.name.upper() not in real and index[c.name.upper()] < i}
+                for i, projection in enumerate(select.expressions)]
+        built_on = set().union(*refs)
+        if not built_on or any(select.expressions[i].find(exp.Window, exp.AggFunc) for i in built_on):
+            continue
+        level: dict[int, int] = {}
+        for i in sorted(built_on):
+            level[i] = 1 + max((level[j] for j in refs[i]), default=-1)
+        # the innermost query reads the tables: every column the select names, under a name of its own
+        carried: dict[str, exp.Expression] = {}
+
+        def carry(node: exp.Expression) -> exp.Expression:
+            if not isinstance(node, exp.Column):
+                return node
+            if node.table:
+                key = node.sql(dialect="duckdb").upper()
+                if key not in carried:
+                    carried[key] = exp.alias_(node.copy(), f"__FXQ{len(carried)}", quoted=True)
+                return exp.column(carried[key].alias, quoted=True)
+            if node.name.upper() in real and node.name.upper() not in carried:
+                carried[node.name.upper()] = node.copy()
+            return node
+
+        for holder in outside:
+            holder.set("this", holder.this.transform(carry)) if isinstance(holder, exp.Qualify) else \
+                holder.set("expressions", [e.transform(carry) for e in holder.expressions])
+        columns = [exp.alias_(p.transform(carry), p.this.copy()) if isinstance(p, exp.Column) and p.table else p.transform(carry)
+                   for p in select.expressions]  # `t.a` is still called A
+        base = exp.Select(expressions=list(carried.values()))
+        for key in ("from_", "joins", "where"):
+            if select.args.get(key) is not None:
+                base.set(key, select.args[key])
+                select.set(key, None)
+        for depth in range(max(level.values()) + 1):
+            base = exp.Select(expressions=[exp.Star(), *[columns[i] for i in sorted(built_on) if level[i] == depth]]).from_(
+                exp.Subquery(this=base, alias=exp.TableAlias(this=exp.to_identifier(f"__FXA{depth}", quoted=True))))
+        select.set("expressions", [exp.column(c.alias) if i in built_on else c for i, c in enumerate(columns)])
+        select.set("from_", exp.From(this=exp.Subquery(this=base, alias=exp.TableAlias(this=exp.to_identifier("__FXA", quoted=True)))))
+    return transformed
+
+
 def resolve_equalities(transformed: exp.Expression, conn) -> exp.Expression:  # noqa: ANN001
     """`_sf_eq(a, b)` compares a VARIANT with text by value. Inside a JOIN condition or a WHERE it also
     hides the equality from DuckDB, which then cannot hash-join and falls back to comparing every

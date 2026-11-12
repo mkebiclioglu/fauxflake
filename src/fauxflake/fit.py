@@ -1654,7 +1654,7 @@ class Fitter:
         tree = self.tree(sql_key) if m else None
         if tree is None:
             return False
-        named = sorted({c.name for c in tree.find_all(exp.Column) if c.this.quoted and c.name != c.name.upper()})
+        named = sorted({c.name for c in tree.find_all(exp.Column) if isinstance(c.this, exp.Identifier) and c.this.quoted and c.name != c.name.upper()})
         if m.group("col").strip('"') not in named:
             return False
         changed = False
@@ -2592,6 +2592,8 @@ class Fitter:
                     continue
                 if "Compilation Error" in message and self.empty_lookup(node["unique_id"], message):
                     continue
+                if "RecursionError" in message and self.few_values(node["unique_id"]):
+                    continue  # a pivot with one column per row: too long a statement to even read
                 compiled = self._compiled(project, node)
                 if compiled and node.get("relation_name") and _fq(node["relation_name"]).count(".") == 2:
                     uid, fq = node["unique_id"], _fq(node["relation_name"])

@@ -525,3 +525,13 @@ def test_dateadd_on_text_put_together_and_objects_of_every_column_in_an_aggregat
         (datetime.datetime(2019, 2, 1), datetime.datetime(2020, 1, 1, 2))]
     rows = run("select id, array_agg(object_construct(*)) from t group by 1 order by 1")
     assert json.loads(rows[0][1]) == [{"ID": 1, "NAME": "a", "AMT": 10.0}]
+
+
+def test_columns_built_on_each_other_are_computed_once(run):
+    # each column reads the one before it three times: written out, the last is 3**24 expressions
+    chain = ", ".join(f"iff(c{i - 1} > 0, c{i - 1}, c{i - 1}) + 1 as c{i}" for i in range(1, 25))
+    run(f"create or replace table chained as select t.id as c0, {chain}, row_number() over (order by c24 desc) as rn, t.name, amt "
+        "from t where t.id >= 1 qualify rn = 1 order by c0")
+    assert run("select c0, c24, rn, name from chained") == [(top := max(r[0] for r in run("select id from t")), top + 24, 1,
+                                                             run(f"select name from t where id = {top}")[0][0])]
+    assert len(run("select column_name from information_schema.columns where table_name = 'CHAINED'")) == 28
