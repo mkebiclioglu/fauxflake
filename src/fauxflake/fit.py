@@ -1229,13 +1229,42 @@ class Fitter:
         state = self.emu._fs.results_cache.get(objects._KEY)
         functions = set(state.functions) if state else set()
         names: list[str] = []
+        fields: list[tuple[str, str]] = []
         for node_id in [sql_key, *sorted(self._ancestors(sql_key))]:
             tree = self.tree(node_id) if node_id == sql_key or node_id.startswith(("model.", "snapshot.")) else None
             for call in (tree.find_all(exp.Anonymous) if tree is not None else []):
                 if call.name.upper() in functions or call.name.lower() in functions:
                     for arg in call.expressions:
+                        inner = arg.unnest()
+                        while isinstance(inner, (exp.Cast, exp.TryCast, exp.Paren)):
+                            inner = inner.this
+                        key = None
+                        if isinstance(inner, exp.Bracket) and isinstance(inner.this, exp.Column) and len(inner.expressions) == 1 \
+                                and isinstance(inner.expressions[0], exp.Literal) and inner.expressions[0].is_string:
+                            key = inner.expressions[0].name
+                        elif isinstance(inner, exp.JSONExtract) and isinstance(inner.this, exp.Column) \
+                                and isinstance(inner.expression, exp.JSONPath):
+                            keys = [str(k.this) for k in inner.expression.expressions if isinstance(k, exp.JSONPathKey)]
+                            key = keys[0] if len(keys) == 1 else None
+                        if key and shape:  # `f(value['event_params'])`: that field of the object is what the function reads
+                            fields += [(n, key) for n in self.origins(node_id, inner.this.name.upper())]
+                            continue
                         names += [n for c in arg.find_all(exp.Column) for n in self.origins(node_id, c.name.upper())]
         changed = False
+        for name, key in dict.fromkeys(fields):
+            for table in self.sources_of(sql_key):
+                columns = self.tables[table].get("columns") or {}
+                gen = columns.get(name)
+                if gen is None or gen.get("gen") not in (*_FREE, "object", "array"):
+                    continue
+                held = dict(gen.get("fields") or {}) if gen.get("gen") == "object" else {}
+                if held.get(key) == shape:
+                    continue
+                held[key] = dict(shape)
+                columns[name] = {**(gen if gen.get("gen") == "object" else {}), "gen": "object", "fields": held}
+                self.retyped.add(table)
+                self.learned.append(f"{table}.{name}: a function of the project reads its field {key!r} as an array; generated as one.")
+                changed = True
         for name in dict.fromkeys(names):
             for table in self.sources_of(sql_key):
                 gen = (self.tables[table].get("columns") or {}).get(name)
@@ -1657,6 +1686,59 @@ class Fitter:
         self.dirty |= changed
         return changed
 
+    def output_columns(self, uid: str) -> list[str] | None:
+        """The columns a model's SQL writes out by name, or None when a `*` reaches a real relation
+        (then they depend on that relation, not on the SQL alone)."""
+        tree = self.tree(uid) if uid in self.sql_of else None
+        if tree is None:
+            return None
+        ctes = {c.alias.upper(): c.this for c in tree.find_all(exp.CTE)}
+
+        def columns(node: exp.Expression, depth: int = 0) -> list[str] | None:
+            node = node.unnest()
+            if isinstance(node, exp.SetOperation):
+                return columns(node.left, depth + 1)
+            if not isinstance(node, exp.Select) or depth > 12:
+                return None
+            out: list[str] = []
+            for e in node.expressions:
+                star = isinstance(e, exp.Star) or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star))
+                if not star:
+                    if not e.alias_or_name:
+                        return None
+                    out.append(e.alias_or_name.upper())
+                    continue
+                if isinstance(e, exp.Star) and (e.args.get("except_") or e.args.get("replace") or e.args.get("rename")):
+                    return None
+                source = node.args.get("from_")
+                relations = [source.this, *[j.this for j in node.args.get("joins") or []]] if source is not None else []
+                if isinstance(e, exp.Column):
+                    relations = [r for r in relations if r.alias_or_name.upper() == e.table.upper()]
+                if not relations:
+                    return None
+                for r in relations:
+                    inner = r.this if isinstance(r, exp.Subquery) else \
+                        ctes.get(r.name.upper()) if isinstance(r, exp.Table) and not r.db else None
+                    found = columns(inner, depth + 1) if inner is not None else None
+                    if found is None:
+                        return None
+                    out += found
+            return out
+
+        return columns(tree)
+
+    def test_names_a_column_the_model_does_not_write(self, node: dict, message: str) -> bool:
+        """`unique: status_id` on a model whose SELECT renames it to `id`: the test fails in the
+        warehouse as well, whatever the data."""
+        m = next((m for m in (p.search(message) for p in _MISSING) if m), None)
+        tested = node.get("attached_node") or next((d for d in node["depends_on"]["nodes"] if d.startswith("model.")), None)
+        if not m or not tested or len([d for d in node["depends_on"]["nodes"] if d in self.nodes]) != 1:
+            return False
+        if tested not in self.sql_of and (self.nodes.get(tested) or {}).get("compiled_code"):
+            self.sql_of[tested] = self.nodes[tested]["compiled_code"].strip().rstrip(";")
+        written = self.output_columns(tested)
+        return written is not None and m.group("col").upper().strip('"') not in written
+
     def learn_upstream(self, uid: str, message: str, depth: int = 0, seen: set[str] | None = None) -> bool:
         """A view runs when it is read: the statement that failed can be the SQL of a view the model
         (or the test) selects from. Offer the error to those, nearest first."""
@@ -2013,8 +2095,12 @@ class Fitter:
                         if compiled:
                             self.sql_of[node["unique_id"]] = compiled
                             self.trees.pop(node["unique_id"], None)
-                            if not self.learn(node["unique_id"], message):
-                                self.learn_upstream(node["unique_id"], message)
+                            if not self.learn(node["unique_id"], message) and not self.learn_upstream(node["unique_id"], message) \
+                                    and self.test_names_a_column_the_model_does_not_write(node, message) and node["name"] not in expected:
+                                expected.append(node["name"])
+                                accepted += 1
+                                outcome.pop(r["unique_id"], None)
+                                self.learned.append(f"test {node['name']}: names a column its model does not write; listed as an expected failure.")
                     if r["status"] == "fail" and not self.learn_from_test(node, analysis) and node["name"] not in expected:
                         expected.append(node["name"])
                         accepted += 1

@@ -144,3 +144,30 @@ def test_an_error_inside_a_view_is_offered_to_the_view():
     f.learn = lambda uid, message: asked.append(uid) or True
     assert f.learn_upstream("model.p.child", "Conversion Error")
     assert asked == ["model.p.view"]
+
+
+def test_a_function_that_iterates_a_field_gets_an_array_in_that_field():
+    from types import SimpleNamespace
+
+    from fauxflake import objects
+
+    tables = {"RAW.GA.EVENTS": {"columns": {"VALUE": {"gen": "array", "fields": {"key": "text", "value": "text"}}}}}
+    tree = parse('select "PREP".s.parse_array(value[\'event_params\'])::variant as p from RAW.GA.EVENTS')
+    emu = SimpleNamespace(_fs=SimpleNamespace(results_cache={objects._KEY: SimpleNamespace(functions={"PARSE_ARRAY": 1})}))
+    f = fitter(trees={"m": tree}, tables=tables, emu=emu)
+    f.sources_of, f._ancestors, f.origins = (lambda uid: ["RAW.GA.EVENTS"]), (lambda uid: set()), (lambda uid, name, depth=0: [name])
+    assert f.udf_input("m", "Python exception occurred while executing the UDF: TypeError: cannot read property 'Symbol.iterator' of undefined")
+    column = tables["RAW.GA.EVENTS"]["columns"]["VALUE"]
+    assert column["gen"] == "object" and column["fields"]["event_params"]["gen"] == "array"
+
+
+def test_a_test_on_a_column_the_model_renames_away_fails_everywhere():
+    sql = "with source as (select * from RAW.A.T), renamed as (select status_id::number as id, status::number as status from source) select * from renamed"
+    nodes = {"model.p.m": {"resource_type": "model"}}
+    f = fitter(nodes=nodes, sql_of={"model.p.m": sql})
+    test = {"attached_node": "model.p.m", "depends_on": {"nodes": ["model.p.m"]}}
+    assert f.output_columns("model.p.m") == ["ID", "STATUS"]
+    assert f.test_names_a_column_the_model_does_not_write(test, 'Referenced column "STATUS_ID" not found in FROM clause!')
+    assert not f.test_names_a_column_the_model_does_not_write(test, 'Referenced column "STATUS" not found in FROM clause!')
+    f = fitter(nodes=nodes, sql_of={"model.p.m": "select * from RAW.A.T"})
+    assert f.output_columns("model.p.m") is None
