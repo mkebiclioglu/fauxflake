@@ -414,3 +414,11 @@ def test_an_alias_of_a_function_call_is_read_in_where_and_flatten(run):
     run("create or replace table arr_src as select 'a,b' as d, 1 as id union all select '', 2")
     assert run("with p as (select *, to_arr(d) as links from arr_src where array_size(links) != 1) "
                "select p.id, f.value::varchar from p, table(flatten(links)) f order by 1, 2") == [(1, "a"), (1, "b")]
+
+
+def test_a_date_format_chosen_per_row(run):
+    run("create or replace table fmt_src as select 'snowplow_2024_03' as s union all select 'x_2024_03_09' union all select 'none'")
+    rows = run("select s, case when regexp_instr(s, '\\\\d{4}_\\\\d{2}_\\\\d{2}') > 0 then 'YYYY_MM_DD' when regexp_instr(s, '\\\\d{4}_\\\\d{2}') > 0 "
+               "then 'YYYY_MM' end as f, to_date(regexp_substr(s, '\\\\d{4}_\\\\d{2}_?\\\\d{0,2}'), f) as d from fmt_src order by 1")
+    assert [(r[0], r[2].isoformat() if r[2] else None) for r in rows] == [
+        ("none", None), ("snowplow_2024_03", "2024-03-01"), ("x_2024_03_09", "2024-03-09")]

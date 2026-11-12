@@ -1218,8 +1218,36 @@ def hierarchical(select: exp.Select) -> None:
     select.set("connect", None)
 
 
+def _format_chosen_at_run_time(node: exp.Expression) -> exp.Expression | None:
+    """`to_date(text, fmt)` where `fmt` is a column or an alias (`case ... then 'YYYY_MM_DD' else 'YYYY_MM' end`).
+    DuckDB wants the format written in the query, and it is: one of the format literals the statement
+    holds. One branch per literal."""
+    fmt = node.args.get("format")
+    if fmt is None or isinstance(fmt, exp.Literal) or isinstance(node.parent, exp.If):
+        return None
+    written = list(dict.fromkeys(
+        lit.name for lit in node.root().find_all(exp.Literal)
+        if lit.is_string and re.search(r"YYYY|YY|MM|DD|HH24|MON", lit.name) and not re.search(r"[a-z%\\]", lit.name) and len(lit.name) <= 40))[:12]
+    if not written:
+        return None
+    name = "to_timestamp" if isinstance(node, exp.StrToTime) else "try_to_date" if node.args.get("safe") else "to_date"
+    ifs = []
+    for text in written:
+        try:
+            parsed = sqlglot.parse_one(f"select {name}(x, '{text}')", read="snowflake").expressions[0]
+        except Exception:  # noqa: BLE001, S112 - not a format after all
+            continue
+        parsed.set("this", node.this.copy())
+        ifs.append(exp.If(this=exp.EQ(this=fmt.copy(), expression=exp.Literal.string(text)), true=parsed))
+    return exp.Case(ifs=ifs) if ifs else None
+
+
 def rewrite(node: exp.Expression) -> exp.Expression:
     """Apply the fixes bottom-up, so nested cases (a ratio of averages) all get rewritten."""
+    if isinstance(node, (exp.TsOrDsToDate, exp.StrToTime, exp.StrToDate, exp.TsOrDsToTimestamp)):
+        chosen = _format_chosen_at_run_time(node)
+        if chosen is not None:
+            return chosen
     if isinstance(node, exp.Select) and node.args.get("connect") is not None and node.args.get("from_") is not None \
             and not node.args.get("joins"):
         hierarchical(node)

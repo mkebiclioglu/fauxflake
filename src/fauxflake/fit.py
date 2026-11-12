@@ -718,6 +718,26 @@ class Fitter:
         self.dirty |= changed
         return changed
 
+    def parsed_as_ip(self, uid: str) -> bool:
+        """PARSE_IP(col, 'inet') on a column that was not generated as addresses."""
+        tree = self.tree(uid)
+        changed = False
+        for call in (tree.find_all(exp.Anonymous) if tree is not None else []):
+            arg = call.expressions[0].unnest() if call.name.upper() == "PARSE_IP" and call.expressions else None
+            if not isinstance(arg, exp.Column):
+                continue
+            for table, name in [(t, n) for t in self.sources_of(uid) for n in self.origins(uid, arg.name.upper())]:
+                columns = self.tables[table].get("columns") or {}
+                if name in columns and columns[name].get("gen") != "ip":
+                    if columns[name].get("gen") in ("sequence", "hash_id"):
+                        self._unkey(table)
+                    columns[name] = {"gen": "ip"}
+                    self.retyped.add(table)
+                    self.learned.append(f"{table}.{name}: read with PARSE_IP, generated as addresses.")
+                    changed = True
+        self.dirty |= changed
+        return changed
+
     def drop_filler(self, uid: str, value: str) -> bool:
         """`replace(replace(hybrid__c, 'Yes', '1'), 'No', '0')::int` met `other_hybrid__c`, the value a categorical
         column carries for "anything else": this column has nothing else."""
@@ -1728,6 +1748,8 @@ class Fitter:
                 if not hint:
                     return False
                 if hint in ("BIGINT", "DOUBLE", "BOOLEAN", "DATE", "TIMESTAMP") and self.drop_filler(sql_key, m.group("value")):
+                    return True
+                if hint in ("BIGINT", "DOUBLE") and self.parsed_as_ip(sql_key):
                     return True
                 if hint in ("BIGINT", "DOUBLE") and re.search(r"DBT_INTERNAL_DEST|__FX_MERGE", message) and self.text_merge_key(sql_key):
                     return True
