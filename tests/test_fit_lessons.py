@@ -171,3 +171,21 @@ def test_a_test_on_a_column_the_model_renames_away_fails_everywhere():
     assert not f.test_names_a_column_the_model_does_not_write(test, 'Referenced column "STATUS" not found in FROM clause!')
     f = fitter(nodes=nodes, sql_of={"model.p.m": "select * from RAW.A.T"})
     assert f.output_columns("model.p.m") is None
+
+
+def test_columns_read_past_a_written_out_listing_are_found_at_once():
+    tree = parse("""with d as (select "ID", "TYPE", max(up) as valid_from from RAW.A.MEMBERS group by "ID", "TYPE"),
+        renamed as (select id::number as member_id, type as member_type, requested_at::timestamp as requested_at,
+                           expires_at::timestamp as expires_at, ldap::boolean as has_ldap, valid_from from d)
+        select * from renamed""")
+    f = fitter()
+    ctes = {c.alias.upper(): c.this for c in tree.find_all(sqlglot.exp.CTE)}
+    assert f.read_past_a_listing(tree, ctes, "RAW.A.MEMBERS", "REQUESTED_AT") == ["REQUESTED_AT", "EXPIRES_AT", "LDAP"]
+
+
+def test_a_model_that_renames_columns_is_not_a_select_star_of_its_source():
+    renames = "with source as (select email, optedout as opted_out from RAW.R.DATA) select * from source"
+    stars = "with source as (select * from RAW.R.OPTOUTS) select * from source"
+    f = fitter(by_rel={"A.B.X": "x", "A.B.Y": "y"}, nodes={"x": {}, "y": {}}, sql_of={"x": renames, "y": stars})
+    assert f.passthrough("A.B.X") is None
+    assert f.passthrough("A.B.Y") == "RAW.R.OPTOUTS"

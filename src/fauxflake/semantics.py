@@ -1760,3 +1760,25 @@ def repair_types(transformed: exp.Expression, conn, params=None) -> exp.Expressi
         return tree
     finally:
         conn.execute("set errors_as_json = false")
+
+
+def view_past_a_schema_named_like_a_database(transformed: exp.Expression, message: str) -> exp.Expression | None:
+    """A view in PREP that reads PREP.SNOWFLAKE.T while a database SNOWFLAKE exists: DuckDB stores a view's
+    references to its own database without the database, and then cannot tell the schema SNOWFLAKE from
+    the database. Those tables are read by their full name instead. None when it is not that case."""
+    m = re.search(r'Ambiguous reference to catalog or schema "([^"]+)"', message)
+    if not m or not isinstance(transformed, exp.Create) or str(transformed.args.get("kind", "")).upper() != "VIEW":
+        return None
+    tree, changed = transformed.copy(), False
+    for table in list(tree.expression.find_all(exp.Table)) if tree.expression is not None else []:
+        if not (table.catalog and table.db.upper() == m.group(1).upper() and isinstance(table.this, exp.Identifier)):
+            continue
+        full = ".".join(f'"{part}"' for part in (table.catalog, table.db, table.name))
+        read = exp.Table(this=exp.Anonymous(this="query_table", expressions=[exp.Literal.string(full)]),
+                         alias=exp.TableAlias(this=exp.to_identifier(table.alias_or_name, quoted=True)))
+        for extra in ("joins", "pivots", "sample"):
+            if table.args.get(extra):
+                read.set(extra, table.args[extra])
+        table.replace(read)
+        changed = True
+    return tree if changed else None

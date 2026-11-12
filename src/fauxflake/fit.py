@@ -298,6 +298,20 @@ class Fitter:
             self.existing[fq] = {"columns": columns, "as": "table"}
             self.learned.append(f"{fq}: built once; later runs start from an empty table with its {len(columns)} columns.")
 
+    def reads_itself_before_it_exists(self, uid: str, fq: str, message: str) -> bool:
+        """dbt dropped the stand-in to build the model, and the model's query reads the model. Build it
+        once against the stand-in: bootstrap() then records the table later runs start from."""
+        if fq not in self.existing or self.existing[fq].get("as") == "table" \
+                or f"Table with name {fq.split('.')[2]} does not exist" not in message:
+            return False
+        self.create_existing(fq)
+        conn = self.emu._fs.connect(database=self.nodes[uid]["database"], schema=self.nodes[uid]["schema"])
+        try:
+            self.run_model(conn, uid, fq)
+        finally:
+            conn.close()
+        return self.existing[fq].get("as") == "table"
+
     def _ancestors(self, uid: str) -> set[str]:
         seen: set[str] = set()
         stack = list(self.nodes.get(uid, {}).get("depends_on", {}).get("nodes", []))
@@ -567,7 +581,9 @@ class Fitter:
             fresh = {"gen": "template", "template": delimiter.join(["{n}"] * max(count, 2))}
             for table in self.sources_of(uid):
                 columns = self.tables[table].get("columns") or {}
-                if column in columns and columns[column] != fresh and columns[column].get("gen") in _FREE:
+                if column in columns and columns[column] != fresh and columns[column].get("gen") in (*_FREE, "sequence", "dist", "hash_id"):
+                    if columns[column].get("gen") in ("sequence", "hash_id"):
+                        self._unkey(table)  # `version` took for a key: nothing can reference 1.2.3
                     columns[column] = dict(fresh)
                     self.retyped.add(table)
                     self.learned.append(f"{table}.{column}: its pieces are read as numbers; generated as {fresh['template']!r}.")
@@ -599,7 +615,8 @@ class Fitter:
         """The model converts column `name` to `hint`: make the sources it reads generate that."""
         changed = False
         tables = self.sources_of(uid)
-        names = list(dict.fromkeys([name, *self.origins(uid, name)]))  # and the source columns an output column is made from
+        # and the source columns an output column is made from
+        names = list(dict.fromkeys([name, *self.origins(uid, name, strict=hint == "DAY")]))
         for table, name in [(t, n) for t in tables for n in names]:
             columns = self.tables[table].get("columns") or {}
             if name not in columns:  # "Sum of Open Opportunities" is sum_of_open_opportunities in generated text
@@ -697,6 +714,28 @@ class Fitter:
                     self.learned.append(f"{fq}.{name}: used as {hint}, declared {wanted}.")
                     changed = True
         self.dirty |= changed
+        return changed
+
+    def compared_with_a_hash(self, uid: str, name: str) -> bool:
+        """An MD5 would not convert to a number: column `name` holds hashes (a surrogate key), and what the
+        model compares it with was generated, or declared, as a number. That side is text too."""
+        changed = False
+        tree = self.tree(uid)
+        own = _fq(self.nodes[uid]["relation_name"]) if (self.nodes.get(uid) or {}).get("relation_name") else None
+        relations = self.real_tables(tree, {c.alias.upper(): c.this for c in tree.find_all(exp.CTE)}) if tree is not None else set()
+        for fq in {*relations, *([own] if own else [])}:  # dbt's merge compares the model's key with the table standing for it
+            for held in (self.existing.get(fq, {}).get("columns"), self.pending.get(fq)):
+                if held and held.get(name) in ("BIGINT", "DOUBLE"):
+                    held[name] = "VARCHAR"
+                    self.create_existing(fq) if fq in self.existing else self.create_pending(fq)
+                    self.learned.append(f"{fq}.{name}: compared with a hash, declared VARCHAR.")
+                    changed = True
+        for eq in (tree.find_all(exp.EQ) if tree is not None else []):
+            sides = [eq.this.unnest(), eq.expression.unnest()]
+            if all(isinstance(x, exp.Column) for x in sides) and any(x.name.upper() == name for x in sides):
+                for other in sides:
+                    if other.name.upper() != name:
+                        changed |= self.retype_column(uid, other.name.upper(), "TEXT")
         return changed
 
     def _unkey(self, table: str) -> None:
@@ -842,18 +881,23 @@ class Fitter:
                 isinstance(e, exp.Column) or (isinstance(e, exp.Alias) and isinstance(e.this, exp.Column) and e.alias.upper() == e.this.name.upper())
                 for e in top.expressions) and not top.args.get("joins") and not top.args.get("group")
             return next(iter(tables)) if listed and len(tables) == 1 else None
-        if len(tables) == 1:
-            return next(iter(tables))
+        # `select *` all the way down to one relation. A CTE that picks or renames columns
+        # (`select email, optedout as opted_out from t`) is a projection, whatever `select *` follows it
         return self._star_owner(t, ctes)
 
     def _star_owner(self, node: exp.Expression, ctes: dict[str, exp.Expression]) -> str | None:
         """`select s.*, p.sku from a s join b p ...`: the columns nobody lists are those of `s`."""
         for _ in range(8):
             node = node.unnest()
+            while isinstance(node, exp.SetOperation):  # the same table stacked on itself
+                node = node.left.unnest()
             if not isinstance(node, exp.Select) or node.args.get("from_") is None:
                 return None
             stars = [e for e in node.expressions if isinstance(e, exp.Star) or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star))]
-            if not stars:
+            listed = len(node.expressions) > 2 and not node.args.get("joins") and not node.args.get("group") and all(
+                isinstance(e, exp.Column) or (isinstance(e, exp.Alias) and isinstance(e.this, exp.Column) and e.alias.upper() == e.this.name.upper())
+                for e in node.expressions)  # dbt_utils.star written out
+            if not stars and not listed:
                 return None
             owner = next((e.table.upper() for e in stars if isinstance(e, exp.Column) and e.table), None)
             relations = [node.args["from_"].this, *[j.this for j in node.args.get("joins") or []]]
@@ -1059,6 +1103,25 @@ class Fitter:
                         singles |= owners if len(owners) == 1 else set()
                 if len(singles) > 1:
                     return any([self.blame(c, col) for c in sorted(singles)])
+        if len(candidates) > 1 and not alias:
+            # `left join mapping on form_url_clean = bizible_url`: a bare column in a join's ON that no relation
+            # has yet is the joined relation's, the one the condition is there to bring in
+            joined: set[str] = set()
+            for c in t.find_all(exp.Column):
+                join = c.find_ancestor(exp.Join)
+                on = join.args.get("on") if join is not None and not c.table and c.name.upper() == col else None
+                if on is not None and any(x is c for x in on.find_all(exp.Column)):
+                    joined |= self.real_tables(join.this, ctes) & candidates
+            if len(joined) == 1:
+                candidates = joined
+        if len(candidates) > 1 and not alias:
+            # still several: the relation whose name shares the most words with the column's
+            # (`pathfactory_content_type` and `..._to_pathfactory_mapping`)
+            words = {w for w in re.split(r"[\W_]+", col.lower()) if len(w) > 2}
+            score = {c: len(words & set(re.split(r"[\W_]+", c.split(".")[-1].lower()))) for c in candidates}
+            best = max(score.values())
+            if best and list(score.values()).count(best) == 1:
+                candidates = {c for c, n in score.items() if n == best}
         if len(candidates) > 1 and self._unioned(t, ctes, candidates):
             # `select * from a union all select * from b`: the branches line up, so every one of them has it
             return any([self.blame(c, col) for c in sorted(candidates)])
@@ -1070,10 +1133,34 @@ class Fitter:
         if owner in self.tables:
             # one error names one column; the model usually reads many more from the same table
             # (a wide config table, read with `select *`): add them all now, not one run at a time
-            for name in self.read_through(t, owner):
+            for name in [*self.read_through(t, owner), *self.read_past_a_listing(t, ctes, owner, col)]:
                 if name != col and re.fullmatch(r"[\w$ ]+", name):
                     self.add_column(owner, name)
         return True
+
+    def read_past_a_listing(self, tree: exp.Expression, ctes: dict[str, exp.Expression], owner: str, col: str) -> list[str]:
+        """`with d as (select "A", "B", max(t) as m from T group by "A", "B") select a, b, c, e from d`: the CTE
+        was written out from the columns T had when the model compiled, so the SELECT that reads `c` from it
+        reads its other missing columns from T too. All of them now, not one compile at a time."""
+        out: list[str] = []
+        for c in tree.find_all(exp.Column):
+            select = c.find_ancestor(exp.Select)
+            if c.table or c.name.upper() != col or select is None or select.args.get("joins") or select.args.get("from_") is None:
+                continue
+            source = select.args["from_"].this
+            inner = ctes.get(source.name.upper()) if isinstance(source, exp.Table) and not source.db else None
+            inner = inner.unnest() if inner is not None else None
+            if not isinstance(inner, exp.Select) or inner.find(exp.Star) or self.real_tables(inner, ctes) != {owner}:
+                continue
+            given = {e.alias_or_name.upper() for e in inner.expressions}
+            own = {e.alias.upper() for e in select.expressions if isinstance(e, exp.Alias)}
+            for other in select.find_all(exp.Column):
+                name = other.name.upper()
+                if not other.table and other.find_ancestor(exp.Select) is select and name not in given and name not in out \
+                        and (name not in own or any(isinstance(e, exp.Alias) and e.alias.upper() == name and any(
+                            x.name.upper() == name for x in e.this.find_all(exp.Column)) for e in select.expressions)):
+                    out.append(name)
+        return out
 
     def read_through(self, tree: exp.Expression, fq: str) -> list[str]:
         """Columns a query certainly reads from table `fq`: qualified with its alias, or bare where it
@@ -1180,7 +1267,7 @@ class Fitter:
         self.dirty |= changed
         return changed
 
-    def origins(self, uid: str, name: str, depth: int = 0) -> list[str]:
+    def origins(self, uid: str, name: str, depth: int = 0, strict: bool = False) -> list[str]:
         """Source column names behind an output column: follows `x as name`, and the bare columns a
         CASE or COALESCE falls back to, through the models upstream."""
         out = [name]
@@ -1194,6 +1281,13 @@ class Fitter:
                 if alias.alias.upper() != name:
                     continue
                 inner = alias.this
+                if strict:  # only the columns whose value it is: through casts, min/max and coalesce
+                    found = [c for c in self._cast_reads(inner.this if isinstance(inner, (exp.Max, exp.Min, exp.AnyValue)) else inner)
+                             if isinstance(c, exp.Column)] if not inner.find(exp.Add, exp.Sub, exp.Mul, exp.Div) else []
+                    for col in found:
+                        if col.name.upper() != name:
+                            out += self.origins(node_id, col.name.upper(), depth + 1, strict=True)
+                    continue
                 found = [inner] if isinstance(inner, exp.Column) else []
                 if isinstance(inner, exp.Case):  # what the branches give, not what they test
                     for e in [*(i.args.get("true") for i in inner.args.get("ifs") or []), inner.args.get("default")]:
@@ -1292,13 +1386,27 @@ class Fitter:
             prefix = re.search(r"prefix\s*=\s*['\"]([^'\"]*)['\"]", rest)
             suffix = re.search(r"suffix\s*=\s*['\"]([^'\"]*)['\"]", rest)
             prefix, suffix = (prefix.group(1) if prefix else ""), (suffix.group(1) if suffix else "")
+            holder = (m.groupdict().get("table") or "").upper()
+            tree = self.tree(sql_key)
+            sources = self.sources_of(sql_key)
             if not prefix and not suffix:
-                continue
-            named = re.findall(r"(?i)\.\s*" + re.escape(prefix) + r"(\w+?)" + re.escape(suffix) + r"\b", compiled)
+                # no prefix to tell the pivoted columns by: they are what the model reads from the CTE that
+                # pivots (`stages_pivoted.application_review`) and that CTE does not otherwise select
+                cte = next((c.this.unnest() for c in tree.find_all(exp.CTE) if c.alias.upper() == holder), None) if tree is not None and holder else None
+                if not isinstance(cte, exp.Select):
+                    continue
+                own = {e.alias_or_name.upper() for e in cte.expressions}
+                named = [c.name for c in tree.find_all(exp.Column) if c.table.upper() == holder and c.name.upper() not in own]
+                looked = re.search(r"get_column_values\(\s*ref\(\s*['\"](\w+)['\"]", rest)
+                where = next((uid for uid, n in self.nodes.items() if looked and n.get("name") == looked.group(1)
+                              and n.get("resource_type") == "model"), None)
+                sources = self.sources_of(where) if where else sources  # the model whose values were pivoted
+            else:
+                named = re.findall(r"(?i)\.\s*" + re.escape(prefix) + r"(\w+?)" + re.escape(suffix) + r"\b", compiled)
             values = [v.lower() for v in dict.fromkeys(named) if not re.search(r"_[0-9a-f]{12}$", v)]
             if not values:
                 continue
-            for table, name in [(t, n) for t in self.sources_of(sql_key) for n in self.origins(sql_key, column)]:
+            for table, name in [(t, n) for t in sources for n in self.origins(sql_key, column)]:
                 columns = self.tables[table].get("columns") or {}
                 gen = columns.get(name)
                 if gen is None or (gen.get("gen") == "categorical" and set(values) <= {str(v) for v in gen.get("values") or {}}):
@@ -1561,17 +1669,33 @@ class Fitter:
                 fmt = fmt.group(1) if fmt else None
                 if not hint:
                     return False
+                if named and hint in ("BIGINT", "DOUBLE") and re.fullmatch(r"[0-9a-f]{32}", m.group("value")) \
+                        and self.compared_with_a_hash(sql_key, named.group(1).upper()):
+                    return True
                 if named and self.retype_column(sql_key, named.group(1).upper(), hint, fmt):
-                    if hint in ("DATE", "TIMESTAMP") and not fmt:
+                    tree = self.tree(sql_key)
+                    kinds = {"DATE": ("date",), "TIMESTAMP": ("timestamp", "timestampntz", "timestampltz", "timestamptz"), "BOOLEAN": ("boolean",),
+                             "DOUBLE": ("float", "double", "decimal", "int", "bigint"), "BIGINT": ("float", "double", "decimal", "int", "bigint")}.get(hint)
+                    if kinds and not fmt and tree is not None:
                         # `a::date ... b::date ... c::date`: the error names one; the model casts the others the same way
-                        tree = self.tree(sql_key)
-                        for c in dict.fromkeys(c.this.name.upper() for c in (tree.find_all(exp.Cast, exp.TryCast) if tree is not None else [])
-                                               if c.to.is_type(hint.lower()) and isinstance(c.this, exp.Column)):
-                            learned = any((self.tables[t].get("columns") or {}).get(c, {}).keys() & {"format", "epoch"}
-                                          for t in self.sources_of(sql_key))
-                            if not learned:
-                                self.retype_column(sql_key, c, hint)
+                        sources = self.sources_of(sql_key)
+                        for c in dict.fromkeys(c.this.name.upper() for c in tree.find_all(exp.Cast, exp.TryCast)
+                                               if c.to.is_type(*kinds) and isinstance(c.this, exp.Column)):
+                            gens = [(self.tables[t].get("columns") or {}).get(c) for t in sources]
+                            gens = [g for g in gens if g]
+                            if any(g.keys() & {"format", "epoch"} for g in gens):
+                                continue  # already learned how this one is written
+                            if hint in ("DOUBLE", "BIGINT", "BOOLEAN") and not all(g.get("gen") in _FREE for g in gens):
+                                continue  # a key or a reference read as a number is a lesson of its own
+                            self.retype_column(sql_key, c, hint)
                     return True  # DuckDB named the column it was reading
+                if named and not fmt and self.tree(sql_key) is not None:
+                    # UNPIVOT (headcount FOR month IN ("2020-04-30", ...)): the value comes from every listed column
+                    listed = [c.name.upper() for pivot in self.tree(sql_key).find_all(exp.Pivot)
+                              if pivot.args.get("unpivot") and any(e.name.upper() == named.group(1).upper() for e in pivot.expressions)
+                              for field in pivot.args.get("fields") or [] for c in field.find_all(exp.Column)]
+                    if any([self.retype_column(sql_key, c, hint) for c in dict.fromkeys(listed)]):
+                        return True
                 precision = re.search(r"to DECIMAL\((\d+),\s*(\d+)\)", message)
                 if precision and re.fullmatch(r"-?[\d.]+", m.group("value")):
                     # a number that does not fit NUMBER(p, s): the column holds smaller ones
@@ -2057,7 +2181,8 @@ class Fitter:
                         self.emu.duck.execute(existing_view(fq, rel.get("columns") or {}, table=rel.get("as") == "table"))
                     except Exception:  # noqa: BLE001, S110
                         pass
-            selected = []
+            # for working on the fitter: FAUXFLAKE_FIT_SELECT="+model_a +model_b" builds only those
+            selected = ["--select", *os.environ["FAUXFLAKE_FIT_SELECT"].split()] if os.environ.get("FAUXFLAKE_FIT_SELECT") else []
             project.invoke(["build", *selected], silent=True)
             if not results_path.exists():
                 self.log(f"  dbt build did not run: {project.last_error[:600] or 'no results were written'}")
@@ -2120,6 +2245,8 @@ class Fitter:
                     self.sql_of[uid] = compiled
                     self.trees.pop(uid, None)
                     self.by_rel[fq] = uid
+                    if self.reads_itself_before_it_exists(uid, fq, message):
+                        continue
                     if not self.learn(uid, message):
                         self.learn_upstream(uid, message)  # the SQL that failed may be a view this model selects from
                         continue
@@ -2146,7 +2273,8 @@ class Fitter:
                 Path(os.environ["FAUXFLAKE_FIT_DEBUG"] + f".build{n_round}.json").write_text(json.dumps(
                     {"failed": {r["unique_id"]: (r.get("message") or "")[:2000] for r in failed},
                      "slow": sorted(((round(r.get("execution_time") or 0), r["unique_id"]) for r in results), reverse=True)[:15],
-                     "learned": self.learned[before:]}, indent=1))
+                     "learned": self.learned[before:], "statements": dict(emulator.FAILED_STATEMENTS)}, indent=1))
+                emulator.FAILED_STATEMENTS.clear()
             if not failed or (len(self.learned) == before and not accepted):
                 break
             # next round: what failed, what reads a source whose values changed, and everything downstream
@@ -2215,7 +2343,12 @@ class Fitter:
             if gen["gen"] in ("sequence", "hash_id"):
                 return False
             numeric = gen["gen"] == "dist" or str(gen.get("type", "")).upper().startswith(("BIGINT", "INT", "DECIMAL", "DOUBLE"))
-            if not any(d["gen"] in ("sequence", "hash_id") for d in columns.values()):
+            if gen["gen"] in ("time_offset", "event_time", "updated_at"):
+                if gen.get("unique"):
+                    return False
+                # a date nobody shares (a sheet with one row per month): stays a date, one day per row
+                columns[col] = {"p": [0, 0.5, 1], "seconds": [0, 86400, 604800], **gen, "gen": "time_offset", "unique": True}
+            elif not any(d["gen"] in ("sequence", "hash_id") for d in columns.values()):
                 columns[col] = {"gen": "sequence" if numeric else "hash_id"}  # the table had no key: this is it
             elif numeric:
                 if gen.get("unique"):

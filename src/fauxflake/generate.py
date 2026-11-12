@@ -208,6 +208,8 @@ class TableSQL:
                 f"case {pick} {' '.join(f'when {i} then {fill(t)}' for i, t in enumerate(shapes))} end"
         elif gen == "time_offset":
             expr = f"_ev + {ms(piecewise(self.u(col), d['p'], d['seconds']))}"
+            if d.get("unique") and self.base == "g":
+                expr = "(timestamp '2000-01-01' + to_days(g::integer))"  # a `unique` test covers it: one day per row
             if d.get("epoch"):  # the moment as seconds since 1970, the way APIs often send it
                 expr = f"epoch({expr})::bigint"
             if d.get("format"):  # a text column holding dates in this format

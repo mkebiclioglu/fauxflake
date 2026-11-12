@@ -360,3 +360,23 @@ def test_a_column_alias_wins_over_a_joined_table_of_the_same_name(run):
     run("create or replace table lp as select 1 as id, 8.0::double as billing_list_price")
     assert run("with list_price as (select * from lp) select billing_list_price as list_price, annual_price - list_price as d, "
                "quantity * list_price as t from joined left join list_price on joined.id = list_price.id") == [(8.0, 2.0, 24.0)]
+
+
+def test_several_columns_dropped_in_one_statement(run):
+    run("create or replace table drop_many (x int, a text, b text, c text)")
+    run('alter table drop_many drop column a, "B"')
+    run("alter table drop_many drop column if exists c, never_there")
+    assert [r[0] for r in run("describe table drop_many")] == ["X"]
+
+
+def test_a_view_in_a_schema_named_like_another_database(run):
+    for sql in ("create database if not exists snowflake", "create schema if not exists snowflake.account_usage",
+                "create or replace table snowflake.account_usage.query_history (query_id text, end_time timestamp)",
+                "insert into snowflake.account_usage.query_history values ('a', '2024-01-01')",
+                "create database if not exists prep_db", "create schema if not exists prep_db.snowflake",
+                "create or replace table prep_db.snowflake.seen (query_id text, query_end_at timestamp)",
+                "insert into prep_db.snowflake.seen values ('z', '2023-01-01')",
+                "create or replace view prep_db.snowflake.fresh as (select query_id from snowflake.account_usage.query_history "
+                "where end_time > (select max(query_end_at) from prep_db.snowflake.seen))"):
+        run(sql)
+    assert run("select * from prep_db.snowflake.fresh") == [("a",)]

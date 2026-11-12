@@ -222,6 +222,7 @@ _ALIAS_ERROR = re.compile(r'Alias (?:with name )?"+([^"]+)"+ (?:exists, but alia
 _MISSING_COLUMN = re.compile(r'Referenced column "([^"]+)" not found in FROM clause')
 _AMBIGUOUS_ERROR = re.compile(r"""Ambiguous reference to column name "+([^"]+)"+ \(use: '"?([^'".]+)"?\.""")
 _patched = False
+FAILED_STATEMENTS: dict[str, str] = {}  # error -> the last statement that raised it (debug mode only)
 
 
 def run_guarded(cursor, work, limit: float | None = None) -> None:  # noqa: ANN001
@@ -470,6 +471,23 @@ def _patch_fakesnow() -> None:
 
     FakeSnowflakeCursor._transform = _transform
 
+    original_explode = FakeSnowflakeCursor._transform_explode
+
+    def _transform_explode(self, expression):  # noqa: ANN001
+        # ALTER TABLE t DROP COLUMN a, b (dbt's on_schema_change: sync_all_columns): one column at a time
+        actions = expression.args.get("actions") or [] if isinstance(expression, exp.Alter) else []
+        dropped = actions[0].args.get("tables") or [] if len(actions) == 1 and isinstance(actions[0], exp.Drop) else []
+        if len(dropped) > 1:
+            parts = []
+            for column in dropped:
+                part = expression.copy()
+                part.args["actions"][0].set("tables", [column.copy()])
+                parts.append(part)
+            return parts
+        return original_explode(self, expression)
+
+    FakeSnowflakeCursor._transform_explode = _transform_explode
+
     original_execute = FakeSnowflakeCursor._execute
 
     def _heal(self) -> None:  # noqa: ANN001
@@ -570,6 +588,11 @@ def _patch_fakesnow() -> None:
                 if as_times is not None:
                     run(as_times)
                     return
+                by_name = semantics.view_past_a_schema_named_like_a_database(transformed, str(e))
+                if by_name is not None:
+                    _heal(self)
+                    run(by_name)
+                    return
                 unshadowed = semantics.aliases_over_tables(transformed) if "STRUCT(" in str(e) else None
                 if unshadowed is not None:
                     _heal(self)
@@ -587,7 +610,13 @@ def _patch_fakesnow() -> None:
                     raise
                 run(repaired)
 
-        run_guarded(self, attempt)
+        try:
+            run_guarded(self, attempt)
+        except Exception as e:
+            if os.environ.get("FAUXFLAKE_FIT_DEBUG"):  # for working on the emulator: what DuckDB refused
+                if len(FAILED_STATEMENTS) < 500:
+                    FAILED_STATEMENTS[str(e)[:160]] = transformed.sql(dialect="duckdb")[:4000]
+            raise
         semantics.coerce_result(self)
 
     FakeSnowflakeCursor._execute = _execute

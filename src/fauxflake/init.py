@@ -807,7 +807,7 @@ def update_spec(project, path: Path, database: str, emu, log=print) -> list[str]
             continue
         columns = tables[name].setdefault("columns", {})
         for col, gen in table["columns"].items():
-            if col not in columns:
+            if col not in columns and gen.get("gen") != "loaded_at":  # no model reads that one: it stays out if it was taken out
                 columns[col] = gen
                 added.append(f"{name}.{col}")
     known = spec.get("udfs") or {}
