@@ -34,7 +34,7 @@ import yaml
 from sqlglot import exp
 
 from . import emulator
-from .init import guess, within_bounds
+from .init import guess, periods_have_length, within_bounds
 from .spec import quoted
 
 Log = Callable[[str], None]
@@ -1030,8 +1030,33 @@ class Fitter:
         self.unions[fq] = members
         return True
 
+    def _is_snapshot(self, fq: str) -> bool:
+        uid = self.by_rel.get(fq) or self.relation_owner.get(fq)
+        return (self.nodes.get(uid) or {}).get("resource_type") == "snapshot"
+
+    def kept_by_snapshot(self, fq: str, col: str) -> bool:
+        """A model reads from a snapshot a column the snapshotted model no longer writes. The snapshot
+        table in production still has it, from when it did: the table is there before the build, with
+        the columns the snapshot gives it and that one."""
+        try:
+            columns = {r[0]: r[1] for r in self.emu.duck.execute(f"describe {quoted(fq)}").fetchall()}
+        except Exception:  # noqa: BLE001 - not built yet: nothing to start from
+            return False
+        if not columns or col in columns:
+            return False
+        columns[col] = duck_type(guess(col, None))
+        self.existing[fq] = {"columns": columns, "as": "table"}
+        try:
+            self.emu.duck.execute(f'alter table {quoted(fq)} add column if not exists "{col}" {columns[col]}')
+        except Exception:  # noqa: BLE001, S110
+            pass
+        self.learned.append(f"{fq}: {col} is read from this snapshot and the model it snapshots no longer writes it; "
+                            f"the snapshot table starts out with the column, as it does where it has history.")
+        self.dirty = True
+        return True
+
     def blameable(self, fq: str, depth: int = 0) -> bool:
-        if fq in self.tables or fq in self.existing or fq in self.pending or self._union_members(fq):
+        if fq in self.tables or fq in self.existing or fq in self.pending or self._union_members(fq) or self._is_snapshot(fq):
             return True
         parent = self.passthrough(fq) if depth <= 8 else None
         return bool(parent) and self.blameable(parent, depth + 1)
@@ -1077,6 +1102,8 @@ class Fitter:
                 added = True
             return added
         parent = self.passthrough(fq) if depth <= 8 else None
+        if self._is_snapshot(fq) and not (parent and self.blameable(parent, depth + 1)):
+            return self.kept_by_snapshot(fq, col)
         if parent and self.blame(parent, col, depth + 1):
             try:  # the model was already built without the column: give it one so the pass can go on
                 self.emu.duck.execute(f'alter table {quoted(fq)} add column if not exists "{col}" varchar')
@@ -1523,6 +1550,183 @@ class Fitter:
         self.dirty |= changed
         return changed
 
+    @staticmethod
+    def _relations(select: exp.Select) -> list[exp.Expression]:
+        source = select.args.get("from_")
+        return [r for r in [source.this if source is not None else None, *[j.this for j in select.args.get("joins") or []]] if r is not None]
+
+    def _flattened(self, node: exp.Expression, base: exp.Column, ctes: dict[str, exp.Expression], depth: int = 0) -> str | None:
+        """The column whose JSON document `base` is an element of: `d.value` next to
+        `lateral flatten(input => parse_json(jsontext)) d`, under whatever name later CTEs give it."""
+        node = node.unnest()
+        if not isinstance(node, exp.Select) or depth > 8:
+            return None
+        relations = self._relations(node)
+        laterals = {r.alias.upper(): r for r in relations if isinstance(r, exp.Lateral)}
+        if base.name.upper() == "VALUE" and (base.table.upper() in laterals or (not base.table and len(laterals) == 1)):
+            arg = (laterals.get(base.table.upper()) or next(iter(laterals.values()))).this.this
+            arg = arg.expression if isinstance(arg, exp.Kwarg) else arg
+            while isinstance(arg, (exp.ParseJSON, exp.Cast, exp.TryCast, exp.Paren)):
+                arg = arg.this
+            return arg.name.upper() if isinstance(arg, exp.Column) else None
+        for rel in relations:
+            body = ctes.get(rel.name.upper()) if isinstance(rel, exp.Table) and not rel.db else rel.this if isinstance(rel, exp.Subquery) else None
+            sub = body.unnest() if body is not None else None
+            if not isinstance(sub, exp.Select):
+                continue
+            written = next((e for e in sub.expressions if e.alias_or_name.upper() == base.name.upper()), None)
+            inner = written.unalias() if written is not None else base if any(isinstance(e, exp.Star) for e in sub.expressions) else None
+            while isinstance(inner, (exp.Cast, exp.TryCast, exp.Paren)):
+                inner = inner.this
+            found = self._flattened(sub, inner, ctes, depth + 1) if isinstance(inner, exp.Column) else None
+            if found:
+                return found
+        return None
+
+    def element_field(self, uid: str, name: str, depth: int = 0, node: exp.Expression | None = None):  # noqa: ANN201
+        """A model column that is one field of each element of a JSON document held by a source column
+        (a YAML file loaded as one value, flattened, `value['key_path']::text as metrics_path`):
+        (table, column, key, element), where `element` is set when the model column says whether the
+        field, an array, contains it."""
+        tree = self.tree(uid)
+        if tree is None or depth > 12:
+            return None
+        ctes = {c.alias.upper(): c.this for c in tree.find_all(exp.CTE)}
+        node = (tree if node is None else node).unnest()
+        while isinstance(node, exp.SetOperation):
+            node = node.left.unnest()
+        if not isinstance(node, exp.Select):
+            return None
+        relations = [r for r in self._relations(node) if not isinstance(r, exp.Lateral)]
+
+        def into(rel: exp.Expression, column: str):  # noqa: ANN202
+            if isinstance(rel, exp.Subquery):
+                return self.element_field(uid, column, depth + 1, rel.this)
+            if isinstance(rel, exp.Table) and not rel.db and rel.name.upper() in ctes:
+                return self.element_field(uid, column, depth + 1, ctes[rel.name.upper()])
+            if isinstance(rel, exp.Table) and rel.catalog and rel.db:
+                fq = f"{rel.catalog.upper()}.{rel.db.upper()}.{rel.name.upper()}"
+                owner = self.by_rel.get(fq) or self.relation_owner.get(fq)
+                if owner and owner != uid and owner in self.nodes:
+                    if owner not in self.sql_of and self.nodes[owner].get("compiled_code"):
+                        self.sql_of[owner] = self.nodes[owner]["compiled_code"].strip().rstrip(";")
+                    return self.element_field(owner, column, depth + 1)
+            return None
+
+        written = next((e for e in node.expressions if e.alias_or_name.upper() == name), None)
+        if written is None:
+            if not any(isinstance(e, exp.Star) or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star)) for e in node.expressions):
+                return None
+            return next((hit for hit in (into(rel, name) for rel in relations) if hit), None)
+        inner, element = written.unalias(), None
+        while isinstance(inner, (exp.Cast, exp.TryCast, exp.Paren, exp.Coalesce, exp.ArrayContains)):
+            if isinstance(inner, exp.ArrayContains):
+                value = inner.expression
+                while isinstance(value, (exp.Cast, exp.Paren)):
+                    value = value.this
+                if not isinstance(value, exp.Literal):
+                    return None
+                element = value.name
+            inner = inner.this
+        if isinstance(inner, exp.Column):
+            owners = [r for r in relations if inner.table and r.alias_or_name.upper() == inner.table.upper()] or relations
+            hit = next((hit for hit in (into(rel, inner.name.upper()) for rel in owners) if hit), None)
+            return (*hit[:3], element or hit[3]) if hit else None
+        key = None
+        if isinstance(inner, exp.Bracket) and len(inner.expressions) == 1 and isinstance(inner.expressions[0], exp.Literal):
+            key = inner.expressions[0].name
+        elif isinstance(inner, exp.JSONExtract) and isinstance(inner.expression, exp.JSONPath):
+            keys = [str(k.this) for k in inner.expression.expressions if isinstance(k, exp.JSONPathKey)]
+            key = keys[0] if len(keys) == 1 else None
+        if key is None or not isinstance(inner.this, exp.Column):
+            return None
+        document = self._flattened(node, inner.this, ctes)
+        table = next((t for t in self.sources_of(uid) if document and document in (self.tables[t].get("columns") or {})), None)
+        return (table, document, key, element) if table else None
+
+    def pivoted_upstream(self, sql_key: str, message: str) -> bool:
+        """The model names columns ("counts.commit_comment") that the model before it makes with
+        `dbt_utils.pivot` from the values a lookup finds when it compiles
+        (`get_column_values(ref('dim_metric'), 'metrics_path', where="is_health_score_metric = TRUE")`).
+        When those values are a field of the entries of a JSON document a source holds (a YAML file
+        of definitions, loaded whole), the document lists the entries the models name."""
+        m = next((m for m in (p.search(message) for p in _MISSING) if m), None)
+        tree = self.tree(sql_key) if m else None
+        if tree is None:
+            return False
+        named = sorted({c.name for c in tree.find_all(exp.Column) if c.this.quoted and c.name != c.name.upper()})
+        if m.group("col").strip('"') not in named:
+            return False
+        changed = False
+        for parent in self.nodes[sql_key].get("depends_on", {}).get("nodes", []):
+            raw = (self.nodes.get(parent) or {}).get("raw_code") or ""
+            if "pivot(" not in raw:
+                continue
+            for look in re.finditer(r"get_column_values\((.*?)\)\s*-?%\}", raw, re.S):
+                args = look.group(1)
+                ref = re.search(r"ref\s*\(\s*['\"](\w+)['\"]", args)
+                column = re.search(r"column\s*=\s*['\"](\w+)['\"]", args) or re.search(r"\)\s*,\s*['\"](\w+)['\"]", args)
+                where = re.search(r"where\s*=\s*\"([^\"]*)\"", args) or re.search(r"where\s*=\s*'([^']*)'", args)
+                holder = next((uid for uid, n in self.nodes.items() if ref and n.get("name") == ref.group(1)
+                               and n.get("resource_type") in ("model", "snapshot", "seed")), None)
+                field = self.element_field(holder, column.group(1).upper()) if holder and column else None
+                if not field:
+                    continue
+                table, document, key, _ = field
+                flags: dict[str, object] = {}
+                try:
+                    tests = sqlglot.parse_one(f"select 1 from t where {where.group(1)}", read="snowflake").args["where"].this if where else None
+                except Exception:  # noqa: BLE001
+                    tests = None
+                for test in ([tests] if isinstance(tests, exp.Column) else list(tests.find_all(exp.EQ, exp.Is)) if tests is not None else []):
+                    flag = test if isinstance(test, exp.Column) else test.this
+                    wanted = True if isinstance(test, exp.Column) else test.expression
+                    if not isinstance(flag, exp.Column) or (not isinstance(test, exp.Column) and not (isinstance(wanted, exp.Boolean) and wanted.this)):
+                        continue
+                    other = self.element_field(holder, flag.name.upper())
+                    if other and other[:2] == (table, document):
+                        flags[other[2]] = [other[3]] if other[3] else True
+                gen = self.tables[table]["columns"][document]
+                try:
+                    held = json.loads(gen["value"]) if gen.get("gen") == "constant" else []
+                except (TypeError, ValueError):
+                    held = []
+                known = {entry.get(key) for entry in held if isinstance(entry, dict)}
+                entries = held + [{key: value, **flags} for value in named if value not in known]
+                if len(entries) == len(held):
+                    continue
+                self.tables[table]["columns"][document] = {"gen": "constant", "value": json.dumps(entries), "type": gen.get("type") or "VARCHAR"}
+                self.retyped.add(table)
+                self.learned.append(f"{table}.{document}: {self.nodes[parent]['name']} pivots the {key} of its entries into columns that "
+                                    f"{self.nodes[sql_key]['name']} names; it now lists those {len(named)} entries.")
+                changed = True
+        self.dirty |= changed
+        return changed
+
+    def empty_lookup(self, sql_key: str, message: str) -> bool:
+        """The model's Jinja loops over the values a lookup finds when it compiles
+        (`get_column_values(ref('fiscal_years'), ...)`), and it found none: the model it reads is empty.
+        What empties such a model here is periods without length (it lists the years a contract spans):
+        in the sources behind it, an end known only by name now comes after its start."""
+        if "'NoneType' object is not iterable" not in message:
+            return False
+        raw = self.nodes.get(sql_key, {}).get("raw_code") or ""
+        changed = False
+        for name in dict.fromkeys(re.findall(r"get_column_values\(\s*(?:table\s*=\s*)?ref\s*\(\s*['\"](\w+)['\"]", raw)):
+            holder = next((uid for uid, n in self.nodes.items() if n.get("name") == name and n.get("resource_type") in ("model", "snapshot")), None)
+            for uid in ([holder, *self._ancestors(holder)] if holder else []):
+                if uid in self.nodes and uid not in self.sql_of and self.nodes[uid].get("compiled_code"):
+                    self.sql_of[uid] = self.nodes[uid]["compiled_code"].strip().rstrip(";")
+            for table in (self.sources_of(holder) if holder else []):
+                ends = periods_have_length(self.tables[table].get("columns") or {})
+                if ends:
+                    self.retyped.add(table)
+                    self.learned.append(f"{table}: {name} is looked up when {self.nodes[sql_key]['name']} compiles and was empty; "
+                                        f"{', '.join(ends[:4])} now come{'s' if len(ends) == 1 else ''} after the start.")
+                    changed = True
+        self.dirty |= changed
+        return changed
+
     def looked_for(self, sql_key: str) -> bool:
         """The model's Jinja asked the warehouse which tables a schema holds (and for which names),
         found none, and compiled to nothing. Give it the tables it asked for by name."""
@@ -1754,7 +1958,8 @@ class Fitter:
         if self.runaway(sql_key, message) or self.looked_for(sql_key) or self.jinja_columns(sql_key, message) \
                 or self.ambiguous_column(sql_key, message):
             return True
-        if self.udf_input(sql_key, message) or self.pivot_values(sql_key, message) or self.missing_column(sql_key, message) or self.missing_relation(sql_key, message) \
+        if self.udf_input(sql_key, message) or self.pivot_values(sql_key, message) or self.pivoted_upstream(sql_key, message) \
+                or self.missing_column(sql_key, message) or self.missing_relation(sql_key, message) \
                 or self.union_widths(sql_key, message):
             return True
         named = _FROM_COLUMN.search(message)
@@ -1855,6 +2060,8 @@ class Fitter:
                     return True
                 for token in m.group("value").split():  # generated text starts with its column's name
                     if "_" in token and self.retype_column(sql_key, token.rsplit("_", 1)[0].upper(), hint, fmt):
+                        if hint in ("DATE", "TIMESTAMP", "BOOLEAN") and not fmt:
+                            self.cast_alike(sql_key, hint)
                         return True
                 return self.retype(m.group("value"), hint, fmt, only=set(self.sources_of(sql_key)))
         if "Failed to cast value to numerical" in message:
@@ -1917,6 +2124,20 @@ class Fitter:
             results = [i.args.get("true") for i in node.args.get("ifs") or []] + [node.args.get("default")]
             return [leaf for arg in results if arg is not None for leaf in Fitter._cast_reads(arg)]
         return []
+
+    def cast_alike(self, uid: str, hint: str) -> None:
+        """`coalesce(c.inquiry_date, l.inquiry_date)::date ... c.mql_date::date`: one of them failed as made-up
+        text; the others the model casts the same way, and that are still made-up text, hold the same kind."""
+        tree = self.tree(uid)
+        kinds = {"DATE": ("date",), "TIMESTAMP": ("timestamp", "timestampntz", "timestampltz", "timestamptz"), "BOOLEAN": ("boolean",)}[hint]
+        sources = self.sources_of(uid)
+        names = [leaf.name.upper() for cast in (tree.find_all(exp.Cast, exp.TryCast) if tree is not None else []) if cast.to.is_type(*kinds)
+                 for leaf in self._cast_reads(cast.this) if isinstance(leaf, exp.Column)]
+        for name in dict.fromkeys(names):
+            gens = [g for origin in self.origins(uid, name, strict=True) for t in sources
+                    if (g := (self.tables[t].get("columns") or {}).get(origin))]
+            if gens and all(g.get("gen") == "template" and not g.get("type") for g in gens):
+                self.retype_column(uid, name, hint)
 
     def retype_field(self, uid: str, access: exp.JSONExtract, hint: str) -> bool:
         """`col:field::int` on an object column whose field was generated as text."""
@@ -2368,6 +2589,8 @@ class Fitter:
                 again.add(node["name"])
                 if "no columns found to union" in message and node.get("relation_name"):
                     self.give_union_columns(_fq(node["relation_name"]), message, self.columns_children_read(node["unique_id"]))
+                    continue
+                if "Compilation Error" in message and self.empty_lookup(node["unique_id"], message):
                     continue
                 compiled = self._compiled(project, node)
                 if compiled and node.get("relation_name") and _fq(node["relation_name"]).count(".") == 2:

@@ -484,3 +484,44 @@ def test_having_without_grouping_filters_rows_by_the_columns_just_defined(run):
                "select 'k' || id as key, name from t where amt > 0 having key not in (select key from first) order by 1")
     assert rows == [("k2", "b")]
     assert run("select count(*) from t having count(*) > 1") == [(2,)]
+
+
+def test_a_qualified_temporary_table_goes_with_its_session():
+    import snowflake.connector
+
+    from fauxflake.emulator import serve
+
+    with serve() as emu:
+        first = snowflake.connector.connect(**emu.connect_kwargs())
+        cur = first.cursor()
+        cur.execute("create database if not exists ANALYTICS")
+        cur.execute("create schema if not exists ANALYTICS.CI")
+        cur.execute("create temporary table ANALYTICS.CI.SCRATCH as select 1 as id")
+        with pytest.raises(Exception, match="already exists"):
+            cur.execute("create temporary table ANALYTICS.CI.SCRATCH as select 2 as id")  # the same session: as in Snowflake
+        second = snowflake.connector.connect(**emu.connect_kwargs())
+        other = second.cursor()
+        other.execute("create temporary table ANALYTICS.CI.SCRATCH as select 3 as id")  # another session has its own
+        assert other.execute("select id from ANALYTICS.CI.SCRATCH").fetchall() == [(3,)]
+        second.close()
+        first.close()
+        third = snowflake.connector.connect(**emu.connect_kwargs())
+        with pytest.raises(Exception, match="does not exist"):
+            third.cursor().execute("select id from ANALYTICS.CI.SCRATCH")
+        third.close()
+
+
+def test_a_missing_table_is_reported_in_snowflakes_words(run):
+    with pytest.raises(Exception, match="does not exist or not authorized") as failure:
+        run("describe table ANALYTICS.CI.NOT_THERE")
+    assert "NOT_THERE" in str(failure.value)
+
+
+def test_dateadd_on_text_put_together_and_objects_of_every_column_in_an_aggregate(run):
+    import datetime
+    import json
+
+    assert run("select dateadd('month', 1, concat('2020' - 1, '-01-01')), dateadd('hour', 2, '2020' || '-01-01')") == [
+        (datetime.datetime(2019, 2, 1), datetime.datetime(2020, 1, 1, 2))]
+    rows = run("select id, array_agg(object_construct(*)) from t group by 1 order by 1")
+    assert json.loads(rows[0][1]) == [{"ID": 1, "NAME": "a", "AMT": 10.0}]

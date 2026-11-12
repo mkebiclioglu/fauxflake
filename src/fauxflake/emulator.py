@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import json
 import logging
 import os
 import re
@@ -219,6 +220,39 @@ def rewrite(sql: str) -> str:
     return sql
 
 
+# `create temporary table db.schema.name`: an ordinary relation here (see REWRITES), that goes when the
+# session that made it ends, and that another session does not see: its own takes the place
+_TEMP_RELATION = re.compile(
+    r"(?is)^(?:\s|--[^\n]*\n|/\*.*?\*/)*create(?:\s+or\s+replace)?(?:\s+secure)?\s+(?:temporary|temp)\s+(?P<kind>table|view)\s+"
+    r"(?:if\s+not\s+exists\s+)?(?P<name>(?:[\w$]+|\"[^\"]+\")(?:\.(?:[\w$]+|\"[^\"]+\")){2})")
+TEMPORARY: dict[str, tuple[int, str, str]] = {}  # DB.SCHEMA.NAME -> (session, table | view, the name as written)
+
+
+def _temporary(cursor, command: str) -> str | None:  # noqa: ANN001
+    made = _TEMP_RELATION.match(command)
+    if made is None:
+        return None
+    key = made.group("name").replace('"', "").upper()
+    held = TEMPORARY.get(key)
+    if held and held[0] != id(cursor._conn):
+        _drop_temporary(cursor._duck_conn, key)
+    return key
+
+
+def _drop_temporary(duck, key: str) -> None:  # noqa: ANN001
+    _, kind, name = TEMPORARY.pop(key)
+    try:
+        duck.execute(f"drop {kind} if exists {name}")
+    except Exception:  # noqa: BLE001, S110 - replaced by something else since
+        pass
+
+
+def end_session(conn=None, duck=None) -> None:  # noqa: ANN001
+    """Drop the temporary relations of one session, or of all of them."""
+    for key in [k for k, held in TEMPORARY.items() if conn is None or held[0] == id(conn)]:
+        _drop_temporary(duck if duck is not None else conn._duck_conn, key)
+
+
 _ALIAS_ERROR = re.compile(r'Alias (?:with name )?"+([^"]+)"+ (?:exists, but aliases cannot be used|referenced(?: in a SELECT clause)? - but the expression has (?:side effects|a subquery))')
 _MISSING_COLUMN = re.compile(r'Referenced column "([^"]+)" not found in FROM clause')
 _AMBIGUOUS_ERROR = re.compile(r"""Ambiguous reference to column name "+([^"]+)"+ \(use: '"?([^'".]+)"?\.""")
@@ -294,9 +328,13 @@ def _patch_fakesnow() -> None:
             handled = objects.intercept(self, command, original)  # functions, procedures, streams, tasks, policies
             if handled is not None:
                 return handled
+            temporary = _temporary(self, command)
             for _ in range(8):
                 try:
                     done = original(self, rewrite(command), *args, **kwargs)
+                    if temporary:
+                        made = _TEMP_RELATION.match(command)
+                        TEMPORARY[temporary] = (id(self._conn), made.group("kind"), made.group("name"))
                     objects.consume_streams(self, command)
                     objects.remember(self)
                     _note_empty_lookup(self, command)
@@ -325,7 +363,12 @@ def _patch_fakesnow() -> None:
             objects.consume_streams(self, command)
             objects.remember(self)
             return done
-        except ProgrammingError:
+        except ProgrammingError as e:
+            if e.errno == 2003 and "does not exist" in str(e.msg) and "not authorized" not in str(e.msg):
+                # Snowflake's wording, which clients look for: dbt reads "no such table" as "no columns yet"
+                self._sqlstate = "42S02"
+                raise ProgrammingError(msg=f"{e.raw_msg or e.msg}\nObject does not exist or not authorized.",
+                                       errno=2003, sqlstate="42S02") from e
             raise
         except Exception as e:  # noqa: BLE001
             # Anything else would surface as an HTTP 500, which the Snowflake
@@ -338,6 +381,33 @@ def _patch_fakesnow() -> None:
     # Failures outside execute() (for example describing an unsupported result type)
     # must also come back as SQL errors, not HTTP 500s the connector retries forever.
     import fakesnow.server as server
+
+    class Sessions(dict):
+        def __delitem__(self, token) -> None:  # noqa: ANN001
+            if token in self:
+                end_session(self[token])
+            super().__delitem__(token)
+
+    server.sessions = Sessions(server.sessions)
+
+    # the connector ends its session on close() only when it was given a master token at login
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
+
+    for i, route in enumerate(server.app.router.routes):
+        if getattr(route, "path", "") == "/session/v1/login-request":
+            login = route.endpoint
+
+            async def login_request(request, login=login):  # noqa: ANN001, ANN202
+                response = await login(request)
+                try:
+                    body = json.loads(response.body)
+                    body["data"].setdefault("masterToken", body["data"]["token"])
+                except Exception:  # noqa: BLE001 - a refused login: as it is
+                    return response
+                return JSONResponse(body, status_code=response.status_code)
+
+            server.app.router.routes[i] = Route(route.path, login_request, methods=list(route.methods or ["POST"]))
     from starlette.responses import JSONResponse
 
     describe = server.describe_as_rowtype
@@ -789,6 +859,7 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
         yield emu
     finally:
         CURRENT = outer
+        end_session(duck=fs.duck_conn)
         objects.close(emu)
         server.should_exit = True
         thread.join(timeout=5)

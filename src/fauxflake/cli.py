@@ -277,6 +277,7 @@ def conformance(connection):
                 passed += 1
             else:
                 failed.append((case, actual))
+        conn.close()
     for case, actual in failed:
         click.echo(f"DIFF {case['id']}\n  snowflake: {json.dumps(expected[case['id']])[:300]}\n  emulator:  {json.dumps(actual)[:300]}")
     click.echo(f"\n{passed}/{passed + len(failed)} cases match Snowflake")
@@ -331,6 +332,7 @@ def query(spec_path, project_dir, db_path, schema, limit, sql_file, model, sql):
         try:
             cur.execute(sql.strip().rstrip(";"))
         except snowflake.connector.errors.ProgrammingError as e:
+            conn.close()
             raise click.ClickException(str(e)) from e
         names = [d[0] for d in cur.description or []]
         rows = [["" if v is None else str(v) for v in row] for row in cur.fetchmany(limit)]

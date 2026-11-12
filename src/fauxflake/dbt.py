@@ -51,6 +51,17 @@ def _tolerate_exposures() -> None:
         Exposure.schema = ""
 
 
+def _close_connections() -> None:
+    """dbt keeps a session open for the next command. Its temporary tables go when it ends, and the
+    emulator it talks to may be gone by the time dbt closes it on its own: end it now."""
+    try:
+        from dbt.adapters.factory import cleanup_connections
+
+        cleanup_connections()
+    except Exception:  # noqa: BLE001, S110 - nothing was open
+        pass
+
+
 class DbtProject:
     def __init__(self, project_dir: str | Path, output: dict, name: str = "emulator"):
         self.dir = Path(project_dir).resolve()
@@ -125,6 +136,7 @@ class DbtProject:
         ]
         _tolerate_exposures()
         result = dbtRunner().invoke(cmd)
+        _close_connections()
         self.last_error = str(result.exception) if result.exception else ""
         return bool(result.success)
 
@@ -146,6 +158,7 @@ class DbtProject:
                 "--target-path", str(self.target_path)])
         finally:
             CompileTask.raise_on_first_error, CompileTask._mark_dependent_errors = saved
+            _close_connections()
         self.last_error = str(result.exception) if result.exception else ""
         manifest = json.loads((self.target_path / "manifest.json").read_text())
         for r in getattr(result.result, "results", None) or []:

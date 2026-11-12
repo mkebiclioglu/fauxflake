@@ -758,6 +758,9 @@ def _fix(node: exp.Expression) -> exp.Expression:
     if isinstance(node, exp.Add) and isinstance(node.expression, exp.Interval) \
             and (node.expression.unit and node.expression.unit.name.upper() in _DAY_UNITS):
         return _fn("_sf_like", node.this.copy(), node)
+    if isinstance(node, (exp.DateAdd, exp.DateSub, exp.TimestampAdd)) and isinstance(node.this, (exp.Concat, exp.DPipe)):
+        # DATEADD(month, 1, CONCAT(year, '-01-01')): text put together is read as a timestamp
+        node.set("this", exp.cast(exp.paren(node.this.copy()), "timestamp"))
     if isinstance(node, exp.DateAdd) and node.unit and node.unit.name.upper() in _DAY_UNITS \
             and not (isinstance(node.parent, exp.Anonymous) and node.parent.name.lower().endswith("_sf_like")):
         if node.unit.name.upper() == "QUARTER":
@@ -1106,6 +1109,12 @@ def balance_chains(transformed: exp.Expression) -> exp.Expression:
 def finish(transformed: exp.Expression) -> exp.Expression:
     """Fix-ups on the DuckDB side of the translation."""
     transformed = balance_chains(transformed)
+    for agg in list(transformed.find_all(exp.ArrayAgg)):
+        # ARRAY_AGG(OBJECT_CONSTRUCT(*)) is written for DuckDB with a filter that leaves out NULLs and
+        # repeats the argument. An object of every column is never NULL, and DuckDB will not expand a
+        # star under NOT: the aggregate goes as it is
+        if isinstance(agg.this, exp.Anonymous) and "*COLUMNS(" in agg.this.sql(dialect="duckdb"):
+            agg.replace(exp.Anonymous(this="ARRAY_AGG", expressions=[agg.this.copy()]))
     for ident in transformed.find_all(exp.Identifier):
         # `end`, `overlaps`... are ordinary names in Snowflake and reserved words in DuckDB
         if not ident.args.get("quoted") and ident.name.upper() in _RESERVED \

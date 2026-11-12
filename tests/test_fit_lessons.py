@@ -224,3 +224,80 @@ def test_an_id_compared_with_a_text_id_is_text_too():
     assert f.cast_to_a_number("n", "X") is False
     f.trees["n"] = parse("select x::int + 1 from t")
     assert f.cast_to_a_number("n", "X")
+
+
+def test_columns_pivoted_from_a_lookup_come_from_the_entries_of_a_json_document():
+    import json
+
+    source = parse("""
+        with source as (select * from "RAW".yaml.metrics),
+        intermediate as (select d.value as data_by_row, uploaded_at from source, lateral flatten(input => parse_json(jsontext), outer => true) d),
+        renamed as (select data_by_row['key_path']::text as metrics_path,
+                           array_contains('health'::variant, data_by_row['indicator']) as is_health from intermediate)
+        select * from renamed""")
+    dim = parse("""
+        with latest as (select * from "PREP".s.metrics_source qualify max(uploaded_at) over () = uploaded_at),
+        metric as (select metrics_path as metrics_path, ifnull(is_health, false) as is_health from latest)
+        select metric.metrics_path, metric.is_health from metric""")
+    child = parse('select "counts.pushes" as pushes, "stage.manage.events" as events, namespace_id from "PREP".s.wide')
+    nodes = {
+        "model.p.metrics_source": {"name": "metrics_source", "resource_type": "model", "depends_on": {"nodes": []}},
+        "model.p.dim_metric": {"name": "dim_metric", "resource_type": "model", "depends_on": {"nodes": ["model.p.metrics_source"]}},
+        "model.p.wide": {"name": "wide", "resource_type": "model", "depends_on": {"nodes": ["model.p.dim_metric"]}, "raw_code":
+                         """{% set names = dbt_utils.get_column_values(table=ref ('dim_metric'), where="is_health = TRUE", column='metrics_path', default=['']) %}
+                         select id, {{ dbt_utils.pivot('ping_name', names, then_value='counter_value') }} from joined group by 1"""},
+        "model.p.child": {"name": "child", "resource_type": "model", "depends_on": {"nodes": ["model.p.wide"]}},
+    }
+    tables = {"RAW.YAML.METRICS": {"columns": {"JSONTEXT": {"gen": "object", "fields": {}, "type": "VARCHAR"}}}}
+    f = fitter(trees={"model.p.metrics_source": source, "model.p.dim_metric": dim, "model.p.child": child}, nodes=nodes, tables=tables,
+               by_rel={"PREP.S.METRICS_SOURCE": "model.p.metrics_source"})
+    f.sources_of = lambda uid: ["RAW.YAML.METRICS"]
+    assert f.element_field("model.p.dim_metric", "METRICS_PATH") == ("RAW.YAML.METRICS", "JSONTEXT", "key_path", None)
+    assert f.pivoted_upstream("model.p.child", 'Binder Error: Referenced column "stage.manage.events" not found in FROM clause!')
+    held = tables["RAW.YAML.METRICS"]["columns"]["JSONTEXT"]
+    assert held["gen"] == "constant" and json.loads(held["value"]) == [
+        {"key_path": "counts.pushes", "indicator": ["health"]}, {"key_path": "stage.manage.events", "indicator": ["health"]}]
+    assert not f.pivoted_upstream("model.p.child", 'Binder Error: Referenced column "stage.manage.events" not found in FROM clause!')
+
+
+def test_an_end_known_only_by_name_comes_after_its_start():
+    from fauxflake.init import guess, periods_have_length
+
+    columns = {c: guess(c, "DATE") for c in ("TERM_START_DATE", "TERM_END_DATE", "EFFECTIVESTARTDATE", "EFFECTIVEENDDATE", "WEEKEND_DATE", "CREATED_DATE")}
+    assert periods_have_length(columns) == ["TERM_END_DATE", "EFFECTIVEENDDATE"]
+    assert min(columns["TERM_END_DATE"]["seconds"]) > max(columns["TERM_START_DATE"]["seconds"])
+    assert columns["WEEKEND_DATE"] == columns["CREATED_DATE"]
+    assert periods_have_length(columns) == []  # once
+
+
+def test_a_lookup_that_found_nothing_gives_periods_a_length():
+    tables = {"RAW.Z.CHARGE": {"columns": {"STARTDATE": {"gen": "time_offset", "p": [0, 1], "seconds": [0, 9]},
+                                           "ENDDATE": {"gen": "time_offset", "p": [0, 1], "seconds": [0, 9]}}}}
+    nodes = {"model.p.years": {"name": "years", "resource_type": "model", "depends_on": {"nodes": []}},
+             "model.p.mart": {"name": "mart", "resource_type": "model", "depends_on": {"nodes": ["model.p.years"]},
+                              "raw_code": "{% set years = dbt_utils.get_column_values(table=ref('years'), column='fiscal_year') %}"}}
+    f = fitter(nodes=nodes, tables=tables)
+    f.sources_of = lambda uid: ["RAW.Z.CHARGE"]
+    assert not f.empty_lookup("model.p.mart", "Database Error: something else")
+    assert f.empty_lookup("model.p.mart", "Compilation Error in model mart\n  'NoneType' object is not iterable")
+    assert tables["RAW.Z.CHARGE"]["columns"]["ENDDATE"]["seconds"][0] == 30 * 86400 and f.retyped == {"RAW.Z.CHARGE"}
+
+
+def test_a_snapshot_keeps_a_column_its_model_no_longer_writes():
+    class Duck:
+        def __init__(self):
+            self.ran = []
+
+        def execute(self, sql):
+            self.ran.append(sql)
+            return self
+
+        def fetchall(self):
+            return [("ID", "BIGINT"), ("DBT_VALID_TO", "TIMESTAMP")]
+
+    nodes = {"snapshot.p.arr": {"name": "arr", "resource_type": "snapshot"}}
+    f = fitter(nodes=nodes, by_rel={"SNAP.S.ARR": "snapshot.p.arr"}, existing={}, pending={}, unions={},
+               emu=type("Emu", (), {"duck": Duck()})())
+    f.passthrough = lambda fq: None
+    assert f.blameable("SNAP.S.ARR") and f.blame("SNAP.S.ARR", "BILLING_COUNTRY")
+    assert f.existing["SNAP.S.ARR"] == {"columns": {"ID": "BIGINT", "DBT_VALID_TO": "TIMESTAMP", "BILLING_COUNTRY": "VARCHAR"}, "as": "table"}

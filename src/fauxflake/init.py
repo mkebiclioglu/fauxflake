@@ -19,6 +19,7 @@ from __future__ import annotations
 import collections
 import json
 import os
+import copy
 import re
 from pathlib import Path
 
@@ -415,6 +416,26 @@ def guess(column: str, hint: str | None) -> dict:
     return {"gen": "template", "template": f"{column.lower()}_{{hex}}"}
 
 
+LASTS = {"p": [0, 0.5, 1], "seconds": [30 * 86400, 365 * 86400, 3 * 365 * 86400]}  # a month to three years
+
+
+def periods_have_length(columns: dict[str, dict]) -> list[str]:
+    """`term_start_date` and `term_end_date`, both known only by name: the end comes after the start,
+    by a month to a few years, as subscriptions, contracts and campaigns do. Returns the ends changed."""
+    changed = []
+    for col, d in columns.items():
+        for end, start in (("END", "START"), ("ENDS", "STARTS"), ("ENDED", "STARTED")):
+            sibling = re.sub(rf"(?<![A-Z]){end}(?![A-Z])", start, col) if re.search(rf"(?<![A-Z]){end}(?![A-Z])", col) else \
+                col.replace(end + "DATE", start + "DATE") if end + "DATE" in col else col
+            other = columns.get(sibling) if sibling != col else None
+            if other and d.get("gen") == other.get("gen") == "time_offset" and d.get("seconds") == other.get("seconds") \
+                    and d.get("p") == other.get("p") and not d.get("unique"):
+                d.update(copy.deepcopy(LASTS))
+                changed.append(col)
+                break
+    return changed
+
+
 def within_bounds(gen: dict, bounds: set[float] | None) -> None:
     """Make a numeric column's values straddle the numbers the SQL compares it with, so that
     `where block_number between 9820000 and 10000000` keeps rows."""
@@ -607,6 +628,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 for sibling, sd in out.items():
                     if sibling != col and sibling.startswith(col[:-2]) and sd["gen"] in ("template", "categorical"):
                         sd["follows"] = col
+        periods_have_length(out)
         tables[name] = {
             "volume": {"rows_per_day": 100_000, "weekly": [1, 1, 1, 1, 1, 1, 1]},  # placeholder: 100 rows a day at the default scale
             "lateness": {"p": [0, 0.5, 0.99, 1], "seconds": [1, 30, 3600, 86400]},  # placeholder
