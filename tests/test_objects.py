@@ -353,3 +353,10 @@ def test_regexp_functions_read_a_number_as_text(run):
     run("create or replace table rx as select 12345.5::double as q, 77::int as n")
     assert run("select regexp_substr(q, '[0-9]+'), regexp_count(n, '7'), regexp_replace(n, '7', 'x'), regexp_like(n, '7+') from rx") == \
         [("12345", 2, "xx", True)]
+
+
+def test_a_column_alias_wins_over_a_joined_table_of_the_same_name(run):
+    run("create or replace table joined as select 1 as id, 10.0::double as annual_price, 3 as quantity")
+    run("create or replace table lp as select 1 as id, 8.0::double as billing_list_price")
+    assert run("with list_price as (select * from lp) select billing_list_price as list_price, annual_price - list_price as d, "
+               "quantity * list_price as t from joined left join list_price on joined.id = list_price.id") == [(8.0, 2.0, 24.0)]

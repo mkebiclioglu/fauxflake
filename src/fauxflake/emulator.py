@@ -570,8 +570,17 @@ def _patch_fakesnow() -> None:
                 if as_times is not None:
                     run(as_times)
                     return
+                unshadowed = semantics.aliases_over_tables(transformed) if "STRUCT(" in str(e) else None
+                if unshadowed is not None:
+                    _heal(self)
+                    transformed = unshadowed
+                    try:
+                        run(transformed)
+                        return
+                    except ProgrammingError as again:
+                        e = again
                 if "No function matches" not in str(e) and "Could not choose a best candidate" not in str(e):
-                    raise
+                    raise e
                 repaired = semantics.repair_types(transformed, self._duck_conn, params)
                 _heal(self)
                 if repaired is None:

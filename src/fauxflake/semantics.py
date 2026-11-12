@@ -1716,6 +1716,27 @@ def _repair_by_types(tree: exp.Expression, conn, details: dict) -> bool:  # noqa
     return done
 
 
+def aliases_over_tables(transformed: exp.Expression) -> exp.Expression | None:
+    """`select ... as list_price, qty * list_price from joined left join list_price on ...`: Snowflake
+    reads the second `list_price` as the column just defined; DuckDB reads it as the joined table's
+    whole row. Write the defined expression in its place. None when there is nothing of the kind."""
+    tree, changed = transformed.copy(), False
+    for select in tree.find_all(exp.Select):
+        source = select.args.get("from_")
+        if source is None:
+            continue
+        relations = {r.alias_or_name.upper() for r in [source.this, *[j.this for j in select.args.get("joins") or []]]}
+        defined: dict[str, exp.Expression] = {}
+        for e in select.expressions:
+            for c in list(e.find_all(exp.Column)):
+                if not c.table and c.name.upper() in defined and c.find_ancestor(exp.Select) is select:
+                    c.replace(exp.paren(defined[c.name.upper()].copy()))
+                    changed = True
+            if isinstance(e, exp.Alias) and e.alias.upper() in relations:
+                defined[e.alias.upper()] = e.this
+    return tree if changed else None
+
+
 def repair_types(transformed: exp.Expression, conn, params=None) -> exp.Expression | None:  # noqa: ANN001
     """The statement with Snowflake's implicit text conversions made explicit, or None."""
     tree, fixed = transformed.copy(), 0

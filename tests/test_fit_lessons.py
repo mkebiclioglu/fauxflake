@@ -124,3 +124,23 @@ def test_an_ambiguous_column_stays_with_the_table_a_model_names_it_with():
     f = fitter(trees={"a": freemium, "b": invoices}, sql_of={"a": freemium.sql().upper(), "b": invoices.sql().upper()}, tables=tables)
     assert f.ambiguous_column("a", "Ambiguous reference to column name \"CHARGE\" (use: 'S.CHARGE' or 'INVOICES.CHARGE')")
     assert "CHARGE" in tables["RAW.STRIPE.INVOICES"]["columns"] and "CHARGE" not in tables["RAW.BLAPI.SUBS"]["columns"]
+
+
+def test_pieces_of_a_text_read_as_numbers_are_generated_as_numbers():
+    tables = {"RAW.A.RELEASES": {"columns": {"VERSION": {"gen": "template", "template": "version_{hex}"}}}}
+    tree = parse("select split_part(version, '.', 1)::number as major, split_part(version, '.', 3)::number as patch from RAW.A.RELEASES")
+    f = fitter(trees={"m": tree}, tables=tables)
+    f.sources_of = lambda uid: ["RAW.A.RELEASES"]
+    assert f.split_numbers("m")
+    assert tables["RAW.A.RELEASES"]["columns"]["VERSION"]["template"] == "{n}.{n}.{n}"
+
+
+def test_an_error_inside_a_view_is_offered_to_the_view():
+    nodes = {"model.p.child": {"resource_type": "model", "depends_on": {"nodes": ["model.p.view"]}},
+             "model.p.view": {"resource_type": "model", "config": {"materialized": "view"}, "depends_on": {"nodes": []},
+                              "compiled_code": "select 1"}}
+    f = fitter(nodes=nodes)
+    asked = []
+    f.learn = lambda uid, message: asked.append(uid) or True
+    assert f.learn_upstream("model.p.child", "Conversion Error")
+    assert asked == ["model.p.view"]

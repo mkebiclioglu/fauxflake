@@ -549,6 +549,32 @@ class Fitter:
         self.dirty |= changed
         return changed
 
+    def split_numbers(self, uid: str) -> bool:
+        """`split_part(version, '.', 2)::number`: every piece the model reads as a number is one."""
+        tree = self.tree(uid)
+        shapes: dict[str, tuple[str, int]] = {}
+        for cast in (tree.find_all(exp.Cast, exp.TryCast) if tree is not None else []):
+            piece = cast.this.unnest()
+            if not (cast.to.is_type("int", "bigint", "decimal", "double", "float") and isinstance(piece, exp.SplitPart)
+                    and isinstance(piece.this, exp.Column)):
+                continue
+            delimiter, part = piece.args.get("delimiter"), piece.args.get("part_index")
+            if isinstance(delimiter, exp.Literal) and isinstance(part, exp.Literal) and part.is_int and 0 < int(part.name) <= 8:
+                column = piece.this.name.upper()
+                shapes[column] = (delimiter.name, max(int(part.name), shapes.get(column, ("", 0))[1]))
+        changed = False
+        for column, (delimiter, count) in shapes.items():
+            fresh = {"gen": "template", "template": delimiter.join(["{n}"] * max(count, 2))}
+            for table in self.sources_of(uid):
+                columns = self.tables[table].get("columns") or {}
+                if column in columns and columns[column] != fresh and columns[column].get("gen") in _FREE:
+                    columns[column] = dict(fresh)
+                    self.retyped.add(table)
+                    self.learned.append(f"{table}.{column}: its pieces are read as numbers; generated as {fresh['template']!r}.")
+                    changed = True
+        self.dirty |= changed
+        return changed
+
     def split_format(self, uid: str, column: str, fmt: str) -> str:
         """`to_date(split_part(col, ' - ', 2), fmt)`: the column holds several dates in that format,
         joined by the delimiter. The format that makes every part parse."""
@@ -630,6 +656,10 @@ class Fitter:
                 if kind == "array":
                     continue
                 fresh = {"gen": "array"}
+            elif hint == "DAY":  # `col + 1`: only a DATE takes a number of days
+                if str(gen.get("type", "")).upper() == "DATE" or gen.get("format") or gen.get("epoch"):
+                    continue
+                fresh = {"gen": "time_offset", "type": "DATE", "p": [0, 0.5, 1], "seconds": [0, 86400, 604800]}
             elif hint in ("DATE", "TIMESTAMP"):
                 if kind in ("time_offset", "event_time", "updated_at") and not gen.get("format") and not gen.get("epoch"):
                     continue
@@ -651,7 +681,7 @@ class Fitter:
             changed = True
         # relations that start out empty (read before they are built, or stand-ins): the declared type
         wanted = {"TEXT": "VARCHAR", "BIGINT": "BIGINT", "DOUBLE": "DOUBLE", "BOOLEAN": "BOOLEAN", "DATE": "DATE",
-                  "TIMESTAMP": "TIMESTAMP", "ARRAY": "JSON", "VARIANT": "JSON"}.get(hint)
+                  "TIMESTAMP": "TIMESTAMP", "ARRAY": "JSON", "VARIANT": "JSON", "DAY": "DATE"}.get(hint)
         tree = self.tree(uid)
         if wanted and tree is not None and not changed:
             for fq in self.real_tables(tree, {c.alias.upper(): c.this for c in tree.find_all(exp.CTE)}):
@@ -686,7 +716,7 @@ class Fitter:
                 if gen.get("gen") == "fk" and str(gen.get("ref", "")).upper() not in keyed:
                     spec["columns"][col] = guess(col, None)
 
-    def retype(self, value: str, hint: str, fmt: str | None = None) -> bool:
+    def retype(self, value: str, hint: str, fmt: str | None = None, only: set[str] | None = None) -> bool:
         """The generated text `value` was converted to `hint`: retype the column(s) that made it.
         Generated text starts with its column's name, which is how the column is found."""
         tokens = value.split()
@@ -694,6 +724,8 @@ class Fitter:
         for position, token in enumerate(tokens):
             name = token.rsplit("_", 1)[0].upper() if "_" in token else ""
             for table, t in self.tables.items():
+                if only and table not in only:
+                    continue  # a column of that name in a table the model does not read is another column
                 gen = (t.get("columns") or {}).get(name)
                 for holder in (t.get("columns") or {}).values():  # the same, for a field inside an object column
                     fields = holder.get("fields") if holder.get("gen") == "object" else None
@@ -1525,6 +1557,8 @@ class Fitter:
                     return any([self.retype_column(sql_key, c, "TIMESTAMP", "%H:%M:%S") for c in self.columns_used(sql_key, "time_of_day")])
                 if hint in ("BIGINT", "DOUBLE") and named and self.split_number(sql_key, named.group(1).upper()):
                     return True
+                if m.group("value") == "" and hint in ("BIGINT", "DOUBLE") and self.split_numbers(sql_key):
+                    return True
                 if m.group("value") == "" and hint in ("BIGINT", "DOUBLE", "DATE", "TIMESTAMP", "BOOLEAN"):
                     # `nullif(col, '')` on a column generated as a number or a date: the SQL treats it as text
                     return any([self.retype_column(sql_key, c, "TEXT") for c in self.columns_used(sql_key, "empty")])
@@ -1552,7 +1586,7 @@ class Fitter:
                 for token in m.group("value").split():  # generated text starts with its column's name
                     if "_" in token and self.retype_column(sql_key, token.rsplit("_", 1)[0].upper(), hint, fmt):
                         return True
-                return self.retype(m.group("value"), hint, fmt)
+                return self.retype(m.group("value"), hint, fmt, only=set(self.sources_of(sql_key)))
         if "Failed to cast value to numerical" in message:
             # coalesce(payload['minutes'], minutes)::float where `minutes` was generated as an object
             tree = self.tree(sql_key)
@@ -1566,6 +1600,16 @@ class Fitter:
                     elif isinstance(leaf, exp.JSONExtract) and isinstance(leaf.this, exp.Column):
                         changed |= self.retype_field(sql_key, leaf, hint)
             return any([self.retype_column(sql_key, c, "DOUBLE") for c in dict.fromkeys(names)]) or changed
+        if re.search(r"argument types '[-+]\((?:TIMESTAMP[^,]*, (?:INTEGER|BIGINT|TINYINT|SMALLINT)|(?:INTEGER|BIGINT)[^,]*, TIMESTAMP)", message):
+            # `term_date + 1`: Snowflake adds days to a DATE and refuses a TIMESTAMP, so the column is a DATE
+            tree = self.tree(sql_key)
+            names = []
+            for node in (tree.find_all(exp.Add, exp.Sub) if tree is not None else []):
+                sides = [node.this.unnest(), node.expression.unnest()]
+                if any(isinstance(x, exp.Literal) and x.is_int for x in sides):
+                    names += [x.name.upper() for x in sides if isinstance(x, exp.Column)]
+            if any([self.retype_column(sql_key, c, "DAY") for c in dict.fromkeys(names)]):
+                return True
         m = _NOT_STRUCT.search(message)
         if m:
             return self.make_variant(m.group("col"), m.group("field"))
@@ -1612,6 +1656,26 @@ class Fitter:
                 changed = True
         self.dirty |= changed
         return changed
+
+    def learn_upstream(self, uid: str, message: str, depth: int = 0, seen: set[str] | None = None) -> bool:
+        """A view runs when it is read: the statement that failed can be the SQL of a view the model
+        (or the test) selects from. Offer the error to those, nearest first."""
+        seen = seen if seen is not None else set()
+        parents = [d for d in ((self.nodes.get(uid) or {}).get("depends_on") or {}).get("nodes") or []
+                   if d in self.nodes and d not in seen and self.nodes[d].get("resource_type") == "model"]
+        seen.update(parents)
+        for parent in parents:
+            node = self.nodes[parent]
+            lazy = (node.get("config") or {}).get("materialized") in ("view", "ephemeral")
+            if not lazy:
+                continue
+            if parent not in self.sql_of and node.get("compiled_code"):
+                self.sql_of[parent] = node["compiled_code"].strip().rstrip(";")
+            if parent in self.sql_of and self.learn(parent, message):
+                return True
+            if depth < 4 and self.learn_upstream(parent, message, depth + 1, seen):
+                return True
+        return False
 
     def wrong_type(self, sql_key: str, function: str) -> bool:
         """Snowflake does not read text as a date in DATE_PART or EXTRACT, or as a number in a few
@@ -1949,7 +2013,8 @@ class Fitter:
                         if compiled:
                             self.sql_of[node["unique_id"]] = compiled
                             self.trees.pop(node["unique_id"], None)
-                            self.learn(node["unique_id"], message)
+                            if not self.learn(node["unique_id"], message):
+                                self.learn_upstream(node["unique_id"], message)
                     if r["status"] == "fail" and not self.learn_from_test(node, analysis) and node["name"] not in expected:
                         expected.append(node["name"])
                         accepted += 1
@@ -1970,6 +2035,7 @@ class Fitter:
                     self.trees.pop(uid, None)
                     self.by_rel[fq] = uid
                     if not self.learn(uid, message):
+                        self.learn_upstream(uid, message)  # the SQL that failed may be a view this model selects from
                         continue
                     # the error taught something: keep going on this model, as loop 1 does, so that one
                     # round finds every column it is missing instead of one per round
