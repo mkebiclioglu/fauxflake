@@ -199,3 +199,12 @@ def test_a_bare_column_is_not_looked_for_in_a_cte_that_lists_its_columns():
     f.add_column = lambda table, col: tables[table]["columns"].setdefault(col, {}) is not None
     assert f.missing_column("m", 'Referenced column "CONTEXT_TRAITS_SERVER" not found in FROM clause!')
     assert "CONTEXT_TRAITS_SERVER" in tables["RAW.B.EVENTS"]["columns"] and "CONTEXT_TRAITS_SERVER" not in tables["RAW.A.DETAILS"]["columns"]
+
+
+def test_a_column_read_as_an_address_is_generated_as_addresses():
+    tree = parse("select parse_ip(source_ip, 'inet')['ip_fields'][0]::number as n from pings")
+    tables = {"RAW.V.PINGS": {"columns": {"SOURCE_IP": {"gen": "dist", "type": "BIGINT"}}}}
+    f = fitter(trees={"m": tree}, tables=tables)
+    f.sources_of, f.origins = (lambda uid: ["RAW.V.PINGS"]), (lambda uid, name, depth=0, strict=False: [name])
+    assert f.parsed_as_ip("m")
+    assert tables["RAW.V.PINGS"]["columns"]["SOURCE_IP"] == {"gen": "ip"}

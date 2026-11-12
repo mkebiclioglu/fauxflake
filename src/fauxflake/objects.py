@@ -23,6 +23,7 @@ import sys
 import threading
 import zlib
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import sqlglot
 from snowflake.connector.errors import ProgrammingError
@@ -52,8 +53,31 @@ class State:
     handlers: dict[str, object] = field(default_factory=dict)  # registered name -> the handler it calls now
     dispatchers: dict[str, object] = field(default_factory=dict)  # what DuckDB holds, kept alive here
     root: object = None  # the emulator's own DuckDB connection
+    home: object = None  # the directory of a warehouse kept on disk: the functions created in it are noted there
+    created: dict[str, list] = field(default_factory=dict)  # function/arity -> [database, schema, statement]
     js: object = None
     lock: threading.RLock = field(default_factory=threading.RLock)
+
+
+FUNCTIONS_FILE = "functions.json"
+
+
+def restore_functions(emu) -> None:  # noqa: ANN001
+    """Create again the functions a kept warehouse had: its views call them."""
+    import snowflake.connector
+
+    file = Path(emu.db_path) / FUNCTIONS_FILE
+    if not file.exists():
+        return
+    for database, schema, statement in json.loads(file.read_text()):
+        try:
+            conn = snowflake.connector.connect(**emu.connect_kwargs(database=database or "ANALYTICS", schema=schema or "PUBLIC"))
+            try:
+                conn.cursor().execute(statement)
+            finally:
+                conn.close()
+        except Exception as e:  # noqa: BLE001 - the warehouse is still readable without it
+            print(f"fauxflake: a function of the kept warehouse was not created again: {str(e)[:200]}", file=sys.stderr)
 
 
 def state_of(conn) -> State:  # noqa: ANN001
@@ -963,6 +987,12 @@ def intercept(cursor, command: str, original):  # noqa: ANN001, ANN201
                 state.procedures[defn["name"]] = defn
             else:
                 _define_function(cursor, state, defn)
+                if state.home is not None:  # DuckDB files do not hold them: a later `fauxflake query` creates them again
+                    state.created[f"{defn['name'].lower()}/{len(defn['args'])}"] = [cursor._conn.database, cursor._conn.schema, command]
+                    try:
+                        (Path(state.home) / FUNCTIONS_FILE).write_text(json.dumps(list(state.created.values())))
+                    except OSError:
+                        pass
             return _status(cursor, original, f"{defn['kind'].capitalize()} {defn['name']} successfully created.")
         m = _ANONYMOUS.match(command)
         if m:

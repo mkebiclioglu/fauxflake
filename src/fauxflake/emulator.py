@@ -8,6 +8,7 @@ data is written at native DuckDB speed without going through the protocol.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import logging
 import os
@@ -450,6 +451,14 @@ def _patch_fakesnow() -> None:
             "FROM _fs_information_schema._fs_columns", "FROM _fs_global._fs_information_schema._fs_columns"))
 
     semantics.patch_upstream()
+    import fakesnow.cursor as cursor_module
+
+    upstream_parse = cursor_module.parse_one
+
+    def parse_named(command):  # noqa: ANN001, ANN202
+        return semantics.name_expressions(upstream_parse(command), command)
+
+    cursor_module.parse_one = parse_named
     original_transform = FakeSnowflakeCursor._transform
 
     def _transform(self, expression, params):  # noqa: ANN001
@@ -581,39 +590,32 @@ def _patch_fakesnow() -> None:
                 except Exception:  # noqa: BLE001, S110 - an optional adjustment: the statement runs as written
                     pass
             _heal(self)  # a probe that failed inside a transaction aborted it
-            try:
-                run(transformed)
-            except ProgrammingError as e:
-                as_times = semantics.numbers_as_times(transformed, str(e)) or semantics.offsets_as_written(transformed, str(e))
-                if as_times is not None:
-                    run(as_times)
+            remedies = {
+                "times": lambda e: semantics.numbers_as_times(transformed, e) or semantics.offsets_as_written(transformed, e),
+                "by_name": lambda e: semantics.view_past_a_schema_named_like_a_database(transformed, e),
+                "grouped": lambda e: semantics.group_by_all_written_out(transformed) if "Cannot mix aggregates" in e else None,
+                "unshadowed": lambda e: semantics.aliases_over_tables(transformed) if "STRUCT(" in e else None,
+                "types": lambda e: semantics.repair_types(transformed, self._duck_conn, params)
+                if "No function matches" in e or "Could not choose a best candidate" in e else None,
+            }
+            used: collections.Counter = collections.Counter()
+            while True:
+                try:
+                    run(transformed)
                     return
-                by_name = semantics.view_past_a_schema_named_like_a_database(transformed, str(e))
-                if by_name is not None:
-                    _heal(self)
-                    run(by_name)
-                    return
-                grouped = semantics.group_by_all_written_out(transformed) if "Cannot mix aggregates" in str(e) else None
-                if grouped is not None:
-                    _heal(self)
-                    run(grouped)
-                    return
-                unshadowed = semantics.aliases_over_tables(transformed) if "STRUCT(" in str(e) else None
-                if unshadowed is not None:
-                    _heal(self)
-                    transformed = unshadowed
-                    try:
-                        run(transformed)
-                        return
-                    except ProgrammingError as again:
-                        e = again
-                if "No function matches" not in str(e) and "Could not choose a best candidate" not in str(e):
-                    raise e
-                repaired = semantics.repair_types(transformed, self._duck_conn, params)
-                _heal(self)
-                if repaired is None:
-                    raise
-                run(repaired)
+                except ProgrammingError as e:
+                    # one repair can uncover the next (an implicit conversion, then an alias named like a table)
+                    for name, remedy in remedies.items():
+                        if used[name] >= 2:
+                            continue
+                        used[name] += 1
+                        repaired = remedy(str(e))
+                        _heal(self)
+                        if repaired is not None:
+                            transformed = repaired
+                            break
+                    else:
+                        raise
 
         try:
             run_guarded(self, attempt)
@@ -752,7 +754,7 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
         logging.getLogger("fakesnow.server").setLevel(logging.WARNING)
     if db_path and not keep:
         Path(db_path).mkdir(parents=True, exist_ok=True)
-        for stale in [*Path(db_path).glob("*.db"), *Path(db_path).glob("*.db.wal")]:
+        for stale in [*Path(db_path).glob("*.db"), *Path(db_path).glob("*.db.wal"), *Path(db_path).glob(objects.FUNCTIONS_FILE)]:
             stale.unlink()  # every run starts from an empty warehouse
     fs = FakeSnow(db_path=db_path, nop_regexes=NOPS)
     for macro in semantics.MACROS:
@@ -763,7 +765,8 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
     semantics.UDFS.clear()  # functions belong to the emulator that defined them
     semantics.UDTFS.clear()
     _SPEC_UDFS.clear()
-    fs.results_cache.setdefault(objects._KEY, objects.State()).root = fs.duck_conn
+    state = fs.results_cache.setdefault(objects._KEY, objects.State())
+    state.root, state.home = fs.duck_conn, db_path
     previous = fakesnow.server.shared_fs
     fakesnow.server.shared_fs = fs
 
@@ -781,6 +784,8 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
     emu = Emulator(port=port, duck=fs.duck_conn, _fs=fs, db_path=db_path)
     outer, CURRENT = CURRENT, emu
     try:
+        if db_path and keep:
+            objects.restore_functions(emu)
         yield emu
     finally:
         CURRENT = outer

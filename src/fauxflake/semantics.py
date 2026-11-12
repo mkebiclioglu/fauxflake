@@ -1715,7 +1715,11 @@ def coerce_union_literals(transformed: exp.Expression, conn) -> exp.Expression: 
                                     "TINYINT", "BOOLEAN", "UBIGINT", "UINTEGER")):
                 continue
             for value in literal_at[i]:
-                value.replace(exp.cast(value.copy(), exp.DataType.build(kind, dialect="duckdb")))
+                written = value.copy()
+                m = _OFFSET_LITERAL.match(value.name) if kind.startswith(("TIMESTAMP", "DATE")) else None
+                if m:  # '9999-12-31 00:00:00.000 +0000': DuckDB reads the offset as +00:00, without the space
+                    written = exp.Literal.string(f"{m.group(1)}{m.group(2)}:{m.group(3)}")
+                value.replace(exp.cast(written, exp.DataType.build(kind, dialect="duckdb")))
     return transformed
 
 
@@ -1754,6 +1758,71 @@ def _repair_by_types(tree: exp.Expression, conn, details: dict) -> bool:  # noqa
                     _convert(side, "timestamp" if other.startswith(_DATE_TYPES) else "double")
                     done = True
     return done
+
+
+_SNOWFLAKE = sqlglot.Dialect.get_or_raise("snowflake")
+_ENDS_A_LISTING = {"FROM", "WHERE", "GROUP_BY", "ORDER_BY", "HAVING", "QUALIFY", "LIMIT", "UNION", "EXCEPT", "INTERSECT", "INTO",
+                   "FETCH", "SEMICOLON", "WINDOW"}
+_OPENS, _CLOSES = {"L_PAREN", "L_BRACKET", "L_BRACE"}, {"R_PAREN", "R_BRACKET", "R_BRACE"}
+
+
+def name_expressions(tree: exp.Expression, command: str) -> exp.Expression:
+    """`select count(*), a+1 from t`: Snowflake names those columns COUNT(*) and A+1, the text as written
+    in upper case. DuckDB would call them count_star() and (a + 1). Give the outermost query's unnamed
+    expressions the names Snowflake gives them."""
+    query = tree.expression if isinstance(tree, exp.Create) else tree
+    while isinstance(query, (exp.Subquery, exp.Paren, exp.SetOperation)):
+        query = query.this
+    if not isinstance(query, exp.Select):
+        return tree
+
+    def unnamed(e: exp.Expression) -> bool:
+        return not isinstance(e, (exp.Alias, exp.Column, exp.Star, exp.Dot, exp.Aliases, exp.PropertyEQ)) and not e.find(exp.Star) \
+            or isinstance(e, exp.Count) and isinstance(e.this, exp.Star)
+
+    if not any(unnamed(e) for e in query.expressions):
+        return tree
+    try:
+        tokens = _SNOWFLAKE.tokenize(command)
+    except Exception:  # noqa: BLE001 - the names stay DuckDB's
+        return tree
+    depth, base, start, pieces, first = 0, None, None, [], None
+    for i, token in enumerate(tokens):
+        kind = token.token_type.name
+        if kind in _OPENS:
+            depth += 1
+        elif kind in _CLOSES:
+            depth -= 1
+        if start is None:
+            if base is None and kind in ("WITH", "SELECT"):
+                base = depth
+            if kind == "SELECT" and depth == base:
+                start = i + 1
+                while start < len(tokens) and tokens[start].token_type.name in ("DISTINCT", "ALL"):
+                    start += 1
+                first = start
+            continue
+        if i < first:
+            continue
+        if depth < base or (depth == base and kind in _ENDS_A_LISTING):
+            pieces.append((first, i - 1))
+            break
+        if depth == base and kind == "COMMA":
+            pieces.append((first, i - 1))
+            first = i + 1
+    else:
+        if start is not None:
+            pieces.append((first, len(tokens) - 1))
+    if len(pieces) != len(query.expressions) or any(a > b for a, b in pieces):
+        return tree  # not read the way the parser read it: leave the names alone
+    for (a, b), e in zip(pieces, list(query.expressions)):
+        if isinstance(e, exp.Paren) and isinstance(e.unnest(), exp.Column):
+            e.replace(e.unnest().copy())  # (id) is named ID
+        elif unnamed(e):
+            name = command[tokens[a].start:tokens[b].end + 1].upper()
+            if len(name) <= 250:
+                e.replace(exp.alias_(e.copy(), exp.to_identifier(name, quoted=True)))
+    return tree
 
 
 def aliases_over_tables(transformed: exp.Expression) -> exp.Expression | None:

@@ -422,3 +422,58 @@ def test_a_date_format_chosen_per_row(run):
                "then 'YYYY_MM' end as f, to_date(regexp_substr(s, '\\\\d{4}_\\\\d{2}_?\\\\d{0,2}'), f) as d from fmt_src order by 1")
     assert [(r[0], r[2].isoformat() if r[2] else None) for r in rows] == [
         ("none", None), ("snowplow_2024_03", "2024-03-01"), ("x_2024_03_09", "2024-03-09")]
+
+
+def test_a_kept_warehouse_remembers_the_functions_its_views_call(tmp_path):
+    import snowflake.connector
+
+    from fauxflake.emulator import serve
+
+    def connect(e):
+        e.ensure_database("ANALYTICS", "PUBLIC")
+        return snowflake.connector.connect(**e.connect_kwargs(database="ANALYTICS", schema="PUBLIC")).cursor()
+
+    with serve(db_path=tmp_path) as e:
+        cur = connect(e)
+        cur.execute("create or replace function twice(n number) returns number as $$ n * 2 $$")
+        cur.execute("create or replace table t as select 21 as n")
+        cur.execute("create or replace view v as select twice(n) as m from t")
+    with serve(db_path=tmp_path, keep=True) as e:
+        cur = connect(e)
+        assert cur.execute("select m from v").fetchall() == [(42,)]
+
+
+def test_a_union_reads_text_with_an_offset_as_the_time_its_column_holds(run):
+    run("create or replace table amendments(id int, starts timestamp_ntz, day date)")
+    run("insert into amendments values (1, '2024-01-01 10:00:00', '2024-01-01')")
+    run("create or replace view amendments_v as select id, starts, day from amendments "
+        "union all select 2, '9999-12-31 00:00:00.000 +0000', '9999-12-31 00:00:00.000 +0000'")
+    rows = run("select id, starts::varchar, day::varchar from amendments_v order by id")
+    assert rows == [(1, "2024-01-01 10:00:00.000", "2024-01-01"), (2, "9999-12-31 00:00:00.000", "9999-12-31")]
+
+
+def test_one_repair_makes_way_for_the_next(run):
+    run("create or replace table days(day date, quarter_start date)")
+    run("insert into days values ('2024-02-01', '2024-01-01'), ('2024-03-01', '2024-01-01')")
+    run("create or replace table opps(id int, made date, closed date, weight varchar)")
+    run("insert into opps values (1, '2024-02-01', '2024-03-01', '2')")
+    # `weight * 1.5` needs text read as a number; `made_day` is a column just defined and a joined table
+    rows = run("select o.made as made_day, made_day.quarter_start as q, o.weight * 1.5 as w, "
+               "case when 1 = 1 then datediff(day, made_day, closed_day.day) end as n "
+               "from opps o left join days as made_day on o.made = made_day.day left join days as closed_day on o.closed = closed_day.day")
+    assert [(str(r[0]), str(r[1]), float(r[2]), r[3]) for r in rows] == [("2024-02-01", "2024-01-01", 3.0, 29)]
+
+
+def test_unnamed_expressions_are_named_as_snowflake_names_them(run):
+    def names(sql):
+        cur = run.emu._fs.connect(database="ANALYTICS", schema="CI").cursor()
+        cur.execute(sql)
+        return [d[0] for d in cur.description]
+
+    assert names("select count(*), sum(amt), max( name ), id+1, id  +  1, upper(name), id, t.id, (id) from t group by id, name") == \
+        ["COUNT(*)", "SUM(AMT)", "MAX( NAME )", "ID+1", "ID  +  1", "UPPER(NAME)", "ID", "ID", "ID"]
+    assert names("with c as (select id, count(*) n from t group by 1) select distinct max(n), id from c group by id") == ["MAX(N)", "ID"]
+    assert names("select name || 'x', case when id = 1 then 'y' end, id::varchar, t.*, id*2 from t") == \
+        ["NAME || 'X'", "CASE WHEN ID = 1 THEN 'Y' END", "ID::VARCHAR", "ID", "NAME", "AMT", "ID*2"]
+    run("create or replace table counted as select count(*), id + 1 from t group by id")
+    assert names("select * from counted") == ["COUNT(*)", "ID + 1"]

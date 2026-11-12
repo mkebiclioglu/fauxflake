@@ -722,8 +722,12 @@ class Fitter:
         """PARSE_IP(col, 'inet') on a column that was not generated as addresses."""
         tree = self.tree(uid)
         changed = False
-        for call in (tree.find_all(exp.Anonymous) if tree is not None else []):
-            arg = call.expressions[0].unnest() if call.name.upper() == "PARSE_IP" and call.expressions else None
+        parse_ip = getattr(exp, "ParseIp", exp.Anonymous)
+        for call in (tree.find_all(exp.Anonymous, parse_ip) if tree is not None else []):
+            if isinstance(call, exp.Anonymous):
+                arg = call.expressions[0].unnest() if call.name.upper() == "PARSE_IP" and call.expressions else None
+            else:
+                arg = call.this.unnest()
             if not isinstance(arg, exp.Column):
                 continue
             for table, name in [(t, n) for t in self.sources_of(uid) for n in self.origins(uid, arg.name.upper())]:
@@ -1370,6 +1374,8 @@ class Fitter:
                 if isinstance(inner, exp.Case):  # what the branches give, not what they test
                     for e in [*(i.args.get("true") for i in inner.args.get("ifs") or []), inner.args.get("default")]:
                         found += list(e.find_all(exp.Column))[:2] if e is not None else []
+                elif isinstance(inner, exp.Coalesce):  # coalesce(a, b, c) as n: each of them is that value
+                    found += [c for c in self._cast_reads(inner) if isinstance(c, exp.Column)]
                 elif not found and isinstance(inner, (exp.Max, exp.Min, exp.AnyValue)) and isinstance(inner.this, exp.Column):
                     found.append(inner.this)  # max(ts) as max_ts: the same kind of value
                 elif not found and not inner.find(exp.Window, exp.AggFunc, exp.Subquery):
