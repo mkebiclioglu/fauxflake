@@ -36,10 +36,10 @@ REWRITES: list[tuple[re.Pattern[str], str, str]] = [
         # TEMPORARY relation. DuckDB only allows temp relations in its `temp`
         # catalog, so they become ordinary relations (dbt replaces them each run).
         re.compile(
-            r"\bcreate(\s+or\s+replace)?\s+(?:temporary|temp)\s+(table|view)\s+(?=[\w\"$]+\.[\w\"$]+\.[\w\"$]+)",
+            r"\bcreate(\s+or\s+replace)?(\s+secure)?\s+(?:temporary|temp)\s+(table|view)\s+(?=[\w\"$]+\.[\w\"$]+\.[\w\"$]+)",
             re.IGNORECASE,
         ),
-        r"create\1 \2 ",
+        r"create\1\2 \3 ",
         "qualified temporary relation -> regular relation",
     ),
     (

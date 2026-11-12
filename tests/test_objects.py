@@ -380,3 +380,8 @@ def test_a_view_in_a_schema_named_like_another_database(run):
                 "where end_time > (select max(query_end_at) from prep_db.snowflake.seen))"):
         run(sql)
     assert run("select * from prep_db.snowflake.fresh") == [("a",)]
+
+
+def test_a_secure_temporary_view_in_a_named_schema(run):
+    run("create or replace secure temporary view analytics.ci.sec__dbt_tmp as (select 1 as x)")
+    assert run("select x from analytics.ci.sec__dbt_tmp") == [(1,)]

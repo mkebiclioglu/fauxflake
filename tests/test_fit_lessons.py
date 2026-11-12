@@ -189,3 +189,13 @@ def test_a_model_that_renames_columns_is_not_a_select_star_of_its_source():
     f = fitter(by_rel={"A.B.X": "x", "A.B.Y": "y"}, nodes={"x": {}, "y": {}}, sql_of={"x": renames, "y": stars})
     assert f.passthrough("A.B.X") is None
     assert f.passthrough("A.B.Y") == "RAW.R.OPTOUTS"
+
+
+def test_a_bare_column_is_not_looked_for_in_a_cte_that_lists_its_columns():
+    tree = parse("""with sdd as (select server_id, min(ts) as first_active from "RAW".a.details group by 1)
+        select coalesce(user_id, context_traits_server) as server_id, max(first_active) from "RAW".b.events join sdd on sdd.server_id = user_id group by 1""")
+    tables = {"RAW.A.DETAILS": {"columns": {}}, "RAW.B.EVENTS": {"columns": {}}}
+    f = fitter(trees={"m": tree}, tables=tables, existing={}, pending={}, unions={})
+    f.add_column = lambda table, col: tables[table]["columns"].setdefault(col, {}) is not None
+    assert f.missing_column("m", 'Referenced column "CONTEXT_TRAITS_SERVER" not found in FROM clause!')
+    assert "CONTEXT_TRAITS_SERVER" in tables["RAW.B.EVENTS"]["columns"] and "CONTEXT_TRAITS_SERVER" not in tables["RAW.A.DETAILS"]["columns"]

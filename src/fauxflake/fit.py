@@ -307,9 +307,11 @@ class Fitter:
         self.create_existing(fq)
         conn = self.emu._fs.connect(database=self.nodes[uid]["database"], schema=self.nodes[uid]["schema"])
         try:
-            self.run_model(conn, uid, fq)
+            error = self.run_model(conn, uid, fq)
         finally:
             conn.close()
+        if error and os.environ.get("FAUXFLAKE_FIT_DEBUG"):
+            self.log(f"    {self.nodes[uid]['name']} against its stand-in: {error[:600]}")
         return self.existing[fq].get("as") == "table"
 
     def _ancestors(self, uid: str) -> set[str]:
@@ -1103,6 +1105,24 @@ class Fitter:
                         singles |= owners if len(owners) == 1 else set()
                 if len(singles) > 1:
                     return any([self.blame(c, col) for c in sorted(singles)])
+        if len(candidates) > 1 and not alias:
+            # a CTE that lists its columns (`sdd as (select server_id, min(...) as first_active_date ...)`) has
+            # exactly those: a bare column read next to it comes from a relation that passes everything on
+            wide: set[str] = set()
+            for c in t.find_all(exp.Column):
+                select = c.find_ancestor(exp.Select)
+                if c.table or c.name.upper() != col or select is None or select.args.get("from_") is None:
+                    continue
+                for rel in [select.args["from_"].this, *[j.this for j in select.args.get("joins") or []]]:
+                    body = ctes.get(rel.name.upper()) if isinstance(rel, exp.Table) and not rel.db else \
+                        rel.this if isinstance(rel, exp.Subquery) else None
+                    top = body.unnest() if body is not None else None
+                    if isinstance(top, exp.Select) and not any(
+                            isinstance(e, exp.Star) or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star)) for e in top.expressions):
+                        continue
+                    wide |= self.real_tables(body if body is not None else rel, ctes) & candidates
+            if wide and wide < candidates:
+                candidates = wide
         if len(candidates) > 1 and not alias:
             # `left join mapping on form_url_clean = bizible_url`: a bare column in a join's ON that no relation
             # has yet is the joined relation's, the one the condition is there to bring in
