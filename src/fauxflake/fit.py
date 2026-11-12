@@ -718,6 +718,42 @@ class Fitter:
         self.dirty |= changed
         return changed
 
+    def drop_filler(self, uid: str, value: str) -> bool:
+        """`replace(replace(hybrid__c, 'Yes', '1'), 'No', '0')::int` met `other_hybrid__c`, the value a categorical
+        column carries for "anything else": this column has nothing else."""
+        m = re.fullmatch(r"other_(\w+)", value)
+        changed = False
+        for table in self.sources_of(uid) if m else []:
+            gen = (self.tables[table].get("columns") or {}).get(m.group(1).upper())
+            values = gen.get("values") if gen and gen.get("gen") == "categorical" else None
+            if isinstance(values, dict) and value in values and len(values) > 1:
+                del values[value]
+                total = sum(values.values()) or 1
+                gen["values"] = {k: round(v / total, 4) for k, v in values.items()}
+                self.retyped.add(table)
+                self.learned.append(f"{table}.{m.group(1).upper()}: every value is converted by the model; no other values generated.")
+                changed = True
+        self.dirty |= changed
+        return changed
+
+    def text_merge_key(self, uid: str) -> bool:
+        """dbt's merge compares the model's unique key with the table standing for the model, whose key
+        was declared a number by its name (`ip_address_hash`) and holds text."""
+        node = self.nodes.get(uid) or {}
+        own = _fq(node["relation_name"]) if node.get("relation_name") else None
+        key = (node.get("config") or {}).get("unique_key")
+        keys = [str(k).upper().strip('"') for k in ([key] if isinstance(key, str) else key or [])]
+        held = self.existing.get(own, {}).get("columns") if own else None
+        changed = False
+        for k in keys:
+            if held and held.get(k) in ("BIGINT", "DOUBLE"):
+                held[k] = "VARCHAR"
+                changed = True
+        if changed:
+            self.create_existing(own)
+            self.learned.append(f"{own}: its merge key holds text, declared VARCHAR.")
+        return changed
+
     def compared_with_a_hash(self, uid: str, name: str) -> bool:
         """An MD5 would not convert to a number: column `name` holds hashes (a surrogate key), and what the
         model compares it with was generated, or declared, as a number. That side is text too."""
@@ -1691,6 +1727,10 @@ class Fitter:
                 fmt = fmt.group(1) if fmt else None
                 if not hint:
                     return False
+                if hint in ("BIGINT", "DOUBLE", "BOOLEAN", "DATE", "TIMESTAMP") and self.drop_filler(sql_key, m.group("value")):
+                    return True
+                if hint in ("BIGINT", "DOUBLE") and re.search(r"DBT_INTERNAL_DEST|__FX_MERGE", message) and self.text_merge_key(sql_key):
+                    return True
                 if named and hint in ("BIGINT", "DOUBLE") and re.fullmatch(r"[0-9a-f]{32}", m.group("value")) \
                         and self.compared_with_a_hash(sql_key, named.group(1).upper()):
                     return True

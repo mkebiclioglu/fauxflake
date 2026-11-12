@@ -406,9 +406,9 @@ def fit(spec_path, project_dir):
 
     from .init import production_target
 
+    database = Spec.load(path).dbt.get("database", "ANALYTICS")  # also takes the target the spec records
     if not os.environ.get("FAUXFLAKE_TARGET") and production_target(project_dir):
         os.environ["FAUXFLAKE_TARGET"] = production_target(project_dir)  # the same target `init` fitted
-    database = Spec.load(path).dbt.get("database", "ANALYTICS")
     with tempfile.TemporaryDirectory(prefix="fauxflake-") as scratch, serve(db_path=scratch) as emu:
         emulator_temp(scratch)
         notes = update_spec(DbtProject(project_dir, emulator_output(emu.port, database)), path, database, emu, log=click.echo)

@@ -394,3 +394,23 @@ def test_dateadd_on_a_date_stays_a_date_for_day_or_longer_units(run):
     kinds = [r[0] for r in run("select data_type from information_schema.columns where table_name = 'DA' order by ordinal_position")]
     assert kinds == ["DATE", "DATE", "TIMESTAMP_NTZ", "DATE", "TIMESTAMP_NTZ"]
     assert run("select a + 1 from da")[0][0].isoformat() == "2009-11-03"
+
+
+def test_group_by_all_looks_through_aliases_of_aggregates(run):
+    run("create or replace table gba as select 'a' as dept, 1 as emp, 10 as mrs union all select 'a', 2, 10 union all select 'b', 3, 4")
+    assert run("select dept, count(distinct emp) as employees, count(*) as n, round(n / nullif(employees, 0), 2) as rate "
+               "from gba group by all order by 1") == [("a", 2, 2, 1.0), ("b", 1, 1, 1.0)]
+    assert run("select gba.dept, count(distinct emp) as employees, gba.mrs, round(mrs / nullif(employees, 0), 2) as rate "
+               "from gba group by all order by 1") == [("a", 2, 10, 5.0), ("b", 1, 4, 4.0)]
+
+
+def test_regexp_instr_is_a_number_other_functions_take(run):
+    assert run("select right('abcdef', len('abcdef') - regexp_instr('abcdef', 'c', 1, 1))") == [("def",)]
+
+
+def test_an_alias_of_a_function_call_is_read_in_where_and_flatten(run):
+    run("create or replace function to_arr(s string) returns array language python runtime_version = '3.8' handler = 'f' as $$\n"
+        "def f(s):\n    return s.split(',')\n$$")
+    run("create or replace table arr_src as select 'a,b' as d, 1 as id union all select '', 2")
+    assert run("with p as (select *, to_arr(d) as links from arr_src where array_size(links) != 1) "
+               "select p.id, f.value::varchar from p, table(flatten(links)) f order by 1, 2") == [(1, "a"), (1, "b")]

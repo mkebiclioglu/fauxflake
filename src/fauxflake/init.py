@@ -681,13 +681,31 @@ def production_target(project_dir: str | Path) -> str | None:
     relations as production does only under that target, and its models often refer to those names
     directly (`from finance.daily_arr`). Under any other target they would look for tables nobody builds."""
     names: collections.Counter = collections.Counter()
+    texts = []
     for path in Path(project_dir).glob("macros/**/*.sql"):
         try:
-            text = path.read_text(errors="ignore")
+            texts.append(path.read_text(errors="ignore"))
         except OSError:
             continue
+    quoted = r"['\"](\w+)['\"]"
+    for text in texts:
         for macro in re.finditer(r"(?s)\{%-?\s*macro\s+generate_(?:schema|database|alias)_name\b.*?endmacro", text):
-            names.update(re.findall(r"target\.name\s*[!=]=\s*['\"](\w+)['\"]", macro.group(0)))
+            body = macro.group(0)
+            names.update(re.findall(r"target\.name\s*[!=]=\s*" + quoted, body))
+            for listed in re.findall(r"target\.name\s+(?:not\s+)?in\s+[(\[]([^)\]]*)[)\]]", body):
+                names.update(re.findall(quoted, listed))
+            # `target.name in production_targets`, a list another macro returns: ('prod', 'docs', 'ci')
+            for variable in re.findall(r"target\.name\s+(?:not\s+)?in\s+(\w+)", body):
+                source = re.search(r"set\s+" + variable + r"\s*=\s*(\w+)\(\)", body)
+                where = re.search(r"set\s+" + variable + r"\s*=\s*[(\[]([^)\]]*)[)\]]", body)
+                if where:
+                    names.update(re.findall(quoted, where.group(1)))
+                for other in texts if source else []:
+                    made = re.search(r"(?s)\{%-?\s*macro\s+" + source.group(1) + r"\b.*?endmacro", other)
+                    if made:
+                        names.update(re.findall(quoted, made.group(0)))
+    if "ci" in names:
+        return "ci"  # this is a CI run: production's names, without what only production itself does
     return names.most_common(1)[0][0] if names else None
 
 

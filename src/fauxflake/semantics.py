@@ -767,6 +767,8 @@ def _fix(node: exp.Expression) -> exp.Expression:
         return _fn("_sf_like", node.this.copy(), node)
     if isinstance(node, exp.MonthsBetween):
         return exp.func("round", node, exp.Literal.number(6))
+    if isinstance(node, exp.RegexpInstr) and not isinstance(node.parent, exp.Cast):
+        return exp.cast(node, "bigint")  # a position, as a NUMBER: DuckDB sums list lengths into a HUGEINT
     if isinstance(node, (exp.Variance, exp.VariancePop)) and not isinstance(node.parent, exp.Window):
         return _fn("_sf_var", node, exp.Min(this=node.this.copy()))
     if isinstance(node, (exp.Stddev, exp.StddevSamp)) and not isinstance(node.parent, exp.Window):
@@ -1027,7 +1029,13 @@ def inline_aliases(tree: exp.Expression, names: set[str]) -> exp.Expression:
         for select in tree.find_all(exp.Select):
             defined = {p.alias.upper(): p for p in select.expressions if isinstance(p, exp.Alias) and p.alias.upper() in names}
             # the other projections, and the JOIN conditions: Snowflake lets `on` use a SELECT alias
-            users = [*select.expressions, *[j.args["on"] for j in select.args.get("joins") or [] if j.args.get("on")]]
+            users = [*select.expressions, *[j.args["on"] for j in select.args.get("joins") or [] if j.args.get("on")],
+                     # and WHERE, QUALIFY, HAVING: `f(x) as links ... where array_size(links) != 0` with a function DuckDB
+                     # will not evaluate twice by itself
+                     *[select.args[k] for k in ("where", "qualify", "having") if select.args.get(k)],
+                     # FLATTEN(links) next to the SELECT that defines `links`
+                     *[j.this for j in select.args.get("joins") or [] if isinstance(j.this, (exp.Lateral, exp.Unnest, exp.Table))
+                       and not isinstance(j.this.this, exp.Identifier)]]
             for proj in users:
                 for col in list(proj.find_all(exp.Column)):
                     owner = defined.get(col.name.upper())
@@ -1784,5 +1792,34 @@ def view_past_a_schema_named_like_a_database(transformed: exp.Expression, messag
             if table.args.get(extra):
                 read.set(extra, table.args[extra])
         table.replace(read)
+        changed = True
+    return tree if changed else None
+
+
+def group_by_all_written_out(transformed: exp.Expression) -> exp.Expression | None:
+    """`select dept, count(*) as n, round(mrs / nullif(n, 0)) as rate ... group by all`: Snowflake groups by
+    the items that hold no aggregate, and `rate` holds one through the alias `n`. DuckDB does not look
+    through the alias. Write the aggregate in its place and name the grouping items by position."""
+    tree, changed = transformed.copy(), False
+    for select in tree.find_all(exp.Select):
+        group = select.args.get("group")
+        if group is None or not group.args.get("all") or any(isinstance(e, exp.Star) or (
+                isinstance(e, exp.Column) and isinstance(e.this, exp.Star)) for e in select.expressions):
+            continue
+        aggregated = {e.alias.upper(): e.this for e in select.expressions if isinstance(e, exp.Alias) and any(
+            a.find_ancestor(exp.Window) is None or a.find_ancestor(exp.Window).find_ancestor(exp.Select) is not select
+            for a in e.this.find_all(exp.AggFunc))}
+        for e in select.expressions:
+            for col in list(e.find_all(exp.Column)):
+                own = e.alias.upper() if isinstance(e, exp.Alias) else None
+                if not col.table and col.name.upper() in aggregated and col.name.upper() != own and col.find_ancestor(exp.Select) is select:
+                    col.replace(exp.paren(aggregated[col.name.upper()].copy()))
+        keys = [exp.Literal.number(i + 1) for i, e in enumerate(select.expressions)
+                if not any(a.find_ancestor(exp.Select) is select for a in e.find_all(exp.AggFunc, exp.Window))]
+        group.set("all", None)
+        if keys:
+            group.set("expressions", keys)
+        else:
+            select.set("group", None)
         changed = True
     return tree if changed else None

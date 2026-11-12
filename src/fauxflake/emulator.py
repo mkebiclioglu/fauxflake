@@ -593,6 +593,11 @@ def _patch_fakesnow() -> None:
                     _heal(self)
                     run(by_name)
                     return
+                grouped = semantics.group_by_all_written_out(transformed) if "Cannot mix aggregates" in str(e) else None
+                if grouped is not None:
+                    _heal(self)
+                    run(grouped)
+                    return
                 unshadowed = semantics.aliases_over_tables(transformed) if "STRUCT(" in str(e) else None
                 if unshadowed is not None:
                     _heal(self)
