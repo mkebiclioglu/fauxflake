@@ -665,6 +665,7 @@ def _patch_fakesnow() -> None:
                 "by_name": lambda e: semantics.view_past_a_schema_named_like_a_database(transformed, e),
                 "grouped": lambda e: semantics.group_by_all_written_out(transformed) if "Cannot mix aggregates" in e else None,
                 "unshadowed": lambda e: semantics.aliases_over_tables(transformed) if "STRUCT(" in e else None,
+                "variants": lambda e: semantics.text_beside_variant(transformed, self._duck_conn) if "Malformed JSON" in e else None,
                 "types": lambda e: semantics.repair_types(transformed, self._duck_conn, params)
                 if "No function matches" in e or "Could not choose a best candidate" in e else None,
             }
@@ -673,15 +674,15 @@ def _patch_fakesnow() -> None:
                 try:
                     run(transformed)
                     return
-                except ProgrammingError as e:
+                except (ProgrammingError, duckdb.Error) as e:
                     # one repair can uncover the next (an implicit conversion, then an alias named like a table)
                     for name, remedy in remedies.items():
                         if used[name] >= 2:
                             continue
-                        used[name] += 1
                         repaired = remedy(str(e))
                         _heal(self)
                         if repaired is not None:
+                            used[name] += 1  # only a repair that was made counts against its two tries
                             transformed = repaired
                             break
                     else:

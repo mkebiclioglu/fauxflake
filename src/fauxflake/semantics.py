@@ -1824,6 +1824,58 @@ def coerce_union_literals(transformed: exp.Expression, conn) -> exp.Expression: 
     return transformed
 
 
+def text_beside_variant(transformed: exp.Expression, conn) -> exp.Expression | None:  # noqa: ANN001
+    """`select * from a union all select * from b` where a column is a VARIANT in one branch and text in
+    another: Snowflake keeps the text as a VARIANT string. DuckDB parses it as JSON and stops at the first
+    value that is not JSON. The text columns are wrapped as JSON strings. None when there is nothing to wrap."""
+    tree, changed = transformed.copy(), False
+    for union in list(tree.find_all(exp.SetOperation)):
+        if isinstance(union.parent, exp.SetOperation) or (isinstance(union.parent, exp.Subquery) and isinstance(union.parent.parent, exp.SetOperation)):
+            continue
+        prefix = _cte_prefix(union)
+        branches = [b for b in _branches(union) if isinstance(b, exp.Select)]
+        shapes = []
+        try:
+            for branch in branches:
+                shapes.append(conn.execute("describe " + prefix + branch.sql(dialect="duckdb")).fetchall())
+        except Exception:  # noqa: BLE001 - a branch that only binds in its context
+            continue
+        if len(branches) < 2 or len({len(d) for d in shapes}) != 1:
+            continue
+        variant = {i for d in shapes for i, row in enumerate(d) if row[1] == "JSON"}
+        for branch, described in zip(branches, shapes):
+            wrap = [described[i][0] for i in sorted(variant) if described[i][1] == "VARCHAR"]
+            if not wrap or len({row[0] for row in described}) != len(described):
+                continue
+            replaced = ", ".join(f'to_json("{c}") as "{c}"' for c in wrap)
+            inner = branch.copy()
+            outer = sqlglot.parse_one(f'select * replace ({replaced}) from (select 1) as "__FXV"', dialect="duckdb")
+            outer.args["from_"].this.set("this", inner)
+            branch.replace(outer)
+            changed = True
+    # `coalesce(account_id, customer_id)` with a text and a VARIANT argument: the same, per argument
+    for node in list(tree.find_all(exp.Coalesce))[:200]:
+        select = node.find_ancestor(exp.Select)
+        args = [node.this, *node.expressions]
+        if select is None or select.args.get("from_") is None or len(args) < 2:
+            continue
+        probe = exp.Select(expressions=[exp.alias_(a.copy(), f"_k{i}") for i, a in enumerate(args)])
+        probe.set("from_", select.args["from_"].copy())
+        if select.args.get("joins"):
+            probe.set("joins", [j.copy() for j in select.args["joins"]])
+        try:
+            kinds = [row[1] for row in conn.execute("describe " + _cte_prefix(select) + probe.sql(dialect="duckdb")).fetchall()]
+        except Exception:  # noqa: BLE001 - an argument that only binds in its place
+            continue
+        if len(kinds) != len(args) or "JSON" not in kinds:
+            continue
+        for arg, kind in zip(args, kinds):
+            if kind == "VARCHAR":
+                arg.replace(exp.func("to_json", arg.copy()))
+                changed = True
+    return tree if changed else None
+
+
 def _repair_by_types(tree: exp.Expression, conn, details: dict) -> bool:  # noqa: ANN001
     """`(a + b) * text_column * .01` inside an aggregate: DuckDB names the operator and not the place.
     Ask for the type of each operand of that operator and convert the text ones, as Snowflake does."""

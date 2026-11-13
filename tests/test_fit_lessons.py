@@ -301,3 +301,25 @@ def test_a_snapshot_keeps_a_column_its_model_no_longer_writes():
     f.passthrough = lambda fq: None
     assert f.blameable("SNAP.S.ARR") and f.blame("SNAP.S.ARR", "BILLING_COUNTRY")
     assert f.existing["SNAP.S.ARR"] == {"columns": {"ID": "BIGINT", "DBT_VALID_TO": "TIMESTAMP", "BILLING_COUNTRY": "VARCHAR"}, "as": "table"}
+
+
+def test_a_built_union_passes_what_its_children_read_to_the_tables_it_lists(tmp_path):
+    import types
+
+    child = parse("""
+        with latest as (select user_id as server_id, max(u.ts) as max_ts from "A".e.flags u group by 1)
+        select ts, enabled, user_id from "A".e.flags f join latest on f.user_id = latest.server_id and latest.max_ts = f.ts""")
+    nodes = {"model.p.flags": {"relation_name": '"A".e.flags', "raw_code": "{{ union_relations(relations) }}", "resource_type": "model",
+                               "package_name": "p", "original_file_path": "models/flags.sql", "depends_on": {"nodes": []}},
+             "model.p.child": {"relation_name": '"A".m.child', "raw_code": "", "resource_type": "model",
+                               "depends_on": {"nodes": ["model.p.flags"]}}}
+    (tmp_path / "compiled" / "p" / "models").mkdir(parents=True)
+    (tmp_path / "compiled" / "p" / "models" / "flags.sql").write_text(
+        'with a as (select cast("_LOADED_AT" as timestamp) as "_LOADED_AT" from "RAW".prod.flags) select * from a')
+    f = fitter(nodes=nodes, trees={"model.p.child": child, "model.p.flags": None}, by_rel={"A.E.FLAGS": "model.p.flags"},
+               tables={"RAW.PROD.FLAGS": {"columns": {"_LOADED_AT": {"gen": "loaded_at"}}}}, pending={}, existing={}, unions={},
+               project=types.SimpleNamespace(target_path=tmp_path),
+               emu=types.SimpleNamespace(duck=types.SimpleNamespace(execute=lambda sql: None)))
+    f.sketch = lambda uid: "not sql ("
+    assert f.blameable("A.E.FLAGS") and f.blame("A.E.FLAGS", "TS")
+    assert {"TS", "ENABLED", "USER_ID"} <= set(f.tables["RAW.PROD.FLAGS"]["columns"])

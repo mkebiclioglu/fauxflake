@@ -535,3 +535,14 @@ def test_columns_built_on_each_other_are_computed_once(run):
     assert run("select c0, c24, rn, name from chained") == [(top := max(r[0] for r in run("select id from t")), top + 24, 1,
                                                              run(f"select name from t where id = {top}")[0][0])]
     assert len(run("select column_name from information_schema.columns where table_name = 'CHAINED'")) == 28
+
+
+def test_a_union_keeps_text_beside_a_variant_as_a_variant_string(run):
+    run("create or replace table docs as select 1 as n, 'abc'::variant as v")
+    run("create or replace table texts as select 2 as n, '' as v union all select 3, 'plain'")
+    assert run("select n, v from (select * from docs union all select * from texts) order by n") == [
+        (1, '"abc"'), (2, '""'), (3, '"plain"')]
+    # the same inside COALESCE, and after another repair was needed first (SUM over text)
+    assert run("select n, coalesce(v, 'none') from (select * from docs union all select 4, null) order by n") == [(1, '"abc"'), (4, '"none"')]
+    run("create or replace table counted as select '2' as users, v from docs union all select '3', v from texts")
+    assert run("select sum(users) over (partition by coalesce(v, '')) from counted order by 1") == [(2,), (3,), (3,)]

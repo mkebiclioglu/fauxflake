@@ -386,6 +386,16 @@ class Fitter:
                         continue
                     found += self.columns_read(tree, tb)
                     select = tb.find_ancestor(exp.Select)
+                    if select is not None and select.args.get("joins") and select.args.get("from_") is not None:
+                        # joined only with CTEs that write their columns out: every other bare column is this table's
+                        ctes = {c.alias.upper(): c.this for c in tree.find_all(exp.CTE)}
+                        others = [r for r in [select.args["from_"].this, *[j.this for j in select.args["joins"]]] if r is not tb]
+                        bodies = [ctes.get(r.name.upper()) if isinstance(r, exp.Table) and not r.db else None for r in others]
+                        if all(isinstance(body, exp.Select) and not body.find(exp.Star) for body in bodies):
+                            given = {e.alias_or_name.upper() for body in bodies for e in body.expressions}
+                            given |= {e.alias.upper() for e in select.expressions if isinstance(e, exp.Alias)}
+                            found += [c.name.upper() for c in select.find_all(exp.Column)
+                                      if not c.table and c.find_ancestor(exp.Select) is select and c.name.upper() not in given]
                     cte = select.parent if select is not None and isinstance(select.parent, exp.CTE) else None
                     listed = select is not None and all(isinstance(e, (exp.Star, exp.Column)) for e in select.expressions)
                     if cte is not None and listed and not select.args.get("joins"):  # select *, or dbt_utils.star written out
@@ -619,7 +629,7 @@ class Fitter:
         tables = self.sources_of(uid)
         # and the source columns an output column is made from
         # a date to add days to, or text to compare with text: only the columns whose value it is
-        names = list(dict.fromkeys([name, *self.origins(uid, name, strict=hint in ("DAY", "TEXT"))]))
+        names = list(dict.fromkeys([name, *self.origins(uid, name, strict=hint in ("DAY", "TEXT", "VARIANT"))]))
         for table, name in [(t, n) for t in tables for n in names]:
             columns = self.tables[table].get("columns") or {}
             if name not in columns:  # "Sum of Open Opportunities" is sum_of_open_opportunities in generated text
@@ -643,6 +653,8 @@ class Fitter:
                 continue  # already holds numbers, dates or booleans as text: a cast reads them
             if kind in ("lifecycle", "loaded_at"):
                 continue
+            if hint == "VARIANT" and kind not in _FREE:
+                continue  # keys, times and numbers the spec already knows are not documents
             if numeric and kind == "hash_id":
                 fresh = {**gen, "gen": "sequence"}  # a text key read as a number: count instead of hashing
             elif numeric and kind == "fk":
@@ -709,8 +721,10 @@ class Fitter:
                   "TIMESTAMP": "TIMESTAMP", "ARRAY": "JSON", "VARIANT": "JSON", "DAY": "DATE"}.get(hint)
         tree = self.tree(uid)
         if wanted and tree is not None and not changed:
+            # a declared column takes the type only when it is that value itself, not something made from it
+            declared = list(dict.fromkeys([names[0], *self.origins(uid, names[0], strict=True)]))
             for fq in self.real_tables(tree, {c.alias.upper(): c.this for c in tree.find_all(exp.CTE)}):
-                for name in names:
+                for name in declared:
                     if fq in self.existing and (self.existing[fq].get("columns") or {}).get(name) not in (None, wanted):
                         self.existing[fq]["columns"][name] = wanted
                         self.create_existing(fq)
@@ -1056,10 +1070,34 @@ class Fitter:
         return True
 
     def blameable(self, fq: str, depth: int = 0) -> bool:
-        if fq in self.tables or fq in self.existing or fq in self.pending or self._union_members(fq) or self._is_snapshot(fq):
+        if fq in self.tables or fq in self.existing or fq in self.pending or self._union_members(fq) or self._is_snapshot(fq) \
+                or self.lists_columns(fq):
             return True
         parent = self.passthrough(fq) if depth <= 8 else None
         return bool(parent) and self.blameable(parent, depth + 1)
+
+    def lists_columns(self, fq: str) -> bool:
+        node = self.nodes.get(self.by_rel.get(fq) or self.relation_owner.get(fq) or "")
+        return bool(node) and getattr(self, "project", None) is not None \
+            and bool(re.search(r"union_relations|star\(", node.get("raw_code") or ""))
+
+    def through_listed_columns(self, fq: str, col: str) -> bool:
+        """A model that writes out the columns it finds (`union_relations`, `star`) was promised a column
+        while it could not be compiled; once it is built it has only what its tables have. The tables
+        it turned out to read get the column."""
+        if not self.lists_columns(fq):
+            return False
+        owner = self.by_rel.get(fq) or self.relation_owner.get(fq)
+        node, project = self.nodes[owner], self.project
+        path = project.target_path / "compiled" / node["package_name"] / node["original_file_path"]
+        try:
+            tree = sqlglot.parse_one(path.read_text(), dialect="snowflake")
+        except Exception:  # noqa: BLE001 - not built yet, or not SQL
+            return False
+        read = {f"{t.catalog.upper()}.{t.db.upper()}.{t.name.upper()}" for t in tree.find_all(exp.Table) if t.catalog and t.db}
+        # everything it was promised and everything read from it, in one round
+        wanted = list(dict.fromkeys([col, *self.pending.get(fq, {}), *self.columns_children_read(owner)]))
+        return any([self.add_column(t, c) for t in sorted(read) if t in self.tables for c in wanted])
 
     def blame(self, fq: str, col: str, depth: int = 0) -> bool:
         if fq in self.tables:
@@ -1086,7 +1124,7 @@ class Fitter:
             return bool(added)
         if fq in self.pending:
             if col in self.pending[fq]:
-                return False
+                return self.through_listed_columns(fq, col)
             self.pending[fq][col] = duck_type(guess(col, None))
             self.create_pending(fq)
             return True
@@ -1101,6 +1139,8 @@ class Fitter:
             if parent and parent != fq and self.blameable(parent, depth + 1) and self.blame(parent, col, depth + 1):
                 added = True
             return added
+        if self.lists_columns(fq) and self.through_listed_columns(fq, col):
+            return True
         parent = self.passthrough(fq) if depth <= 8 else None
         if self._is_snapshot(fq) and not (parent and self.blameable(parent, depth + 1)):
             return self.kept_by_snapshot(fq, col)
@@ -2094,7 +2134,8 @@ class Fitter:
         if tree is not None and re.search(r"argument types '[-+]\((?:BIGINT|INTEGER|HUGEINT|DOUBLE|DECIMAL\([\d, ]+\)), INTERVAL\)", message):
             # `first_seen + INTERVAL '1 DAY'` on a column generated as a number: it is a time
             names = [side.name.upper() for node in tree.find_all(exp.Add, exp.Sub) if isinstance(node.expression.unnest(), exp.Interval)
-                     for side in [node.this.unnest()] if isinstance(side, exp.Column)]
+                     for side in [node.this.unnest()] for side in [side.this if isinstance(side, (exp.Max, exp.Min)) else side]
+                     if isinstance(side, exp.Column)]  # also `max(date) - interval '2 day'`
             if any([self.retype_column(sql_key, c, "TIMESTAMP") for c in dict.fromkeys(names)]):
                 return True
         if tree is not None and re.search(r"argument types '(?:sum|avg)\((?:DATE|TIMESTAMP[^)]*)\)'", message):
@@ -2505,6 +2546,7 @@ class Fitter:
         selected: list[str] = []
         outcome: dict[str, tuple[str, str, str]] = {}  # node -> (kind, status, message), across rounds
         os.environ["FAUXFLAKE_STATEMENT_TIMEOUT"] = "300"  # a real build, at build scale: more room than a trial run gets
+        self.project = project
         for n_round in range(1, rounds + 1):
             # at the scale and history `fauxflake build` uses, so that what is reported here is what a build gives
             self.generate(scale=0.001, history=60)
