@@ -117,6 +117,22 @@ class TableSQL:
         return self._key_expr(table, d, index)
 
     def _key_expr(self, table: Table, d: dict, index: str) -> str:
+        if d.get("template") and d["gen"] == "hash_id":
+            # an id with a shape (`{n}.{n}.{n}`): the row's number written across the `{n}`s, the last ones a digit
+            # each, so every row has its own; `{hex}` is text that differs from row to row
+            pieces = re.split(r"(\{n\}|\{hex\})", str(d["template"]))
+            numbers = [i for i, piece in enumerate(pieces) if piece == "{n}"]
+            out = []
+            for i, piece in enumerate(pieces):
+                if piece == "{n}":
+                    place = len(numbers) - 1 - numbers.index(i)  # 0 for the last
+                    digit = f"({index} // {10 ** place})" if i == numbers[0] else f"(({index} // {10 ** place}) % 10)"
+                    out.append(f"{digit}::bigint::varchar")
+                elif piece == "{hex}":
+                    out.append(f"left(md5(concat({lit(f'{self.spec.seed}:{table.name.upper()}:{i}:')}, {index})), 12)")
+                elif piece:
+                    out.append(lit(piece))
+            return f"concat({', '.join(out)})"
         if d["gen"] == "sequence":
             # each table counts in its own range, as ids from different systems do: two tables'
             # keys never collide when a model unions them

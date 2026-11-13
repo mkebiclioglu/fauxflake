@@ -179,6 +179,8 @@ def _split_use(use: "SourceUse", column: str, call: exp.Expression) -> bool:
     while isinstance(outer, (exp.Right, exp.Left, exp.Substring, exp.Trim, exp.Paren)):
         outer, sliced = outer.parent, True
     hint = outer.to.sql(dialect="duckdb") if isinstance(outer, (exp.Cast, exp.TryCast)) else None
+    if isinstance(outer, (exp.ToNumber, exp.ToDouble)):
+        hint = "BIGINT"  # try_to_decimal(split_part(version, '.', 1)): that piece is a number
     found = use.splits.setdefault(column, {"seps": {}, "digits": False})
     parts = found["seps"].setdefault(sep.name, {})
     position = int(index.name) - base
@@ -1352,6 +1354,11 @@ def analyse(manifest: dict, database: str) -> Analysis:
             if col == key:
                 numeric = (hint or "").upper().startswith(("BIGINT", "INT", "DECIMAL", "NUMBER")) or (not hint and col.endswith("ID"))
                 out[col] = {"gen": "sequence" if numeric else "hash_id"}
+                if col in use.splits and not numeric:
+                    # a key the SQL takes apart (`split_part(version, '.', 2)::int`): ids of that shape, each one once
+                    (sep, wanted), *_ = use.splits[col]["seps"].items()
+                    out[col] = {"gen": "hash_id", "template": sep.join(
+                        "{n}" if use.splits[col]["digits"] or hint_is_number(wanted.get(i)) else "{hex}" for i in range(max(max(wanted) + 1, 2)))}
             elif (name, col) in fks:
                 out[col] = {"gen": "fk", "ref": fks[(name, col)][0], "skew": 1.5}
             elif (name, col) in accepted:

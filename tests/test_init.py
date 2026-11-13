@@ -426,3 +426,19 @@ def test_an_id_asked_for_by_name_through_a_foreign_key_exists_in_the_table_it_re
     spec, _ = build_spec(manifest, "A")
     assert spec["tables"]["RAW.S.EVENTS"]["columns"]["SERVER_ID"]["gen"] == "fk"
     assert spec["tables"]["RAW.S.SERVERS"]["columns"]["ID"] == {"gen": "hash_id", "named": ["93mykbogbjfrbbdqphx3zhze5c"]}
+
+
+def test_a_key_the_sql_takes_apart_keeps_its_shape():
+    from fauxflake.init import build_spec
+
+    manifest = {
+        "sources": {"source.p.s.releases": {"database": "RAW", "schema": "S", "name": "releases", "identifier": "releases", "columns": {}}},
+        "nodes": {
+            "model.p.m": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.M", "compiled_code": """
+                select version, try_to_decimal(split_part(version, '.', 1)) as major, split_part(version, '.', 2)::int as minor
+                from raw.s.releases"""},
+            "test.p.u": {"resource_type": "test", "attached_node": "source.p.s.releases", "column_name": "version",
+                         "depends_on": {"nodes": ["source.p.s.releases"]},
+                         "test_metadata": {"name": "unique", "kwargs": {"column_name": "version"}}}},
+    }
+    assert build_spec(manifest, "A")[0]["tables"]["RAW.S.RELEASES"]["columns"]["VERSION"] == {"gen": "hash_id", "template": "{n}.{n}"}

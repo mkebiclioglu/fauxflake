@@ -96,3 +96,20 @@ def test_ids_asked_for_by_name_are_held_by_the_first_rows_and_referred_to():
         orphans = cur.execute("select count(*) from RAW.T.EVENTS e left join RAW.T.SERVERS s on s.ID = e.SERVER_ID where s.ID is null").fetchone()[0]
     assert servers[0] == servers[1] and servers[2] == 2
     assert events > 0 and orphans == 0
+
+
+def test_a_key_with_a_shape_is_unique_and_what_refers_to_it_finds_it():
+    from fauxflake.spec import Spec
+
+    table = {"volume": {"rows_per_day": 400, "weekly": [1] * 7}, "lateness": {"p": [0, 1], "seconds": [0, 1]}}
+    spec = Spec.from_raw({"seed": 42, "start": "2025-01-01", "tables": {
+        "RAW.T.RELEASES": {**table, "columns": {"VERSION": {"gen": "hash_id", "template": "{n}.{n}.{n}"}}},
+        "RAW.T.SERVERS": {**table, "columns": {"ID": {"gen": "sequence"}, "VERSION": {"gen": "fk", "ref": "RAW.T.RELEASES", "skew": 1.5}}},
+    }}, ".")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 3))
+        cur = emu.cursor()
+        total, distinct, shaped = cur.execute("select count(*), count(distinct VERSION), count_if(regexp_full_match(VERSION, '[0-9]+[.][0-9][.][0-9]')) "
+                                              "from RAW.T.RELEASES").fetchone()
+        orphans = cur.execute("select count(*) from RAW.T.SERVERS s left join RAW.T.RELEASES r on r.VERSION = s.VERSION where r.VERSION is null").fetchone()[0]
+    assert total == distinct == shaped and total > 500 and orphans == 0
