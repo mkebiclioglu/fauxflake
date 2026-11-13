@@ -354,7 +354,8 @@ class TableSQL:
             if d.get("unique") and self.base == "g":
                 expr = "(timestamp '2000-01-01' + to_days(g::integer))"  # a `unique` test covers it: one day per row
                 if d.get("every_days"):  # periods that follow one another from the start of the history
-                    expr = f"(timestamp '{self.spec.start:%Y-%m-%d}' + to_days((g * {int(d['every_days'])})::integer))"
+                    expr = (f"(timestamp '{self.spec.start:%Y-%m-%d}' + "
+                            f"to_days((g * {int(d['every_days'])} + {int(d.get('plus_days', 0))})::integer))")
             if d.get("epoch"):  # the moment as seconds since 1970, the way APIs often send it
                 expr = f"epoch({expr})::bigint"
             if d.get("format"):  # a text column holding dates in this format

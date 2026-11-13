@@ -61,7 +61,8 @@ class SourceUse:
         self.numbers: set[str] = set()  # columns that are summed, averaged or used in arithmetic
         self.literals: dict[str, set[str]] = {}  # column -> string values the SQL compares it with
         self.patterns: dict[str, set[str]] = {}  # column -> LIKE patterns the SQL keeps rows by
-        self.periods: set[str] = set()  # time columns that bound a period other rows are looked up in (`on t.at between p.start and p.end`)
+        # time columns that bound a period other rows are looked up in (`on t.at between p.start and p.end`): "start" or "end"
+        self.periods: dict[str, str] = {}
         self.depends: dict[str, str] = {}  # column -> the column that decides it (`group by id having count(distinct seats) = 1`)
         self.examples: dict[str, set[str]] = {}  # column -> texts that match the regular expressions it is tested with
         # text column -> separator -> position -> shapes that part is kept by (`split_part(request, ' ', 1) = 'POST'`)
@@ -639,7 +640,10 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
             # is looked up in the periods of `r`, which follow one another (a row in two periods would be counted twice)
             on = join.args.get("on")
             lower, upper = {}, {}  # table that bounds from below / above -> the bounding expressions
-            for test in (on.find_all(exp.GT, exp.GTE, exp.LT, exp.LTE, exp.Between) if on is not None else []):
+            keyed = on is not None and any(
+                isinstance(e.this, exp.Column) and isinstance(e.expression, exp.Column) and e.this.table != e.expression.table
+                for e in on.find_all(exp.EQ))  # `on a.id = b.id and a.day between b.valid_from and b.valid_to`: periods of one id
+            for test in (on.find_all(exp.GT, exp.GTE, exp.LT, exp.LTE, exp.Between) if on is not None and not keyed else []):
                 if isinstance(test, exp.Between):
                     pairs = [(test.args.get("low"), lower), (test.args.get("high"), upper)]
                     probe = test.this
@@ -649,14 +653,19 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 for bound, role in pairs:
                     owners = {c.table.upper() for c in bound.find_all(exp.Column)} if bound is not None else set()
                     probes = {c.table.upper() for c in probe.find_all(exp.Column)}
+                    # what is looked up is a time the sources hold (an issue's creation), not a calendar's day: a
+                    # calendar joined to periods spreads each period over its days, which is another thing
+                    looked_up = [resolve_path(c) for c in probe.find_all(exp.Column)]
+                    if not looked_up or not all(isinstance(spot, tuple) and spot[0] in sources for spot in looked_up):
+                        continue
                     if len(owners) == 1 and probes and not owners & probes and "" not in owners:
                         role.setdefault(next(iter(owners)), []).append(bound)
             for owner in set(lower) & set(upper):
-                for bound in [*lower[owner], *upper[owner]]:
-                    for column in bound.find_all(exp.Column):
+                for role, bounds in (("start", lower[owner]), ("end", upper[owner])):
+                    for column in (c for bound in bounds for c in bound.find_all(exp.Column)):
                         spot = resolve_path(column)
                         if isinstance(spot, tuple) and not spot[2] and spot[0] in sources:
-                            sources[spot[0]].periods.add(spot[1])
+                            sources[spot[0]].periods.setdefault(spot[1], role)
 
         having, group = select.args.get("having"), select.args.get("group")
         if having is not None and group is not None and len(group.expressions) == 1:
@@ -1578,10 +1587,13 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 for sibling, sd in out.items():
                     if sibling != col and sibling.startswith(col[:-2]) and sd["gen"] in ("template", "categorical"):
                         sd["follows"] = col
-        for col in use.periods:
-            # the bound of a period rows are looked up in: one every two months, so that no two periods overlap
+        for col, role in use.periods.items():
+            # the bound of a period rows are looked up in: one every two months, so that no two periods overlap;
+            # where the table holds both ends, a period lasts six weeks
             if col in out and out[col].get("gen") == "time_offset" and not out[col].get("format") and not out[col].get("epoch"):
                 out[col].update(unique=True, every_days=60)
+                if role == "end" and "start" in use.periods.values():
+                    out[col]["plus_days"] = 45
         for col, by in use.depends.items():
             # one value per `by`: generated from it, not from the row
             if col in out and by in out and not out[col].get("follows") and out[by].get("follows") != col \
