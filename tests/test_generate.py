@@ -113,3 +113,18 @@ def test_a_key_with_a_shape_is_unique_and_what_refers_to_it_finds_it():
                                               "from RAW.T.RELEASES").fetchone()
         orphans = cur.execute("select count(*) from RAW.T.SERVERS s left join RAW.T.RELEASES r on r.VERSION = s.VERSION where r.VERSION is null").fetchone()[0]
     assert total == distinct == shaped and total > 500 and orphans == 0
+
+
+def test_period_bounds_are_two_months_apart_from_the_start_of_the_history():
+    from fauxflake.spec import Spec
+
+    spec = Spec.from_raw({"seed": 42, "start": "2025-01-01", "tables": {"RAW.T.RELEASES": {
+        "volume": {"rows_per_day": 20, "weekly": [1] * 7}, "lateness": {"p": [0, 1], "seconds": [0, 1]},
+        "columns": {"ID": {"gen": "sequence"}, "RELEASE_DATE": {"gen": "time_offset", "type": "DATE", "p": [0, 1], "seconds": [0, 9],
+                                                               "unique": True, "every_days": 60}}}}}, ".")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 3))
+        rows = emu.cursor().execute("select RELEASE_DATE from RAW.T.RELEASES order by 1").fetchall()
+    days = [r[0] for r in rows]
+    assert str(days[0])[:10] == "2025-01-01" and len(set(days)) == len(days) > 20
+    assert all((b - a).days == 60 for a, b in zip(days, days[1:]))

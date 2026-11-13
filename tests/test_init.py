@@ -508,3 +508,21 @@ def test_a_test_that_says_one_time_is_after_another_orders_them():
     columns = build_spec(manifest, "A")[0]["tables"]["RAW.S.RELEASES"]["columns"]
     assert min(columns["RELEASE_DATE"]["seconds"]) > max(columns["RC1_DATE"]["seconds"])
     assert columns["OTHER_DATE"]["seconds"] == columns["RC1_DATE"]["seconds"]
+
+
+def test_times_that_bound_a_period_rows_are_looked_up_in_follow_one_another():
+    from fauxflake.init import build_spec
+
+    manifest = {
+        "sources": {"source.p.s.releases": {"database": "RAW", "schema": "S", "name": "releases", "identifier": "releases", "columns": {}},
+                    "source.p.s.issues": {"database": "RAW", "schema": "S", "name": "issues", "identifier": "issues", "columns": {}}},
+        "nodes": {"model.p.m": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.M", "compiled_code": """
+            with rv as (select version, release_date::date as planned, dateadd(month, -1, release_date::date) as window_start,
+                               announced_at::timestamp as announced_at from raw.s.releases)
+            select i.id, rt.version from raw.s.issues i
+            left join rv rt on i.created_at >= rt.window_start and i.created_at <= rt.planned"""}},
+    }
+    tables = build_spec(manifest, "A")[0]["tables"]
+    assert tables["RAW.S.RELEASES"]["columns"]["RELEASE_DATE"]["every_days"] == 60 and tables["RAW.S.RELEASES"]["columns"]["RELEASE_DATE"]["unique"]
+    assert "every_days" not in tables["RAW.S.RELEASES"]["columns"]["ANNOUNCED_AT"]
+    assert "every_days" not in tables["RAW.S.ISSUES"]["columns"]["CREATED_AT"]
