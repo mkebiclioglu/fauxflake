@@ -107,6 +107,18 @@ def _table_id(table: exp.Table) -> str:
     return ".".join(p.upper() for p in (table.catalog, table.db, table.name) if p)
 
 
+def _belongs_inside(col: exp.Column, select: exp.Select, sources: dict) -> bool:
+    """An unqualified column written in a subquery belongs to what that subquery reads. When that is a
+    relation the project builds (`select max(ts) from {{ this }} where kind = ...`), the name says
+    nothing about the tables the outer query reads."""
+    inner = col.find_ancestor(exp.Select)
+    if inner is None or inner is select:
+        return False
+    tables = [t for part in (inner.args.get("from") or inner.args.get("from_"), *(inner.args.get("joins") or ()))
+              if part is not None for t in ([part.this] if isinstance(part.this, exp.Table) else [])]
+    return any(t.db and _table_id(t) not in sources for t in tables)
+
+
 _WRAPPERS = (exp.Cast, exp.TryCast, exp.Paren, exp.Lower, exp.Upper, exp.Trim)
 _SAME_VALUE = (exp.Lower, exp.Upper, exp.Trim, exp.Initcap, exp.Nullif, exp.Lag, exp.Lead, exp.FirstValue, exp.LastValue, exp.Max,
                exp.Min, exp.AnyValue, exp.IgnoreNulls, exp.RespectNulls, exp.Window) + tuple(
@@ -257,6 +269,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
 
         def resolve(col: exp.Column, depth: int = 0):
             table = col.table.upper()
+            if not table and _belongs_inside(col, select, sources):
+                return None
             if not table and col.name.upper() in aliases and not isinstance(col.parent, exp.Alias):
                 inner = aliases[col.name.upper()]
                 while isinstance(inner, (exp.Cast, exp.TryCast, exp.Paren)):

@@ -323,3 +323,27 @@ def test_a_built_union_passes_what_its_children_read_to_the_tables_it_lists(tmp_
     f.sketch = lambda uid: "not sql ("
     assert f.blameable("A.E.FLAGS") and f.blame("A.E.FLAGS", "TS")
     assert {"TS", "ENABLED", "USER_ID"} <= set(f.tables["RAW.PROD.FLAGS"]["columns"])
+
+
+def test_a_row_a_day_for_each_group_that_did_not_finish_gets_fewer_groups():
+    tree = parse("""
+        with firsts as (select coalesce(user_id, anonymous_id) as server_id, plugin_version, min(ts) as first_seen
+                        from "RAW".p.events group by 1, 2)
+        select d.date, f.server_id, f.plugin_version, count(*) from analytics.util.dates d
+        join firsts f on d.date >= f.first_seen group by 1, 2, 3""")
+    columns = {"USER_ID": {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000]},
+               "ANONYMOUS_ID": {"gen": "template", "template": "anonymous_id_{hex}"},
+               "PLUGIN_VERSION": {"gen": "template", "template": "plugin_version_{hex}"},
+               "ID": {"gen": "template", "template": "id_{hex}", "unique": True},
+               "TS": {"gen": "event_time"}}
+    f = fitter(trees={"m": tree}, tables={"RAW.P.EVENTS": {"columns": columns}})
+    f.sources_of, f.origins = lambda uid: ["RAW.P.EVENTS"], lambda uid, name: [name]
+    assert f.runaway("m", "Out of Memory Error: failed to offload data block")
+    assert columns["USER_ID"]["v"] == [1, 50]
+    assert len(columns["PLUGIN_VERSION"]["values"]) == len(columns["ANONYMOUS_ID"]["values"]) == 6
+    assert columns["ID"]["gen"] == "template" and columns["TS"] == {"gen": "event_time"}
+    # joined on a key, a model that runs out of room is not a row a day for each group
+    g = fitter(trees={"m": parse('select a.k, count(*) from "RAW".p.events a join "RAW".p.events b on a.k = b.k group by 1')},
+               tables={"RAW.P.EVENTS": {"columns": {"K": {"gen": "template", "template": "k_{hex}"}}}})
+    g.sources_of, g.origins = lambda uid: ["RAW.P.EVENTS"], lambda uid, name: [name]
+    assert not g.runaway("m", "Out of Memory Error") and g.tables["RAW.P.EVENTS"]["columns"]["K"]["gen"] == "template"

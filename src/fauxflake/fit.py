@@ -1972,12 +1972,14 @@ class Fitter:
             return changed
         ctes = {c.alias.upper(): c.this for c in tree.find_all(exp.CTE)}
         targets: set[str] = set()
+        ranged = False
         for join in tree.find_all(exp.Join):
             on = join.args.get("on")
             equal = [e for e in (on.find_all(exp.EQ) if on is not None else [])
                      if isinstance(e.this, exp.Column) and isinstance(e.expression, exp.Column) and e.this.table != e.expression.table]
             if equal or join.args.get("using"):
                 continue  # joined on a key
+            ranged = True
             for fq in self.real_tables(join.this, ctes):
                 source = self._source_behind(fq) or (fq if fq in self.tables else None)
                 owner = self.by_rel.get(fq) or self.relation_owner.get(fq) or ""
@@ -1992,7 +1994,41 @@ class Fitter:
             self.learned.append(f"{table}: joined on a range by {self.nodes.get(sql_key, {}).get('name', sql_key)}, which did not "
                                 f"finish; generated as a small reference table ({volume['rows_per_day']} rows a day before scaling).")
             changed = True
+        if ranged and self.fewer_groups(sql_key, tree):
+            changed = True
         self.dirty |= changed
+        return changed
+
+    def fewer_groups(self, sql_key: str, tree) -> bool:  # noqa: ANN001
+        """`from dates d join per_server s on d.date >= s.first_seen group by ...` keeps a row a day for
+        every group, for as long as the history runs. Made-up text gives one group per row and guessed
+        ids a thousand: the columns the model groups by get a handful of values instead."""
+        names: set[str] = set()
+        for select in tree.find_all(exp.Select):
+            group = select.args.get("group")
+            for e in (group.expressions if group is not None else []):
+                if isinstance(e, exp.Literal) and e.is_int and 0 < int(e.name) <= len(select.expressions):
+                    e = select.expressions[int(e.name) - 1]
+                names |= {c.name.upper() for c in e.find_all(exp.Column)}
+        changed = False
+        model = self.nodes.get(sql_key, {}).get("name", sql_key)
+        for table in self.sources_of(sql_key):
+            columns = self.tables[table].get("columns") or {}
+            key = self.tables[table].get("key") or []
+            for name in sorted({n for column in names for n in self.origins(sql_key, column)} & set(columns)):
+                gen = columns[name]
+                if gen.get("unique") or name in ([key] if isinstance(key, str) else key):
+                    continue
+                if gen.get("gen") in _FREE:
+                    values = [f"{name.lower()}_{i}" for i in range(1, 7)]
+                    columns[name] = {"gen": "categorical", "values": {v: round(1 / len(values), 4) for v in values}}
+                elif gen.get("gen") == "dist" and gen.get("type") == "BIGINT" and gen.get("v") == [1, 1000] and name.endswith("ID"):
+                    columns[name] = {**gen, "v": [1, 50]}
+                else:
+                    continue
+                self.retyped.add(table)
+                self.learned.append(f"{table}.{name}: {model} keeps a row a day for each value and did not finish; generated with a handful of values.")
+                changed = True
         return changed
 
     def learn(self, sql_key: str, message: str) -> bool:

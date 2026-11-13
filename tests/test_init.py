@@ -273,3 +273,15 @@ def test_filters_on_null_and_on_the_future_shape_the_column():
     }, ["RAW.T.LEADS"])
     use = uses["RAW.T.LEADS"]
     assert use.nullable == {"CONVERTED"} and use.future == {"EXPIRES"}
+
+
+def test_a_name_in_a_subquery_over_a_built_relation_is_not_a_source_column():
+    from fauxflake.init import SourceUse, scan_model
+
+    sources = {"RAW.APP.EVENT": SourceUse()}
+    scan_model("""
+        select m.id, max(m.ts) as max_ts from raw.app.event m
+        where m.ts > (select max(max_ts) from analytics.events.by_date where _dbt_source_relation = 'x')
+        group by 1""", sources)
+    assert "_DBT_SOURCE_RELATION" not in sources["RAW.APP.EVENT"].columns
+    assert {"ID", "TS"} <= set(sources["RAW.APP.EVENT"].columns)

@@ -213,8 +213,12 @@ def _freeze_clock(sql: str) -> str:
 MAX_STATEMENT = 1_048_576  # Snowflake accepts 1 MB of SQL text
 
 
+_ROWS_WRITTEN_OUT = re.compile(r"\s*insert\s+into\s", re.I)
+
+
 def rewrite(sql: str) -> str:
-    if len(sql) > MAX_STATEMENT:
+    # a seed's rows arrive written out in the INSERT: data, which real projects load in batches larger than this
+    if len(sql) > MAX_STATEMENT and not _ROWS_WRITTEN_OUT.match(sql):
         from snowflake.connector.errors import ProgrammingError
 
         # a pivot with one column per row of made-up text, usually: refused at once, as Snowflake would,
