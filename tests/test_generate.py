@@ -158,3 +158,26 @@ def test_a_grain_gives_one_row_a_day_for_each_listed_value():
         rows, pairs, days, kinds_seen = emu.cursor().execute(
             "select count(*), count(distinct (DAY, KIND)), count(distinct DAY), count(distinct KIND) from RAW.T.RATES").fetchone()
     assert rows == pairs == days * 3 and kinds_seen == 3 and days >= 4
+
+
+def test_an_hourly_series_has_every_entity_every_hour_once():
+    from fauxflake.spec import Spec
+
+    table = {"volume": {"rows_per_day": 300, "weekly": [1] * 7}, "lateness": {"p": [0, 1], "seconds": [0, 1]}}
+    entity = {"gen": "pool", "pool": "entity_id", "size": 4, "numeric": True}
+    spec = Spec.from_raw({"seed": 42, "start": "2025-01-01", "tables": {
+        "RAW.T.METERING": {**table, "grain": ["START_TIME", "ENTITY_ID"], "columns": {
+            "START_TIME": {"gen": "event_time", "trunc": "hour"}, "ENTITY_ID": dict(entity),
+            "CREDITS": {"gen": "dist", "type": "DOUBLE", "p": [0, 1], "v": [0, 3]}}},
+        "RAW.T.QUERIES": {**table, "columns": {"ID": {"gen": "sequence"}, "WAREHOUSE_ID": dict(entity), "AT": {"gen": "event_time"}}},
+    }}, ".")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 4))
+        cur = emu.cursor()
+        rows, pairs, hours, entities = cur.execute(
+            "select count(*), count(distinct (START_TIME, ENTITY_ID)), count(distinct START_TIME), count(distinct ENTITY_ID) from RAW.T.METERING").fetchone()
+        matched, queries = cur.execute(
+            "select count(m.ENTITY_ID), count(*) from RAW.T.QUERIES q left join RAW.T.METERING m "
+            "on m.ENTITY_ID = q.WAREHOUSE_ID and m.START_TIME = date_trunc('hour', q.AT) where q.AT < timestamp '2025-01-03'").fetchone()
+    assert rows == pairs == hours * 4 and entities == 4 and hours >= 48
+    assert matched == queries > 100  # every query finds its warehouse's hour

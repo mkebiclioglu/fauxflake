@@ -63,6 +63,8 @@ class SourceUse:
         self.patterns: dict[str, set[str]] = {}  # column -> LIKE patterns the SQL keeps rows by
         # time columns that bound a period other rows are looked up in (`on t.at between p.start and p.end`): "start" or "end"
         self.periods: dict[str, str] = {}
+        self.truncs: dict[str, str] = {}  # time column -> the unit a model cuts it to before matching on it (`date_trunc('hour', at)`)
+        self.series: set[frozenset[str]] = set()  # columns a join matches on together (`on a.id = b.id and a.hour = b.hour`)
         self.depends: dict[str, str] = {}  # column -> the column that decides it (`group by id having count(distinct seats) = 1`)
         self.examples: dict[str, set[str]] = {}  # column -> texts that match the regular expressions it is tested with
         # text column -> separator -> position -> shapes that part is kept by (`split_part(request, ' ', 1) = 'POST'`)
@@ -123,6 +125,18 @@ def _belongs_inside(col: exp.Column, select: exp.Select, sources: dict) -> bool:
     tables = [t for part in (inner.args.get("from") or inner.args.get("from_"), *(inner.args.get("joins") or ()))
               if part is not None for t in ([part.this] if isinstance(part.this, exp.Table) else [])]
     return any(t.db and _table_id(t) not in sources for t in tables)
+
+
+def _key_pairs(join: exp.Join) -> list[exp.EQ]:
+    """The `a.x = b.y` of a join's ON that match a column of one relation with a column of another."""
+    on = join.args.get("on")
+    return [e for e in (on.find_all(exp.EQ) if on is not None else [])
+            if isinstance(e.this, exp.Column) and isinstance(e.expression, exp.Column) and e.this.table and e.expression.table
+            and e.this.table.upper() != e.expression.table.upper()]
+
+
+def _key_width(join: exp.Join) -> int:
+    return len(_key_pairs(join))
 
 
 def _like_patterns(test: exp.Expression) -> list[str]:
@@ -420,6 +434,13 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 if len(marks) == 2 and isinstance(base, tuple) and not base[2]:
                     return base[0], base[1], ("~between", marks[0], marks[1])
                 return None
+            if isinstance(node, (exp.TimestampTrunc, exp.DateTrunc)):
+                # date_trunc('hour', started_at): still that time, on the hour
+                base = resolve_path(node.this, depth + 1)
+                unit = node.args.get("unit")
+                if isinstance(base, tuple) and not base[2] and base[0] in sources and unit is not None and unit.name.lower() in ("hour", "day"):
+                    sources[base[0]].truncs.setdefault(base[1], unit.name.lower())
+                return base
             if isinstance(node, exp.SplitPart):
                 # split_part(request, ' ', 1): that piece of the text
                 mark, index = node.args.get("delimiter"), node.args.get("part_index")
@@ -542,7 +563,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                             # `from a join b on a.x = b.y`: b is looked up by y; a row of a should find one b, not thirty
                             joined = (join.this.alias_or_name or "").upper()
                             tables_of = lambda e: {c.table.upper() for c in e.find_all(exp.Column)}  # noqa: E731
-                            if tables_of(side) == {joined} and joined not in tables_of(other):
+                            if tables_of(side) == {joined} and joined not in tables_of(other) and _key_width(join) == 1:
+                                # (matched on two columns, neither is the table's key by itself)
                                 lookups[mine] += 1  # (the other side is visited too, and counts nothing)
                                 lookups[theirs] -= 1
             if not found[2]:
@@ -638,6 +660,18 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
         for join in select.args.get("joins") or []:
             # `join releases r on i.created_at >= r.window_start and i.created_at <= r.release_date`: each row of `i`
             # is looked up in the periods of `r`, which follow one another (a row in two periods would be counted twice)
+            pairs = _key_pairs(join)
+            if len(pairs) >= 2:
+                # matched on two columns or more: together they name one row of each side (an entity and an hour)
+                sides: dict[tuple[str, str], set[str]] = {}
+                for column in (c for pair in pairs for c in (pair.this, pair.expression)):
+                    spot = resolve_path(column)
+                    if isinstance(spot, tuple) and not spot[2] and spot[0] in sources:
+                        sides.setdefault((column.table.upper(), spot[0]), set()).add(spot[1])
+                joined = (join.this.alias_or_name or "").upper()
+                for (alias, source), columns in sides.items():
+                    if len(columns) >= 2 and alias == joined:  # the side that is looked up, not the rows looking
+                        sources[source].series.add(frozenset(columns))
             on = join.args.get("on")
             lower, upper = {}, {}  # table that bounds from below / above -> the bounding expressions
             keyed = on is not None and any(
@@ -1703,6 +1737,36 @@ def analyse(manifest: dict, database: str) -> Analysis:
             return column
         return (column.get("fields") or {}).get(spot[2]) if column.get("gen") == "object" else None
 
+    for name, use in uses.items():
+        # a table matched on an entity and its period together (`on q.warehouse_id = m.entity_id and q.hour = m.start_time`)
+        # holds one row per period for each of a few entities, as a meter or a daily balance does: generated so, and
+        # whatever is joined to the entity draws from the same few
+        columns = tables.get(name, {}).get("columns") or {}
+        for together_here in sorted(use.series, key=sorted):
+            for c in together_here:  # cut to the hour by the models that match on it: on the hour here
+                if columns.get(c, {}).get("gen") in ("event_time", "time_offset") and not columns[c].get("trunc") and use.truncs.get(c) \
+                        and str(columns[c].get("type", "")).upper() != "DATE" and not columns[c].get("format") and not columns[c].get("epoch"):
+                    columns[c]["trunc"] = use.truncs[c]
+            times = [c for c in together_here if columns.get(c, {}).get("gen") in ("event_time", "time_offset")
+                     and not columns[c].get("format") and not columns[c].get("epoch") and not columns[c].get("unique")
+                     and (columns[c].get("trunc") in ("hour", "day") or str(columns[c].get("type", "")).upper() == "DATE")]
+            entities = [c for c in together_here if columns.get(c, {}).get("gen") in ("pool", "dist")
+                        and not columns[c].get("format") and c not in times]
+            if len(times) != 1 or len(entities) != 1 or len(together_here) != 2 or tables[name].get("grain"):
+                continue
+            entity, hourly = entities[0], columns[times[0]].get("trunc") == "hour"
+            held = columns[entity]
+            few = 4 if hourly else 20
+            pool = held.get("pool") or entity.lower()
+            numeric = bool(held.get("numeric")) or held.get("gen") == "dist"
+            columns[entity] = {"gen": "pool", "pool": pool, "size": few, **({"numeric": True} if numeric else {})}
+            tables[name]["grain"] = [times[0], entity]
+            for other in tables.values():
+                for d in other["columns"].values():
+                    if d.get("gen") == "pool" and d.get("pool") == pool:
+                        d["size"] = few
+            notes.append(f"{name}: models match it on {entity} and {times[0]} together; generated as one row "
+                         f"{'an hour' if hourly else 'a day'} for each of {few} {entity.lower()}s.")
     for name, columns in together:
         if name in tables:
             unique_together(tables[name], columns)

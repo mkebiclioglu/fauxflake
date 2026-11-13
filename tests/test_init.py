@@ -559,3 +559,24 @@ def test_columns_joined_together_to_a_seed_take_the_rows_it_lists(tmp_path):
         Warehouse(emu, Spec.from_raw({**spec, "start": "2025-01-01"}, "."), 0.01).advance_to(datetime(2025, 1, 3))
         pairs = set(emu.cursor().execute("select EVENT, ACTION from RAW.S.TRACKS").fetchall())
     assert pairs == {("incident", "create"), ("incident", "end"), ("tasks", "add_task")}
+
+
+def test_a_table_matched_on_an_entity_and_its_hour_is_a_series():
+    from fauxflake.init import build_spec
+
+    def source(name):
+        return {"database": "RAW", "schema": "S", "name": name, "identifier": name, "columns": {}}
+
+    manifest = {
+        "sources": {"source.p.s.metering": source("metering"), "source.p.s.queries": source("queries")},
+        "nodes": {"model.p.m": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.M", "compiled_code": """
+            with hourly as (select date_trunc('hour', start_time) as hour, entity_id as warehouse_id, sum(credits) as credits
+                            from raw.s.metering group by 1, 2),
+            q as (select query_id, warehouse_id, date_trunc('hour', started_at) as hour from raw.s.queries)
+            select q.query_id, hourly.credits from q
+            join hourly on q.warehouse_id = hourly.warehouse_id and q.hour = hourly.hour"""}},
+    }
+    tables = build_spec(manifest, "A")[0]["tables"]
+    metering = tables["RAW.S.METERING"]
+    assert metering["columns"]["ENTITY_ID"] == {"gen": "pool", "pool": "entity_id", "size": 4, "numeric": True}
+    assert tables["RAW.S.QUERIES"]["columns"]["WAREHOUSE_ID"] == metering["columns"]["ENTITY_ID"]

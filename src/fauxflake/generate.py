@@ -108,9 +108,28 @@ class TableSQL:
         return f"((hash(hash({self.base}, {lit(self.salt(salt))}{args})) >> 11)::double / 9007199254740992.0)"
 
     def grain(self) -> dict[str, int]:
-        """The listed-value columns of the table's `grain` (unique together with the day) and how many values each has."""
-        return {c: len(self.t.columns[c]["values"]) for c in self.t.raw.get("grain") or []
-                if self.t.columns.get(c, {}).get("gen") == "categorical" and self.t.columns[c].get("values")}
+        """The columns of the table's `grain` that take their values in turn (listed values, or a pool's), with how
+        many each has: unique together with the period (the day, or the hour when the time column is cut to hours)."""
+        out = {}
+        for c in self.t.raw.get("grain") or []:
+            d = self.t.columns.get(c, {})
+            if d.get("gen") == "categorical" and d.get("values"):
+                out[c] = len(d["values"])
+            elif d.get("gen") == "pool":
+                out[c] = int(d.get("size", 200))
+        return out
+
+    def grain_time(self) -> tuple[str, str] | None:
+        """The time column of the grain and its period (hour or day): the rows of a day fill its periods in turn."""
+        for c in self.t.raw.get("grain") or []:
+            d = self.t.columns.get(c, {})
+            if d.get("gen") in ("event_time", "time_offset") and self.grain():
+                return c, "hour" if d.get("trunc") == "hour" else "day"
+        return None
+
+    def grain_hour(self) -> str | None:
+        found = self.grain_time()
+        return found[0] if found and found[1] == "hour" else None
 
     def key_expr(self, table: Table, index: str) -> str:
         _col, d = table.key
@@ -318,6 +337,10 @@ class TableSQL:
             # from the same row, so the pairs that occur are the ones the list has
             known = "[" + ", ".join("NULL" if v is None else lit(str(v)) for v in d["values"]) + "]"
             expr = f"list_extract({known}, 1 + floor({self.u('row_of:' + str(d['group']))} * {len(d['values'])})::bigint)"
+        elif gen == "pool" and col in self.grain() and self.base == "g":
+            sizes = self.grain()
+            n = f"((_n // {math.prod(list(sizes.values())[:list(sizes).index(col)])}) % {sizes[col]})::bigint"
+            expr = f"({n} + 1)" if d.get("numeric") else f"concat({lit(str(d['pool']) + '_')}, {n})"
         elif gen == "pool":
             # one of `size` values shared by every column that names the same pool: joins between them match
             n = f"floor({self.u(col)} * {int(d.get('size', 200))})::bigint"
@@ -390,6 +413,11 @@ class TableSQL:
             expr = lit(d.get("value"))
         else:
             raise ValueError(f"{self.t.name}.{col}: unknown gen {gen!r}")
+        if gen in ("event_time", "time_offset") and self.base == "g" and (self.grain_time() or ("", ""))[0] == col \
+                and not d.get("format") and not d.get("epoch"):
+            # one row a period for each entity: the day's rows fill its hours in turn (or all belong to the day)
+            expr = "day::timestamp" if self.grain_time()[1] == "day" else \
+                f"(day::timestamp + to_hours(((_n // {math.prod(self.grain().values())}) % 24)::integer))"
         if d.get("trunc") and gen in ("event_time", "time_offset", "updated_at") and not d.get("format") and not d.get("epoch"):
             expr = f"date_trunc({lit(str(d['trunc']))}, {expr})"  # reported per hour (or day): on the boundary
         rate = repr(float(d.get("null_rate") or 0.0))
@@ -440,7 +468,7 @@ class TableSQL:
         cols = ",\n  ".join(self.column(c, d) for c, d in t.columns.items())
         # one row a day for each combination of the listed values: the rows of a day take them in turn, and
         # a day has no more rows than there are combinations
-        grain = f" and _n < {math.prod(self.grain().values())}" if self.grain() else ""
+        grain = f" and _n < {math.prod(self.grain().values()) * (24 if self.grain_hour() else 1)}" if self.grain() else ""
         if with_new_column:
             since = f"timestamp '{self.sc.start} 00:00:00'"
             cols += f',\n  case when _loaded >= {since} then \'v2\' end as "{self.sc.new_column}"'
