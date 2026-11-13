@@ -2514,6 +2514,10 @@ class Fitter:
                      f"{len(self.learned) - before} thing(s) learned")
             if len(self.learned) == before:
                 break
+            state = (frozenset(failures), tuple(sorted(self.learned[before:])))
+            if state == getattr(self, "_last_pass", None):
+                break  # the same lessons about the same failures as the pass before: another pass would repeat them
+            self._last_pass = state
             # next pass: what failed, what reads a source whose values changed, and everything downstream of those
             again = set(failures)
             if self.retyped:
