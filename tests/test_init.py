@@ -475,3 +475,11 @@ def test_a_value_that_must_be_the_same_for_every_row_of_a_group_follows_the_grou
     columns = build_spec(manifest, "A")[0]["tables"]["RAW.S.LIC"]["columns"]
     assert columns["USERS"]["follows"] == columns["ISSUED"]["follows"] == "LICENSE_ID"
     assert "follows" not in columns["SERVER_ID"] and "follows" not in columns["TS"]
+
+
+def test_a_document_field_tested_with_a_regular_expression_gets_texts_that_match():
+    sources = {"RAW.N.RECEIPTS": SourceUse()}
+    staged = scan_model("select r:id::string as id, r:outcome.status::string as status_value from raw.n.receipts", sources)
+    scan_model("select id, regexp_substr(status_value, 'Success') as ok from a.b.rec where not regexp_like(id, 'x.*')",
+               sources, {"A.B.REC": staged})
+    assert sources["RAW.N.RECEIPTS"].path_literals == {"R": {"outcome.status": {"Success"}}}

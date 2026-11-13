@@ -132,6 +132,8 @@ def _like_patterns(test: exp.Expression) -> list[str]:
             if isinstance(one, exp.Literal) and one.is_string and len(one.name) <= 60 and re.search(r"[A-Za-z0-9]", one.name)]
 
 
+_REGEX_TESTS = tuple(getattr(exp, name) for name in ("RegexpLike", "RegexpILike", "RegexpExtract", "RegexpInstr", "RegexpCount")
+                     if hasattr(exp, name))
 _ARRAY_READERS = tuple(getattr(exp, name) for name in (
     "ArrayToString", "ArraySize", "ArrayContains", "ArrayOverlaps", "ArrayDistinct", "ArraySlice", "ArrayPosition", "ArrayConcat")
     if hasattr(exp, name))
@@ -594,6 +596,12 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     for value in named:
                         known.setdefault(path_text(found[2][:-1] + (value,)), None)
                 continue
+            if isinstance(test, _REGEX_TESTS) and test.this is compared and isinstance(test.expression, exp.Literal) \
+                    and not isinstance(test.parent, exp.Not):
+                # regexp_substr(v:status, 'Success'): texts the expression finds
+                flag = test.args.get("flag") or test.args.get("parameters")
+                named |= set(regex_examples(test.expression.name, whole=isinstance(test, exp.RegexpLike),
+                                            ignore_case=isinstance(test, exp.RegexpILike) or (flag is not None and "i" in flag.name)))
             if hint or text not in known:
                 known[text] = hint or known.get(text)
             if named:
@@ -697,7 +705,7 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 while isinstance(tested.parent, _WRAPPERS):
                     tested = tested.parent
                 regex = tested.parent
-                if isinstance(regex, (exp.RegexpLike, exp.RegexpILike, exp.RegexpExtract, exp.RegexpInstr, exp.RegexpCount)) \
+                if isinstance(regex, _REGEX_TESTS) \
                         and regex.this is tested and isinstance(regex.expression, exp.Literal) and not isinstance(regex.parent, exp.Not):
                     # rlike(uri, '^/[0-9]+/.*'): some rows should pass
                     flag = regex.args.get("flag") or regex.args.get("parameters")
