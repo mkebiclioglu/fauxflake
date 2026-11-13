@@ -449,3 +449,29 @@ def test_a_column_handed_to_an_array_function_is_a_list():
     scan_model("""select t.id, array_to_string(custom_fields, ',') as s, array_size(tags) as n, array_contains('x'::variant, labels) as l,
                   upper(title) as title from raw.z.tickets t""", sources)
     assert sources["RAW.Z.TICKETS"].arrays == {"CUSTOM_FIELDS", "TAGS", "LABELS"}
+
+
+def test_like_any_names_patterns_too():
+    sources = {"RAW.Z.PLANS": SourceUse()}
+    scan_model("""select case when tier like any ('%Self-Managed - Starter%', '%Support%') then 'sm' end as kind, v:name::varchar as n
+                  from raw.z.plans where lower(label) like any ('tap-%', 'target-%') and v:kind like any ('%gold%', '%silver%')""", sources)
+    use = sources["RAW.Z.PLANS"]
+    assert use.patterns == {"TIER": {"%Self-Managed - Starter%", "%Support%"}, "LABEL": {"tap-%", "target-%"}}
+    assert use.path_patterns == {"V": {"kind": {"%gold%", "%silver%"}}}
+
+
+def test_a_value_that_must_be_the_same_for_every_row_of_a_group_follows_the_group():
+    from fauxflake.init import build_spec
+
+    manifest = {
+        "sources": {"source.p.s.lic": {"database": "RAW", "schema": "S", "name": "lic", "identifier": "lic", "columns": {}}},
+        "nodes": {
+            "model.p.daily": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.DAILY", "compiled_code": """
+                select license_id, users::int as licensed_seats, issued::timestamp as starts_at, server_id, ts::date as day from raw.s.lic"""},
+            "model.p.m": {"resource_type": "model", "depends_on": {"nodes": ["model.p.daily"]}, "relation_name": "A.B.M", "compiled_code": """
+                select license_id from a.b.daily group by license_id
+                having count(distinct licensed_seats) = 1 and count(distinct starts_at) = 1 and count(*) > 2"""}},
+    }
+    columns = build_spec(manifest, "A")[0]["tables"]["RAW.S.LIC"]["columns"]
+    assert columns["USERS"]["follows"] == columns["ISSUED"]["follows"] == "LICENSE_ID"
+    assert "follows" not in columns["SERVER_ID"] and "follows" not in columns["TS"]

@@ -61,6 +61,7 @@ class SourceUse:
         self.numbers: set[str] = set()  # columns that are summed, averaged or used in arithmetic
         self.literals: dict[str, set[str]] = {}  # column -> string values the SQL compares it with
         self.patterns: dict[str, set[str]] = {}  # column -> LIKE patterns the SQL keeps rows by
+        self.depends: dict[str, str] = {}  # column -> the column that decides it (`group by id having count(distinct seats) = 1`)
         self.examples: dict[str, set[str]] = {}  # column -> texts that match the regular expressions it is tested with
         # text column -> separator -> position -> shapes that part is kept by (`split_part(request, ' ', 1) = 'POST'`)
         self.part_shapes: dict[str, dict[str, dict[int, set[str]]]] = {}
@@ -120,6 +121,15 @@ def _belongs_inside(col: exp.Column, select: exp.Select, sources: dict) -> bool:
     tables = [t for part in (inner.args.get("from") or inner.args.get("from_"), *(inner.args.get("joins") or ()))
               if part is not None for t in ([part.this] if isinstance(part.this, exp.Table) else [])]
     return any(t.db and _table_id(t) not in sources for t in tables)
+
+
+def _like_patterns(test: exp.Expression) -> list[str]:
+    """The patterns of `x like '%a%'` or `x like any ('%a%', '%b%')` that say something."""
+    wanted = test.expression
+    wanted = wanted.this if isinstance(wanted, exp.Any) else wanted
+    wanted = wanted.unnest() if isinstance(wanted, (exp.Paren, exp.Subquery)) else wanted
+    return [one.name for one in (wanted.expressions if isinstance(wanted, (exp.Tuple, exp.Array)) else [wanted])
+            if isinstance(one, exp.Literal) and one.is_string and len(one.name) <= 60 and re.search(r"[A-Za-z0-9]", one.name)]
 
 
 _ARRAY_READERS = tuple(getattr(exp, name) for name in (
@@ -492,12 +502,7 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     values = test.expressions if isinstance(test, exp.In) else [test.expression if test.this is held else test.this]
                     shapes = {v for v in map(named_value, values) if v}
                 elif isinstance(test, (exp.Like, exp.ILike)) and test.this is held and not isinstance(test.parent, exp.Not):
-                    wanted = test.expression
-                    wanted = wanted.this if isinstance(wanted, exp.Any) else wanted  # LIKE ANY ('%a', '%b')
-                    wanted = wanted.unnest() if isinstance(wanted, (exp.Paren, exp.Subquery)) else wanted
-                    for one in (wanted.expressions if isinstance(wanted, (exp.Tuple, exp.Array)) else [wanted]):
-                        if isinstance(one, exp.Literal) and one.is_string and re.search(r"[^%_\s]", one.name):
-                            shapes.add(like_shape(one.name))
+                    shapes = {like_shape(one) for one in _like_patterns(test)}
                 elif isinstance(test, exp.RegexpLike) and test.this is held and isinstance(test.expression, exp.Literal) \
                         and not isinstance(test.parent, exp.Not):
                     shapes = set(regex_examples(test.expression.name))
@@ -535,7 +540,7 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 # a source column reached through other models: what it is compared with counts as much
                 # as in the model that reads the source
                 held = cast if cast is not None else top
-                while isinstance(held.parent, _WRAPPERS):
+                while isinstance(held.parent, (*_WRAPPERS, exp.Max, exp.Min)):  # `having max(expire_at) >= current_date`
                     held = held.parent
                 test = held.parent
                 if isinstance(test, exp.Is) and isinstance(test.expression, exp.Null) and test.this is held \
@@ -566,9 +571,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                         use.literals.setdefault(found[1], set()).update(named)
                         use.texts.add(found[1])
                 if isinstance(test, (exp.Like, exp.ILike)) and test.this is held and not isinstance(test.parent, exp.Not) \
-                        and isinstance(test.expression, exp.Literal) and len(test.expression.name) <= 60 \
-                        and re.search(r"[^%_\s]", test.expression.name):
-                    use.patterns.setdefault(found[1], set()).add(test.expression.name)
+                        and _like_patterns(test):
+                    use.patterns.setdefault(found[1], set()).update(_like_patterns(test))
                     use.texts.add(found[1])
                 continue
             known = use.paths.setdefault(found[1], {})
@@ -599,8 +603,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 # iff(status:Failure is not null, 'Fail', 'Success'): both answers occur only if the key is sometimes absent
                 use.path_optional.setdefault(found[1], set()).add(text)
             if isinstance(test, (exp.Like, exp.ILike)) and test.this is compared and not isinstance(test.parent, exp.Not) \
-                    and isinstance(test.expression, exp.Literal) and re.search(r"[^%_\s]", test.expression.name):
-                use.path_patterns.setdefault(found[1], {}).setdefault(text, set()).add(test.expression.name)
+                    and _like_patterns(test):
+                use.path_patterns.setdefault(found[1], {}).setdefault(text, set()).update(_like_patterns(test))
 
         if joins is not None:
             for join in select.args.get("joins") or []:
@@ -613,6 +617,23 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     for one, two in zip(places, places[1:]):
                         if one != two:
                             joins.append((one, two))
+
+        having, group = select.args.get("having"), select.args.get("group")
+        if having is not None and group is not None and len(group.expressions) == 1:
+            # `group by license_id having count(distinct seats) = 1`: rows are kept when a license has one number
+            # of seats, so the seats are decided by the license
+            by = group.expressions[0]
+            if isinstance(by, exp.Literal) and by.is_int and 0 < int(by.name) <= len(select.expressions):
+                by = select.expressions[int(by.name) - 1].unalias()
+            key = resolve_path(by)
+            for test in having.find_all(exp.EQ):
+                count, one = test.this, test.expression
+                if not (isinstance(count, exp.Count) and isinstance(count.this, exp.Distinct) and isinstance(one, exp.Literal)
+                        and one.name == "1" and len(count.this.expressions) == 1 and isinstance(key, tuple) and not key[2]):
+                    continue
+                decided = resolve_path(count.this.expressions[0])
+                if isinstance(decided, tuple) and not decided[2] and decided[0] == key[0] and decided[1] != key[1] and decided[0] in sources:
+                    sources[decided[0]].depends.setdefault(decided[1], key[1])
 
         if joins is not None:
             # `where server_id in (select id from servers)`: a join by another name
@@ -691,6 +712,10 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     if not (isinstance(parent, exp.JSONExtract) and parent.this is col):
                         use.paths.setdefault(hit[1], {})
                 elif isinstance(parent, (exp.EQ, exp.NEQ, exp.Like, exp.ILike, exp.In)):
+                    if isinstance(parent, (exp.Like, exp.ILike)) and parent.this is col and isinstance(parent.expression, exp.Any) \
+                            and not isinstance(parent.parent, exp.Not) and _like_patterns(parent):
+                        use.patterns.setdefault(hit[1], set()).update(_like_patterns(parent))  # name LIKE ANY ('tap-%', 'target-%')
+                        use.texts.add(hit[1])
                     other = parent.expression if not isinstance(parent, exp.In) else (parent.expressions or [None])[0]
                     other = parent.this if other is col else other
                     if isinstance(parent, exp.EQ) and not isinstance(other, exp.Literal) and named_value(other):
@@ -1432,6 +1457,11 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 for sibling, sd in out.items():
                     if sibling != col and sibling.startswith(col[:-2]) and sd["gen"] in ("template", "categorical"):
                         sd["follows"] = col
+        for col, by in use.depends.items():
+            # one value per `by`: generated from it, not from the row
+            if col in out and by in out and not out[col].get("follows") and out[by].get("follows") != col \
+                    and out[col]["gen"] in ("dist", "template", "categorical", "time_offset", "pool"):
+                out[col]["follows"] = by
         periods_have_length(out)
         tables[name] = {
             "volume": {"rows_per_day": 100_000, "weekly": [1, 1, 1, 1, 1, 1, 1]},  # placeholder: 100 rows a day at the default scale
