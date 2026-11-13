@@ -463,3 +463,18 @@ def test_a_test_that_returns_repeats_is_followed_up_to_the_table_that_holds_the_
     generic = {"name": "combo", "attached_node": "model.p.stg_rates", "depends_on": {"nodes": ["model.p.stg_rates"]},
                "test_metadata": {"name": "unique_combination_of_columns", "kwargs": {"combination_of_columns": ["date", "usage_type"]}}}
     assert not f.learn_from_test(generic, places)  # already so
+
+
+def test_a_number_type_does_not_outlive_the_guess_that_gave_it():
+    tables = {"RAW.S.LEADS": {"columns": {
+        "ID": {"gen": "hash_id"},
+        "LEADID": {"gen": "pool", "pool": "sfid", "size": 600, "type": "BIGINT"},
+        "OWNER": {"gen": "fk", "ref": "RAW.S.LEADS", "type": "BIGINT"},
+        "RANK": {"gen": "categorical", "values": {"1": 0.5, "2": 0.5}, "type": "BIGINT"},
+        "NOTE": {"gen": "template", "template": "note_{hex}", "type": "VARCHAR"},
+        "N": {"gen": "template", "template": "{n}", "type": "BIGINT"}}}}
+    f = fitter(tables=tables)
+    f.repair()
+    columns = tables["RAW.S.LEADS"]["columns"]
+    assert "type" not in columns["LEADID"] and "type" not in columns["OWNER"]
+    assert columns["RANK"]["type"] == "BIGINT" and columns["NOTE"]["type"] == "VARCHAR" and columns["N"]["type"] == "BIGINT"

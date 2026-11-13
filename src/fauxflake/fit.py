@@ -862,6 +862,28 @@ class Fitter:
             for col, gen in list((spec.get("columns") or {}).items()):
                 if gen.get("gen") == "fk" and str(gen.get("ref", "")).upper() not in keyed:
                     spec["columns"][col] = guess(col, None)
+                elif self._holds_text(gen) and re.match(r"BIGINT|INT|SMALLINT|DECIMAL|NUMERIC|DOUBLE|FLOAT|HUGEINT", str(gen.get("type") or "").upper()):
+                    # a number type left over from before the column's values were known to be text: the cast would fail
+                    gen.pop("type")
+                    self.learned.append(f"{table}.{col}: holds text now; the number type an earlier guess gave it is dropped.")
+
+    def _holds_text(self, gen: dict) -> bool:
+        number = lambda v: isinstance(v, (int, float)) or re.fullmatch(r"-?\d+(\.\d+)?", str(v)) is not None  # noqa: E731
+        kind = gen.get("gen")
+        if kind == "pool":
+            return not gen.get("numeric")
+        if kind == "template":
+            return any(re.sub(r"\{n\}", "", str(t)) != "" for t in (gen.get("templates") or [gen.get("template")]))
+        if kind == "categorical":
+            return any(not number(v) for v in gen.get("values") or {})
+        if kind == "row_of":
+            return any(v is not None and not number(v) for v in gen.get("values") or [])
+        if kind == "hash_id":
+            return True
+        if kind == "fk":
+            parent = self.tables.get(str(gen.get("ref", "")).upper(), {}).get("columns") or {}
+            return any(d.get("gen") == "hash_id" for d in parent.values())
+        return False
 
     def retype(self, value: str, hint: str, fmt: str | None = None, only: set[str] | None = None) -> bool:
         """The generated text `value` was converted to `hint`: retype the column(s) that made it.
@@ -2803,7 +2825,9 @@ class Fitter:
                     if gen.get("gen") == "fk" and str(gen.get("ref", "")).upper() not in self.tables:
                         continue
                     mine[col] = {**gen, **({"follows": held["follows"]} if held.get("follows") and gen.get("gen") == "template" else {}),
-                                 **({"type": held["type"]} if held.get("type") and gen.get("gen") in ("fk", "pool") and "type" not in gen else {})}
+                                 # a cast to text the models need stays; a number the name suggested does not (the ids are texts now)
+                                 **({"type": held["type"]} if str(held.get("type") or "").upper() in ("VARCHAR", "TEXT")
+                                    and gen.get("gen") in ("fk", "pool") and "type" not in gen else {})}
                     changed += 1
                     self.retyped.add(table)
         for table, spec in fresh.spec["tables"].items():

@@ -568,3 +568,16 @@ def test_array_and_object_columns_are_described_as_such(run):
     run("create or replace table declared (a array, o object, v variant, n number)")
     assert kinds("DECLARED") == {"A": "ARRAY", "O": "OBJECT", "V": "VARIANT", "N": "NUMBER"}
     assert [r[1] for r in run("describe table semi")][:3] == ["ARRAY", "OBJECT", "VARIANT"]
+
+
+def test_a_seed_written_out_in_its_insert_is_not_refused_for_its_size():
+    import pytest
+    from snowflake.connector.errors import ProgrammingError
+
+    from fauxflake import emulator
+
+    rows = ", ".join(["('a city with a long name', 1.5, 2.5)"] * 40000)
+    seed = '/* {"app": "dbt", "node_id": "seed.p.world_cities"} */\n  insert into a.b.world_cities (name, lat, lon) values ' + rows
+    assert len(seed) > emulator.MAX_STATEMENT and emulator._ROWS_WRITTEN_OUT.match(seed)
+    with pytest.raises(ProgrammingError, match="1 MB"):
+        emulator.rewrite("select " + ", ".join(["'x' as c"] * 120000))

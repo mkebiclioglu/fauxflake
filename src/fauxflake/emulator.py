@@ -213,7 +213,7 @@ def _freeze_clock(sql: str) -> str:
 MAX_STATEMENT = 1_048_576  # Snowflake accepts 1 MB of SQL text
 
 
-_ROWS_WRITTEN_OUT = re.compile(r"\s*insert\s+into\s", re.I)
+_ROWS_WRITTEN_OUT = re.compile(r"\s*(?:/\*.*?\*/\s*|--[^\n]*\n\s*)*insert\s+into\s", re.I | re.S)  # dbt writes a comment first
 
 
 def rewrite(sql: str) -> str:
