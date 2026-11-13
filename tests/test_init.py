@@ -285,3 +285,18 @@ def test_a_name_in_a_subquery_over_a_built_relation_is_not_a_source_column():
         group by 1""", sources)
     assert "_DBT_SOURCE_RELATION" not in sources["RAW.APP.EVENT"].columns
     assert {"ID", "TS"} <= set(sources["RAW.APP.EVENT"].columns)
+
+
+def test_a_joined_model_that_selects_one_tables_star_passes_that_table_through():
+    from fauxflake.init import SourceUse, scan_model
+
+    sources = {"RAW.CRM.ITEM": SourceUse()}
+    latest = scan_model("""
+        select distinct o.id as sfid, o.* from raw.crm.item o
+        join (select id, max(_seq) as seq from raw.crm.item group by id) oo on o.id = oo.id and o._seq = oo.seq
+        where not isdeleted""", sources)
+    scan_model("select sfid, count(*) from analytics.crm.item where product_type = 'Recurring' group by 1",
+               sources, {"ANALYTICS.CRM.ITEM": latest})
+    use = sources["RAW.CRM.ITEM"]
+    assert use.literals["PRODUCT_TYPE"] == {"Recurring"}
+    assert "SFID" not in use.columns and "ID" in use.columns

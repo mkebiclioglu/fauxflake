@@ -227,6 +227,7 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
         # which source (if any) each alias in this scope stands for, and prior renames
         direct: dict[str, str] = {}
         added: dict[str, set[str]] = {}
+        explicit: dict[str, dict] = {}  # next to a model's star: the columns it wrote out under another name
         renames: dict[str, dict[str, tuple[str, str]]] = {}
         selected = {alias: src for alias, (_, src) in scope.selected_sources.items()}
         # inside LATERAL FLATTEN(input => t.col) the outer table is visible too
@@ -243,6 +244,7 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     through, computed_there = models[_table_id(node)]["*"]
                     direct[alias.upper()] = through
                     added[alias.upper()] = set(computed_there.split("|")) - {""}
+                    explicit[alias.upper()] = {k: v for k, v in models[_table_id(node)].items() if k not in ("*", _PATHS)}
                 elif models and _table_id(node) in models:  # another model: follow its lineage
                     renames[alias.upper()] = models[_table_id(node)]
             else:  # a CTE or subquery scope
@@ -280,6 +282,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 return None
             if table in direct or (not table and only):
                 owner = table or next(iter(direct))
+                if col.name.upper() in explicit.get(owner, ()):
+                    return explicit[owner][col.name.upper()]  # `o.id as sfid, o.*`: sfid is the source's id
                 if col.name.upper() in added.get(owner, ()):
                     return None  # computed in the CTE (a row_number, say), not a source column
                 return (direct.get(table) or only), col.name.upper()
@@ -671,6 +675,13 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 sources[only].star = True
                 extra = {p.alias_or_name.upper() for p in select.expressions if p not in stars} | added.get(next(iter(direct)), set())
                 outputs["*"] = (only, "|".join(sorted(extra)))  # the whole model passes the source through
+        elif len(stars) == 1 and not name and isinstance(stars[0], exp.Column) and stars[0].table.upper() in direct \
+                and scope.is_root and not isinstance(select.parent, exp.SetOperation):
+            # `select o.id as sfid, o.* from source o join (latest per id) oo on ...`: still every column of `o`
+            owner = stars[0].table.upper()
+            sources[direct[owner]].star = True
+            extra = {p.alias_or_name.upper() for p in select.expressions if p not in stars} | added.get(owner, set())
+            outputs["*"] = (direct[owner], "|".join(sorted(extra - set(outputs))))
         if stars and len(renames) == 1 and len(selected) == 1:
             outputs = {**next(iter(renames.values())), **outputs}
             if paths_out:

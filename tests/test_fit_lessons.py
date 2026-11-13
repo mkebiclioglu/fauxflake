@@ -347,3 +347,13 @@ def test_a_row_a_day_for_each_group_that_did_not_finish_gets_fewer_groups():
                tables={"RAW.P.EVENTS": {"columns": {"K": {"gen": "template", "template": "k_{hex}"}}}})
     g.sources_of, g.origins = lambda uid: ["RAW.P.EVENTS"], lambda uid, name: [name]
     assert not g.runaway("m", "Out of Memory Error") and g.tables["RAW.P.EVENTS"]["columns"]["K"]["gen"] == "template"
+
+
+def test_a_column_computed_beside_a_star_is_not_read_from_the_table():
+    tree = parse("""
+        with subs as (select s.*, p.sku, row_number() over (partition by s.id order by s.tx desc) as row_num
+                      from "RAW".b.subs s join "RAW".b.products p on s.product_id = p.id)
+        select * from subs where row_num = 1 and state = 'active'""")
+    read = fitter().read_through(tree, "RAW.B.SUBS")
+    assert "ROW_NUM" not in read and "SKU" not in read
+    assert {"ID", "TX", "PRODUCT_ID", "STATE"} <= set(read)

@@ -1351,14 +1351,17 @@ class Fitter:
             name = holder.alias.upper() if isinstance(holder, (exp.CTE, exp.Subquery)) and holder.alias else None
             if not name:
                 continue
+            # `s.*, row_number() over (...) as row_num`: what it writes out beside the star is not the table's
+            written = {e.alias_or_name.upper() for e in select.expressions
+                       if not (isinstance(e, exp.Star) or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star)))}
             if isinstance(holder, exp.CTE):
                 for other in tree.find_all(exp.Table):
                     if other.name.upper() == name and not other.db:
-                        out += self.columns_read(tree, other)
+                        out += [c for c in self.columns_read(tree, other) if c not in written]
             else:
                 outer = holder.find_ancestor(exp.Select)
                 out += [c.name.upper() for c in (outer.find_all(exp.Column) if outer is not None else [])
-                        if c.table and c.table.upper() == name and not isinstance(c.this, exp.Star)]
+                        if c.table and c.table.upper() == name and not isinstance(c.this, exp.Star) and c.name.upper() not in written]
         return list(dict.fromkeys(out))
 
     def _unioned(self, tree: exp.Expression, ctes: dict[str, exp.Expression], candidates: set[str]) -> bool:
