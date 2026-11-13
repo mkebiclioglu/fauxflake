@@ -302,6 +302,11 @@ class TableSQL:
                 acc += weight / total
                 arms.append(f"when {x} < {acc!r} then {lit(value)}")
             expr = f"case {' '.join(arms)} else {lit(list(d['values'])[-1])} end"
+        elif gen == "row_of":
+            # one row of a list the project wrote down (a seed); every column of the same `group` takes its value
+            # from the same row, so the pairs that occur are the ones the list has
+            known = "[" + ", ".join("NULL" if v is None else lit(str(v)) for v in d["values"]) + "]"
+            expr = f"list_extract({known}, 1 + floor({self.u('row_of:' + str(d['group']))} * {len(d['values'])})::bigint)"
         elif gen == "pool":
             # one of `size` values shared by every column that names the same pool: joins between them match
             n = f"floor({self.u(col)} * {int(d.get('size', 200))})::bigint"

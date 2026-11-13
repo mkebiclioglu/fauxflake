@@ -526,3 +526,36 @@ def test_times_that_bound_a_period_rows_are_looked_up_in_follow_one_another():
     assert tables["RAW.S.RELEASES"]["columns"]["RELEASE_DATE"]["every_days"] == 60 and tables["RAW.S.RELEASES"]["columns"]["RELEASE_DATE"]["unique"]
     assert "every_days" not in tables["RAW.S.RELEASES"]["columns"]["ANNOUNCED_AT"]
     assert "every_days" not in tables["RAW.S.ISSUES"]["columns"]["CREATED_AT"]
+
+
+def test_columns_joined_together_to_a_seed_take_the_rows_it_lists(tmp_path):
+    from datetime import datetime
+
+    from fauxflake.emulator import serve
+    from fauxflake.generate import Warehouse
+    from fauxflake.init import build_spec
+
+    (tmp_path / "plan.csv").write_text("event_name,event_action,owner\nincident,create,a\nincident,end,a\ntasks,add_task,b\n")
+    manifest = {
+        "sources": {"source.p.s.tracks": {"database": "RAW", "schema": "S", "name": "tracks", "identifier": "tracks", "columns": {}}},
+        "nodes": {
+            "seed.p.plan": {"resource_type": "seed", "relation_name": "A.B.PLAN", "root_path": str(tmp_path), "original_file_path": "plan.csv",
+                            "depends_on": {"nodes": []}},
+            "model.p.stg": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.STG", "compiled_code": """
+                select id as event_id, event as event_name, action as event_action, ts::timestamp as at from raw.s.tracks"""},
+            "test.p.t": {"resource_type": "test", "depends_on": {"nodes": ["model.p.stg", "seed.p.plan"]}, "compiled_code": """
+                with seen as (select event_name, event_action, max(at) from a.b.stg group by 1, 2)
+                select pe.event_name from a.b.plan pe left join seen t
+                  on t.event_name = pe.event_name and t.event_action = pe.event_action
+                where t.event_name is null"""}},
+    }
+    spec, _ = build_spec(manifest, "A")
+    columns = spec["tables"]["RAW.S.TRACKS"]["columns"]
+    assert columns["EVENT"] == {"gen": "row_of", "group": "A.B.PLAN", "values": ["incident", "incident", "tasks"]}
+    assert columns["ACTION"]["values"] == ["create", "end", "add_task"]
+    from fauxflake.spec import Spec
+
+    with serve() as emu:
+        Warehouse(emu, Spec.from_raw({**spec, "start": "2025-01-01"}, "."), 0.01).advance_to(datetime(2025, 1, 3))
+        pairs = set(emu.cursor().execute("select EVENT, ACTION from RAW.S.TRACKS").fetchall())
+    assert pairs == {("incident", "create"), ("incident", "end"), ("tasks", "add_task")}

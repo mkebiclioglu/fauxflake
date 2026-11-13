@@ -1297,6 +1297,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
 
     # seeds are read like sources (so what is joined to them is known), and not generated: their rows are in the project
     seed_values: dict[tuple[str, str], list[str]] = {}
+    seed_rows: dict[str, list[dict]] = {}
     for node in manifest["nodes"].values():
         if node.get("resource_type") != "seed" or not node.get("relation_name"):
             continue
@@ -1308,6 +1309,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
         except (OSError, UnicodeDecodeError, csv.Error):
             continue
         uses.setdefault(relation, SourceUse())
+        seed_rows[relation] = [{str(k).upper(): v for k, v in row.items() if k} for row in rows]
         for column in (rows[0] if rows else {}):
             if column:
                 seed_values[(relation, column.upper())] = list(dict.fromkeys(r[column] for r in rows if r.get(column) not in (None, "")))
@@ -1322,7 +1324,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
 
     def scan(uid: str) -> None:
         node = manifest["nodes"].get(uid)
-        if uid in outputs or not node or node["resource_type"] != "model":
+        if uid in outputs or not node or node["resource_type"] not in ("model", "snapshot"):
             return
         outputs[uid] = {}  # guards against cycles
         for parent in node["depends_on"]["nodes"]:
@@ -1334,6 +1336,15 @@ def analyse(manifest: dict, database: str) -> Analysis:
 
     for uid in manifest["nodes"]:
         scan(uid)
+    # a test the project wrote out as a query joins what must match (a tracking plan with the events that
+    # arrive): the joins count; what it filters on does not (it looks for the rows that should not be there)
+    scratch = {name: SourceUse() for name in uses}
+    for node in manifest["nodes"].values():
+        if node["resource_type"] == "test" and not node.get("test_metadata") and node.get("compiled_code"):
+            try:
+                scan_model(node["compiled_code"], scratch, by_relation, None, joins)
+            except Exception:  # noqa: BLE001 - a test that does not parse teaches nothing
+                pass
 
     # what is known about one column of a union holds for the columns aligned with it
     for _ in range(3):
@@ -1612,6 +1623,21 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 known = values[:100]
                 holder[key] = {"gen": "categorical", "values": {v: round(1 / len(known), 6) for v in known}}
                 joined.append(f"{'.'.join(x for x in other if x)}: joined to the seed {seed[0]} ({seed[1]}), generated from its values.")
+    # two columns joined to two columns of one seed (`on t.event = p.event and t.action = p.action`): the pairs the
+    # seed lists, not every combination of its values
+    paired: dict[tuple[str, str], dict[str, str]] = {}
+    for a, b in joins:
+        for seed, other in ((a, b), (b, a)):
+            if seed[0] in seed_rows and not (len(seed) > 2 and seed[2]) and not (len(other) > 2 and other[2]) and other[0] in tables:
+                paired.setdefault((seed[0], other[0]), {})[other[1]] = seed[1]
+    for (seed, table), columns in paired.items():
+        held = tables[table]["columns"]
+        if len(set(columns.values())) < 2 or any(held.get(c, {}).get("gen") not in ("categorical", *_FREE) for c in columns):
+            continue
+        rows = list(dict.fromkeys(tuple(row.get(columns[c]) or None for c in columns) for row in seed_rows[seed]))[:300]
+        for i, column in enumerate(columns):
+            held[column] = {"gen": "row_of", "group": seed, "values": [row[i] for row in rows]}
+        joined.append(f"{table} ({', '.join(columns)}): joined together to the seed {seed}, generated as the rows it lists.")
     _share_join_values(tables, joins, joined, lookups)
     _share_union_values(tables, links)
     if joined:

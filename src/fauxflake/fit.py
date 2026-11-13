@@ -2779,7 +2779,7 @@ class Fitter:
                                              for hint in (None, gen.get("type")))
 
         def told(gen: dict) -> bool:
-            return gen.get("gen") in ("categorical", "pool", "fk", "link", "hash_id") or bool(gen.get("templates")) or bool(
+            return gen.get("gen") in ("categorical", "pool", "fk", "link", "hash_id", "row_of") or bool(gen.get("templates")) or bool(
                 gen.get("parts")) or (gen.get("gen") == "template" and "{n}" in str(gen.get("template")))
 
         changed = 0
