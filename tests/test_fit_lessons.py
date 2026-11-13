@@ -397,3 +397,34 @@ def test_an_end_kept_in_a_document_comes_after_a_start_kept_in_a_column():
     assert min(fields["cws-license-end-date"]["seconds"]) > max(columns["CURRENT_PERIOD_START"]["seconds"])
     assert fields["cws-license-end-date"]["epoch"] and fields["license-start-date"]["seconds"] == WEEK["seconds"]
     assert columns["CREATED"]["seconds"] == WEEK["seconds"]
+
+
+class _Places:
+    def __init__(self, places):
+        self.places = places
+
+    def place(self, uid, column):
+        return self.places.get((uid, column.upper()))
+
+
+def test_a_written_out_test_that_counts_rows_for_one_parent_limits_them():
+    tables = {"RAW.S.ITEMS": {"columns": {"SUBSCRIPTION": {"gen": "fk", "ref": "RAW.S.SUBS", "skew": 1.5}, "ID": {"gen": "sequence"}}}}
+    f = fitter(tables=tables, by_rel={"A.CI.STG_ITEMS": "model.p.stg_items", "A.CI.STG_PRODUCTS": "model.p.stg_products"})
+    places = _Places({("model.p.stg_items", "SUBSCRIPTION_ID"): ("RAW.S.ITEMS", "SUBSCRIPTION", "")})
+    sql = """select si.subscription_id, count(si.item_id) from a.ci.stg_items si left join a.ci.stg_products p on si.product_id = p.product_id
+             where p.name not ilike '%cloud%' group by subscription_id having count(si.item_id) > 2"""
+    node = {"name": "max_two", "resource_type": "test"}
+    assert f.learn_from_singular(node, places, sql) and tables["RAW.S.ITEMS"]["columns"]["SUBSCRIPTION"]["per_parent"] == 2
+    assert not f.learn_from_singular(node, places, sql)  # once
+    assert not f.learn_from_singular({**node, "test_metadata": {"name": "unique"}}, places, sql)
+
+
+def test_a_written_out_test_that_returns_rows_out_of_order_orders_the_two_times():
+    week = {"gen": "time_offset", "p": [0, 0.5, 1], "seconds": [0, 86400, 604800]}
+    tables = {"RAW.S.SUBS": {"columns": {"STARTED": dict(week), "ENDED": dict(week), "N": {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 9]}}}}
+    f = fitter(tables=tables, by_rel={"A.CI.STG_SUBS": "model.p.stg_subs"})
+    places = _Places({("model.p.stg_subs", "START_AT"): ("RAW.S.SUBS", "STARTED", ""), ("model.p.stg_subs", "END_AT"): ("RAW.S.SUBS", "ENDED", "")})
+    assert f.learn_from_singular({"name": "start_before_end"}, places, "select * from a.ci.stg_subs where start_at > end_at")
+    columns = tables["RAW.S.SUBS"]["columns"]
+    assert min(columns["ENDED"]["seconds"]) > max(columns["STARTED"]["seconds"]) and columns["STARTED"] == week
+    assert not f.learn_from_singular({"name": "start_before_end"}, places, "select * from a.ci.stg_subs where start_at > end_at")

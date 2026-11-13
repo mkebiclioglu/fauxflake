@@ -291,6 +291,9 @@ class TableSQL:
             idx = f"floor(pow({self.u(col)}, {skew!r}) * greatest(_pc_{col}, 1))::bigint"
             if d.get("first"):  # inside a document: one of the parent's first rows
                 idx = f"floor({self.u(col)} * {int(d['first'])})::bigint"
+            elif d.get("per_parent") and self.base == "g":
+                # at most so many rows for one parent (`having count(*) > 2` is a test): rows share parents in turn
+                idx = f"((g // {max(int(d['per_parent']), 1)}) % greatest(_pe_{col}, 1))::bigint"
             expr = self.key_expr(parent, idx)
         elif gen == "categorical":
             total = sum(d["values"].values())
@@ -388,7 +391,8 @@ class TableSQL:
         joins = "".join(
             f" left join cal_{self.spec.tables[d['ref'].upper()].ident} pc_{c} on pc_{c}.day = c.day" for c, d in fks
         )
-        pcs = "".join(f", coalesce(pc_{c}.cum, 0) as _pc_{c}" for c, _ in fks)
+        # parents there before the row's day, and (for rows that take parents in turn) by the end of it
+        pcs = "".join(f", coalesce(pc_{c}.cum, 0) as _pc_{c}, coalesce(pc_{c}.cum, 0) + coalesce(pc_{c}.n, 0) as _pe_{c}" for c, _ in fks)
 
         intraday = t.raw.get("intraday")
         second_of_day = piecewise(self.u("ev"), intraday["p"], [h * 3600 for h in intraday["hours"]]) if intraday \

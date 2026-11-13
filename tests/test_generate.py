@@ -128,3 +128,19 @@ def test_period_bounds_are_two_months_apart_from_the_start_of_the_history():
     days = [r[0] for r in rows]
     assert str(days[0])[:10] == "2025-01-01" and len(set(days)) == len(days) > 20
     assert all((b - a).days == 60 for a, b in zip(days, days[1:]))
+
+
+def test_a_parent_has_no_more_rows_than_a_test_allows():
+    from fauxflake.spec import Spec
+
+    table = {"volume": {"rows_per_day": 300, "weekly": [1] * 7}, "lateness": {"p": [0, 1], "seconds": [0, 1]}}
+    spec = Spec.from_raw({"seed": 42, "start": "2025-01-01", "tables": {
+        "RAW.T.SUBS": {**table, "columns": {"ID": {"gen": "sequence"}}},
+        "RAW.T.ITEMS": {**table, "columns": {"ITEM_ID": {"gen": "sequence"}, "SUB_ID": {"gen": "fk", "ref": "RAW.T.SUBS", "skew": 1.5, "per_parent": 2}}},
+    }}, ".")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 4))
+        cur = emu.cursor()
+        most = cur.execute("select max(n) from (select count(*) n from RAW.T.ITEMS group by SUB_ID)").fetchone()[0]
+        orphans = cur.execute("select count(*) from RAW.T.ITEMS i left join RAW.T.SUBS s on s.ID = i.SUB_ID where s.ID is null").fetchone()[0]
+    assert most == 2 and orphans == 0

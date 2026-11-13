@@ -2677,7 +2677,8 @@ class Fitter:
                                 accepted += 1
                                 outcome.pop(r["unique_id"], None)
                                 self.learned.append(f"test {node['name']}: names a column its model does not write; listed as an expected failure.")
-                    if r["status"] == "fail" and not self.learn_from_test(node, analysis) and node["name"] not in expected:
+                    if r["status"] == "fail" and not self.learn_from_test(node, analysis) \
+                            and not self.learn_from_singular(node, analysis, self._compiled(project, node)) and node["name"] not in expected:
                         expected.append(node["name"])
                         accepted += 1
                         outcome.pop(r["unique_id"], None)
@@ -2872,6 +2873,69 @@ class Fitter:
             return node["compiled_code"].strip().rstrip(";")
         path = project.target_path / "compiled" / node["package_name"] / node["original_file_path"]
         return path.read_text().strip().rstrip(";") if path.exists() else None
+
+    def learn_from_singular(self, node: dict, analysis, compiled: str | None) -> bool:  # noqa: ANN001
+        """A failing test the project wrote out as a query returns the rows that break a rule. Two rules are
+        read off the query: `group by subscription_id having count(*) > 2` (no more than two rows for one
+        parent) and `where start_at > end_at` (one time never after the other)."""
+        if node.get("test_metadata") or not compiled:
+            return False
+        try:
+            tree = sqlglot.parse_one(compiled, read="snowflake")
+        except Exception:  # noqa: BLE001
+            return False
+        select = tree if isinstance(tree, exp.Select) else tree.find(exp.Select)
+        if select is None:
+            return False
+        relations = {}
+        for tb in select.find_all(exp.Table):
+            if tb.find_ancestor(exp.Select) is select and tb.db:
+                fq = ".".join(part.upper() for part in (tb.catalog, tb.db, tb.name) if part)
+                relations[tb.alias_or_name.upper()] = self.by_rel.get(fq) or self.relation_owner.get(fq)
+
+        def spot(column: exp.Expression):  # noqa: ANN202
+            if not isinstance(column, exp.Column):
+                return None
+            owners = [relations.get(column.table.upper())] if column.table else list(relations.values())
+            found = [s for s in (analysis.place(uid, column.name) for uid in owners if uid) if s]
+            return found[0] if len(found) == 1 and found[0][0] in self.tables else None
+
+        def held(place):  # noqa: ANN001, ANN202
+            gen = self.tables[place[0]].get("columns", {}).get(place[1])
+            if gen is None or not place[2]:
+                return gen
+            return (gen.get("fields") or {}).get(place[2]) if gen.get("gen") == "object" else None
+
+        having, group = select.args.get("having"), select.args.get("group")
+        if having is not None and group is not None and len(group.expressions) == 1:
+            test = having.this
+            place = spot(group.expressions[0])
+            gen = held(place) if place else None
+            if isinstance(test, (exp.GT, exp.GTE)) and isinstance(test.this, exp.Count) and isinstance(test.expression, exp.Literal) \
+                    and test.expression.is_int and gen is not None and gen.get("gen") == "fk":
+                most = int(test.expression.name) - (1 if isinstance(test, exp.GTE) else 0)
+                if most >= 1 and gen.get("per_parent") != most:
+                    gen["per_parent"] = most
+                    self.retyped.add(place[0])
+                    self.dirty = True
+                    self.learned.append(f"{place[0]}.{place[1]}: test {node['name']} allows at most {most} row(s) for one parent; generated so.")
+                    return True
+        where = select.args.get("where")
+        test = where.this if where is not None else None
+        if isinstance(test, (exp.GT, exp.GTE, exp.LT, exp.LTE)) and having is None:
+            # the rows returned break the rule: `where start_at > end_at` says the start is never after the end
+            first, second = (test.this, test.expression) if isinstance(test, (exp.GT, exp.GTE)) else (test.expression, test.this)
+            early, late = spot(first), spot(second)
+            before, after = (held(early) if early else None), (held(late) if late else None)
+            if before and after and early[0] == late[0] and before.get("gen") == after.get("gen") == "time_offset" and not after.get("unique"):
+                top = max(before["seconds"])
+                if min(after["seconds"]) <= top:
+                    after.update(p=[0, 0.5, 1], seconds=[top + 86400, top + 30 * 86400, top + 365 * 86400])
+                    self.retyped.add(late[0])
+                    self.dirty = True
+                    self.learned.append(f"{late[0]}.{late[1]}: test {node['name']} says it is never before {early[1]}; generated after it.")
+                    return True
+        return False
 
     def learn_from_test(self, node: dict, analysis) -> bool:  # noqa: ANN001
         """A failing generic test states a fact about the data the spec did not know."""
