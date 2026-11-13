@@ -73,6 +73,21 @@ _HINTS = {"INT8": "BIGINT", "INT16": "BIGINT", "INT32": "BIGINT", "INT64": "BIGI
 _FREE = ("template", "pool")  # generators that only make up text: safe to retype
 
 
+class _Readings:
+    """The latest reading of the project, falling back on the ones before it for a column it lost track of
+    (a model that was not compiled in the build it was read from)."""
+
+    def __init__(self, latest, earlier) -> None:  # noqa: ANN001
+        self.latest, self.earlier = latest, earlier
+        self.spec, self.notes = latest.spec, latest.notes
+
+    def place(self, node_id: str, column: str):  # noqa: ANN201
+        return self.latest.place(node_id, column) or (self.earlier.place(node_id, column) if self.earlier is not None else None)
+
+    def locate(self, node_id: str, column: str):  # noqa: ANN201
+        return self.latest.locate(node_id, column) or (self.earlier.locate(node_id, column) if self.earlier is not None else None)
+
+
 def _text_ids(gen: dict) -> bool:
     """A key whose ids are certainly text: some are named by the SQL, or they have a shape."""
     return bool(gen.get("template")) or any(not re.fullmatch(r"\d{1,18}", str(v)) for v in gen.get("named") or ())
@@ -2674,8 +2689,8 @@ class Fitter:
                         self.trees.pop(uid, None)
                     if n.get("relation_name") and _fq(n["relation_name"]).count(".") == 2:
                         self.by_rel[_fq(n["relation_name"])] = uid
-            if n_round == 1:
-                analysis = self.read_again(manifest, analysis)
+            # every round: a model skipped in one (its parent failed) is compiled in a later one
+            analysis = self.read_again(manifest, analysis)
             failed = [r for r in results if r["status"] in ("error", "fail")]
             expected = self.spec.setdefault("dbt", {}).setdefault("expected_failures", [])
             accepted = 0
@@ -2754,6 +2769,20 @@ class Fitter:
                      "learned": self.learned[before:], "statements": dict(emulator.FAILED_STATEMENTS)}, indent=1))
                 emulator.FAILED_STATEMENTS.clear()
             if not failed or (len(self.learned) == before and not accepted):
+                # before stopping: the tests listed along the way were judged with what was known then. With all that
+                # was read and learned since, some can be taught to the spec after all; those come off the list and
+                # the build runs once more
+                if expected and not getattr(self, "_second_look", False) and n_round < rounds:
+                    self._second_look = True
+                    by_name = {n["name"]: n for n in nodes.values() if n.get("resource_type") == "test"}
+                    taught = [name for name in list(expected) if name in by_name and (
+                        self.learn_from_test(by_name[name], analysis)
+                        or self.learn_from_singular(by_name[name], analysis, self._compiled(project, by_name[name])))]
+                    if taught:
+                        expected[:] = [name for name in expected if name not in taught]
+                        self.log(f"  a second look at the listed tests: {len(taught)} can be taught to the spec; building again")
+                        selected = []
+                        continue
                 break
             # next round: what failed, what reads a source whose values changed, and everything downstream
             changed = [f"source:{n['source_name']}.{n['name']}+" for uid, n in manifest.get("sources", {}).items()
@@ -2785,10 +2814,21 @@ class Fitter:
         models compare, join and take apart now reaches the sources, for the columns nothing was known about."""
         from . import init
 
+        compiled = {uid: n.get("compiled_code") for uid, n in manifest.get("nodes", {}).items()
+                    if n.get("resource_type") in ("model", "snapshot")}
+        seen = (len(compiled), sum(1 for code in compiled.values() if code), hash(tuple(sorted((u, c or "") for u, c in compiled.items()))))
+        if getattr(self, "_read", None) == seen:
+            return analysis  # nothing was compiled that had not been read
+        self._read = seen
+        # a model the build skipped has no SQL in this manifest: the SQL the first reading compiled stands in
+        filled = {**manifest, "nodes": {uid: ({**n, "compiled_code": self.sql_of[uid]} if not n.get("compiled_code") and uid in self.sql_of
+                                              and n.get("resource_type") in ("model", "snapshot") else n)
+                                        for uid, n in manifest.get("nodes", {}).items()}}
         try:
-            fresh = init.analyse(manifest, str(self.spec.get("dbt", {}).get("database") or "ANALYTICS"))
+            fresh = init.analyse(filled, str(self.spec.get("dbt", {}).get("database") or "ANALYTICS"))
         except Exception:  # noqa: BLE001 - the first reading stands
             return analysis
+        fresh = _Readings(fresh, analysis)
 
         def unknown(name: str, gen: dict) -> bool:
             label = re.sub(r"~\w+|\[\]", "", name).split(".")[-1].lower()
