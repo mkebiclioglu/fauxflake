@@ -428,3 +428,38 @@ def test_a_written_out_test_that_returns_rows_out_of_order_orders_the_two_times(
     columns = tables["RAW.S.SUBS"]["columns"]
     assert min(columns["ENDED"]["seconds"]) > max(columns["STARTED"]["seconds"]) and columns["STARTED"] == week
     assert not f.learn_from_singular({"name": "start_before_end"}, places, "select * from a.ci.stg_subs where start_at > end_at")
+
+
+def test_columns_that_are_unique_together_change_as_little_as_they_can():
+    from fauxflake.init import unique_together
+
+    day = {"gen": "event_time", "type": "DATE"}
+    kind = {"gen": "categorical", "values": {"a": 0.5, "b": 0.5}}
+    table = {"columns": {"DAY": dict(day), "KIND": dict(kind), "NOTE": {"gen": "template", "templates": ["x-{hex}"]}}}
+    assert unique_together(table, ["DAY", "KIND"]) == "one row a day for each value of KIND" and table["grain"] == ["DAY", "KIND"]
+    assert unique_together(table, ["DAY", "KIND"]) is None  # once
+    table = {"columns": {"LICENSE": {"gen": "pool", "pool": "license", "size": 200}, "REQUEST": {"gen": "fk", "ref": "RAW.S.R"}}}
+    assert unique_together(table, ["LICENSE", "REQUEST"]) and table["columns"]["LICENSE"] == {"gen": "template", "template": "license_{hex}"}
+    table = {"columns": {"ID": {"gen": "sequence"}, "KIND": dict(kind)}}
+    assert unique_together(table, ["ID", "KIND"]) is None and "grain" not in table  # the key is unique by itself
+    table = {"columns": {"AT": {"gen": "time_offset", "p": [0, 1], "seconds": [0, 9]}, "KIND": dict(kind)}}
+    assert unique_together(table, ["AT", "KIND"]) and table["columns"]["AT"]["every_days"] == 1
+    assert unique_together(table, ["AT", "MISSING"]) is None
+
+
+def test_a_test_that_returns_repeats_is_followed_up_to_the_table_that_holds_the_columns():
+    table = {"columns": {"DATE": {"gen": "event_time", "type": "DATE"}, "USAGE_TYPE": {"gen": "categorical", "values": {"compute": 1, "storage": 1}}}}
+    nodes = {"model.p.daily_rates": {"name": "daily_rates", "depends_on": {"nodes": ["model.p.stg_rates", "model.p.other"]}},
+             "model.p.stg_rates": {"name": "stg_rates", "depends_on": {"nodes": ["source.p.s.rates"]}},
+             "model.p.other": {"name": "other", "depends_on": {"nodes": []}}}
+    f = fitter(tables={"SNOWFLAKE.O.RATES": table}, nodes=nodes, by_rel={"A.CI.DAILY_RATES": "model.p.daily_rates"})
+    places = _Places({("model.p.daily_rates", "USAGE_TYPE"): ("SNOWFLAKE.O.RATES", "USAGE_TYPE", ""),  # its date comes from a spine
+                      ("model.p.stg_rates", "DATE"): ("SNOWFLAKE.O.RATES", "DATE", ""),
+                      ("model.p.stg_rates", "USAGE_TYPE"): ("SNOWFLAKE.O.RATES", "USAGE_TYPE", "")})
+    sql = "select date, usage_type from a.ci.daily_rates group by 1, 2 having count(*) > 1"
+    assert f.learn_from_singular({"name": "assert_unique_daily_rates"}, places, sql)
+    assert table["grain"] == ["DATE", "USAGE_TYPE"] and f.retyped == {"SNOWFLAKE.O.RATES"}
+    assert not f.learn_from_singular({"name": "assert_unique_daily_rates"}, places, sql)
+    generic = {"name": "combo", "attached_node": "model.p.stg_rates", "depends_on": {"nodes": ["model.p.stg_rates"]},
+               "test_metadata": {"name": "unique_combination_of_columns", "kwargs": {"combination_of_columns": ["date", "usage_type"]}}}
+    assert not f.learn_from_test(generic, places)  # already so

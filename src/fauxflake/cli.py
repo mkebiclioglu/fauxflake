@@ -355,7 +355,7 @@ def query(spec_path, project_dir, db_path, schema, limit, sql_file, model, sql):
 @click.option("--project-dir", default=".", show_default=True)
 @click.option("--db-path", default=None, help="Where the run kept its data. Default: the project's .fauxflake/warehouse (see --keep).")
 @click.option("--all", "every", is_flag=True, help="Every model that came out empty although what it reads has rows.")
-@click.option("--unique", "unique", default=None, help="A column that should be unique in the model: say where it comes to repeat.")
+@click.option("--unique", "unique", default=None, help="A column that should be unique in the model (or several, comma-separated, unique together): say where it comes to repeat.")
 @click.argument("models", nargs=-1)
 def why(spec_path, project_dir, db_path, every, unique, models):
     """Say where a model's rows stop: `fauxflake why my_model` after `fauxflake build --keep`.

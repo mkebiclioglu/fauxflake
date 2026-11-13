@@ -240,7 +240,10 @@ class Twice(Why):
 
     def __init__(self, cursor, sql: str, key: str) -> None:  # noqa: ANN001
         super().__init__(cursor, sql)
-        self.key = key
+        # one column, or several that are unique together (`date, usage_type`)
+        self.names = [k.strip() for k in key.split(",") if k.strip()] or [key]
+        self.shown = ", ".join(self.names)
+        self.key = self.names[0] if len(self.names) == 1 else f"hash({', '.join(self.names)})"
 
     def both(self, body: str, upto: int | None, key: str | None = None) -> tuple[int, int] | None:
         """(rows, distinct keys) of a query, or None when it does not have the key (or does not run)."""
@@ -272,12 +275,16 @@ class Twice(Why):
                 seen = self.both(branch.sql(dialect="snowflake"), upto)
                 if seen and seen[0] > seen[1]:
                     return self.inside_twice(branch, f"{scope}, one side of its UNION", upto)
-            return Finding(scope, "union", detail=f"each side holds {self.key} once; the sides share values", clause=query.sql(dialect="snowflake")[:300])
+            return Finding(scope, "union", detail=f"each side holds {self.shown} once; the sides share values", clause=query.sql(dialect="snowflake")[:300])
         if not isinstance(query, exp.Select) or query.args.get("from_") is None:
             return Finding(scope, "unknown", query.sql(dialect="snowflake")[:300])
         # what the key is, written in terms of the relations read (the SELECT may only rename it)
-        written = next((p.unalias() for p in query.expressions if p.alias_or_name.upper() == self.key.upper()), None)
-        key = written.sql(dialect="snowflake") if written is not None and not written.find(exp.AggFunc, exp.Window) else self.key
+        def as_written(name: str) -> str:
+            written = next((p.unalias() for p in query.expressions if p.alias_or_name.upper() == name.upper()), None)
+            return written.sql(dialect="snowflake") if written is not None and not written.find(exp.AggFunc, exp.Window) else name
+
+        parts = [as_written(name) for name in self.names]
+        key = parts[0] if len(parts) == 1 else f"hash({', '.join(parts)})"
         source = query.args["from_"].this
         base = exp.Select(expressions=[exp.Star()])
         base.set("from_", query.args["from_"].copy())
@@ -296,7 +303,7 @@ class Twice(Why):
         if before:
             inputs[name] = before[0]
             if before[0] > before[1]:
-                return Finding(scope, "input", detail=f"{name} already holds {before[0] - before[1]} repeated value(s) of {key}", inputs=inputs)
+                return Finding(scope, "input", detail=f"{name} already holds {before[0] - before[1]} repeated value(s) of {', '.join(parts)}", inputs=inputs)
         def total(select: exp.Select) -> int | None:
             try:
                 return int(self.rows(f"{self.prefix(upto)}select count(*) from {self._relation(select)}")[0][0])
@@ -337,13 +344,13 @@ class Twice(Why):
                     finding.columns.append((f"{columns} (value, times) in {join.this.alias_or_name}", [tuple(r) for r in repeated]))
                 return finding
             before = after or before
-        return Finding(scope, "unknown", detail=f"no join adds rows; {self.key} repeats after the WHERE / GROUP BY of this step", inputs=inputs)
+        return Finding(scope, "unknown", detail=f"no join adds rows; {self.shown} repeats after the WHERE / GROUP BY of this step", inputs=inputs)
 
 
 def explain_duplicates(cursor, sql: str, key: str) -> Finding:  # noqa: ANN001
     try:
         found = Twice(cursor, sql, key).find()
-        found.said = f"{key} repeats from"
+        found.said = f"{', '.join(k.strip() for k in key.split(',') if k.strip())} repeats from"
         return found
     except Exception as e:  # noqa: BLE001
         return Finding("the model", "error", detail=str(e)[:300])

@@ -34,7 +34,7 @@ import yaml
 from sqlglot import exp
 
 from . import emulator
-from .init import guess, periods_have_length, within_bounds
+from .init import guess, periods_have_length, unique_together, within_bounds
 from .spec import quoted
 
 Log = Callable[[str], None]
@@ -2874,6 +2874,29 @@ class Fitter:
         path = project.target_path / "compiled" / node["package_name"] / node["original_file_path"]
         return path.read_text().strip().rstrip(";") if path.exists() else None
 
+    def together(self, uid: str, names: list[str], analysis, test: str) -> bool:  # noqa: ANN001
+        """These columns of a model (or source) are unique together, a test says. They are looked for in the model
+        and then in what it reads, nearest first: where all of them are plain columns of one generated table, that
+        table is given the combination once."""
+        if not names or not all(re.fullmatch(r"\w+", n) for n in names):
+            return False
+        pile, seen = [uid], set()
+        while pile and len(seen) < 40:
+            here = pile.pop(0)
+            if here in seen:
+                continue
+            seen.add(here)
+            spots = [analysis.place(here, n) for n in names]
+            if all(spots) and len({s[0] for s in spots}) == 1 and not any(s[2] for s in spots) and spots[0][0] in self.tables:
+                did = unique_together(self.tables[spots[0][0]], [s[1] for s in spots])
+                if did:
+                    self.retyped.add(spots[0][0])
+                    self.dirty = True
+                    self.learned.append(f"{spots[0][0]}: test {test} says {', '.join(names)} are unique together; {did}.")
+                return bool(did)
+            pile += [d for d in (self.nodes.get(here) or {}).get("depends_on", {}).get("nodes", []) if d.startswith(("model.", "snapshot.", "source."))]
+        return False
+
     def learn_from_singular(self, node: dict, analysis, compiled: str | None) -> bool:  # noqa: ANN001
         """A failing test the project wrote out as a query returns the rows that break a rule. Two rules are
         read off the query: `group by subscription_id having count(*) > 2` (no more than two rows for one
@@ -2907,6 +2930,13 @@ class Fitter:
             return (gen.get("fields") or {}).get(place[2]) if gen.get("gen") == "object" else None
 
         having, group = select.args.get("having"), select.args.get("group")
+        if having is not None and group is not None and isinstance(having.this, exp.GT) and isinstance(having.this.this, exp.Count) \
+                and isinstance(having.this.expression, exp.Literal) and having.this.expression.name == "1" and len(relations) == 1:
+            # `select day, kind from m group by 1, 2 having count(*) > 1`: the rows returned are the repeats
+            keys = [select.expressions[int(e.name) - 1].unalias() if isinstance(e, exp.Literal) and e.is_int
+                    and 0 < int(e.name) <= len(select.expressions) else e for e in group.expressions]
+            if all(isinstance(k, exp.Column) for k in keys) and next(iter(relations.values())):
+                return self.together(next(iter(relations.values())), [k.name.upper() for k in keys], analysis, node["name"])
         if having is not None and group is not None and len(group.expressions) == 1:
             test = having.this
             place = spot(group.expressions[0])
@@ -2945,6 +2975,8 @@ class Fitter:
             return False
         node = {**node, "attached_node": tested}  # a test under a source names no attached node
         kwargs = meta["kwargs"].get("arguments") or meta["kwargs"]
+        if meta["name"] == "unique_combination_of_columns":
+            return self.together(node["attached_node"], [str(c) for c in kwargs.get("combination_of_columns") or []], analysis, node["name"])
         column = node.get("column_name") or kwargs.get("column_name") or meta["kwargs"].get("column_name")
         here = analysis.place(node["attached_node"], column) if column and re.fullmatch(r"\w+", str(column)) else None
         if not here or here[0] not in self.tables or here[1] not in self.tables[here[0]].get("columns", {}):

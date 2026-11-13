@@ -144,3 +144,17 @@ def test_a_parent_has_no_more_rows_than_a_test_allows():
         most = cur.execute("select max(n) from (select count(*) n from RAW.T.ITEMS group by SUB_ID)").fetchone()[0]
         orphans = cur.execute("select count(*) from RAW.T.ITEMS i left join RAW.T.SUBS s on s.ID = i.SUB_ID where s.ID is null").fetchone()[0]
     assert most == 2 and orphans == 0
+
+
+def test_a_grain_gives_one_row_a_day_for_each_listed_value():
+    from fauxflake.spec import Spec
+
+    kinds = {"gen": "categorical", "values": {"compute": 0.5, "storage": 0.3, "other": 0.2}}
+    spec = Spec.from_raw({"seed": 42, "start": "2025-01-01", "tables": {"RAW.T.RATES": {
+        "volume": {"rows_per_day": 50, "weekly": [1] * 7}, "lateness": {"p": [0, 1], "seconds": [0, 1]}, "grain": ["DAY", "KIND"],
+        "columns": {"DAY": {"gen": "event_time", "type": "DATE"}, "KIND": kinds, "RATE": {"gen": "dist", "type": "DOUBLE", "p": [0, 1], "v": [1, 3]}}}}}, ".")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 6))
+        rows, pairs, days, kinds_seen = emu.cursor().execute(
+            "select count(*), count(distinct (DAY, KIND)), count(distinct DAY), count(distinct KIND) from RAW.T.RATES").fetchone()
+    assert rows == pairs == days * 3 and kinds_seen == 3 and days >= 4

@@ -15,6 +15,7 @@ property gives everything else:
 from __future__ import annotations
 
 import json
+import math
 import re
 import zlib
 from pathlib import Path
@@ -105,6 +106,11 @@ class TableSQL:
         # hashed twice: DuckDB combines the arguments of one hash() so lightly that two columns' draws for
         # the same row moved together (a third of the combinations of two categories never occurred)
         return f"((hash(hash({self.base}, {lit(self.salt(salt))}{args})) >> 11)::double / 9007199254740992.0)"
+
+    def grain(self) -> dict[str, int]:
+        """The listed-value columns of the table's `grain` (unique together with the day) and how many values each has."""
+        return {c: len(self.t.columns[c]["values"]) for c in self.t.raw.get("grain") or []
+                if self.t.columns.get(c, {}).get("gen") == "categorical" and self.t.columns[c].get("values")}
 
     def key_expr(self, table: Table, index: str) -> str:
         _col, d = table.key
@@ -295,6 +301,11 @@ class TableSQL:
                 # at most so many rows for one parent (`having count(*) > 2` is a test): rows share parents in turn
                 idx = f"((g // {max(int(d['per_parent']), 1)}) % greatest(_pe_{col}, 1))::bigint"
             expr = self.key_expr(parent, idx)
+        elif gen == "categorical" and col in self.grain() and self.base == "g":
+            sizes = self.grain()
+            stride = math.prod(list(sizes.values())[:list(sizes).index(col)])
+            known = "[" + ", ".join(lit(v) for v in d["values"]) + "]"
+            expr = f"list_extract({known}, 1 + ((_n // {stride}) % {sizes[col]})::bigint)"
         elif gen == "categorical":
             total = sum(d["values"].values())
             x, arms, acc = self.u(col), [], 0.0
@@ -426,12 +437,15 @@ class TableSQL:
                 up = f"({down} + {ms(repr(self.sc.outage_hours * 3600))})"
                 arrived = f"(select case when x >= {down} and x < {up} then {up} else x end from (select {arrived} as x))"
         cols = ",\n  ".join(self.column(c, d) for c, d in t.columns.items())
+        # one row a day for each combination of the listed values: the rows of a day take them in turn, and
+        # a day has no more rows than there are combinations
+        grain = f" and _n < {math.prod(self.grain().values())}" if self.grain() else ""
         if with_new_column:
             since = f"timestamp '{self.sc.start} 00:00:00'"
             cols += f',\n  case when _loaded >= {since} then \'v2\' end as "{self.sc.new_column}"'
         return f"""
 with b as (
-  select r.g, c.day{pcs}
+  select r.g, c.day, r.g - c.cum as _n{pcs}
   from range($lo, $hi) r(g)
   asof join (select * from cal_{t.ident} where n > 0) c on r.g >= c.cum{joins}
 ),
@@ -447,7 +461,7 @@ d as (
 select
   {cols}
 from d
-where _loaded > $after and _loaded <= $until"""
+where _loaded > $after and _loaded <= $until{grain}"""
 
 
 def existing_view(name: str, columns: dict[str, str], replace: bool = False, table: bool = False) -> str:

@@ -1242,6 +1242,42 @@ def periods_have_length(columns: dict[str, dict]) -> list[str]:
     return changed
 
 
+def unique_together(table: dict, names: list[str]) -> str | None:
+    """Make the combination of these columns unique in a generated table, changing as little as it can:
+    a column nothing is known about gets a value of its own per row; a day with listed values becomes the
+    table's grain (one row a day for each value); a time becomes one day per row. Says what it did."""
+    columns = table.get("columns") or {}
+    gens = {n: columns.get(n) for n in names}
+    if not names or any(g is None for g in gens.values()):
+        return None
+    free = lambda n, g: g["gen"] == "template" and g.get("template") == f"{n.lower()}_{{hex}}" and not g.get("templates")  # noqa: E731
+    if any(g["gen"] in ("sequence", "hash_id") or g.get("unique") or g.get("per_parent") == 1 or (free(n, g) and not g.get("follows"))
+           for n, g in gens.items()) or set(table.get("grain") or ()) >= set(names) and table.get("grain"):
+        return None  # one of them is unique by itself already
+    for n, g in gens.items():
+        if g["gen"] == "dist" and str(g.get("type", "BIGINT")).upper().startswith(("BIGINT", "INT")):
+            columns[n] = {**g, "unique": True}
+            return f"{n} has a value of its own in every row"
+    for n, g in gens.items():
+        if g["gen"] in ("template", "pool") and not g.get("templates") and not g.get("parts") and not g.get("format"):
+            columns[n] = {"gen": "template", "template": f"{n.lower()}_{{hex}}"}
+            return f"{n} has a value of its own in every row"
+    days = [n for n, g in gens.items() if g["gen"] == "event_time" and str(g.get("type", "")).upper() == "DATE"]
+    listed = [n for n, g in gens.items() if g["gen"] == "categorical" and g.get("values")]
+    if len(days) == 1 and listed and len(days) + len(listed) == len(names):
+        table["grain"] = [days[0], *listed]
+        return f"one row a day for each value of {', '.join(listed)}"
+    for n, g in gens.items():
+        if g["gen"] == "time_offset" and not g.get("format") and not g.get("epoch"):
+            columns[n] = {"p": [0, 0.5, 1], "seconds": [0, 86400, 604800], **g, "unique": True, "every_days": 1}
+            return f"{n} is one day per row"
+    for n, g in gens.items():
+        if g["gen"] == "fk":
+            g["per_parent"] = 1
+            return f"{n} refers to each parent once"
+    return None
+
+
 def within_bounds(gen: dict, bounds: set[float] | None) -> None:
     """Make a numeric column's values straddle the numbers the SQL compares it with, so that
     `where block_number between 9820000 and 10000000` keeps rows."""
@@ -1385,6 +1421,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
 
     keys: dict[str, str] = {}
     ordered: list[tuple[tuple[str, str, str], tuple[str, str, str]]] = []  # (the later, the earlier) of two times a test compares
+    together: list[tuple[str, list[str]]] = []  # (table, columns a test says are unique together)
     fks: dict[tuple[str, str], tuple[str, str]] = {}
     accepted: dict[tuple[str, str], list] = {}
     for node in manifest["nodes"].values():
@@ -1397,6 +1434,12 @@ def analyse(manifest: dict, database: str) -> Analysis:
             continue
         node = {**node, "attached_node": tested}
         column = node.get("column_name") or meta["kwargs"].get("column_name")
+        if meta["name"] == "unique_combination_of_columns":
+            listed = (meta["kwargs"].get("arguments") or meta["kwargs"]).get("combination_of_columns") or []
+            spots = [locate(node["attached_node"], str(c)) for c in listed if re.fullmatch(r"\w+", str(c))]
+            if spots and all(spots) and len(spots) == len(listed) and len({spot[0] for spot in spots}) == 1:
+                together.append((spots[0][0], [spot[1] for spot in spots]))
+            continue
         if meta["name"] == "expression_is_true" and not column:
             # `expression: "release_date > rc1_date"`: one of the two comes after the other
             try:
@@ -1648,6 +1691,9 @@ def analyse(manifest: dict, database: str) -> Analysis:
             return column
         return (column.get("fields") or {}).get(spot[2]) if column.get("gen") == "object" else None
 
+    for name, columns in together:
+        if name in tables:
+            unique_together(tables[name], columns)
     for later, earlier in ordered:
         # a test says one time is after the other: it starts where the other's range stops
         after, before = held_at(later), held_at(earlier)
