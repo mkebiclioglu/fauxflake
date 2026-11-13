@@ -17,10 +17,13 @@ columns through renames. Volumes and distributions are placeholders until
 from __future__ import annotations
 
 import collections
+import csv
+import itertools
 import json
 import os
 import copy
 import re
+from datetime import date, timedelta
 from pathlib import Path
 
 import sqlglot
@@ -58,6 +61,10 @@ class SourceUse:
         self.numbers: set[str] = set()  # columns that are summed, averaged or used in arithmetic
         self.literals: dict[str, set[str]] = {}  # column -> string values the SQL compares it with
         self.patterns: dict[str, set[str]] = {}  # column -> LIKE patterns the SQL keeps rows by
+        self.path_literals: dict[str, dict[str, set[str]]] = {}  # variant column -> {"a.b": values it is compared with}
+        self.path_patterns: dict[str, dict[str, set[str]]] = {}  # variant column -> {"a.b": LIKE patterns that keep rows}
+        self.path_optional: dict[str, set[str]] = {}  # variant column -> paths a CASE / IFF tests for being there
+        self.embeds: dict[str, list[tuple[str, str, tuple[str, str]]]] = {}  # text column -> (before, after, the column whose value sits between them)
         self.star = False
 
     def add(self, column: str, type_hint: str | None = None) -> None:
@@ -68,21 +75,57 @@ class SourceUse:
             self.columns[column] = type_hint or current
 
 
+_DATE_LITERAL = re.compile(r"(\d{4})-(\d{2})-(\d{2})(?:[ T]00:00:00(?:\.0+)?)?")
+# what the emulator answers for the session: a column compared with one of these holds that value
+CONTEXT = {"CURRENT_ACCOUNT": "FAUXFLAKE", "CURRENT_ACCOUNT_NAME": "FAUXFLAKE", "CURRENT_ORGANIZATION_NAME": "FAUXFLAKE",
+           "CURRENT_REGION": "LOCAL", "CURRENT_WAREHOUSE": "LOCAL"}
+_PATHS = "\0paths"  # in a model's outputs: {column: (source, source column, path inside its document)}
+
+
+def named_value(node: exp.Expression | None) -> str | None:
+    """The text a comparison names: a string literal, or what the session answers (CURRENT_ACCOUNT_NAME())."""
+    if isinstance(node, exp.Literal):
+        return node.name if node.is_string and len(node.name) <= 60 else None
+    if isinstance(node, exp.Func) and not isinstance(node, exp.Anonymous):
+        return CONTEXT.get(node.sql_name().upper()) if not any(v for v in node.args.values()) else None
+    if isinstance(node, exp.Anonymous) and not node.expressions:
+        return CONTEXT.get(node.name.upper())
+    return None
+
+
+def path_text(path: tuple[str, ...]) -> str:
+    """(chunk, transactions, [], hash) -> `chunk.transactions[].hash`."""
+    out = ""
+    for key in path:
+        out += key if key == "[]" or key.startswith("~") else (("." if out else "") + key)
+    return out
+
+
 def _table_id(table: exp.Table) -> str:
     return ".".join(p.upper() for p in (table.catalog, table.db, table.name) if p)
 
 
 _WRAPPERS = (exp.Cast, exp.TryCast, exp.Paren, exp.Lower, exp.Upper, exp.Trim)
+_SAME_VALUE = (exp.Lower, exp.Upper, exp.Trim, exp.Initcap, exp.Nullif, exp.Lag, exp.Lead, exp.FirstValue, exp.LastValue, exp.Max,
+               exp.Min, exp.AnyValue, exp.IgnoreNulls, exp.RespectNulls, exp.Window) + tuple(
+    getattr(exp, name) for name in ("Replace",) if hasattr(exp, name))
 
 
 def _parsed_as(node: exp.Expression) -> str | None:
     """TIMESTAMP or DATE when the value (possibly cast to text first) is handed to a function that
     reads it as a point in time: to_timestamp_ntz(v:header:timestamp::string)."""
-    top = node
-    while isinstance(top.parent, (exp.Cast, exp.TryCast, exp.Paren)) and (
-            isinstance(top.parent, exp.Paren) or top.parent.to.is_type(*exp.DataType.TEXT_TYPES)):
+    top, as_number = node, False
+    while isinstance(top.parent, (exp.Cast, exp.TryCast, exp.Paren)):
+        if not isinstance(top.parent, exp.Paren) and not top.parent.to.is_type(*exp.DataType.TEXT_TYPES):
+            if not top.parent.to.is_type(*exp.DataType.NUMERIC_TYPES):
+                break
+            as_number = True  # to_timestamp(ts::int): seconds since 1970
         top = top.parent
     reader = top.parent
+    if as_number:
+        named = reader.name.upper() if isinstance(reader, exp.Anonymous) else reader.sql_name().upper() if isinstance(reader, exp.Func) else ""
+        first = reader.expressions[0] if isinstance(reader, exp.Anonymous) and reader.expressions else getattr(reader, "this", None)
+        return "EPOCH" if first is top and re.fullmatch(r"(TRY_)?TO_TIMESTAMP(_NTZ|_LTZ|_TZ)?|UNIX_TO_TIME", named) else None
     if isinstance(reader, exp.TsOrDsToDate) and reader.this is top and not reader.args.get("format"):
         return "DATE"
     if isinstance(reader, exp.Anonymous) and reader.expressions and reader.expressions[0] is top and len(reader.expressions) == 1 \
@@ -117,13 +160,34 @@ def _split_use(use: "SourceUse", column: str, call: exp.Expression) -> bool:
 def scan_model(sql: str, sources: dict[str, SourceUse],
                models: dict[str, dict[str, tuple[str, str]]] | None = None,
                links: list[set[tuple[str, str]]] | None = None,
-               joins: list[tuple[tuple[str, str], tuple[str, str]]] | None = None) -> dict[str, tuple[str, str]]:
+               joins: list[tuple[tuple[str, str], tuple[str, str]]] | None = None,
+               dates: list[tuple[str, date]] | None = None,
+               lookups: collections.Counter | None = None) -> dict[str, tuple[str, str]]:
     """Record source columns used by one model. Returns {output column: (source, source column)}
     for outputs that are a plain (possibly cast or renamed) source column."""
     try:
         tree = sqlglot.parse_one(sql, read="snowflake")
     except sqlglot.errors.SqlglotError:
         return {}
+    if dates is not None:
+        # dates the SQL compares with: `= '2022-04-01'` has to fall inside the simulated history,
+        # `< '2023-01-01'` after its start, `>= '2021-09-01'` before its end
+        for test in tree.find_all(exp.EQ, exp.LT, exp.LTE, exp.GT, exp.GTE, exp.Between, exp.In):
+            sides = [test.args.get("low"), test.args.get("high")] if isinstance(test, exp.Between) else \
+                test.expressions if isinstance(test, exp.In) else [test.this, test.expression]
+            for i, side in enumerate(sides):
+                while isinstance(side, (exp.Cast, exp.TryCast, exp.Paren, exp.TsOrDsToDate, exp.Date)) and side.this is not None:
+                    side = side.this
+                m = _DATE_LITERAL.fullmatch(side.name) if isinstance(side, exp.Literal) and side.is_string else None
+                if not m or not 2015 <= int(m.group(1)) <= 2035:
+                    continue
+                try:
+                    day = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                except ValueError:
+                    continue
+                how = "in" if isinstance(test, (exp.EQ, exp.In)) else ("after" if i == 0 else "before") if isinstance(test, exp.Between) \
+                    else "before" if isinstance(test, (exp.LT, exp.LTE)) == (i == 1) else "after"
+                dates.append((how, day))
     passthrough: dict[str, str] = {}  # CTE name -> source it is `select *` of
     computed: dict[str, set[str]] = {}  # CTE name -> columns it adds next to the star
     lineage: dict[str, dict[str, tuple[str, str]]] = {}  # CTE name -> its outputs
@@ -168,12 +232,18 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 elif models and _table_id(node) in models:  # another model: follow its lineage
                     renames[alias.upper()] = models[_table_id(node)]
             else:  # a CTE or subquery scope
-                name = alias.upper()
+                # `from base_receipts r`: known by the CTE's name, used by its alias
+                written = scope.selected_sources.get(alias, (None, None))[0]
+                name, alias_name = (written.name.upper() if isinstance(written, exp.Table) else alias.upper()), alias.upper()
+                if name not in passthrough and name not in lineage:
+                    name = alias_name
                 if name in passthrough:
-                    direct[name] = passthrough[name]
-                    added[name] = computed.get(name, set())
+                    direct[alias_name] = passthrough[name]
+                    added[alias_name] = computed.get(name, set())
                 elif name in lineage:
-                    renames[name] = lineage[name]
+                    renames[alias_name] = lineage[name]
+                elif id(getattr(node, "expression", None)) in outputs_of:
+                    renames[alias_name] = outputs_of[id(node.expression)]  # `(select ...) as t`: what the subquery wrote
         # a lateral FLATTEN next to the table only contributes its own fixed columns
         laterals = {a.upper() for a, src in selected.items() if getattr(src, "is_udtf", False)}
         others = {a.upper() for a in selected} - set(direct) - laterals
@@ -203,6 +273,252 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 return next(iter(renames.values())).get(col.name.upper())
             return None
 
+        # where a value sits inside a source's document, followed through models, aliases and FLATTEN
+        path_maps = {a: r[_PATHS] for a, r in renames.items() if _PATHS in r}
+        plain = [a.upper() for a in selected if a.upper() not in laterals]
+        flatten_inputs: dict[str, exp.Expression] = {}
+        for alias, src in selected.items():
+            lateral = getattr(src, "expression", None)
+            call = lateral.this if isinstance(lateral, exp.Lateral) else None
+            if isinstance(call, exp.Explode):
+                given = call.this.expression if isinstance(call.this, exp.Kwarg) else call.this
+                named = next((k.expression for k in call.find_all(exp.Kwarg) if k.this.name.upper() == "INPUT"), None)
+                flatten_inputs[alias.upper()] = named if named is not None else given
+
+        def into(base, keys):  # noqa: ANN001, ANN202
+            """Follow `keys` into what is known of a value: a place in a source's document, or an
+            object / array a model put together (OBJECT_CONSTRUCT, ARRAY_AGG) from such places."""
+            for key in keys:
+                if isinstance(base, dict):
+                    base = base.get(key)
+                elif isinstance(base, list):
+                    base = base[0] if key == "[]" else None
+                elif isinstance(base, tuple):
+                    base = (base[0], base[1], base[2] + (key,))
+                if base is None:
+                    return None
+            return base
+
+        def resolve_path(node: exp.Expression, depth: int = 0):  # noqa: ANN202
+            if depth > 12 or node is None:
+                return None
+            while isinstance(node, (exp.Cast, exp.TryCast, exp.Paren, exp.WithinGroup)):
+                node = node.this
+            if isinstance(node, (exp.ParseJSON, exp.TryBase64DecodeString, exp.Base64DecodeString)):
+                # text inside a document that holds JSON, or base64 of something: `~json` / `~b64` say how the
+                # value is written; what is read under them is its content
+                base = resolve_path(node.this, depth + 1)
+                mark = "~json" if isinstance(node, exp.ParseJSON) else "~b64"
+                if isinstance(base, tuple) and base[2] and base[2][-1] != mark and "{}" not in base[2]:
+                    return base[0], base[1], base[2] + (mark,)
+                return base
+            if isinstance(node, exp.JSONExtract):
+                keys = []
+                for k in node.expression.expressions if isinstance(node.expression, exp.JSONPath) else [None]:
+                    if isinstance(k, exp.JSONPathKey):
+                        keys.append(str(k.this))
+                    elif isinstance(k, exp.JSONPathSubscript):
+                        keys.append("[]")
+                    elif not isinstance(k, exp.JSONPathRoot):
+                        return None
+                return into(resolve_path(node.this, depth + 1), keys)
+            if isinstance(node, exp.Bracket):
+                index = node.expressions[0] if node.expressions else None
+                if not isinstance(index, exp.Literal):
+                    return None
+                return into(resolve_path(node.this, depth + 1), [index.name if index.is_string else "[]"])
+            if isinstance(node, exp.If):  # iff(kind = 'a', v:msg, v): what the first answer that is known holds
+                for value in (node.args.get("true"), node.args.get("false")):
+                    found = resolve_path(value, depth + 1) if value is not None else None
+                    if found is not None:
+                        return found
+                return None
+            if isinstance(node, exp.Coalesce):
+                for value in [node.this, *node.expressions]:
+                    found = resolve_path(value, depth + 1)
+                    if found is not None:
+                        return found
+                return None
+            if isinstance(node, exp.SplitPart) and isinstance(node.this, exp.SplitPart):
+                # split_part(split_part(text, '(<@', 2), '>)', 1): what the text holds between two marks
+                inner, marks = node.this, []
+                for call, wanted in ((inner, "2"), (node, "1")):
+                    mark, index = call.args.get("delimiter"), call.args.get("part_index")
+                    if isinstance(mark, exp.Literal) and mark.is_string and isinstance(index, exp.Literal) and index.name == wanted:
+                        marks.append(mark.name)
+                base = resolve_path(inner.this, depth + 1)
+                if len(marks) == 2 and isinstance(base, tuple) and not base[2]:
+                    return base[0], base[1], ("~between", marks[0], marks[1])
+                return None
+            if isinstance(node, _SAME_VALUE):
+                # lower(x), replace(x, 'overage-', ''), lag(x) over (...): still one of x's values, give or take
+                # its spelling, so what the result is compared with is what x should hold
+                return resolve_path(node.this, depth + 1)
+            if isinstance(node, exp.Struct):  # object_construct('k', v, ...)
+                made = {e.this.name: resolve_path(e.expression, depth + 1) for e in node.expressions
+                        if isinstance(e, exp.PropertyEQ) and isinstance(e.this, exp.Literal)}
+                made = {k: v for k, v in made.items() if v is not None}
+                return made or None
+            if isinstance(node, exp.ArrayAgg):
+                inner = resolve_path(node.this, depth + 1)
+                return [inner] if inner is not None else None
+            if isinstance(node, exp.Array) and node.expressions:
+                inner = resolve_path(node.expressions[0], depth + 1)
+                return [inner] if inner is not None else None
+            if not isinstance(node, exp.Column) or isinstance(node.this, exp.Star):
+                return None
+            table, name = node.table.upper(), node.name.upper()
+            if table in flatten_inputs or (not table and name in FLATTEN_COLUMNS and flatten_inputs):
+                which = table if table in flatten_inputs else next(iter(flatten_inputs)) if len(flatten_inputs) == 1 else None
+                base = resolve_path(flatten_inputs[which], depth + 1) if which and name in ("VALUE", "THIS", "KEY") else None
+                if not base:
+                    return None
+                # `{}` stands for "the name of each key": what a FLATTEN over an object calls KEY
+                return base if name == "THIS" else into(base, ["{}" if name == "KEY" else "[]"])
+            if not table and name in aliases and not isinstance(node.parent, exp.Alias):
+                return resolve_path(aliases[name], depth + 1)
+            owner = table or (plain[0] if len(plain) == 1 else "")
+            if not owner and not direct:
+                # an unqualified column next to a join: the one relation known to write it
+                having = [a for a in plain if name in path_maps.get(a, ()) or name in renames.get(a, ())]
+                owner = having[0] if len(having) == 1 else ""
+            if name in path_maps.get(owner, ()):
+                return path_maps[owner][name]
+            hit = resolve(node)
+            if hit and len(hit) == 2 and isinstance(hit[1], str):
+                return hit[0], hit[1], ()
+            if not table and owner in direct and name not in added.get(owner, ()):
+                return direct[owner], name, ()
+            if renames.get(owner, {}).get(name) and name != _PATHS:
+                return (*renames[owner][name], ())
+            return None
+
+        for node in select.find_all(exp.JSONExtract, exp.Bracket, exp.Column):
+            if isinstance(node.parent, (exp.JSONExtract, exp.Bracket)) and node.parent.this is node:
+                continue  # part of a longer path: that one is recorded
+            if node.find_ancestor(exp.Select) is not select:
+                continue
+            found = resolve_path(node)
+            if not isinstance(found, tuple) or found[0] not in sources:
+                continue
+            top = node
+            while isinstance(top.parent, exp.Paren):
+                top = top.parent
+            reader = top.parent
+            cast = reader if isinstance(reader, (exp.Cast, exp.TryCast)) else None
+            hint = _parsed_as(top) or (cast.to.sql(dialect="duckdb") if cast else None)
+            outer = cast.parent if cast is not None else reader
+            flattened = isinstance(outer, (exp.Explode, exp.ArraySize)) or (
+                isinstance(outer, exp.Kwarg) and isinstance(outer.parent, exp.Explode))
+            if found[2][:1] == ("~between",):
+                # joined to another column: the text mentions that column's values between the two marks
+                side = cast if cast is not None else top
+                while isinstance(side.parent, _WRAPPERS):
+                    side = side.parent
+                if isinstance(side.parent, exp.EQ):
+                    other = side.parent.expression if side.parent.this is side else side.parent.this
+                    there = resolve_path(other) if not isinstance(other, exp.Literal) else None
+                    if isinstance(there, tuple) and there[0] in sources and not there[2]:
+                        sources[found[0]].embeds.setdefault(found[1], []).append((found[2][1], found[2][2], (there[0], there[1])))
+                continue
+            use, text = sources[found[0]], path_text(found[2])
+            if joins is not None and "{}" not in found[2]:
+                # a.x = b.y, where either side may sit inside a document: the two must share values
+                side = cast if cast is not None else top
+                while isinstance(side.parent, _WRAPPERS):
+                    side = side.parent
+                if isinstance(side.parent, exp.EQ):
+                    other = side.parent.expression if side.parent.this is side else side.parent.this
+                    there = resolve_path(other) if not isinstance(other, exp.Literal) else None
+                    if isinstance(there, tuple) and there[0] in sources and "{}" not in there[2] and "~between" not in there[2] \
+                            and (there[0], there[1], there[2]) != found:
+                        mine, theirs = (found[0], found[1], text), (there[0], there[1], path_text(there[2]))
+                        if found[2] or there[2] or not resolve(node):  # two plain columns of sources are recorded below
+                            joins.append((mine, theirs))
+                        join = side.find_ancestor(exp.Join)
+                        if lookups is not None and join is not None and join.find_ancestor(exp.Select) is select:
+                            # `from a join b on a.x = b.y`: b is looked up by y; a row of a should find one b, not thirty
+                            joined = (join.this.alias_or_name or "").upper()
+                            tables_of = lambda e: {c.table.upper() for c in e.find_all(exp.Column)}  # noqa: E731
+                            if tables_of(side) == {joined} and joined not in tables_of(other):
+                                lookups[mine] += 1  # (the other side is visited too, and counts nothing)
+                                lookups[theirs] -= 1
+            if not found[2]:
+                if flattened:
+                    use.arrays.add(found[1])
+                # a source column reached through other models: what it is compared with counts as much
+                # as in the model that reads the source
+                held = cast if cast is not None else top
+                while isinstance(held.parent, _WRAPPERS):
+                    held = held.parent
+                test = held.parent
+                if isinstance(test, (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ, exp.Between)):
+                    sides = [test.args.get("low"), test.args.get("high")] if isinstance(test, exp.Between) else \
+                        [test.expression if test.this is held else test.this]
+                    for side in sides:
+                        negative = isinstance(side, exp.Neg)
+                        number = side.this if negative else side
+                        if isinstance(number, exp.Literal) and not number.is_string:
+                            try:
+                                use.bounds.setdefault(found[1], set()).add(-float(number.name) if negative else float(number.name))
+                            except ValueError:
+                                pass
+                if isinstance(test, (exp.EQ, exp.In)) and held in (test.this, test.args.get("expression")) \
+                        and not isinstance(test.parent, exp.Not):
+                    values = test.expressions if isinstance(test, exp.In) else [test.expression if test.this is held else test.this]
+                    named = {v for v in map(named_value, values) if v is not None and not re.fullmatch(r"[\d\s:.\-/T+Z]*", v)}
+                    if named:
+                        use.literals.setdefault(found[1], set()).update(named)
+                        use.texts.add(found[1])
+                if isinstance(test, (exp.Like, exp.ILike)) and test.this is held and not isinstance(test.parent, exp.Not) \
+                        and isinstance(test.expression, exp.Literal) and len(test.expression.name) <= 60 \
+                        and re.search(r"[^%_\s]", test.expression.name):
+                    use.patterns.setdefault(found[1], set()).add(test.expression.name)
+                    use.texts.add(found[1])
+                continue
+            known = use.paths.setdefault(found[1], {})
+            if flattened:
+                known.setdefault(text + "[]", None)
+                continue
+            compared = cast if cast is not None else top
+            while isinstance(compared.parent, _WRAPPERS):
+                compared = compared.parent
+            test = compared.parent
+            named: set[str] = set()
+            if isinstance(test, (exp.EQ, exp.In)) and compared in (test.this, test.args.get("expression")) \
+                    and not isinstance(test.parent, exp.Not):
+                values = test.expressions if isinstance(test, exp.In) else [test.expression if test.this is compared else test.this]
+                named = {v for v in map(named_value, values) if v is not None}
+            if "{}" in found[2]:
+                # flatten(obj) ... where key = 'FunctionCall': the object has a key of that name
+                if found[2][-1] == "{}":
+                    for value in named:
+                        known.setdefault(path_text(found[2][:-1] + (value,)), None)
+                continue
+            if hint or text not in known:
+                known[text] = hint or known.get(text)
+            if named:
+                use.path_literals.setdefault(found[1], {}).setdefault(text, set()).update(named)
+            if isinstance(test, exp.Is) and isinstance(test.expression, exp.Null) and test.this is compared \
+                    and test.find_ancestor(exp.If, exp.Case) is not None:
+                # iff(status:Failure is not null, 'Fail', 'Success'): both answers occur only if the key is sometimes absent
+                use.path_optional.setdefault(found[1], set()).add(text)
+            if isinstance(test, (exp.Like, exp.ILike)) and test.this is compared and not isinstance(test.parent, exp.Not) \
+                    and isinstance(test.expression, exp.Literal) and re.search(r"[^%_\s]", test.expression.name):
+                use.path_patterns.setdefault(found[1], {}).setdefault(text, set()).add(test.expression.name)
+
+        if joins is not None:
+            for join in select.args.get("joins") or []:
+                for named in join.args.get("using") or []:
+                    places = []
+                    for owner in plain:
+                        there = resolve_path(exp.column(named.name, table=owner))
+                        if isinstance(there, tuple) and there[0] in sources and "{}" not in there[2] and "~between" not in there[2]:
+                            places.append((there[0], there[1], path_text(there[2])))
+                    for one, two in zip(places, places[1:]):
+                        if one != two:
+                            joins.append((one, two))
+
         for col in scope.columns:
             hit = resolve(col)
             if hit:
@@ -211,6 +527,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 use.add(hit[1], cast.to.sql(dialect="duckdb") if cast else None)
                 if not cast and _parsed_as(col) and not use.columns.get(hit[1]):
                     use.columns[hit[1]] = _parsed_as(col)
+                elif cast and _parsed_as(col) == "EPOCH":
+                    use.columns[hit[1]] = "EPOCH"  # cast to a number only to be read as a point in time
                 if isinstance(parent, (exp.Sum, exp.Avg, exp.Add, exp.Sub, exp.Mul, exp.Div)):
                     use.numbers.add(hit[1])
                 if joins is not None:
@@ -254,18 +572,25 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 elif isinstance(parent, (exp.EQ, exp.NEQ, exp.Like, exp.ILike, exp.In)):
                     other = parent.expression if not isinstance(parent, exp.In) else (parent.expressions or [None])[0]
                     other = parent.this if other is col else other
+                    if isinstance(parent, exp.EQ) and not isinstance(other, exp.Literal) and named_value(other):
+                        use.literals.setdefault(hit[1], set()).add(named_value(other))  # account_name = current_account_name()
+                        use.texts.add(hit[1])
                     if isinstance(other, exp.Literal) and other.is_string and not re.fullmatch(r"[\d\s:.\-/T+Z]*", other.name):
                         use.texts.add(hit[1])  # id = 'USLACKBOT': not a number
                         if isinstance(parent, (exp.Like, exp.ILike)) and parent.this is col and len(other.name) <= 60 \
                                 and not isinstance(parent.parent, exp.Not) and re.search(r"[A-Za-z0-9]", other.name):
                             use.patterns.setdefault(hit[1], set()).add(other.name)  # name LIKE 'tap-%'
-                        if isinstance(parent, (exp.EQ, exp.NEQ, exp.In)):
+                        # `label != '(not set)'` names a value to leave out: not one to generate rows with
+                        if isinstance(parent, (exp.EQ, exp.In)) and not isinstance(parent.parent, exp.Not):
                             compared = parent.expressions if isinstance(parent, exp.In) else [other]
                             use.literals.setdefault(hit[1], set()).update(
                                 v.name for v in compared if isinstance(v, exp.Literal) and v.is_string and len(v.name) <= 60)
                 if isinstance(parent, exp.JSONExtract) and parent.this is col:
                     # v:a.b::int tells us the column is a variant holding {"a": {"b": <int>}}
                     keys = [k.name for k in parent.expression.expressions if isinstance(k, exp.JSONPathKey)]
+                    if any(isinstance(k, exp.JSONPathSubscript) for k in parent.expression.expressions):
+                        keys = []  # v:items[0].sku: recorded above, as a path through an array
+                        use.paths.setdefault(hit[1], {})
                     outer = parent.parent
                     hint = outer.to.sql(dialect="duckdb") if isinstance(outer, (exp.Cast, exp.TryCast)) else None
                     hint = _parsed_as(parent) or hint
@@ -276,7 +601,7 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                                 and (hint if hint_is_number(previous) else previous).upper().startswith(("TIMESTAMP", "DATE", "EPOCH")):
                             hint = "EPOCH"  # cast to a number here, read as a point in time there: seconds since 1970
                         known[".".join(keys)] = "EPOCH" if previous == "EPOCH" else (hint or previous)
-                    else:
+                    elif not any(isinstance(k, exp.JSONPathSubscript) for k in parent.expression.expressions):
                         use.arrays.add(hit[1])
                 elif isinstance(parent, (exp.Split, exp.SplitPart)) and parent.this is col and _split_use(use, hit[1], parent):
                     pass  # split(col, '/')[0]::number: the text has parts, and this one is a number
@@ -294,9 +619,23 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
             while isinstance(inner, (exp.Cast, exp.TryCast, exp.Paren)):
                 inner = inner.this
             hit = resolve(inner) if isinstance(inner, exp.Column) and not isinstance(inner.this, exp.Star) else None
-            by_position.append(hit)
+            placed = None if hit or isinstance(proj, exp.Star) else resolve_path(proj.unalias())
+            by_position.append(hit or ((placed[0], placed[1], path_text(placed[2])) if isinstance(placed, tuple) and placed[0] in sources
+                                       and "{}" not in placed[2] and "~between" not in placed[2] else None))
             if hit:
                 outputs[proj.alias_or_name.upper()] = hit
+        paths_out: dict[str, tuple[str, str, tuple[str, ...]]] = {}
+        if stars and len(plain) == 1 and plain[0] in path_maps:
+            paths_out.update(path_maps[plain[0]])  # `select *` (next to a FLATTEN or not) keeps what is known
+        for proj in select.expressions:
+            if isinstance(proj, exp.Star) or (isinstance(proj, exp.Column) and isinstance(proj.this, exp.Star)):
+                continue
+            found = resolve_path(proj.unalias())
+            if isinstance(found, (dict, list)) or (
+                    found and found[0] in sources and (found[2] or proj.alias_or_name.upper() not in outputs)):
+                paths_out[proj.alias_or_name.upper()] = found
+        if paths_out:
+            outputs[_PATHS] = paths_out
         name = scope.expression.parent.alias.upper() if isinstance(scope.expression.parent, exp.CTE) else None
         if stars and only and not select.args.get("joins"):
             if name:  # `select *, row_number() ... as rn from source` still passes every column through
@@ -309,6 +648,16 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 outputs["*"] = (only, "|".join(sorted(extra)))  # the whole model passes the source through
         if stars and len(renames) == 1 and len(selected) == 1:
             outputs = {**next(iter(renames.values())), **outputs}
+            if paths_out:
+                outputs[_PATHS] = paths_out
+        else:
+            # `select base.*, other.x from base join other ...`: everything known of `base` passes through
+            for star in stars:
+                through = renames.get(star.table.upper()) if isinstance(star, exp.Column) and star.table else None
+                if through:
+                    outputs = {**{k: v for k, v in through.items() if k != _PATHS}, **outputs}
+                    if through.get(_PATHS):
+                        outputs[_PATHS] = {**through[_PATHS], **(outputs.get(_PATHS) or {})}
         if stars and len(select.expressions) == 1 and len(selected) == 1:
             inner_name = next(iter(selected)).upper()
             if inner_name in cte_positions:  # `select * from cte` keeps the CTE's column order
@@ -339,20 +688,44 @@ _KEYS = ("sequence", "hash_id")
 _FREE = ("template", "dist", "categorical", "constant")  # generators with no meaning of their own
 
 
-def _share_join_values(tables: dict[str, dict], joins: list, notes: list[str]) -> None:
+def _share_join_values(tables: dict[str, dict], joins: list, notes: list[str], lookups=None) -> None:  # noqa: ANN001
     """Columns that models join on must draw from the same values. Group them, then:
     a key in the group makes the others reference it; named values are shared; otherwise
-    every member draws from one common pool."""
-    group_of: dict[tuple[str, str], set] = {}
+    every member draws from one common pool. A member is a column, or a place inside a
+    document column (`payload`, `items[].sku`)."""
+
+    def place(m):  # noqa: ANN001, ANN202
+        return (m[0], m[1], m[2] if len(m) > 2 else "")
+
+    def holder(m):  # noqa: ANN001, ANN202
+        """The dict that holds the member's generator, and its key there."""
+        column = tables.get(m[0], {}).get("columns", {}).get(m[1])
+        if column is None:
+            return None
+        if not m[2]:
+            return tables[m[0]]["columns"], m[1]
+        fields = column.get("fields") if column.get("gen") == "object" else None
+        return (fields, m[2]) if fields is not None and m[2] in fields else None
+
+    group_of: dict[tuple[str, str, str], set] = {}
     for a, b in joins:
-        if not all(m[0] in tables and m[1] in tables[m[0]]["columns"] for m in (a, b)):
+        a, b = place(a), place(b)
+        if holder(a) is None or holder(b) is None:
             continue
         merged = group_of.get(a, {a}) | group_of.get(b, {b})
         for m in merged:
             group_of[m] = merged
     for group in {id(g): g for g in group_of.values()}.values():
         members = sorted(group)
-        gen = {m: tables[m[0]]["columns"][m[1]] for m in members}
+        gen = {m: holder(m)[0][holder(m)[1]] for m in members}
+
+        def put(m, fresh: dict) -> None:  # noqa: ANN001
+            where, key = holder(m)
+            where[key] = fresh
+
+        def name(m) -> str:  # noqa: ANN001
+            return ".".join(x for x in m if x)
+
         keys = [m for m in members if gen[m]["gen"] in _KEYS]
         if keys:
             parent = keys[0]
@@ -361,12 +734,33 @@ def _share_join_values(tables: dict[str, dict], joins: list, notes: list[str]) -
                 if gen[m]["gen"] != gen[parent]["gen"]:
                     gen[m]["gen"] = gen[parent]["gen"]
             for m in members:
-                if m[0] != parent[0] and gen[m]["gen"] in _FREE:
-                    tables[m[0]]["columns"][m[1]] = {"gen": "fk", "ref": parent[0], "skew": 1.5}
-                    notes.append(f"{m[0]}.{m[1]}: joined to {parent[0]}.{parent[1]} in a model, generated as a reference to it.")
+                if gen[m]["gen"] not in _FREE or (m[0] == parent[0] and not m[2]):
+                    continue
+                if m[2]:  # inside a document: one of the parent's first rows, which every day's load has
+                    put(m, {"gen": "fk", "ref": parent[0], "first": 50})
+                elif m[0] != parent[0]:
+                    put(m, {"gen": "fk", "ref": parent[0], "skew": 1.5})
+                else:
+                    continue
+                notes.append(f"{name(m)}: joined to {parent[0]}.{parent[1]} in a model, generated as a reference to it.")
             continue
         free = [m for m in members if gen[m]["gen"] in _FREE]
         if len(free) < 2:
+            continue
+        # inside documents: `receipt.receipt_id` joined to the elements of `outcome.receipt_ids[]` is an id and
+        # the references to it. An id is one per element; drawing both from a small pool would pair every
+        # row with hundreds of others.
+        lists = [m for m in free if m[2].endswith("[]")]
+        ids = [m for m in free if m[2] and not m[2].endswith("[]")
+               and re.search(r"(^|_)(id|hash|key|uuid|guid)$", m[2].replace("[]", "").split(".")[-1].lower())]
+        if lists and len(ids) == 1 and all(gen[m]["gen"] == "template" for m in free):
+            key = ids[0]
+            domain = f"{key[0]}.{key[1]}.{key[2]}"
+            put(key, {"gen": "hash_id", "domain": domain})
+            for slot, m in enumerate(m for m in free if m != key):
+                put(m, {"gen": "link", "domain": domain, "depth": key[2].count("[]"),
+                        **({"layered": True, "slot": slot} if m[0] == key[0] else {})})
+            notes.append(f"{name(key)}: an id that {', '.join(name(m) for m in free if m != key)} refer to; generated as one.")
             continue
         named = [gen[m] for m in free if gen[m]["gen"] == "categorical"]
         if named:
@@ -375,13 +769,75 @@ def _share_join_values(tables: dict[str, dict], joins: list, notes: list[str]) -
                 for v, w in d["values"].items():
                     values.setdefault(v, w)
             for m in free:
-                tables[m[0]]["columns"][m[1]] = {"gen": "categorical", "values": dict(values)}
+                put(m, {"gen": "categorical", "values": dict(values)})
         else:
-            pool = free[0][1].lower()
+            pool = (free[0][2].replace("[]", "").split(".")[-1] or free[0][1]).lower()
             numeric = any(gen[m]["gen"] == "dist" for m in free)
+
+            def belongs_to_an_id(m) -> bool:  # noqa: ANN001
+                """`author_username` next to `author_id`, or `login` in a document keyed by its `id`."""
+                if not m[2]:
+                    return bool(gen[m].get("follows"))
+                column = tables[m[0]]["columns"][m[1]]
+                return bool(column.get("keyed_by")) and m[2] != column["keyed_by"] and "." not in m[2] and "[" not in m[2]
+
+            if not numeric and all(belongs_to_an_id(m) for m in free):
+                # names that each belong to an id: the name is written from the id, so one id has one name in
+                # every table, two ids never share one, and the join on the name pairs the same ids
+                for m in free:
+                    put(m, {"gen": "template", "template": f"{pool}_{{n}}", **({"follows": gen[m]["follows"]} if gen[m].get("follows") else {})})
+                notes.append(f"{', '.join(name(m) for m in free)}: joined in a model; each is the name of an id, generated from the id.")
+                continue
+            # the side that is looked up (`join b on a.x = b.y`) holds each value once, as the table of the
+            # things themselves does; the others refer to its values. Both drawn at random, every row of a
+            # would meet several of b, and a model's rows would multiply at each join.
+            looked_up = max(free, key=lambda m: (lookups or {}).get(m, 0))
+            one_each = looked_up if (lookups or {}).get(looked_up, 0) > 0 and not looked_up[2] and len(
+                [m for m in free if (lookups or {}).get(m, 0) == (lookups or {}).get(looked_up, 0)]) == 1 else None
             for m in free:
-                tables[m[0]]["columns"][m[1]] = {"gen": "pool", "pool": pool, "size": 200, **({"numeric": True} if numeric else {})}
-        notes.append(f"{', '.join('.'.join(m) for m in free)}: joined in a model, generated from the same values.")
+                if m == one_each:
+                    put(m, {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000], "unique": True} if numeric
+                        else {"gen": "template", "template": f"{pool}_{{n}}"})
+                else:
+                    put(m, {"gen": "pool", "pool": pool, "size": 200, **({"numeric": True} if numeric else {})})
+        notes.append(f"{', '.join(name(m) for m in free)}: joined in a model, generated from the same values.")
+
+
+def _share_union_values(tables: dict[str, dict], links: list) -> None:
+    """`select author_id, author_username from merge_requests union select ... from issues`: the two tables
+    describe the same people. Where a join made one side's column a shared pool, or a name written from its id,
+    the columns lined up with it in a UNION are generated the same way: one id has one name in both."""
+
+    def holder(m):  # noqa: ANN001, ANN202
+        column = tables.get(m[0], {}).get("columns", {}).get(m[1])
+        if column is None:
+            return None
+        if not m[2]:
+            return tables[m[0]]["columns"], m[1]
+        fields = column.get("fields") if column.get("gen") == "object" else None
+        return (fields, m[2]) if fields is not None and m[2] in fields else None
+
+    def of_an_id(m, gen: dict) -> bool:  # noqa: ANN001
+        if not m[2]:
+            return bool(gen.get("follows"))
+        column = tables[m[0]]["columns"][m[1]]
+        return bool(column.get("keyed_by")) and m[2] != column["keyed_by"] and "." not in m[2] and "[" not in m[2]
+
+    for _ in range(2):  # a decision can travel through two unions
+        for group in links:
+            members = [(m[0], m[1], m[2] if len(m) > 2 else "") for m in group]
+            held = {m: holder(m) for m in members}
+            gens = {m: held[m][0][held[m][1]] for m in members if held[m]}
+            named = next((g for g in gens.values() if g.get("gen") == "template" and "{n}" in str(g.get("template")) and "templates" not in g), None)
+            pooled = next((g for g in gens.values() if g.get("gen") == "pool"), None)
+            for m, gen in gens.items():
+                if gen.get("gen") != "template" or "templates" in gen or "parts" in gen or gen.get("format"):
+                    continue
+                where, key = held[m]
+                if named and gen is not named and "{n}" not in str(gen.get("template")) and of_an_id(m, gen):
+                    where[key] = {"gen": "template", "template": named["template"], **({"follows": gen["follows"]} if gen.get("follows") else {})}
+                elif pooled and not named:
+                    where[key] = dict(pooled)
 
 
 def guess(column: str, hint: str | None) -> dict:
@@ -392,13 +848,20 @@ def guess(column: str, hint: str | None) -> dict:
     if h == "ARRAY" or h.endswith("[]"):
         return {"gen": "array"}
     if h.startswith(("DECIMAL", "NUMERIC")) and not h.endswith(",0)"):
+        size = re.search(r"\((\d+)\s*,\s*(\d+)\)", h)
+        whole = int(size.group(1)) - int(size.group(2)) if size else 9
+        if whole < 4:  # DECIMAL(2,2), DECIMAL(5,2): values that fit the digits before the point
+            top = round(10 ** max(whole, 0) - 10 ** -int(size.group(2)), int(size.group(2)))
+            return {"gen": "dist", "type": h, "p": [0, 0.5, 1], "v": [0, round(top / 4, int(size.group(2))), top]}
         return {"gen": "dist", "type": h, **AMOUNT}
     if h in ("DOUBLE", "FLOAT", "REAL"):
         return {"gen": "dist", "type": "DOUBLE", **AMOUNT}
     if h == "EPOCH":
         return {"gen": "time_offset", "epoch": True, **WEEK}
     if h in ("BIGINT", "INTEGER", "INT", "SMALLINT", "NUMBER") or h.endswith(",0)"):  # an explicit type beats a name
-        return {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000]}
+        digits = re.search(r"\((\d+)\s*,\s*0\)", h)
+        top = min(1000, 10 ** int(digits.group(1)) - 1) if digits else 1000
+        return {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1 if top > 1 else 0, top]}
     if h == "BOOLEAN" or (not h and re.match(r"^(IS|HAS|WAS)_", c)):
         return {"gen": "categorical", "type": "BOOLEAN", "values": {True: 0.5, False: 0.5}}
     if h == "DATE" or (not h.startswith("TIMESTAMP") and c.endswith(("_DATE", "_DAY"))):
@@ -414,6 +877,48 @@ def guess(column: str, hint: str | None) -> dict:
     if "EMAIL" in c:
         return {"gen": "template", "template": "user_{hex}@example.com"}
     return {"gen": "template", "template": f"{column.lower()}_{{hex}}"}
+
+
+def like_shape(pattern: str) -> str:
+    """A template whose values match the LIKE pattern: `%.pool%.near` -> `{hex}.pool{hex}.near`."""
+    return pattern.replace("\\", "").replace("%", "{hex}").replace("_", "x")
+
+
+def history_window(dates: list[tuple[str, date]], default: date = date(2025, 1, 1), days: int = 60) -> tuple[date, int | None]:
+    """Where the generated history starts and how many days it spans, so that the dates the SQL names
+    select something: a day it asks for by name is inside, an upper limit comes after the start, a lower
+    limit before the end. (None for the span when the default does.)"""
+    inside = sorted(d for how, d in dates if how == "in")
+    before = sorted(d for how, d in dates if how == "before")
+    after = sorted(d for how, d in dates if how == "after")
+    start = default
+    if inside:
+        start = min(start, inside[0].replace(day=1))
+    if before and before[0] <= start + timedelta(days=7):
+        start = (before[0] - timedelta(days=45)).replace(day=1)
+    end = start + timedelta(days=days)
+    if inside:
+        end = max(end, inside[-1] + timedelta(days=31))
+    if after and after[-1] >= end - timedelta(days=7):
+        end = after[-1] + timedelta(days=45)
+    span = min((end - start).days, 1500)  # four years at most: beyond that the volume is the cost
+    return start, (span if (start, span) != (default, days) else None)
+
+
+def field_gen(path: str, hint: str | None, literals: set[str] | None = None, patterns: set[str] | None = None) -> dict:
+    """A generator for one value inside a document: `items[].sku` is named `sku`; `tags[]` holds `tag`s."""
+    name = re.sub(r"~\w+|\[\]", "", path).split(".")[-1] or "value"
+    if patterns and not hint_is_number(hint):
+        # `like '%.pool%.near'` keeps some rows, and the values compared by name are there too
+        return {"gen": "template", "templates": [*sorted(like_shape(p) for p in patterns), *sorted(literals or ()),
+                                                  f"{name.lower()}_{{hex}}"]}
+    if literals and not hint_is_number(hint):
+        named = sorted(literals)
+        share = round(0.8 / len(named), 4)
+        return {"gen": "categorical", "values": {**{v: share for v in named}, f"other_{name.lower()}": 0.2}}
+    if re.sub(r"~\w+$", "", path).endswith("[]") and (hint or "").upper() in ("", "ARRAY", "VARIANT", "JSON"):
+        return {"gen": "template", "template": f"{name.lower()}_{{hex}}"}  # what each element holds, when nothing says more
+    return guess(name, hint)
 
 
 LASTS = {"p": [0, 0.5, 1], "seconds": [30 * 86400, 365 * 86400, 3 * 365 * 86400]}  # a month to three years
@@ -442,9 +947,16 @@ def within_bounds(gen: dict, bounds: set[float] | None) -> None:
     if not bounds or gen.get("gen") != "dist" or str(gen.get("type", "")).upper() not in ("BIGINT", "DOUBLE", ""):
         return
     lo, hi = min(bounds), max(bounds)
+    whole = str(gen.get("type", "")).upper() == "BIGINT"
     if lo == hi:  # one threshold: values on both sides of it
         lo, hi = (0, max(2 * hi, 10)) if hi >= 0 else (2 * lo, 0)
-    whole = str(gen.get("type", "")).upper() == "BIGINT"
+    elif len(bounds) > 2:
+        # several thresholds (`between 9820000 and 10000000` here, `>= 75000000` there): as many values
+        # between each pair as beyond the last, so every one of the comparisons keeps rows
+        knots = sorted(bounds)
+        knots.append(knots[-1] + max((knots[-1] - knots[0]) / len(knots), 10))
+        gen.update(p=[round(i / (len(knots) - 1), 6) for i in range(len(knots))], v=[int(k) if whole else k for k in knots])
+        return
     gen.update(p=[0, 1], v=[int(lo), int(hi)] if whole else [lo, hi])
 
 
@@ -460,8 +972,10 @@ class Analysis:
     """What reading the project gives: a first spec, notes for the user, and where each model
     column comes from (so a failing test can be traced to the source column it is about)."""
 
-    def __init__(self, spec: dict, notes: list[str], locate) -> None:  # noqa: ANN001
+    def __init__(self, spec: dict, notes: list[str], locate, place=None) -> None:  # noqa: ANN001
         self.spec, self.notes, self.locate = spec, notes, locate
+        # like `locate`, also for a column that is a value inside a source's document: (table, column, `a.b[].c`)
+        self.place = place or (lambda node_id, column: (lambda hit: (*hit, "") if hit else None)(locate(node_id, column)))
         self.bounds: dict[tuple[str, str], set[float]] = {}
 
 
@@ -480,11 +994,30 @@ def analyse(manifest: dict, database: str) -> Analysis:
         for col, meta in (s.get("columns") or {}).items():
             uses[ids[uid]].add(col, (meta.get("data_type") or "").upper() or None)
 
+    # seeds are read like sources (so what is joined to them is known), and not generated: their rows are in the project
+    seed_values: dict[tuple[str, str], list[str]] = {}
+    for node in manifest["nodes"].values():
+        if node.get("resource_type") != "seed" or not node.get("relation_name"):
+            continue
+        relation = node["relation_name"].replace('"', "").upper()
+        path = Path(node.get("root_path") or "") / (node.get("original_file_path") or "")
+        try:
+            with path.open(newline="", encoding="utf-8-sig") as handle:
+                rows = list(itertools.islice(csv.DictReader(handle), 5000))
+        except (OSError, UnicodeDecodeError, csv.Error):
+            continue
+        uses.setdefault(relation, SourceUse())
+        for column in (rows[0] if rows else {}):
+            if column:
+                seed_values[(relation, column.upper())] = list(dict.fromkeys(r[column] for r in rows if r.get(column) not in (None, "")))
+
     # how each model's outputs map back to source columns
     outputs: dict[str, dict[str, tuple[str, str]]] = {}
     by_relation: dict[str, dict[str, tuple[str, str]]] = {}
     links: list[set[tuple[str, str]]] = []
     joins: list[tuple[tuple[str, str], tuple[str, str]]] = []
+    dates: list[tuple[str, date]] = []
+    lookups: collections.Counter = collections.Counter()
 
     def scan(uid: str) -> None:
         node = manifest["nodes"].get(uid)
@@ -494,7 +1027,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
         for parent in node["depends_on"]["nodes"]:
             scan(parent)
         if node.get("compiled_code"):
-            outputs[uid] = scan_model(node["compiled_code"], uses, by_relation, links, joins)
+            outputs[uid] = scan_model(node["compiled_code"], uses, by_relation, links, joins, dates, lookups)
         if node.get("relation_name"):
             by_relation[node["relation_name"].replace('"', "").upper()] = outputs[uid]
 
@@ -504,7 +1037,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
     # what is known about one column of a union holds for the columns aligned with it
     for _ in range(3):
         for group in links:
-            members = [(uses[s], c) for s, c in group if s in uses]
+            members = [(uses[m[0]], m[1]) for m in group if len(m) == 2 and m[0] in uses]
             if any(c in u.numbers for u, c in members):
                 for u, c in members:
                     u.numbers.add(c)
@@ -515,6 +1048,11 @@ def analyse(manifest: dict, database: str) -> Analysis:
             for u, c in members:
                 if hint and not u.columns.get(c):
                     u.columns[c] = hint
+            # what a model downstream of the union compares the column with applies to every branch
+            for kind in ("literals", "patterns", "bounds"):
+                shared = set().union(*(getattr(u, kind).get(c, set()) for u, c in members))
+                for u, c in members if shared else []:
+                    getattr(u, kind).setdefault(c, set()).update(shared)
 
     def locate(node_id: str, column: str) -> tuple[str, str] | None:
         if node_id in ids:
@@ -523,6 +1061,15 @@ def analyse(manifest: dict, database: str) -> Analysis:
         if column.upper() not in known and "*" in known and column.upper() not in known["*"][1].split("|"):
             return known["*"][0], column.upper()  # a pass-through model: the column is the source's
         return known.get(column.upper())
+
+    def place(node_id: str, column: str) -> tuple[str, str, str] | None:
+        hit = locate(node_id, column)
+        if hit:
+            return hit[0], hit[1], ""
+        found = (outputs.get(node_id, {}).get(_PATHS) or {}).get(column.upper())
+        if isinstance(found, tuple) and "{}" not in found[2]:
+            return found[0], found[1], path_text(found[2])
+        return None
 
     keys: dict[str, str] = {}
     fks: dict[tuple[str, str], tuple[str, str]] = {}
@@ -553,11 +1100,13 @@ def analyse(manifest: dict, database: str) -> Analysis:
     for uid, name in ids.items():
         use, src = uses[name], src_nodes[uid]
         cols = dict(use.columns)
+        declared = {c.upper(): str(meta.get("data_type") or "").upper() for c, meta in (src.get("columns") or {}).items()}
         for col, kind in catalog.view(name, tuple(cols)).items():  # a Snowflake system view: its real columns
             if kind or not cols.get(col):
                 cols[col] = kind
             if kind:
                 use.texts.discard(col)
+                declared[col] = str(kind).upper()
         if not cols:
             # only ever read with `select *`: `init` learns the columns by running the models (see fit.py)
             cols = {"_LOADED_AT": None}
@@ -592,7 +1141,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 out[col] = {"gen": "categorical", "values": {**{v: share for v in named}, f"other_{col.lower()}": 0.2}}
             elif col in use.patterns and not hint_is_number(hint):
                 # `where name like 'tap-%'` should keep some rows: make values that fit each pattern
-                shapes = sorted(p.replace("\\", "").replace("%", "{hex}").replace("_", "x") for p in use.patterns[col])
+                shapes = sorted(like_shape(p) for p in use.patterns[col])
                 out[col] = {"gen": "template", "templates": [*shapes, f"{col.lower()}_{{hex}}"]}
             elif col in use.ips and not hint_is_number(hint):
                 out[col] = {"gen": "ip", "cidr": "/" in (use.splits.get(col) or {}).get("seps", {})}  # parse_ip(network, 'INET')
@@ -604,7 +1153,14 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 # other separators the SQL splits on come after: 123/456.json
                 out[col] = {"gen": "template", "template": sep.join(shape) + "".join(f"{other}x" for other, _ in others)}
             elif col in use.paths:
-                out[col] = {"gen": "object", "fields": {path: guess(path.split(".")[-1], h) for path, h in sorted(use.paths[col].items())}}
+                out[col] = {"gen": "object", "fields": {
+                    path: field_gen(path, h, use.path_literals.get(col, {}).get(path), use.path_patterns.get(col, {}).get(path))
+                    for path, h in sorted(use.paths[col].items())}}
+                for path in use.path_optional.get(col, ()):
+                    # the key itself, or (when deeper keys are read) every path under it
+                    for field, d in out[col]["fields"].items():
+                        if field == path or field.startswith(path + "."):
+                            d["optional"] = 0.5
                 if "id" in out[col]["fields"]:
                     out[col]["keyed_by"] = "id"  # {"id": 7, "login": "x"}: the login belongs to the id
                 if col in use.json_text:
@@ -616,12 +1172,17 @@ def analyse(manifest: dict, database: str) -> Analysis:
             elif col == loaded:
                 out[col] = {"gen": "loaded_at"}
             elif col == event:
-                out[col] = {"gen": "event_time"}
+                # a column declared DATE (by the source's yml, or by Snowflake for its own views) holds days:
+                # `on spine.date = t.date` matches only then. A cast to DATE in a model says nothing: it truncates.
+                out[col] = {"gen": "event_time", **({"type": "DATE"} if declared.get(col) == "DATE" else {})}
             elif col == updated:
-                out[col] = {"gen": "updated_at"}
+                out[col] = {"gen": "updated_at", **({"type": "DATE"} if declared.get(col) == "DATE" else {})}
             else:
                 out[col] = guess(col, hint)
             within_bounds(out[col], use.bounds.get(col))
+        for col, habit in catalog.habits(name, out).items():
+            if out[col].get("gen") in ("event_time", "time_offset", "updated_at") and not out[col].get("format"):
+                out[col] = {**habit, **({"type": out[col]["type"]} if out[col].get("type") else {})}
         # author_id + author_username: the name belongs to the id, so it must not vary between rows
         for col, d in out.items():
             if col.endswith("_ID") and d["gen"] in ("dist", "fk", "template"):
@@ -634,6 +1195,27 @@ def analyse(manifest: dict, database: str) -> Analysis:
             "lateness": {"p": [0, 0.5, 0.99, 1], "seconds": [1, 30, 3600, 86400]},  # placeholder
             "columns": out,
         }
+    # `dbt_utils.pivot('role', dbt_utils.get_column_values(ref('users'), 'role'))` writes one column per value it
+    # finds: the column holds a handful of values, not one per row
+    by_name = {n.get("name"): uid for uid, n in manifest["nodes"].items() if n.get("resource_type") == "model"}
+    pivoted: list[str] = []
+    for node in manifest["nodes"].values():
+        raw = node.get("raw_code") or ""
+        if "get_column_values" not in raw:
+            continue
+        for model, column in re.findall(r"get_column_values\(\s*(?:table\s*=\s*)?ref\(\s*['\"](\w+)['\"]\s*\)\s*,\s*(?:column\s*=\s*)?['\"](\w+)['\"]", raw):
+            where = place(by_name.get(model, ""), column)
+            holder = tables.get(where[0], {}).get("columns", {}) if where else {}
+            if where and where[2]:
+                holder = (holder.get(where[1]) or {}).get("fields") or {}
+            key = (where[2] or where[1]) if where else None
+            if key in holder and holder[key].get("gen") in ("template", "dist"):
+                label = re.sub(r"~\w+|\[\]", "", key).split(".")[-1].lower()
+                holder[key] = {"gen": "categorical", "values": {f"{label}_{i}": round(1 / 6, 4) for i in range(1, 7)}}
+                pivoted.append(f"{where[0]}.{where[1]}" + (f" ({where[2]})" if where[2] else ""))
+    if pivoted:
+        notes.append(f"{len(pivoted)} column(s) are pivoted into one column per value and generated with six values: "
+                     f"{', '.join(pivoted[:6])}{' ...' if len(pivoted) > 6 else ''}.")
     if assumed:
         notes.append(f"{len(assumed)} source(s) have no `unique` test; assumed keys: {', '.join(assumed[:12])}{' ...' if len(assumed) > 12 else ''}.")
     if keyless:
@@ -651,8 +1233,43 @@ def analyse(manifest: dict, database: str) -> Analysis:
     if guessed:
         notes.append(f"{len(guessed)} column(s) are named like another table's key and assumed to reference it (no relationships "
                      f"test says so): {'; '.join(guessed[:6])}{' ...' if len(guessed) > 6 else ''}.")
+    # text that mentions another column's value between two marks (`... (<@U123>) ...`, parsed back out with SPLIT_PART)
+    for name, use in uses.items():
+        for col, found in use.embeds.items():
+            before, after, (other_table, other_col) = found[0]
+            target = tables.get(other_table, {}).get("columns", {}).get(other_col)
+            mine = tables.get(name, {}).get("columns", {}).get(col)
+            if target is None or mine is None or mine.get("gen") not in _FREE:
+                continue
+            if target["gen"] in _KEYS:
+                part = {"gen": "fk", "ref": other_table, "first": 50}
+            elif target["gen"] in ("categorical", "pool"):
+                part = copy.deepcopy(target)
+            elif target["gen"] in _FREE:
+                target = tables[other_table]["columns"][other_col] = {"gen": "pool", "pool": other_col.lower(), "size": 200}
+                part = dict(target)
+            else:
+                continue
+            tables[name]["columns"][col] = {"gen": "template", "template": f"{col.lower()} {{hex}} {before}{{0}}{after}", "parts": [part]}
+            notes.append(f"{name}.{col}: models read a value of {other_table}.{other_col} out of it, between `{before}` and `{after}`; "
+                         "generated with one there.")
     joined: list[str] = []
-    _share_join_values(tables, joins, joined)
+    # a column joined to a seed's column holds the seed's values: the project wrote them down
+    for a, b in joins:
+        for seed, other in ((a, b), (b, a)):
+            values = seed_values.get((seed[0], seed[1])) if len(seed) < 3 or not seed[2] else None
+            column = tables.get(other[0], {}).get("columns", {}).get(other[1])
+            if not values or column is None:
+                continue
+            holder, key = tables[other[0]]["columns"], other[1]
+            if len(other) > 2 and other[2]:
+                holder, key = (column.get("fields") or {}), other[2]
+            if key in holder and holder[key].get("gen") in _FREE:
+                known = values[:100]
+                holder[key] = {"gen": "categorical", "values": {v: round(1 / len(known), 6) for v in known}}
+                joined.append(f"{'.'.join(x for x in other if x)}: joined to the seed {seed[0]} ({seed[1]}), generated from its values.")
+    _share_join_values(tables, joins, joined, lookups)
+    _share_union_values(tables, links)
     if joined:
         notes.append(f"{len(joined)} group(s) of columns are joined in models and generated to match, for example: {' '.join(joined[:3])}")
     # a foreign key needs its parent to have a key
@@ -678,12 +1295,34 @@ def analyse(manifest: dict, database: str) -> Analysis:
             table["volume"]["rows_per_day"] = rows
         notes.append(f"{len(tables)} source tables: placeholder volumes are {rows} rows a day ({rows // 1000} at the default scale) "
                      "to keep builds quick. `fauxflake profile` replaces them with what production has.")
+    # a shared pool as large as the table: two tables of a few thousand rows joined on a column drawn from
+    # 200 values pair every row with dozens of others, and three such joins in a row fill the disk. Drawn from
+    # about as many values as there are rows, each row finds a partner or two, as with real ids. (The smaller
+    # table's values are the first of the larger one's, so they still meet.)
+    for table in tables.values():
+        rows = int(float(table["volume"]["rows_per_day"]) * 0.001 * 60)  # at the default scale and history
+
+        def widen(gens: dict) -> None:
+            for d in gens.values():
+                if d.get("gen") == "pool" and d.get("size") == 200:
+                    d["size"] = max(200, rows)  # noqa: B023
+                for part in d.get("parts") or []:
+                    widen({"": part})
+                if d.get("gen") == "object":
+                    widen(d.get("fields") or {})
+
+        widen(table["columns"])
     settings = {"database": database}
     if os.environ.get("FAUXFLAKE_TARGET"):
         settings["target"] = os.environ["FAUXFLAKE_TARGET"]
         notes.append(f"the project names its schemas differently for the target `{settings['target']}` and refers to those names "
                      f"directly, so it is built as that target (`dbt: {{target: {settings['target']}}}`). Nothing leaves this machine.")
-    analysis = Analysis({"seed": 42, "start": "2025-01-01", "dbt": settings, "tables": tables}, notes, locate)
+    start, history = history_window(dates)
+    if (start, history) != (date(2025, 1, 1), None):
+        notes.append(f"the SQL compares with dates between {min(d for _, d in dates)} and {max(d for _, d in dates)}: "
+                     f"the generated history starts {start}" + (f" and spans {history} days." if history else "."))
+    analysis = Analysis({"seed": 42, "start": start.isoformat(), **({"history": history} if history else {}),
+                         "dbt": settings, "tables": tables}, notes, locate, place)
     analysis.bounds = {(name, col): numbers for name, use in uses.items() for col, numbers in use.bounds.items()}
     return analysis
 

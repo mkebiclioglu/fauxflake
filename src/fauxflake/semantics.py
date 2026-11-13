@@ -82,7 +82,9 @@ MACROS = [
           (x json) as json_array_length(x),
           (x) as len(x)""",
     f"create or replace macro {_NS}_sf_current_account_name() as 'FAUXFLAKE'",
-    f"create or replace macro {_NS}_sf_try_base64(x) as try(from_base64(x)::varchar)",
+    # the text behind the base64, as UTF-8; a VARIANT string is read without its JSON quotes
+    f"create or replace macro {_NS}_sf_try_base64(x) as try(decode(from_base64({_NS}_sf_text(x))))",
+    f"create or replace macro {_NS}_sf_base64(x) as decode(from_base64({_NS}_sf_text(x)))",
     f"create or replace macro {_NS}_sf_array_distinct(l) as list_filter(l, lambda x, i: list_position(l, x) = i)",
     f"create or replace macro {_NS}_sf_jarowinkler(a, b) as round(jaro_winkler_similarity(upper(a), upper(b)) * 100)::bigint",
     f"""create or replace macro {_NS}_sf_object_insert
@@ -294,7 +296,7 @@ _RENAMED = {  # Snowflake function -> macro, same arguments
     "width_bucket": "_sf_width_bucket",
     "jarowinkler_similarity": "_sf_jarowinkler", "object_insert": "_sf_object_insert",
     "object_delete": "_sf_object_delete", "object_pick": "_sf_object_pick",
-    "current_account_name": "_sf_current_account_name", "try_base64_decode_string": "_sf_try_base64",
+    "current_account_name": "_sf_current_account_name", "try_base64_decode_string": "_sf_try_base64", "base64_decode_string": "_sf_base64",
     "soundex": "_sf_soundex", "parse_url": "_sf_parse_url", "parse_ip": "_sf_parse_ip",
     "get_ignore_case": "_sf_get_ignore_case", "object_keys": "_sf_object_keys", "hash_agg": "_sf_hash_agg",
     "try_hex_decode_string": "_sf_try_hex", "encrypt_raw": "_sf_encrypt_raw",
@@ -736,6 +738,8 @@ def _fix(node: exp.Expression) -> exp.Expression:
             node.set("this", exp.cast(node.this, "varchar"))  # v:s = 'x' compares the value, not JSON text
     if isinstance(node, (exp.Like, exp.ILike)) and isinstance(node.this, _VARIANT_ACCESS):
         node.set("this", exp.cast(node.this, "varchar"))
+    elif isinstance(node, (exp.Like, exp.ILike)) and isinstance(node.this, exp.Column):
+        node.set("this", _fn("_sf_text", node.this))  # a VARIANT column matches by its text, without JSON quotes
     if isinstance(node, exp.TryCast) and node.to.is_type("timestamp", "timestampntz") and node.args.get("requires_string"):
         return _fn("_sf_try_timestamp", node.this)
     if isinstance(node, exp.UnixToTime) and isinstance(node.this, exp.Literal) and node.this.is_string \
@@ -1874,6 +1878,125 @@ def text_beside_variant(transformed: exp.Expression, conn) -> exp.Expression | N
                 arg.replace(exp.func("to_json", arg.copy()))
                 changed = True
     return tree if changed else None
+
+
+# --- ARRAY and OBJECT columns. DuckDB holds every semi-structured value as JSON; Snowflake types an expression
+# as ARRAY, OBJECT or VARIANT when the statement is written, and DESCRIBE / INFORMATION_SCHEMA say which.
+_ARRAY_MAKERS = {
+    "ARRAY_CONSTRUCT", "ARRAY_CONSTRUCT_COMPACT", "ARRAY_AGG", "ARRAY_APPEND", "ARRAY_CAT", "ARRAY_COMPACT", "ARRAY_DISTINCT",
+    "ARRAY_EXCEPT", "ARRAY_INSERT", "ARRAY_INTERSECTION", "ARRAY_PREPEND", "ARRAY_REMOVE", "ARRAY_REMOVE_AT", "ARRAY_SLICE",
+    "ARRAY_SORT", "ARRAY_UNIQUE_AGG", "ARRAY_UNION_AGG", "ARRAY_FLATTEN", "ARRAY_GENERATE_RANGE", "ARRAY_REVERSE", "ARRAYS_ZIP",
+    "TO_ARRAY", "STRTOK_TO_ARRAY", "SPLIT", "OBJECT_KEYS", "REGEXP_SUBSTR_ALL", "ARRAY", "ARRAY_CONCAT", "ARRAY_UNIQUE_AGG",
+    "STRTOK_SPLIT_TO_TABLE", "ARRAYAGG", "STR_TO_ARRAY", "STRING_TO_ARRAY", "ARRAY_TO_ARRAY",
+}
+_OBJECT_MAKERS = {"OBJECT_CONSTRUCT", "OBJECT_CONSTRUCT_KEEP_NULL", "OBJECT_AGG", "OBJECT_INSERT", "OBJECT_DELETE", "OBJECT_PICK",
+                  "TO_OBJECT", "STRUCT", "OBJECT", "PARSE_URL", "PARSE_IP", "MAP"}
+_KEEPS_KIND = (exp.Coalesce, exp.If, exp.Case, exp.Max, exp.Min, exp.AnyValue, exp.FirstValue, exp.LastValue, exp.Lag, exp.Lead,
+               exp.Nullif, exp.Window, exp.IgnoreNulls, exp.RespectNulls, exp.Paren, exp.Alias, exp.WithinGroup, exp.Subquery)
+
+
+def _made_kind(node: exp.Expression) -> str | None:
+    """ARRAY or OBJECT when the expression itself makes one (a constructor or a cast)."""
+    if isinstance(node, (exp.Cast, exp.TryCast)):
+        return "ARRAY" if node.to.is_type("array", "list") else "OBJECT" if node.to.is_type("object", "map", "struct") else ""
+    if isinstance(node, exp.Anonymous):
+        name = node.name.upper()
+    elif isinstance(node, exp.Func):
+        name = node.sql_name().upper()
+    else:
+        return None
+    return "ARRAY" if name in _ARRAY_MAKERS else "OBJECT" if name in _OBJECT_MAKERS else None
+
+
+def semi_kinds(create: exp.Create, known) -> dict[str, str]:  # noqa: ANN001
+    """{COLUMN: 'ARRAY' | 'OBJECT'} for the relation a CREATE makes. `known(table)` gives the same for a
+    relation that exists. Columns not listed are VARIANT (or not semi-structured at all)."""
+    from sqlglot.optimizer.scope import Scope, build_scope
+
+    target = create.this
+    if isinstance(target, exp.Schema) and create.expression is None:
+        out = {}
+        for column in target.expressions:
+            kind = column.args.get("kind") if isinstance(column, exp.ColumnDef) else None
+            if kind is not None and kind.is_type("array", "list"):
+                out[column.name.upper()] = "ARRAY"
+            elif kind is not None and kind.is_type("object", "map", "struct"):
+                out[column.name.upper()] = "OBJECT"
+        return out
+    query = create.expression
+    while isinstance(query, (exp.Subquery, exp.Paren)):
+        query = query.this
+    if not isinstance(query, exp.Query):
+        return {}
+    root = build_scope(query)
+    if root is None:
+        return {}
+
+    def of_source(source, name: str, depth: int) -> str | None:  # noqa: ANN001
+        if isinstance(source, exp.Table):
+            return known(source).get(name)
+        return in_scope(source, name, depth + 1) if isinstance(source, Scope) else None
+
+    def of_expression(node: exp.Expression, scope, depth: int) -> str | None:  # noqa: ANN001
+        made = _made_kind(node)
+        if made is not None:
+            return made or None
+        if isinstance(node, exp.Column) and not isinstance(node.this, exp.Star):
+            for alias, (_, source) in scope.selected_sources.items():
+                if node.table and alias.upper() != node.table.upper():
+                    continue
+                kind = of_source(source, node.name.upper(), depth)
+                if kind:
+                    return kind
+            return None
+        if isinstance(node, exp.Subquery) and isinstance(node.this, exp.Select) and len(node.this.expressions) == 1:
+            inner = next((s for s in scope.subquery_scopes if s.expression is node.this), None)
+            return of_expression(node.this.expressions[0].unalias(), inner, depth + 1) if inner is not None else None
+        if isinstance(node, _KEEPS_KIND) and depth < 30:
+            if isinstance(node, exp.Case):
+                values = [i.args.get("true") for i in node.args.get("ifs") or []] + [node.args.get("default")]
+            elif isinstance(node, exp.If):
+                values = [node.args.get("true"), node.args.get("false")]
+            elif isinstance(node, exp.Coalesce):
+                values = [node.this, *node.expressions]
+            else:
+                values = [node.this]
+            kinds = {of_expression(v, scope, depth + 1) for v in values if v is not None and not isinstance(v, exp.Null)}
+            return kinds.pop() if len(kinds) == 1 else None
+        return None
+
+    def in_scope(scope, name: str, depth: int = 0) -> str | None:  # noqa: ANN001
+        if scope is None or depth > 30:
+            return None
+        select = scope.expression
+        if isinstance(select, exp.SetOperation):
+            return in_scope(scope.union_scopes[0], name, depth + 1) if scope.union_scopes else None
+        if not isinstance(select, exp.Select):
+            return None
+        stars = []
+        for projection in select.expressions:
+            if isinstance(projection, exp.Star) or (isinstance(projection, exp.Column) and isinstance(projection.this, exp.Star)):
+                stars.append(projection)
+            elif projection.alias_or_name.upper() == name:
+                return of_expression(projection.unalias(), scope, depth)
+        for star in stars:
+            only = star.table.upper() if isinstance(star, exp.Column) and star.table else None
+            for alias, (_, source) in scope.selected_sources.items():
+                if only and alias.upper() != only:
+                    continue
+                kind = of_source(source, name, depth)
+                if kind:
+                    return kind
+        return None
+
+    class Lazily(dict):
+        """Asked for one column at a time, once the relation exists and its JSON columns are known."""
+
+        def __missing__(self, name: str):  # noqa: ANN204
+            self[name] = found = in_scope(root, name)
+            return found
+
+    return Lazily()
 
 
 def _repair_by_types(tree: exp.Expression, conn, details: dict) -> bool:  # noqa: ANN001

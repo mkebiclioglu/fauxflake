@@ -15,6 +15,7 @@ property gives everything else:
 from __future__ import annotations
 
 import json
+import re
 import zlib
 from pathlib import Path
 from dataclasses import dataclass
@@ -101,7 +102,9 @@ class TableSQL:
 
     def u(self, salt: str, *extra: str) -> str:
         args = "".join(f", {e}" for e in extra)
-        return f"((hash({self.base}, {lit(self.salt(salt))}{args}) >> 11)::double / 9007199254740992.0)"
+        # hashed twice: DuckDB combines the arguments of one hash() so lightly that two columns' draws for
+        # the same row moved together (a third of the combinations of two categories never occurred)
+        return f"((hash(hash({self.base}, {lit(self.salt(salt))}{args})) >> 11)::double / 9007199254740992.0)"
 
     def key_expr(self, table: Table, index: str) -> str:
         _col, d = table.key
@@ -116,41 +119,107 @@ class TableSQL:
     def column(self, col: str, d: dict) -> str:
         return f'{self.expr(col, d)} as "{col}"'
 
+    @staticmethod
+    def path_segments(path: str) -> tuple[str, ...]:
+        """`chunk.transactions[].hash` -> (chunk, transactions, [], hash): `[]` stands for "each element"."""
+        out: list[str] = []
+        for part in path.split("."):
+            # `args~b64~json[]`: the key, then how its value is written (base64 of JSON text), then "each element"
+            for piece in re.findall(r"~\w+|\[\]|[^~\[]+|\[", part):
+                out.append(piece)
+        return tuple(out)
+
     def _object(self, col: str, fields: dict[str, dict], keyed_by: str | None = None) -> str:
         """`keyed_by` names the field that identifies the entity the object describes (a user's
-        id): the other fields are then a function of it, so the same id always has the same name."""
+        id): the other fields are then a function of it, so the same id always has the same name.
+        A path through `[]` describes the elements of an array: `items[].sku` is a list of objects."""
         key_expr = f"({self.expr(f'{col}.{keyed_by}', fields[keyed_by])})" if keyed_by in fields else None
         tree: dict = {}
-        nested = {p.rsplit(".", 1)[0] for p in fields if "." in p}
+        segments = {path: self.path_segments(path) for path in fields}
+        nested = {s[:i] for s in segments.values() for i in range(1, len(s))}
         for path, d in fields.items():
-            if path in nested or any(p.startswith(path + ".") for p in nested):
+            keys = segments[path]
+            if keys and keys in nested and keys + ("~json",) in nested | set(segments.values()) and (
+                    d.get("templates") or d.get("gen") == "categorical"):
+                # text that some models match by pattern and others parse as JSON: some rows hold the one, some the other
+                node = tree
+                for key in keys:
+                    node = node.setdefault(key, {})
+                    if not isinstance(node, dict):
+                        break
+                else:
+                    node["~text"] = ("leaf", path, d)
+                continue
+            if not keys or keys in nested:
                 continue  # `header` next to `header.height`: the children say what the object holds
             node = tree
-            *parents, leaf = path.split(".")
-            for key in parents:
+            for key in keys[:-1]:
                 node = node.setdefault(key, {})
-                if not isinstance(node, dict) or "gen" in node:
+                if not isinstance(node, dict):
                     break
             else:
-                node[leaf] = ("leaf", path, d)
+                node[keys[-1]] = ("leaf", path, d)
 
-        def build(node: dict) -> str:
-            parts = []
+        def leaf(value: tuple) -> str:
+            if key_expr and value[1] != keyed_by and self.base == "g":
+                self.base = key_expr
+                try:
+                    return self._expr(f"{col}.{value[1]}", value[2])
+                finally:
+                    self.base = "g"
+            return self.expr(f"{col}.{value[1]}", value[2])
+
+        def build(node, where: str = "", depth: int = 0) -> str:  # noqa: ANN001
+            if isinstance(node, tuple):
+                return leaf(node)
+            if isinstance(node.get("~json"), dict) and any(not key.startswith("~") for key in node):
+                # read by key and also handed to PARSE_JSON: an object (parsing one gives it back), with the keys of both
+                node = {**node["~json"], **{key: value for key, value in node.items() if key != "~json"}}
+            for mark in ("~b64", "~json"):
+                if mark in node:
+                    # text holding JSON, or base64 of what is under it: what PARSE_JSON / BASE64_DECODE read back
+                    inner = build(node[mark], where + mark, depth)
+                    made = f"to_json({inner})::varchar" if mark == "~json" else f"to_base64(encode(({inner})::varchar))"
+                    if "~text" in node:
+                        return f"(case when {self.u(f'{col}.{where}:text')} < 0.5 then ({leaf(node['~text'])})::varchar else {made} end)"
+                    return made
+            if "[]" in node and len(node) > 1 and isinstance(node["[]"], dict):
+                # flattened and read by key (`{"FunctionCall": {...}}`, `{"Transfer": {...}}`): an object with one
+                # of the keys the SQL names, holding what the elements hold. One key each, as a value that is
+                # one kind of thing or another is written; FLATTEN then gives one row for it, not one per kind.
+                shape = node["[]"]
+                kinds = {key: ({**shape, **value} if isinstance(value, dict) else shape) for key, value in node.items() if key != "[]"}
+                pick = f"floor({self.u(f'{col}.{where}:kind')} * {len(kinds)})::bigint"
+                arms = " ".join(f"when {i} then json_object({lit(key)}, {build(value, f'{where}.{key}', depth)})"
+                                for i, (key, value) in enumerate(kinds.items()))
+                return f"(case {pick} {arms} end)"
+            if "[]" in node and len(node) > 1:
+                node = {key: value for key, value in node.items() if key != "[]"}
+            if "[]" in node:
+                # one to three elements, each with its own values: what is flattened always gives rows
+                count = f"floor({self.u(f'{col}.{where}:len')} * 3)::bigint"
+                outer, index = self.base, f"_i{depth}"
+                self.base = f"hash({outer}, {index})"
+                try:
+                    inner = build(node["[]"], where + "[]", depth + 1)
+                finally:
+                    self.base = outer
+                return f"list_transform(range(1 + {count}), lambda {index}: {inner})"
+            always, sometimes = [], []
             for key, value in node.items():
-                if not isinstance(value, tuple):
-                    inner = build(value)
-                elif key_expr and value[1] != keyed_by and self.base == "g":
-                    self.base = key_expr
-                    try:
-                        inner = self._expr(f"{col}.{value[1]}", value[2])
-                    finally:
-                        self.base = "g"
+                part = f"{lit(key)}, {build(value, f'{where}.{key}', depth)}"
+                rate = value[2].get("optional") if isinstance(value, tuple) else None
+                if rate:  # a key the SQL tests for being there: present in some documents, absent in the others
+                    sometimes.append(f"case when {self.u(f'{col}.{where}.{key}:there')} < {float(rate)!r} then '{{}}'::json "
+                                     f"else json_object({part}) end")
                 else:
-                    inner = self.expr(f"{col}.{value[1]}", value[2])
-                parts.append(f"{lit(key)}, {inner}")
-            return f"json_object({', '.join(parts)})"
+                    always.append(part)
+            made = f"json_object({', '.join(always)})"
+            return f"json_merge_patch({made}, {', '.join(sometimes)})" if sometimes else made
 
-        return f"{build(tree)}::JSON" if tree else "'{}'::JSON"
+        if not tree:
+            return "'{}'::JSON"
+        return f"to_json({build(tree)})::JSON" if "[]" in tree else f"{build(tree)}::JSON"
 
     def expr(self, col: str, d: dict) -> str:
         """SQL for one column. With `follows: OTHER`, the value is a function of OTHER's value
@@ -166,12 +235,35 @@ class TableSQL:
 
     def _expr(self, col: str, d: dict) -> str:
         gen = d.get("gen")
-        if gen in ("sequence", "hash_id"):
+        if gen == "hash_id" and d.get("domain") and "." in col:
+            # an id inside a document: one per element, in a range of its own that `link` values point into
+            expr = f"md5(concat({lit(f'{self.spec.seed}:{d['domain']}:')}, {self.base}))"
+        elif gen in ("sequence", "hash_id"):
             expr = self.key_expr(self.t, "g")
+        elif gen == "link":
+            # the id of another row's element: of one of the first rows, or (ids of the same table, which form
+            # a hierarchy) of a row a little earlier and one level up, so that chains end and never loop
+            draw = self.u(col)
+            depth, slot = int(d.get("depth", 0)), int(d.get("slot", 0))
+            if d.get("layered"):
+                # the row before, one level up, and only from the first element of a list: an id has at most one
+                # row referring to it through this field, as a child has one parent. The rest point nowhere.
+                inside = re.findall(r"_i\d+", self.base)
+                first = "".join(f" and {index} = 0" for index in dict.fromkeys(inside))
+                target = f"(case when g % 3 > 0{first} then g - 1 else -1 - g * 16{f' - {inside[-1]}' if inside else ''} end)"
+            else:
+                target = f"floor({draw} * {int(d.get('first', 50))})::bigint"
+            for level in range(depth):
+                # the element of the row it points at: each referring field has its own (`slot`), so two fields
+                # never name the same id
+                target = f"hash({target}, {slot if level == depth - 1 else 0})"
+            expr = f"md5(concat({lit(f'{self.spec.seed}:{d['domain']}:')}, {target}))"
         elif gen == "fk":
             parent = self.spec.tables[d["ref"].upper()]
             skew = float(d.get("skew", 1.0))
             idx = f"floor(pow({self.u(col)}, {skew!r}) * greatest(_pc_{col}, 1))::bigint"
+            if d.get("first"):  # inside a document: one of the parent's first rows
+                idx = f"floor({self.u(col)} * {int(d['first'])})::bigint"
             expr = self.key_expr(parent, idx)
         elif gen == "categorical":
             total = sum(d["values"].values())
@@ -193,8 +285,13 @@ class TableSQL:
         elif gen == "template":
             def fill(template: str) -> str:
                 parts = []
+                for i, part in enumerate(d.get("parts") or []):
+                    template = template.replace("{" + str(i) + "}", f"\0part{i}\0")
                 for chunk in template.replace("{n}", "\0n\0").replace("{hex}", "\0hex\0").split("\0"):
-                    if chunk == "n":
+                    if chunk.startswith("part") and chunk[4:].isdigit() and int(chunk[4:]) < len(d.get("parts") or []):
+                        # another generator's value inside the text: an id a model parses back out of it
+                        parts.append(f"({self._expr(f'{col}:{chunk}', d['parts'][int(chunk[4:])])})::varchar")
+                    elif chunk == "n":
                         parts.append(f"({self.base} + 1)::varchar" if self.base == "g" else f"({self.base})::varchar")
                     elif chunk == "hex":
                         parts.append(f"substr(md5(concat({lit(self.salt(col) + ':')}, {self.base})), 1, 12)")
@@ -244,6 +341,8 @@ class TableSQL:
             expr = lit(d.get("value"))
         else:
             raise ValueError(f"{self.t.name}.{col}: unknown gen {gen!r}")
+        if d.get("trunc") and gen in ("event_time", "time_offset", "updated_at") and not d.get("format") and not d.get("epoch"):
+            expr = f"date_trunc({lit(str(d['trunc']))}, {expr})"  # reported per hour (or day): on the boundary
         rate = repr(float(d.get("null_rate") or 0.0))
         if self.sc and self.sc.null_rate is not None and gen in ("fk", "categorical", "dist", "pool", "template", "time_offset", "object", "array"):
             rate = self.during(repr(self.sc.null_rate), rate)
@@ -388,7 +487,7 @@ class Warehouse:
                 kind = self.cur.execute("select table_type from information_schema.tables where table_catalog = ? and "
                                         "table_schema = ? and table_name = ?", [db, schema, name.split(".")[2]]).fetchone()
                 if kind is None:  # the project has not built it yet in this warehouse
-                    self.cur.execute(existing_view(name, rel.get("columns") or {}, table=rel.get("as") == "table"))
+                    emulator.stand_in(self.cur, name, existing_view(name, rel.get("columns") or {}, table=rel.get("as") == "table"))
         self.now = until
         if self.emu.db_path:  # `fauxflake query` reads the clock back from here
             (Path(self.emu.db_path) / "fauxflake.json").write_text(json.dumps({"now": until.isoformat()}))

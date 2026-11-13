@@ -99,6 +99,7 @@ class Spec:
     udfs: dict[str, str] = field(default_factory=dict)  # name -> "(args) as <DuckDB SQL>"
     # relations the project reads before it builds them (hard-coded names): DB.SCHEMA.NAME -> {columns: {COL: type}}
     existing: dict[str, dict] = field(default_factory=dict)
+    history: int | None = None  # days of history present at the start, when the project's own date filters need more than the default
 
     @classmethod
     def load(cls, path: str | Path) -> "Spec":
@@ -117,7 +118,8 @@ class Spec:
         spec = cls(seed=int(raw.get("seed", 1)), start=_date(raw["start"]), tables=tables,
                    dbt=raw.get("dbt") or {}, path=Path(path),
                    udfs={k.lower(): v for k, v in (raw.get("udfs") or {}).items()},
-                   existing={k.upper(): dict(v or {}) for k, v in (raw.get("existing") or {}).items()})
+                   existing={k.upper(): dict(v or {}) for k, v in (raw.get("existing") or {}).items()},
+                   history=int(raw["history"]) if raw.get("history") else None)
         spec.validate()
         for var, value in (spec.dbt.get("env") or {}).items():
             os.environ.setdefault(var, str(value))  # placeholders for env vars the project requires
@@ -142,17 +144,20 @@ class Spec:
     def ordered(self) -> list[Table]:
         """Parents before children."""
         seen: dict[str, Table] = {}
-
-        def visit(t: Table) -> None:
-            if t.name in seen:
-                return
+        entered: set[str] = set()  # two tables that reference each other: a key is a function of the row number, so either order works
+        pile: list[tuple[Table, bool]] = [(t, False) for t in reversed(list(self.tables.values()))]
+        while pile:
+            t, done = pile.pop()
+            if done:
+                seen.setdefault(t.name, t)
+                continue
+            if t.name in seen or t.name in entered:
+                continue
+            entered.add(t.name)
+            pile.append((t, True))
             for d in t.columns.values():
                 if d.get("gen") == "fk" and d["ref"].upper() != t.name:
-                    visit(self.tables[d["ref"].upper()])
-            seen[t.name] = t
-
-        for t in self.tables.values():
-            visit(t)
+                    pile.append((self.tables[d["ref"].upper()], False))
         return list(seen.values())
 
 

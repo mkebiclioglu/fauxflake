@@ -51,6 +51,7 @@ seconds. Generating 281 million rows takes 102 seconds on an 8 GB laptop.
 | While editing a model | `fauxflake dev` rebuilds on save and shows what changed against your last commit |
 | Before pushing | `fauxflake build` (any dbt selector works: `fauxflake build -s my_model+`) |
 | A model came out wrong | `fauxflake build --keep`, then `fauxflake query "select ..."` or `fauxflake query --model my_model` |
+| A model came out empty | `fauxflake why my_model` names the join or filter where its rows stop (`--all` for every such model) |
 | One model or one test again | `fauxflake dbt test -s my_model` runs any dbt command on the kept warehouse |
 | Reviewing a pull request | `fauxflake diff --base origin/main` shows which rows a change alters |
 | Incremental models and snapshots | `fauxflake simulate --days 14` lets time pass, then compares with a full refresh |
@@ -126,6 +127,31 @@ fauxflake dbt run -s fct_orders+             # any dbt command, on the same kept
 `query` speaks Snowflake SQL, and its clock stands where the build left it, so
 `current_date` means what it meant to the models. The functions the project created during the
 build are there too, so views that call them can be read.
+
+### why: a model with no rows
+
+A model that builds empty passes every test on it and proves only that its SQL binds. After `fauxflake build --keep`:
+
+```console
+$ fauxflake why silver_social__decoded_actions silver__nft_mints_s3
+silver_social__decoded_actions: no rows; rows stop in all_social_receipts: where
+  _partition_by_block_number >= 75000000
+  reads ANALYTICS.silver_social.receipts: 2520 row(s)
+  _partition_by_block_number holds: 9820466, 9820555, 9820569, 9820847, 9821144
+silver__nft_mints_s3: no rows; rows stop in mint_transactions: where
+  tx_status = 'Success'
+  reads ANALYTICS.silver.streamline_transactions_final: 3017 row(s)
+  tx_status holds: 'Fail'
+```
+
+It walks the model's CTEs on the kept warehouse, finds the first one that is empty although what it reads is not, and in it
+the join, `WHERE` condition, `FLATTEN`, `QUALIFY` or `HAVING` that keeps nothing, with a sample of what each column involved
+holds. `fauxflake why --all` does this for every model where rows stop (models that are empty only because one before them
+is are left out).
+
+A `unique` test that fails has the mirror question, and `fauxflake why my_model --unique order_id` answers it: the join
+after which a row meets several on the other side (with the values that side holds more than once), the UNION whose
+sides share keys, or the relation that already held the key twice.
 
 ### diff: what did my change do?
 

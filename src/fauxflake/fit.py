@@ -327,7 +327,7 @@ class Fitter:
     def create_pending(self, fq: str) -> None:
         from .generate import existing_view
 
-        self.emu.duck.execute(existing_view(fq, self.pending[fq], replace=True))
+        emulator.stand_in(self.emu.duck, fq, existing_view(fq, self.pending[fq], replace=True))
 
     def push_pending(self) -> None:
         """Stand-ins for models that did not compile have collected the columns read from them."""
@@ -412,8 +412,8 @@ class Fitter:
 
         kind = self.emu.duck.execute("select table_type from information_schema.tables where table_catalog = ? and "
                                      "table_schema = ? and table_name = ?", fq.split(".")).fetchone()
-        if kind is None or kind[0] == "VIEW":  # once the project has built the real thing, leave it alone
-            self.emu.duck.execute(existing_view(fq, self.existing[fq].get("columns") or {}, replace=True))
+        if kind is None or (kind[0] == "VIEW" and fq in emulator.STANDINS):  # once the project has built the real thing, leave it alone
+            emulator.stand_in(self.emu.duck, fq, existing_view(fq, self.existing[fq].get("columns") or {}, replace=True))
 
     def sources_of(self, uid: str) -> list[str]:
         """The generated tables a model reads, directly or through the models before it."""
@@ -653,6 +653,8 @@ class Fitter:
                 continue  # already holds numbers, dates or booleans as text: a cast reads them
             if kind in ("lifecycle", "loaded_at"):
                 continue
+            if kind in ("object", "array") and (gen.get("fields") or kind == "array") and hint not in ("VARIANT", "ARRAY", "TEXT"):
+                continue  # a document the models read fields of: the value that failed is one of its fields
             if hint == "VARIANT" and kind not in _FREE:
                 continue  # keys, times and numbers the spec already knows are not documents
             if numeric and kind == "hash_id":
@@ -868,10 +870,10 @@ class Fitter:
                 for holder in (t.get("columns") or {}).values():  # the same, for a field inside an object column
                     fields = holder.get("fields") if holder.get("gen") == "object" else None
                     for path, field in list((fields or {}).items()):
-                        if path.split(".")[-1].upper() == name and field.get("gen") in _FREE and not field.get("format"):
+                        if re.sub(r"~\w+|\[\]", "", path).split(".")[-1].upper() == name and field.get("gen") in _FREE and not field.get("format"):
                             fresh = {"gen": "time_offset", "format": fmt, "p": [0, 0.5, 1], "seconds": [0, 86400, 604800]} if fmt \
                                 else guess(name, hint)
-                            if fresh["gen"] not in _FREE:
+                            if fresh["gen"] not in _FREE or (field["gen"] == "template" and fresh["gen"] != "template"):
                                 fields[path] = fresh
                                 self.retyped.add(table)
                                 self.learned.append(f"{table}: field {path} used as {fresh.get('format') or hint}, retyped.")
@@ -2549,7 +2551,7 @@ class Fitter:
         self.project = project
         for n_round in range(1, rounds + 1):
             # at the scale and history `fauxflake build` uses, so that what is reported here is what a build gives
-            self.generate(scale=0.001, history=60)
+            self.generate(scale=0.001, history=int(self.spec.get("history") or 60))
             before = len(self.learned)
             self.retyped = set()
             results_path = project.target_path / "run_results.json"
@@ -2571,11 +2573,13 @@ class Fitter:
                 for fq, rel in self.existing.items():
                     try:
                         self.emu.ensure_database(*fq.split(".")[:2])
-                        self.emu.duck.execute(existing_view(fq, rel.get("columns") or {}, table=rel.get("as") == "table"))
+                        emulator.stand_in(self.emu.duck, fq, existing_view(fq, rel.get("columns") or {}, table=rel.get("as") == "table"))
                     except Exception:  # noqa: BLE001, S110
                         pass
             # for working on the fitter: FAUXFLAKE_FIT_SELECT="+model_a +model_b" builds only those
             selected = ["--select", *os.environ["FAUXFLAKE_FIT_SELECT"].split()] if os.environ.get("FAUXFLAKE_FIT_SELECT") else []
+            project.build_prior(self.existing)
+            results_path.unlink(missing_ok=True)
             project.invoke(["build", *selected], silent=True)
             if not results_path.exists():
                 self.log(f"  dbt build did not run: {project.last_error[:600] or 'no results were written'}")
@@ -2634,7 +2638,7 @@ class Fitter:
                     continue
                 if "Compilation Error" in message and self.empty_lookup(node["unique_id"], message):
                     continue
-                if "RecursionError" in message and self.few_values(node["unique_id"]):
+                if ("RecursionError" in message or "MB of SQL text" in message) and self.few_values(node["unique_id"]):
                     continue  # a pivot with one column per row: too long a statement to even read
                 compiled = self._compiled(project, node)
                 if compiled and node.get("relation_name") and _fq(node["relation_name"]).count(".") == 2:
@@ -2692,10 +2696,37 @@ class Fitter:
                 selected = []
             else:
                 selected = ["--select", *[f"{name}+" for name in sorted(again)], *sorted(changed)]
+        self.recheck_expected(project)
         if not self.spec["dbt"].get("expected_failures"):
             self.spec["dbt"].pop("expected_failures", None)
         self.save()
         return summary
+
+    def recheck_expected(self, project) -> None:  # noqa: ANN001
+        """A test listed in an early round is left out of the rounds after it. What the spec learned since may
+        have made it pass: run the listed tests once more on the last build and keep only those that still fail."""
+        listed = list(self.spec.get("dbt", {}).get("expected_failures") or [])
+        if not listed:
+            return
+        held = os.environ.pop("FAUXFLAKE_EXPECTED_FAILURES", None)
+        results_path = project.target_path / "run_results.json"
+        try:
+            results_path.unlink(missing_ok=True)
+            project.invoke(["test", "--select", *listed], silent=True)
+            if not results_path.exists():
+                return
+            status = {r["unique_id"].split(".")[2]: r["status"] for r in json.loads(results_path.read_text())["results"]
+                      if r["unique_id"].startswith("test.")}
+        except Exception:  # noqa: BLE001 - the list stays as it was
+            return
+        finally:
+            if held is not None:
+                os.environ["FAUXFLAKE_EXPECTED_FAILURES"] = held
+        passing = [name for name in listed if status.get(name) in ("pass", "warn")]
+        if passing:
+            self.spec["dbt"]["expected_failures"] = [name for name in listed if name not in passing]
+            self.learned.append(f"{len(passing)} test(s) listed as expected failures pass on the data as it is now; taken off the list.")
+            self.log(f"  {len(passing)} listed test(s) pass now and are off the list; {len(listed) - len(passing)} remain")
 
     def _selected(self, selected: list[str]) -> set[str] | None:
         """The nodes `--select name+ source:x.y+ ...` covers; None when everything is built."""
@@ -2729,13 +2760,47 @@ class Fitter:
             return False
         kwargs = meta["kwargs"].get("arguments") or meta["kwargs"]
         column = node.get("column_name") or kwargs.get("column_name") or meta["kwargs"].get("column_name")
-        here = analysis.locate(node["attached_node"], column) if column and re.fullmatch(r"\w+", str(column)) else None
+        here = analysis.place(node["attached_node"], column) if column and re.fullmatch(r"\w+", str(column)) else None
         if not here or here[0] not in self.tables or here[1] not in self.tables[here[0]].get("columns", {}):
             return False
-        table, col = here
+        table, col, path = here
         columns = self.tables[table]["columns"]
-        gen = columns[col]
         name = meta["name"]
+        if path:
+            # the column is a value inside a source's document: the fact is about that field
+            fields = columns[col].get("fields") if columns[col].get("gen") == "object" else None
+            field = (fields or {}).get(path)
+            if field is None:
+                return False
+            if name == "unique":
+                if field.get("gen") in ("hash_id", "link") or field.get("unique"):
+                    return False
+                kind = str(field.get("type") or "").upper()
+                if field.get("gen") == "dist":
+                    fields[path] = {**field, "unique": True}
+                elif field.get("numeric") or kind.startswith(("BIGINT", "INT", "DECIMAL", "NUMERIC", "DOUBLE")) \
+                        or (field.get("gen") == "fk" and self.tables.get(str(field.get("ref", "")).upper(), {}).get("columns") and any(
+                            d.get("gen") == "sequence" for d in self.tables[str(field["ref"]).upper()]["columns"].values())):
+                    fields[path] = {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000], "unique": True}  # read as a number
+                else:
+                    fields[path] = {"gen": "hash_id", "domain": f"{table}.{col}.{path}"}
+            elif name == "not_null":
+                if not field.get("null_rate") and not field.get("optional"):
+                    return False
+                field.pop("null_rate", None)
+                field.pop("optional", None)
+            elif name == "accepted_values":
+                values = kwargs.get("values") or []
+                if not values or field.get("gen") in ("hash_id", "link"):
+                    return False
+                fields[path] = {"gen": "categorical", "values": {v: round(1 / len(values), 4) for v in values}}
+            else:
+                return False
+            self.learned.append(f"{table}.{col}: field {path}: a `{name}` test failed; generated to pass it.")
+            self.dirty = True
+            self.retyped.add(table)
+            return True
+        gen = columns[col]
         if name == "unique":
             if gen["gen"] in ("sequence", "hash_id"):
                 return False

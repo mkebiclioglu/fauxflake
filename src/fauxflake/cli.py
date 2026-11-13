@@ -13,15 +13,16 @@ from . import __version__
 from .spec import Spec
 
 
-def _start(spec: Spec, history: int) -> datetime:
-    return datetime.combine(spec.start, datetime.min.time()) + timedelta(days=history)
+def _start(spec: Spec, history: int | None) -> datetime:
+    """The simulated present: `history` days after the spec's start (the option, else the spec's own, else 60)."""
+    return datetime.combine(spec.start, datetime.min.time()) + timedelta(days=history or spec.history or 60)
 
 
 common = [
     click.option("--spec", "spec_path", default="fauxflake.yml", show_default=True, help="Source data spec."),
     click.option("--project-dir", default=".", show_default=True, help="dbt project directory."),
     click.option("--scale", default=0.001, show_default=True, help="Fraction of production volume to generate."),
-    click.option("--history", default=60, show_default=True, help="Days of history present at the start."),
+    click.option("--history", default=None, type=int, help="Days of history present at the start. [default: the spec's `history`, else 60]"),
     click.option("--db-path", default=None, help="Keep data in DuckDB files here instead of memory (for large scales)."),
     click.option("--keep", is_flag=True, help="Keep the warehouse in the project's .fauxflake/warehouse, for `fauxflake query`."),
 ]
@@ -107,6 +108,9 @@ def build(spec_path, project_dir, scale, history, db_path, keep, dbt_args):
         if expected:
             click.echo(f"leaving out {len(expected)} test(s) listed under dbt.expected_failures in {spec_path}")
         project = DbtProject(project_dir, emulator_output(emu.port, spec.dbt.get("database", "ANALYTICS")))
+        prior = project.build_prior(spec.existing)
+        if prior:
+            click.echo(f"built {prior} relation(s) the project reads by name before building them, as a warehouse that has run before holds them")
         ok = project.invoke(["build", *dbt_args])
     if not ok:
         click.echo("\nto look at the data behind a failure: " + ("fauxflake query \"select ...\"" if keep else
@@ -344,6 +348,95 @@ def query(spec_path, project_dir, db_path, schema, limit, sql_file, model, sql):
     for row in rows:
         click.echo("  ".join(v[:60].ljust(w) for v, w in zip(row, widths)))
     click.echo(f"({len(rows)} row{'s' if len(rows) != 1 else ''}{', more not shown' if more else ''})")
+
+
+@main.command()
+@click.option("--spec", "spec_path", default="fauxflake.yml", show_default=True)
+@click.option("--project-dir", default=".", show_default=True)
+@click.option("--db-path", default=None, help="Where the run kept its data. Default: the project's .fauxflake/warehouse (see --keep).")
+@click.option("--all", "every", is_flag=True, help="Every model that came out empty although what it reads has rows.")
+@click.option("--unique", "unique", default=None, help="A column that should be unique in the model: say where it comes to repeat.")
+@click.argument("models", nargs=-1)
+def why(spec_path, project_dir, db_path, every, unique, models):
+    """Say where a model's rows stop: `fauxflake why my_model` after `fauxflake build --keep`.
+
+    A model that builds with no rows passes its tests and proves little. This names the CTE and, in it,
+    the join, WHERE condition, FLATTEN or QUALIFY that keeps nothing, with what the columns involved hold.
+    With --unique COLUMN it says instead where that column's values come to repeat: the join that pairs a
+    row with several, or the relation that already holds a value twice."""
+    import os
+    from pathlib import Path
+
+    from . import emulator
+    from . import why as explain
+    from .emulator import define_udfs
+    from .emulator import serve as serve_emulator
+
+    db_path = db_path or str(Path(project_dir) / ".fauxflake" / "warehouse")
+    if not list(Path(db_path).glob("*.db")):
+        raise click.ClickException(f"no warehouse in {db_path}: run `fauxflake build --keep` first")
+    manifest_path = Path(project_dir) / "target" / "emulator" / "manifest.json"
+    if not manifest_path.exists():
+        raise click.ClickException("no build to look at: run `fauxflake build --keep` first")
+    nodes = json.loads(manifest_path.read_text())["nodes"]
+    built = {n["name"]: n for n in nodes.values() if n.get("resource_type") in ("model", "snapshot") and n.get("relation_name")}
+    unknown = [m for m in models if m not in built]
+    if unknown:
+        raise click.ClickException(f"no model named {', '.join(unknown)} in the last build")
+    if not models and not every:
+        raise click.ClickException("which model? Name one or more, or pass --all")
+    spec = Spec.load(spec_path) if os.path.exists(spec_path) else None
+    empty = 0
+    with serve_emulator(db_path=db_path, keep=True) as emu:
+        if spec:
+            define_udfs(emu, spec.udfs)
+        for file in Path(db_path).glob("*.db"):
+            emu.ensure_database(file.stem, "CI")
+        state = Path(db_path) / "fauxflake.json"
+        if state.exists():
+            emulator.FROZEN_NOW = datetime.fromisoformat(json.loads(state.read_text())["now"])
+
+        def rows(node) -> int | None:  # noqa: ANN001
+            try:
+                return emu.duck.execute(f"select count(*) from {node['relation_name']}").fetchone()[0]
+            except Exception:  # noqa: BLE001 - not built
+                return None
+
+        counts = {name: rows(node) for name, node in built.items()} if every else {m: rows(built[m]) for m in models}
+        by_id = {n["unique_id"]: n["name"] for n in built.values()}
+        for name in (models or sorted(n for n, c in counts.items() if c == 0)):
+            node = built[name]
+            if counts.get(name) is None:
+                click.echo(f"{name}: not in the warehouse (it failed, or was not built)")
+                continue
+            if unique:
+                compiled = manifest_path.parent / "compiled" / node["package_name"] / node["original_file_path"]
+                sql = (node.get("compiled_code") or (compiled.read_text() if compiled.exists() else "")).strip().rstrip(";")
+                conn = emu._fs.connect(database=node["database"], schema=node["schema"])
+                try:
+                    click.echo(f"{name}: " + explain.explain_duplicates(conn.cursor(), sql, unique).text())
+                finally:
+                    conn.close()
+                continue
+            if counts[name]:
+                click.echo(f"{name}: {counts[name]:,} row(s)")
+                continue
+            parents = [by_id[p] for p in node["depends_on"]["nodes"] if p in by_id]
+            if every and any(counts.get(p) == 0 for p in parents):
+                continue  # empty because a model before it is: that one is reported
+            compiled = manifest_path.parent / "compiled" / node["package_name"] / node["original_file_path"]
+            sql = (node.get("compiled_code") or (compiled.read_text() if compiled.exists() else "")).strip().rstrip(";")
+            if not sql:
+                click.echo(f"{name}: no compiled SQL")
+                continue
+            empty += 1
+            conn = emu._fs.connect(database=node["database"], schema=node["schema"])
+            try:
+                click.echo(f"{name}: no rows; " + explain.explain(conn.cursor(), sql).text())
+            finally:
+                conn.close()
+    if every:
+        click.echo(f"{empty} model(s) are where rows stop; {sum(1 for c in counts.values() if c == 0)} of {len(counts)} are empty")
 
 
 @main.command()

@@ -103,6 +103,19 @@ def view(name: str, columns: tuple[str, ...] = ()) -> dict[str, str | None]:
     return {col: (None if kind == "VARIANT" else kind) for col, kind in borrowed.items()}
 
 
+def habits(name: str, columns) -> dict[str, dict]:  # noqa: ANN001
+    """How Snowflake fills some columns of its own usage views, as generator settings: the metering
+    views report one row per hour (START_TIME on the hour, END_TIME an hour later), which is what a
+    project joins its own hourly spine to."""
+    if name.partition(".")[0] != "SNOWFLAKE":
+        return {}
+    columns = set(columns)
+    if {"START_TIME", "END_TIME"} <= columns and any(c.startswith("CREDITS_USED") for c in columns):
+        return {"START_TIME": {"gen": "event_time", "trunc": "hour"},
+                "END_TIME": {"gen": "time_offset", "p": [0, 1], "seconds": [3600, 3600], "trunc": "hour"}}
+    return {}
+
+
 def table_function(name: str) -> dict[str, str] | None:
     """Columns of a Snowflake system table function such as INFORMATION_SCHEMA.TASK_HISTORY()."""
     name = _ALIASES.get(name.upper(), name.upper())

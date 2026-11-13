@@ -111,6 +111,28 @@ class DbtProject:
             if all(re.fullmatch(r"[\w$]+", n) for n in names):  # skips names dbt has not rendered yet
                 emulator.CURRENT.ensure_database(*names)
 
+    def build_prior(self, existing, schema: str = "CI") -> int:  # noqa: ANN001
+        """Relations the project reads by a written-out name (not through ref()) and builds itself hold,
+        in production, what the last run left. dbt sees no dependency there, so on an empty warehouse
+        the reader can run first and find nothing. They are built once before the real build, with all
+        they need: the build then starts from the state a warehouse that has run before is in.
+        Returns how many relations that was."""
+        existing = {str(name).replace('"', "").upper() for name in existing or ()}
+        if not existing or not self._local:
+            return 0
+        if not self._databases_ready:
+            self._create_databases()
+        path = self.target_path / "manifest.json"
+        if not path.exists():
+            return 0
+        nodes = json.loads(path.read_text())["nodes"]
+        owners = sorted(n["name"] for n in nodes.values() if n.get("resource_type") in ("model", "snapshot")
+                        and str(n.get("relation_name") or "").replace('"', "").upper() in existing)
+        if owners:
+            self.invoke(["build", "--select", *[f"+{name}" for name in owners], "--exclude-resource-type", "test", "unit_test"],
+                        schema=schema, silent=True)
+        return len(owners)
+
     def invoke(self, args: list[str], schema: str = "CI", quiet: bool = False, silent: bool = False) -> bool:
         from dbt.cli.main import dbtRunner
 

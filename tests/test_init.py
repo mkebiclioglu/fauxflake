@@ -1,3 +1,4 @@
+from datetime import date, timedelta
 """The spec can be inferred from the dbt project alone."""
 
 from fauxflake.dbt import DbtProject, emulator_output
@@ -52,14 +53,16 @@ def test_semi_structured_and_text_date_columns_are_inferred():
                to_date(closed_on, 'YYYY/MM/DD') as closed_date, f.value::string as label
         from raw.gh.issues, lateral flatten(input => labels) f""", sources)
     use = sources["RAW.GH.ISSUES"]
-    assert use.paths == {"USER": {"login": "TEXT", "id": "INT"}, "PAYLOAD": {"repo.name": "TEXT"}}
+    # `[]` is "each element": what is flattened holds text
+    assert use.paths == {"USER": {"login": "TEXT", "id": "INT"}, "PAYLOAD": {"repo.name": "TEXT"}, "LABELS": {"[]": "TEXT"}}
     assert use.arrays == {"LABELS"} and use.formats == {"CLOSED_ON": "%Y/%m/%d"}
 
     scan_model("""select parse_json(context):app.version::string as v, parse_json(raw_blob) as blob
                   from raw.gh.issues where user_id <> 'USLACKBOT' and state = 'open' and created = '2025-01-01'""", sources)
     assert use.json_text == {"CONTEXT", "RAW_BLOB"} and use.paths["CONTEXT"] == {"app.version": "TEXT"}
     assert use.texts == {"USER_ID", "STATE"}  # a date-looking literal says nothing about the type
-    assert use.literals == {"USER_ID": {"USLACKBOT"}, "STATE": {"open"}}
+    # `<> 'USLACKBOT'` names a value to leave out, not one to generate rows with
+    assert use.literals == {"STATE": {"open"}}
 
 
 def test_generated_objects_and_text_dates_are_usable(emu):
@@ -139,6 +142,124 @@ def test_joined_columns_share_values():
     spec, notes = build_spec(manifest, "A")
     tables = spec["tables"]
     assert tables["RAW.S.EVENTS"]["columns"]["ACTOR"] == {"gen": "fk", "ref": "RAW.S.USERS", "skew": 1.5}
-    shared = [tables["RAW.S.USERS"]["columns"]["PLAN_CODE"], tables["RAW.S.PLANS"]["columns"]["CODE"],
-              tables["RAW.S.EVENTS"]["columns"]["PLAN"]]
-    assert shared[0] == shared[1] == shared[2] and shared[0]["gen"] in ("pool", "categorical")
+    # plans are looked up by their code: one code each; the columns joined to it draw from those codes
+    assert tables["RAW.S.PLANS"]["columns"]["CODE"] == {"gen": "template", "template": "plan_{n}"}
+    assert tables["RAW.S.USERS"]["columns"]["PLAN_CODE"] == tables["RAW.S.EVENTS"]["columns"]["PLAN"] == {
+        "gen": "pool", "pool": "plan", "size": 6000}
+
+
+def _scan(models: dict[str, str], sources: list[str]):
+    """Scan `models` (name -> SQL, in dependency order) the way `analyse` does."""
+    from fauxflake.init import _PATHS
+
+    uses = {name: SourceUse() for name in sources}
+    by_relation, joins, dates, outputs = {}, [], [], {}
+    for name, sql in models.items():
+        outputs[name] = by_relation[name.upper()] = scan_model(sql, uses, by_relation, [], joins, dates)
+    return uses, outputs, joins, dates, _PATHS
+
+
+def test_a_place_inside_a_document_is_followed_through_models_and_flatten():
+    uses, outputs, _, _, paths = _scan({
+        "db.s.shards": "select value:chunk::variant as chunk, _part from raw.near.shards",
+        "db.s.chunks": "with s as (select * from db.s.shards where chunk != 'null') "
+                       "select chunk:transactions::array as chunk_transactions, chunk:header:hash::string as chunk_hash from s",
+        "db.s.txs": "select value:transaction:hash::string as tx_hash, value:outcome:ids[0]::string as first_id, value as tx, index "
+                    "from db.s.chunks, lateral flatten(input => chunk_transactions) where array_size(chunk_transactions) > 0",
+        "db.s.final": "select t.tx_hash, t.tx:transaction:nonce::number as nonce from db.s.txs t where t.tx:transaction:kind = 'call'",
+    }, ["RAW.NEAR.SHARDS"])
+    use = uses["RAW.NEAR.SHARDS"]
+    assert use.paths["VALUE"] == {
+        "chunk": "VARIANT", "chunk.transactions": "[]", "chunk.header.hash": "TEXT", "chunk.transactions[]": None,
+        "chunk.transactions[].transaction.hash": "TEXT", "chunk.transactions[].outcome.ids[]": "TEXT",
+        "chunk.transactions[].transaction.nonce": "DECIMAL(38, 0)", "chunk.transactions[].transaction.kind": None}
+    assert use.path_literals == {"VALUE": {"chunk.transactions[].transaction.kind": {"call"}}}
+    assert outputs["db.s.final"][paths]["TX_HASH"] == ("RAW.NEAR.SHARDS", "VALUE", ("chunk", "transactions", "[]", "transaction", "hash"))
+
+
+def test_objects_and_arrays_a_model_puts_together_keep_what_they_are_made_of():
+    uses, _, _, _, _ = _scan({
+        "db.s.a": "select id, object_construct('actions', v:actions, 'hash', v:hash) as tx, array_agg(v:outcome) within group (order by id) as outcomes "
+                  "from raw.t.docs group by 1, 2",
+        "db.s.b": "select f.value:kind::string as kind, a.outcomes[0]:status::string as status from db.s.a a, lateral flatten(input => a.tx:actions) f",
+    }, ["RAW.T.DOCS"])
+    assert {"actions[]", "actions[].kind", "outcome.status"} <= set(uses["RAW.T.DOCS"].paths["V"])
+
+
+def test_encoded_text_keys_of_an_object_and_keys_tested_for_being_there():
+    uses, _, _, _, _ = _scan({
+        "db.s.a": "select try_parse_json(try_base64_decode_string(v:call:args)):prices as prices, f.key as action_name, "
+                  "iff(v:status:Failure is not null, 'Fail', 'Success') as status "
+                  "from raw.t.docs, lateral flatten(input => v:action) f where f.key = 'FunctionCall'",
+    }, ["RAW.T.DOCS"])
+    use = uses["RAW.T.DOCS"]
+    assert "call.args~b64~json.prices" in use.paths["V"] and "action.FunctionCall" in use.paths["V"]
+    assert use.path_optional == {"V": {"status.Failure"}}
+
+
+def test_what_a_downstream_model_compares_with_reaches_the_source_column():
+    uses, _, joins, dates, _ = _scan({
+        "db.s.stg": "select id, kind as event_kind, block as block_number, acct from raw.t.events",
+        "db.s.mid": "select * from db.s.stg where block_number between 100 and 200",
+        "db.s.top": "select m.id from db.s.mid m join db.s.other o on m.id = o.ref where m.event_kind in ('swap', 'mint') "
+                    "and m.block_number >= 7500 and m.acct = current_account_name() and m.event_kind != 'burn' "
+                    "and o.day = '2022-04-01' and o.day < '2030-01-01'",
+        }, ["RAW.T.EVENTS"])
+    use = uses["RAW.T.EVENTS"]
+    assert use.literals == {"KIND": {"swap", "mint"}, "ACCT": {"FAUXFLAKE"}}  # not 'burn': that one is filtered out
+    assert use.bounds["BLOCK"] == {100.0, 200.0, 7500.0}
+    assert sorted(dates) == [("before", date(2030, 1, 1)), ("in", date(2022, 4, 1))]
+
+
+def test_the_history_covers_the_dates_the_sql_names():
+    from fauxflake.init import history_window
+
+    assert history_window([]) == (date(2025, 1, 1), None)
+    assert history_window([("after", date(2021, 9, 1)), ("before", date(2030, 1, 1))]) == (date(2025, 1, 1), None)
+    start, span = history_window([("in", date(2022, 4, 1)), ("in", date(2022, 6, 30))])
+    assert start == date(2022, 4, 1) and start + timedelta(days=span) > date(2022, 6, 30)
+
+
+def test_ids_inside_documents_are_keys_and_links_not_a_shared_pool():
+    from fauxflake.init import _share_join_values
+
+    template = lambda name: {"gen": "template", "template": name + "_{hex}"}  # noqa: E731
+    tables = {"RAW.T.DOCS": {"columns": {"V": {"gen": "object", "fields": {
+        "receipts[].receipt_id": template("receipt_id"), "receipts[].outcome.receipt_ids[]": template("receipt_ids"),
+        "txs[].outcome.receipt_ids[]": template("receipt_ids")}}}}}
+    place = lambda path: ("RAW.T.DOCS", "V", path)  # noqa: E731
+    _share_join_values(tables, [(place("receipts[].receipt_id"), place("receipts[].outcome.receipt_ids[]")),
+                                (place("txs[].outcome.receipt_ids[]"), place("receipts[].receipt_id"))], [])
+    fields = tables["RAW.T.DOCS"]["columns"]["V"]["fields"]
+    assert fields["receipts[].receipt_id"]["gen"] == "hash_id"
+    # each referring field points at its own element of the row before (`slot`): an id has one parent at most
+    assert fields["txs[].outcome.receipt_ids[]"] == {"gen": "link", "domain": fields["receipts[].receipt_id"]["domain"],
+                                                     "depth": 1, "layered": True, "slot": 1}
+    assert fields["receipts[].outcome.receipt_ids[]"]["slot"] == 0
+
+
+def test_the_looked_up_side_of_a_join_holds_each_value_once():
+    uses, _, joins, _, _ = _scan({
+        "db.s.events": "select session_ref, kind from raw.t.events",
+        "db.s.sessions": "select session_code, started from raw.t.sessions",
+        "db.s.joined": "select e.kind, s.started from db.s.events e join db.s.sessions s on e.session_ref = s.session_code",
+    }, ["RAW.T.EVENTS", "RAW.T.SESSIONS"])
+    assert (("RAW.T.EVENTS", "SESSION_REF"), ("RAW.T.SESSIONS", "SESSION_CODE")) in joins
+
+    import collections
+
+    from fauxflake.init import _share_join_values
+
+    counted = collections.Counter()
+    scan_model("select e.kind from raw.t.events e join raw.t.sessions s on e.session_ref = s.session_code",
+               {"RAW.T.EVENTS": SourceUse(), "RAW.T.SESSIONS": SourceUse()}, {}, [], [], [], counted)
+    assert counted == {("RAW.T.SESSIONS", "SESSION_CODE", ""): 1, ("RAW.T.EVENTS", "SESSION_REF", ""): -1}
+
+    template = lambda name: {"gen": "template", "template": name + "_{hex}"}  # noqa: E731
+    tables = {"RAW.T.EVENTS": {"columns": {"SESSION_REF": template("session_ref")}},
+              "RAW.T.SESSIONS": {"columns": {"SESSION_CODE": template("session_code")}}}
+    lookups = collections.Counter({("RAW.T.SESSIONS", "SESSION_CODE", ""): 1, ("RAW.T.EVENTS", "SESSION_REF", ""): -1})
+    _share_join_values(tables, joins, [], lookups)
+    # sessions are looked up: one code each; events refer to those codes
+    assert tables["RAW.T.SESSIONS"]["columns"]["SESSION_CODE"] == {"gen": "template", "template": "session_ref_{n}"}
+    assert tables["RAW.T.EVENTS"]["columns"]["SESSION_REF"]["gen"] == "pool"

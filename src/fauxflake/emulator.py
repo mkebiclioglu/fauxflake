@@ -210,7 +210,17 @@ def _freeze_clock(sql: str) -> str:
     return "".join(part if i % 2 else _CLOCK.sub(sub, part) for i, part in enumerate(parts))
 
 
+MAX_STATEMENT = 1_048_576  # Snowflake accepts 1 MB of SQL text
+
+
 def rewrite(sql: str) -> str:
+    if len(sql) > MAX_STATEMENT:
+        from snowflake.connector.errors import ProgrammingError
+
+        # a pivot with one column per row of made-up text, usually: refused at once, as Snowflake would,
+        # rather than parsed for a quarter of an hour
+        raise ProgrammingError(msg=f"SQL statement is {len(sql) / 1_048_576:.1f} MB; Snowflake accepts at most 1 MB of SQL text.",
+                               errno=1003, sqlstate="42000")
     if FROZEN_NOW is not None:
         sql = _freeze_clock(sql)
     for pattern, replacement, _why in REWRITES:
@@ -258,6 +268,126 @@ _MISSING_COLUMN = re.compile(r'Referenced column "([^"]+)" not found in FROM cla
 _AMBIGUOUS_ERROR = re.compile(r"""Ambiguous reference to column name "+([^"]+)"+ \(use: '"?([^'".]+)"?\.""")
 _patched = False
 FAILED_STATEMENTS: dict[str, str] = {}  # error -> the last statement that raised it (debug mode only)
+
+# Relations that stand for what production holds before the run (the spec's `existing:`). Queries read
+# them; dbt does not see them, so a model whose own relation has a stand-in is built as on a first run
+# (an incremental model that found an empty table would filter on MAX() of nothing and keep no rows).
+STANDINS: set[str] = set()
+_STANDINS_TABLE = "_fs_global.main._fx_standins"
+
+
+_SEMI_TABLE = "_fs_global.main._fx_semi"  # (c, s, t, col, kind): the columns that are ARRAY or OBJECT rather than VARIANT
+
+
+def _describe_semi_types(duck) -> None:  # noqa: ANN001
+    """INFORMATION_SCHEMA.COLUMNS, DESCRIBE and SHOW COLUMNS say ARRAY and OBJECT where Snowflake would."""
+    from fakesnow import info_schema
+
+    duck.execute(f"create or replace table {_SEMI_TABLE} (c varchar, s varchar, t varchar, col varchar, kind varchar)")
+    view = info_schema.SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW
+    typed = view.replace("when columns.data_type='JSON' then 'VARIANT'", "when columns.data_type='JSON' then coalesce(fxk.kind, 'VARIANT')")
+    joined = typed.replace("where schema_name != '_fs_information_schema'",
+                           f"LEFT JOIN {_SEMI_TABLE} fxk ON fxk.c = columns.table_catalog AND fxk.s = columns.table_schema "
+                           "AND fxk.t = columns.table_name AND fxk.col = columns.column_name\n"
+                           "where schema_name != '_fs_information_schema'")
+    if typed == view or joined == typed:
+        return  # another fakesnow than the one this was written against: columns stay VARIANT
+    duck.execute(joined.replace("create view if not exists", "create or replace view"))
+
+
+def _target(cursor, tree: exp.Create) -> tuple[str, str, str] | None:  # noqa: ANN001
+    target = tree.this.this if isinstance(tree.this, exp.Schema) else tree.this
+    if not isinstance(target, exp.Table) or str(tree.args.get("kind") or "").upper() not in ("TABLE", "VIEW"):
+        return None
+    conn = cursor._conn
+    return (target.catalog or conn.database or "").upper(), (target.db or conn.schema or "").upper(), target.name.upper()
+
+
+def _note_semi_types(cursor, tree: exp.Create) -> None:  # noqa: ANN001
+    """Before the statement is rewritten for DuckDB: which of the columns it makes are ARRAY or OBJECT."""
+    cursor._fauxflake_semi = None
+    where = _target(cursor, tree)
+    if where is None:
+        return
+    duck, conn = cursor._duck_conn, cursor._conn
+
+    def known(table: exp.Table) -> dict[str, str]:
+        place = [(table.catalog or conn.database or "").upper(), (table.db or conn.schema or "").upper(), table.name.upper()]
+        return dict(duck.execute(f"select col, kind from {_SEMI_TABLE} where c = ? and s = ? and t = ?", place).fetchall())
+
+    try:
+        # a copy: the statement is rewritten in place afterwards, and the columns are asked for once it has run
+        cursor._fauxflake_semi = (where, semantics.semi_kinds(tree.copy(), known))
+    except Exception:  # noqa: BLE001 - typing is a description, never a reason to fail the statement
+        cursor._fauxflake_semi = (where, {})
+
+
+def _record_semi_types(cursor) -> None:  # noqa: ANN001
+    noted = getattr(cursor, "_fauxflake_semi", None)
+    if not noted:
+        return
+    cursor._fauxflake_semi = None
+    (db, schema, name), kinds = noted
+    duck = cursor._duck_conn
+    try:
+        duck.execute(f"delete from {_SEMI_TABLE} where c = ? and s = ? and t = ?", [db, schema, name])
+        columns = [r[0] for r in duck.execute("select column_name from information_schema.columns where table_catalog = ? and "
+                                              "table_schema = ? and table_name = ? and data_type = 'JSON'", [db, schema, name]).fetchall()]
+        rows = [(db, schema, name, col, kind) for col in columns for kind in [kinds.get(col.upper()) or (
+            kinds[col.upper()] if not isinstance(kinds, dict) or type(kinds) is not dict else None)] if kind]
+        if rows:
+            duck.executemany(f"insert into {_SEMI_TABLE} values (?, ?, ?, ?, ?)", rows)
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+
+def stand_in(duck, name: str, statement: str) -> None:  # noqa: ANN001
+    """Create a stand-in with `statement` and keep it out of SHOW OBJECTS / TABLES / VIEWS."""
+    duck.execute(statement)
+    name = name.replace('"', "").upper()
+    if name not in STANDINS:
+        STANDINS.add(name)
+        duck.execute(f"insert into {_STANDINS_TABLE} values (?)", [name])
+
+
+def _hide_stand_ins(duck) -> None:  # noqa: ANN001
+    from fakesnow.transforms import show
+
+    STANDINS.clear()
+    duck.execute(f"create or replace table {_STANDINS_TABLE} (name varchar)")
+    hidden = f"(table_catalog || '.' || table_schema || '.' || table_name) not in (select name from {_STANDINS_TABLE})"
+    for view in (show.SQL_CREATE_VIEW_SHOW_OBJECTS, show.SQL_CREATE_VIEW_SHOW_TABLES, show.SQL_CREATE_VIEW_SHOW_VIEWS):
+        duck.execute(view.replace("create view if not exists", "create or replace view").rstrip() + f"\nand {hidden}")
+
+
+def _over_a_stand_in(cursor, tree: exp.Create):  # noqa: ANN001, ANN202
+    """dbt builds a relation that has a stand-in: the stand-in makes way. Returns how to put it back
+    should the build fail (the models that read it by name still need something there)."""
+    target = tree.this.this if isinstance(tree.this, exp.Schema) else tree.this
+    kind = str(tree.args.get("kind") or "").upper()
+    if not isinstance(target, exp.Table) or kind not in ("TABLE", "VIEW"):
+        return None
+    conn = cursor._conn
+    db, schema, name = (target.catalog or conn.database or "").upper(), (target.db or conn.schema or "").upper(), target.name.upper()
+    fq = f"{db}.{schema}.{name}"
+    if fq not in STANDINS:
+        return None
+    duck = cursor._duck_conn
+    there = duck.execute("select table_type from information_schema.tables where table_catalog = ? and table_schema = ? "
+                         "and table_name = ?", [db, schema, name]).fetchone()
+    restore = None
+    if there and (("VIEW" if there[0] == "VIEW" else "TABLE") != kind or not tree.args.get("replace")):
+        was = "view" if there[0] == "VIEW" else "table"
+        columns = duck.execute(f'describe "{db}"."{schema}"."{name}"').fetchall()
+        shape = ", ".join(f'null::{c[1]} as "{c[0]}"' for c in columns)
+        restore = f'create view if not exists "{db}"."{schema}"."{name}" as select {shape} where false'
+        duck.execute(f'drop {was} "{db}"."{schema}"."{name}"')
+    return fq, restore
+
+
+def _built(cursor, fq: str) -> None:  # noqa: ANN001
+    STANDINS.discard(fq)
+    cursor._duck_conn.execute(f"delete from {_STANDINS_TABLE} where name = ?", [fq])
 
 
 def run_guarded(cursor, work, limit: float | None = None) -> None:  # noqa: ANN001
@@ -541,6 +671,8 @@ def _patch_fakesnow() -> None:
             expression = semantics.inline_aliases(expression, self._fauxflake_inline)
         if getattr(self, "_fauxflake_layer", False):
             expression = semantics.layer_windows(expression)
+        if isinstance(expression, exp.Create):
+            _note_semi_types(self, expression)
         out = original_transform(self, semantics.rewrite(expression), params)
         out = semantics.finish(semantics.parenthesize_arrows(out))
         out = semantics.keep_outer_rows(out, getattr(self, "_fauxflake_outer", []), getattr(self, "_fauxflake_recursive", []))
@@ -626,9 +758,17 @@ def _patch_fakesnow() -> None:
                     return
             journaled = getattr(self._conn, "_fauxflake_txn", False) and not isinstance(tree, (exp.Query, exp.Describe, exp.Show))
             kept = tree.copy() if journaled else None
+            replaced = _over_a_stand_in(self, tree) if STANDINS and isinstance(tree, exp.Create) else None
             try:
                 original_execute(self, tree, params)
+                if replaced:
+                    _built(self, replaced[0])
+                if isinstance(tree, exp.Create):
+                    _record_semi_types(self)
             except Exception as e:
+                if replaced and replaced[1]:
+                    with contextlib.suppress(Exception):
+                        self._duck_conn.execute(replaced[1])
                 if kept is not None and _TWO_DATABASES in str(e) and not getattr(self._conn, "_fauxflake_healing", False):
                     # DuckDB keeps a transaction to one database, and this statement needs a second
                     # (MERGE works through a temporary table): what the transaction did so far is
@@ -788,6 +928,8 @@ def engine() -> Iterator[Emulator]:
     for macro in semantics.MACROS:
         fs.duck_conn.execute(macro)
     semantics.reserved_words(fs.duck_conn)
+    _hide_stand_ins(fs.duck_conn)
+    _describe_semi_types(fs.duck_conn)
     fs.duck_conn.execute("set global old_implicit_casting = true")  # text compares with numbers and dates, as in Snowflake
     spill = _spill_directory(fs.duck_conn)
     semantics.UDFS.clear()  # functions belong to the emulator that defined them
@@ -831,6 +973,8 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
     for macro in semantics.MACROS:
         fs.duck_conn.execute(macro)
     semantics.reserved_words(fs.duck_conn)
+    _hide_stand_ins(fs.duck_conn)
+    _describe_semi_types(fs.duck_conn)
     fs.duck_conn.execute("set global old_implicit_casting = true")  # text compares with numbers and dates, as in Snowflake
     spill = _spill_directory(fs.duck_conn)
     semantics.UDFS.clear()  # functions belong to the emulator that defined them

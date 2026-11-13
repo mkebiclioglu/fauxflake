@@ -546,3 +546,25 @@ def test_a_union_keeps_text_beside_a_variant_as_a_variant_string(run):
     assert run("select n, coalesce(v, 'none') from (select * from docs union all select 4, null) order by n") == [(1, '"abc"'), (4, '"none"')]
     run("create or replace table counted as select '2' as users, v from docs union all select '3', v from texts")
     assert run("select sum(users) over (partition by coalesce(v, '')) from counted order by 1") == [(2,), (3,), (3,)]
+
+
+def test_base64_text_is_decoded_as_text_also_from_a_variant(run):
+    # {"a":1} in base64; inside a VARIANT the string comes with JSON quotes, which are not part of it
+    assert run("select try_base64_decode_string('eyJhIjoxfQ=='), base64_decode_string(to_variant('eyJhIjoxfQ==')), "
+               "try_parse_json(try_base64_decode_string(to_variant('eyJhIjoxfQ=='))):a::int, "
+               "try_base64_decode_string('not base64!')") == [('{"a":1}', '{"a":1}', 1, None)]
+
+
+def test_array_and_object_columns_are_described_as_such(run):
+    run("create or replace table semi as select array_construct(1, 2) as arr, object_construct('a', 1) as obj, "
+        "parse_json('[1]') as v, t.name::variant as w, split(t.name, 'a') as parts, t.id from t")
+    kinds = lambda name: dict(run(f"select column_name, data_type from information_schema.columns "  # noqa: E731
+                                  f"where table_name = '{name}' order by ordinal_position"))
+    assert kinds("SEMI") == {"ARR": "ARRAY", "OBJ": "OBJECT", "V": "VARIANT", "W": "VARIANT", "PARTS": "ARRAY", "ID": "NUMBER"}
+    # the type travels with the column: through `*`, a CTE, a rename, COALESCE and an aggregate
+    run("create or replace view semi_v as with s as (select * from semi) "
+        "select arr as items, coalesce(obj, object_construct()) as o2, v, max(parts) over () as p2, array_agg(id) over () as ids from s")
+    assert kinds("SEMI_V") == {"ITEMS": "ARRAY", "O2": "OBJECT", "V": "VARIANT", "P2": "ARRAY", "IDS": "ARRAY"}
+    run("create or replace table declared (a array, o object, v variant, n number)")
+    assert kinds("DECLARED") == {"A": "ARRAY", "O": "OBJECT", "V": "VARIANT", "N": "NUMBER"}
+    assert [r[1] for r in run("describe table semi")][:3] == ["ARRAY", "OBJECT", "VARIANT"]

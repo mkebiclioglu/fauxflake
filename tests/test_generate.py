@@ -63,3 +63,18 @@ def test_rewrites():
     merged = rewrite('merge into A.B.T as d using A.B.S as s on s.id = d.id '
                      'when not matched then insert ("ID", "V") values ("ID", "V")')
     assert 's."ID"' in merged and 's."V"' in merged
+
+
+def test_two_columns_of_a_row_are_drawn_independently():
+    """`where plan = 'pro' and region = 'eu'` keeps rows only if every pair of values occurs."""
+    from fauxflake.spec import Spec
+
+    values = {"gen": "categorical", "values": {"a": 0.25, "b": 0.25, "c": 0.25, "d": 0.25}}
+    spec = Spec.from_raw({"seed": 42, "start": "2025-01-01", "tables": {"RAW.T.PAIRS": {
+        "volume": {"rows_per_day": 2000, "weekly": [1] * 7}, "lateness": {"p": [0, 1], "seconds": [0, 1]},
+        "columns": {"ID": {"gen": "sequence"}, "PLAN": dict(values), "REGION": dict(values)}}}}, ".")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 3))
+        pairs = emu.cursor().execute("select count(distinct (PLAN, REGION)), min(n), max(n) from "
+                                     "(select PLAN, REGION, count(*) over (partition by PLAN, REGION) n from RAW.T.PAIRS)").fetchone()
+    assert pairs[0] == 16 and pairs[1] > pairs[2] / 2  # all sixteen pairs, in similar numbers
