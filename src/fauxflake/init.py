@@ -63,6 +63,7 @@ class SourceUse:
         self.patterns: dict[str, set[str]] = {}  # column -> LIKE patterns the SQL keeps rows by
         # time columns that bound a period other rows are looked up in (`on t.at between p.start and p.end`): "start" or "end"
         self.periods: dict[str, str] = {}
+        self.path_prefix: dict[str, dict[str, str]] = {}  # variant column -> path -> text stripped off before the rest is parsed
         self.truncs: dict[str, str] = {}  # time column -> the unit a model cuts it to before matching on it (`date_trunc('hour', at)`)
         self.series: set[frozenset[str]] = set()  # columns a join matches on together (`on a.id = b.id and a.hour = b.hour`)
         self.depends: dict[str, str] = {}  # column -> the column that decides it (`group by id having count(distinct seats) = 1`)
@@ -148,6 +149,7 @@ def _like_patterns(test: exp.Expression) -> list[str]:
             if isinstance(one, exp.Literal) and one.is_string and len(one.name) <= 60 and re.search(r"[^%_\s]", one.name)]
 
 
+_REPLACE = tuple(getattr(exp, name) for name in ("Replace",) if hasattr(exp, name))
 _REGEX_TESTS = tuple(getattr(exp, name) for name in ("RegexpLike", "RegexpILike", "RegexpExtract", "RegexpInstr", "RegexpCount")
                      if hasattr(exp, name))
 _ARRAY_READERS = tuple(getattr(exp, name) for name in (
@@ -356,11 +358,12 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
         flatten_inputs: dict[str, exp.Expression] = {}
         for alias, src in selected.items():
             lateral = getattr(src, "expression", None)
-            call = lateral.this if isinstance(lateral, exp.Lateral) else None
+            # `lateral flatten(...)` or `table(flatten(...))`: the same thing, written two ways
+            call = lateral.this if isinstance(lateral, (exp.Lateral, exp.TableFromRows)) else None
             if isinstance(call, exp.Explode):
                 given = call.this.expression if isinstance(call.this, exp.Kwarg) else call.this
                 named = next((k.expression for k in call.find_all(exp.Kwarg) if k.this.name.upper() == "INPUT"), None)
-                flatten_inputs[alias.upper()] = named if named is not None else given
+                flatten_inputs[alias.upper() or "_FLATTENED"] = named if named is not None else given
 
         def into(base, keys):  # noqa: ANN001, ANN202
             """Follow `keys` into what is known of a value: a place in a source's document, or an
@@ -449,6 +452,14 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                         and isinstance(index, exp.Literal) and index.is_int and int(index.name) >= 1:
                     return base[0], base[1], ("~part", mark.name, str(int(index.name) - 1))
                 return None
+            if isinstance(node, _REPLACE) and isinstance(node.expression, exp.Literal) and node.expression.is_string \
+                    and node.expression.name and (node.args.get("replacement") is None or node.args["replacement"].name == ""):
+                # try_parse_json(replace(value, 'EVENT_JSON:')): the text is that mark, then JSON (used only where
+                # the rest is in fact parsed)
+                base = resolve_path(node.this, depth + 1)
+                if isinstance(base, tuple) and base[2] and base[0] in sources and "{}" not in base[2]:
+                    sources[base[0]].path_prefix.setdefault(base[1], {})[path_text(base[2])] = node.expression.name
+                return base
             if isinstance(node, _SAME_VALUE):
                 # lower(x), replace(x, 'overage-', ''), lag(x) over (...): still one of x's values, give or take
                 # its spelling, so what the result is compared with is what x should hold
@@ -1583,6 +1594,9 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 out[col] = {"gen": "object", "fields": {
                     path: field_gen(path, h, use.path_literals.get(col, {}).get(path), use.path_patterns.get(col, {}).get(path))
                     for path, h in sorted(use.paths[col].items())}}
+                for path, mark in use.path_prefix.get(col, {}).items():
+                    if any(field.startswith(path + "~json") for field in out[col]["fields"]):
+                        out[col]["fields"][path + "~prefix"] = {"gen": "constant", "value": mark}
                 for path in use.path_optional.get(col, ()):
                     # the key itself, or (when deeper keys are read) every path under it
                     for field, d in out[col]["fields"].items():

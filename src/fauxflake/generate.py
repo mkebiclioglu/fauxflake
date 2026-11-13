@@ -255,6 +255,9 @@ class TableSQL:
                     # text holding JSON, or base64 of what is under it: what PARSE_JSON / BASE64_DECODE read back
                     inner = build(node[mark], where + mark, depth)
                     made = f"to_json({inner})::varchar" if mark == "~json" else f"to_base64(encode(({inner})::varchar))"
+                    if mark == "~json" and isinstance(node.get("~prefix"), tuple):
+                        # `EVENT_JSON:{...}`: what the SQL strips off before it parses the rest
+                        made = f"concat({lit(str(node['~prefix'][2].get('value', '')))}, {made})"
                     if "~text" in node:
                         return f"(case when {self.u(f'{col}.{where}:text')} < 0.5 then ({leaf(node['~text'])})::varchar else {made} end)"
                     return made

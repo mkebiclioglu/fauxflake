@@ -593,3 +593,29 @@ def test_a_key_that_reports_a_failure_is_there_in_few_documents():
     }
     fields = build_spec(manifest, "A")[0]["tables"]["RAW.S.RECEIPTS"]["columns"]["V"]["fields"]
     assert fields["outcome.status.Failure"]["optional"] == 0.95 and fields["outcome.proof"]["optional"] == 0.5
+
+
+def test_table_flatten_and_a_mark_stripped_before_json_is_parsed(tmp_path):
+    from datetime import datetime
+
+    from fauxflake.emulator import serve
+    from fauxflake.generate import Warehouse
+    from fauxflake.init import build_spec
+    from fauxflake.spec import Spec
+
+    manifest = {
+        "sources": {"source.p.s.r": {"database": "RAW", "schema": "S", "name": "r", "identifier": "r", "columns": {}}},
+        "nodes": {
+            "model.p.a": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.A",
+                          "compiled_code": "select r:id::string as id, r:outcome.logs as logs from raw.s.r"},
+            "model.p.m": {"resource_type": "model", "depends_on": {"nodes": ["model.p.a"]}, "relation_name": "A.B.M", "compiled_code": """
+                select id, replace(value, 'EVENT_JSON:') as json, try_parse_json(json):event::string as event
+                from a.b.a, table(flatten(input => logs)) where event is not null"""}},
+    }
+    spec, _ = build_spec(manifest, "A")
+    fields = spec["tables"]["RAW.S.R"]["columns"]["R"]["fields"]
+    assert "outcome.logs[]~json.event" in fields and fields["outcome.logs[]~prefix"] == {"gen": "constant", "value": "EVENT_JSON:"}
+    with serve() as emu:
+        Warehouse(emu, Spec.from_raw({**spec, "start": "2025-01-01"}, "."), 0.01).advance_to(datetime(2025, 1, 3))
+        logs = [row[0] for row in emu.cursor().execute("select R->'outcome'->'logs'->>0 from RAW.S.R limit 50").fetchall()]
+    assert logs and all(text.startswith('EVENT_JSON:{"event":') for text in logs)
