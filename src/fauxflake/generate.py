@@ -109,6 +109,8 @@ class TableSQL:
     def key_expr(self, table: Table, index: str) -> str:
         _col, d = table.key
         named = d.get("named") or []
+        if d["gen"] == "sequence":  # a numeric key holds only the ids that are numbers
+            named = [v for v in named if re.fullmatch(r"\d{1,18}", str(v))]
         if named:
             # ids the project's SQL asks for by name (`where server_id = '93myk...'`): the first rows have them
             numeric = d["gen"] == "sequence"

@@ -71,6 +71,11 @@ _HINTS = {"INT8": "BIGINT", "INT16": "BIGINT", "INT32": "BIGINT", "INT64": "BIGI
           "DOUBLE": "DOUBLE", "FLOAT": "DOUBLE", "DECIMAL": "DOUBLE", "BOOL": "BOOLEAN", "BOOLEAN": "BOOLEAN", "DATE": "DATE",
           "TIMESTAMP": "TIMESTAMP", "TIME": "TIMESTAMP", "VARIANT": "VARIANT", "ARRAY": "ARRAY", "OBJECT": "VARIANT"}
 _FREE = ("template", "pool")  # generators that only make up text: safe to retype
+
+
+def _text_ids(gen: dict) -> bool:
+    """A key whose ids are certainly text: some are named by the SQL, or they have a shape."""
+    return bool(gen.get("template")) or any(not re.fullmatch(r"\d{1,18}", str(v)) for v in gen.get("named") or ())
 # Jinja whose output depends on the columns or the list of relations it finds in the warehouse. (Asking
 # whether the model's own table exists, as is_incremental() does, gives the first-run answer and is fine.)
 _INSPECTS = re.compile(r"get_columns_in_relation|get_filtered_columns_in_relation|get_relations_by|list_relations|"
@@ -658,11 +663,13 @@ class Fitter:
             if hint == "VARIANT" and kind not in _FREE:
                 continue  # keys, times and numbers the spec already knows are not documents
             if numeric and kind == "hash_id":
+                if _text_ids(gen):
+                    continue  # ids the SQL names as text (`id = '0013p00001rIvwnAAC'`), or takes apart: not numbers
                 fresh = {**gen, "gen": "sequence"}  # a text key read as a number: count instead of hashing
             elif numeric and kind == "fk":
                 parent = self.tables.get(str(gen.get("ref", "")).upper(), {}).get("columns") or {}
                 key = next((c for c, d in parent.items() if d.get("gen") == "hash_id"), None)
-                if key is None:
+                if key is None or _text_ids(parent[key]):
                     continue
                 parent[key] = {**parent[key], "gen": "sequence"}  # the reference follows its parent's key
                 self.retyped.add(str(gen["ref"]).upper())
