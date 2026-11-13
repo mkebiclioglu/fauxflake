@@ -370,3 +370,12 @@ def test_a_column_tested_with_a_regular_expression_gets_texts_that_match():
     backends = columns["BACKEND"]["templates"]
     assert any(t.endswith("https_git") for t in backends) and any(t.endswith("registry") for t in backends)
     assert "templates" not in columns["AGENT"]  # a pattern rows are dropped by is not one to generate
+
+
+def test_names_that_run_words_together_or_carry_a_custom_field_suffix_are_still_read():
+    from fauxflake.init import guess
+
+    assert {guess(c, None).get("type") for c in ("CLOSEDATE", "CREATEDDATE", "TRIAL_REQ_DATE__C", "TRANDATE")} == {"DATE"}
+    assert guess("ISDELETED", None)["type"] == guess("IS_ACTIVE__C", None)["type"] == "BOOLEAN"
+    assert guess("AMOUNT__C", None)["type"].startswith("DECIMAL")
+    assert {guess(c, None)["gen"] for c in ("LAST_UPDATE", "CANDIDATE", "ISSUE", "GEO__C")} == {"template"}

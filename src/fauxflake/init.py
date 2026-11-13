@@ -925,6 +925,11 @@ def _share_union_values(tables: dict[str, dict], links: list) -> None:
                     where[key] = dict(pooled)
 
 
+_FLAGS = {"ISDELETED", "ISWON", "ISCLOSED", "ISACTIVE", "ISCONVERTED", "ISARCHIVED", "ISPRIVATE"}
+# CREATEDDATE, CLOSEDATE, TRANDATE: a date, written without the underscore (not UPDATE, CANDIDATE, VALIDATE ...)
+_RUN_ON_DATE = re.compile(r"(?<!UP)(?<!CANDI)(?<!VALI)(?<!MAN)(?<!CONSOLI)(?<!LIQUI)DATE$")
+
+
 def guess(column: str, hint: str | None) -> dict:
     """A generator for a column we know only by name and (maybe) a cast."""
     c, h = column.upper(), (hint or "").upper()
@@ -947,11 +952,12 @@ def guess(column: str, hint: str | None) -> dict:
         digits = re.search(r"\((\d+)\s*,\s*0\)", h)
         top = min(1000, 10 ** int(digits.group(1)) - 1) if digits else 1000
         return {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1 if top > 1 else 0, top]}
-    if h == "BOOLEAN" or (not h and re.match(r"^(IS|HAS|WAS)_", c)):
+    c = re.sub(r"__P?C$", "", c)  # Salesforce's suffix for a custom field: the name before it says what it holds
+    if h == "BOOLEAN" or (not h and (re.match(r"^(IS|HAS|WAS)_", c) or c in _FLAGS)):
         return {"gen": "categorical", "type": "BOOLEAN", "values": {True: 0.5, False: 0.5}}
-    if h == "DATE" or (not h.startswith("TIMESTAMP") and c.endswith(("_DATE", "_DAY"))):
+    if h == "DATE" or (not h.startswith("TIMESTAMP") and (c.endswith(("_DATE", "_DAY")) or _RUN_ON_DATE.search(c))):
         return {"gen": "time_offset", "type": "DATE", **WEEK}
-    if h.startswith("TIMESTAMP") or c.endswith(("_AT", "_TS", "_TIME", "_TIMESTAMP")):
+    if h.startswith("TIMESTAMP") or c.endswith(("_AT", "_TS", "_TIME", "_TIMESTAMP")) or c == "SYSTEMMODSTAMP":
         return {"gen": "time_offset", **({"type": "TIMESTAMPTZ"} if h == "TIMESTAMPTZ" else {}), **WEEK}
     if h in ("VARCHAR", "TEXT"):
         return {"gen": "template", "template": f"{column.lower()}_{{hex}}"}
