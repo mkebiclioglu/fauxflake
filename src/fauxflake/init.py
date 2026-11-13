@@ -61,6 +61,7 @@ class SourceUse:
         self.numbers: set[str] = set()  # columns that are summed, averaged or used in arithmetic
         self.literals: dict[str, set[str]] = {}  # column -> string values the SQL compares it with
         self.patterns: dict[str, set[str]] = {}  # column -> LIKE patterns the SQL keeps rows by
+        self.examples: dict[str, set[str]] = {}  # column -> texts that match the regular expressions it is tested with
         self.path_literals: dict[str, dict[str, set[str]]] = {}  # variant column -> {"a.b": values it is compared with}
         self.path_patterns: dict[str, dict[str, set[str]]] = {}  # variant column -> {"a.b": LIKE patterns that keep rows}
         self.path_optional: dict[str, set[str]] = {}  # variant column -> paths a CASE / IFF tests for being there
@@ -117,6 +118,19 @@ def _belongs_inside(col: exp.Column, select: exp.Select, sources: dict) -> bool:
     tables = [t for part in (inner.args.get("from") or inner.args.get("from_"), *(inner.args.get("joins") or ()))
               if part is not None for t in ([part.this] if isinstance(part.this, exp.Table) else [])]
     return any(t.db and _table_id(t) not in sources for t in tables)
+
+
+def _is_condition(col: exp.Column) -> bool:
+    """`where not is_deleted`, `iff(active, ...)`, `won = true`: the column is read as a truth value."""
+    parent = col.parent
+    if isinstance(parent, (exp.Not, exp.And, exp.Or, exp.Where, exp.Having)):
+        return True
+    if isinstance(parent, exp.If) and parent.this is col:
+        return True
+    if isinstance(parent, (exp.EQ, exp.NEQ, exp.Is)):
+        other = parent.expression if parent.this is col else parent.this
+        return isinstance(other, exp.Boolean)
+    return False
 
 
 _WRAPPERS = (exp.Cast, exp.TryCast, exp.Paren, exp.Lower, exp.Upper, exp.Trim)
@@ -555,12 +569,25 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                         if one != two:
                             joins.append((one, two))
 
+        if joins is not None:
+            # `where server_id in (select id from servers)`: a join by another name
+            for test in select.find_all(exp.In):
+                query = test.args.get("query")
+                inner = query.unnest() if query is not None else None
+                if not isinstance(inner, exp.Select) or isinstance(test.parent, exp.Not) or test.find_ancestor(exp.Select) is not select:
+                    continue
+                mine, theirs = resolve_path(test.this), (positional.get(id(inner)) or [None])[0]
+                if isinstance(mine, tuple) and mine[0] in sources and "{}" not in mine[2] and "~between" not in mine[2] and theirs:
+                    one, two = (mine[0], mine[1], path_text(mine[2])), (theirs if len(theirs) == 3 else (*theirs, ""))
+                    if one != two:
+                        joins.append((one, two))
+
         for col in scope.columns:
             hit = resolve(col)
             if hit:
                 cast = col.parent if isinstance(col.parent, (exp.Cast, exp.TryCast)) else None
                 use, parent = sources[hit[0]], col.parent
-                use.add(hit[1], cast.to.sql(dialect="duckdb") if cast else None)
+                use.add(hit[1], cast.to.sql(dialect="duckdb") if cast else "BOOLEAN" if _is_condition(col) else None)
                 if not cast and _parsed_as(col) and not use.columns.get(hit[1]):
                     use.columns[hit[1]] = _parsed_as(col)
                 elif cast and _parsed_as(col) == "EPOCH":
@@ -600,6 +627,19 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 if isinstance(parent, exp.ConvertTimezone) and col in (parent.args.get("source_tz"), parent.args.get("target_tz")):
                     use.literals.setdefault(hit[1], set()).update({"UTC", "America/Los_Angeles", "Europe/Berlin"})  # a time zone name
                     use.texts.add(hit[1])
+                tested = col
+                while isinstance(tested.parent, _WRAPPERS):
+                    tested = tested.parent
+                regex = tested.parent
+                if isinstance(regex, (exp.RegexpLike, exp.RegexpILike, exp.RegexpExtract, exp.RegexpInstr, exp.RegexpCount)) \
+                        and regex.this is tested and isinstance(regex.expression, exp.Literal) and not isinstance(regex.parent, exp.Not):
+                    # rlike(uri, '^/[0-9]+/.*'): some rows should pass
+                    flag = regex.args.get("flag") or regex.args.get("parameters")
+                    made = regex_examples(regex.expression.name, whole=isinstance(regex, exp.RegexpLike),
+                                          ignore_case=isinstance(regex, exp.RegexpILike) or (flag is not None and "i" in flag.name))
+                    if made:
+                        use.examples.setdefault(hit[1], set()).update(made)
+                        use.texts.add(hit[1])
                 if isinstance(parent, exp.ParseJSON):
                     use.json_text.add(hit[1])  # parse_json(col):a.b  ->  col is text holding {"a": {"b": ...}}
                     col, parent = parent, parent.parent
@@ -924,6 +964,81 @@ def guess(column: str, hint: str | None) -> dict:
     return {"gen": "template", "template": f"{column.lower()}_{{hex}}"}
 
 
+def regex_examples(pattern: str, count: int = 4, ignore_case: bool = False, whole: bool = True) -> list[str]:
+    """A few texts the regular expression matches, for a column the SQL keeps rows of by it:
+    `^/[1-9]{1,3}[.][0-9]{1,3}/.*` -> `/1.0/a`, ... Empty when the pattern is beyond this (it is checked)."""
+    import re._constants as c
+    import re._parser as parser
+
+    import warnings
+
+    pattern = pattern.replace("\\\\", "\\")  # written '\\d' in a SQL string, read as \d
+    for name, inside in (("alpha", "a-zA-Z"), ("digit", "0-9"), ("alnum", "a-zA-Z0-9"), ("upper", "A-Z"), ("lower", "a-z"),
+                         ("space", " "), ("punct", ".,;-"), ("xdigit", "0-9a-f")):
+        pattern = pattern.replace(f"[:{name}:]", inside)
+    flags = re.IGNORECASE if ignore_case else 0
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            compiled, parsed = re.compile(pattern, flags), parser.parse(pattern, flags)
+    except Exception:  # noqa: BLE001
+        return []
+    classes = {c.CATEGORY_DIGIT: "0123456789", c.CATEGORY_WORD: "abcdefgh", c.CATEGORY_SPACE: " ",
+               c.CATEGORY_NOT_DIGIT: "abc", c.CATEGORY_NOT_WORD: "-", c.CATEGORY_NOT_SPACE: "abc"}
+
+    def member(item, i: int) -> str:  # noqa: ANN001
+        op, av = item
+        if op is c.LITERAL:
+            return chr(av)
+        if op is c.RANGE:
+            return chr(av[0] + i % (av[1] - av[0] + 1))
+        if op is c.CATEGORY:
+            return classes[av][i % len(classes[av])]
+        raise ValueError(op)
+
+    def sample(items, i: int) -> str:  # noqa: ANN001
+        out = []
+        for op, av in items:
+            if op is c.LITERAL:
+                out.append(chr(av))
+            elif op is c.NOT_LITERAL:
+                out.append("x" if av != ord("x") else "y")
+            elif op is c.ANY:
+                out.append("abcd"[i % 4])
+            elif op is c.IN:
+                if av and av[0][0] is c.NEGATE:
+                    out.append(next(ch for ch in "a1-_ x/Z" if not re.fullmatch("[" + "".join(
+                        re.escape(member(m, k)) for m in av[1:] for k in range(26 if m[0] is c.RANGE else 10)) + "]", ch)))
+                else:
+                    out.append(member(av[i % len(av)], i))
+            elif op in (c.MAX_REPEAT, c.MIN_REPEAT, getattr(c, "POSSESSIVE_REPEAT", None)):
+                low, high, inner = av
+                times = min(max(low, 1 if high else 0) + (i % 2 if high > max(low, 1) else 0), 6)
+                out += [sample(inner, i + k) for k in range(times)]
+            elif op is c.SUBPATTERN:
+                out.append(sample(av[3], i))
+            elif op is c.BRANCH:
+                out.append(sample(av[1][i % len(av[1])], i))
+            elif op in (c.AT, c.ASSERT, c.ASSERT_NOT):
+                continue
+            else:
+                raise ValueError(op)
+        return "".join(out)
+
+    found: list[str] = []
+    for i in range(count * 3):
+        try:
+            text = sample(parsed, i)
+        except (ValueError, StopIteration, KeyError):
+            return []
+        if text and text not in found and (compiled.fullmatch(text) if whole else compiled.search(text)) \
+                and len(text) <= 60 and "{" not in text and "}" not in text:
+            found.append(text)
+        if len(found) == count:
+            break
+    return found
+
+
 def like_shape(pattern: str) -> str:
     """A template whose values match the LIKE pattern: `%.pool%.near` -> `{hex}.pool{hex}.near`."""
     return pattern.replace("\\", "").replace("%", "{hex}").replace("_", "x")
@@ -1186,12 +1301,12 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 out[col] = {"gen": "categorical", "values": {v: round(1 / len(values), 4) for v in values}}
             elif 0 < len(use.literals.get(col, ())) <= 30 and not hint_is_number(hint):
                 # `where status = 'open'` should select something: use the values the SQL names
-                named = sorted(use.literals[col])
+                named = sorted(use.literals[col] | set(sorted(use.examples.get(col, ()))[:12]))
                 share = round(0.8 / len(named), 4)
                 out[col] = {"gen": "categorical", "values": {**{v: share for v in named}, f"other_{col.lower()}": 0.2}}
-            elif col in use.patterns and not hint_is_number(hint):
+            elif (col in use.patterns or col in use.examples) and not hint_is_number(hint):
                 # `where name like 'tap-%'` should keep some rows: make values that fit each pattern
-                shapes = sorted(like_shape(p) for p in use.patterns[col])
+                shapes = sorted(like_shape(p) for p in use.patterns.get(col, ())) + sorted(use.examples.get(col, ()))[:24]
                 out[col] = {"gen": "template", "templates": [*shapes, f"{col.lower()}_{{hex}}"]}
             elif col in use.ips and not hint_is_number(hint):
                 out[col] = {"gen": "ip", "cidr": "/" in (use.splits.get(col) or {}).get("seps", {})}  # parse_ip(network, 'INET')

@@ -324,3 +324,49 @@ def test_a_cte_is_found_however_it_is_capitalised_and_bare_columns_beside_a_join
         select master.account_id, government, geo from master left join acct on acct.account_id = master.account_id""", sources)
     scan_model("select * from analytics.f.tx where geo = 'AMER' and government = 'Yes'", sources, {"ANALYTICS.F.TX": out})
     assert sources["RAW.C.ACCOUNT"].literals == {"GEO": {"AMER"}, "GOV": {"Yes"}}
+
+
+def test_a_column_read_as_a_truth_value_is_a_boolean():
+    from fauxflake.init import SourceUse, scan_model
+
+    sources = {"RAW.C.ITEM": SourceUse()}
+    scan_model("""select id, iff(active, 1, 0) as a, case when flagged then 1 end as f from raw.c.item
+                  where not manual_override and is_won = true and kind = 'x' and amount > 3""", sources)
+    columns = sources["RAW.C.ITEM"].columns
+    assert {columns[c] for c in ("ACTIVE", "MANUAL_OVERRIDE", "IS_WON")} == {"BOOLEAN"}
+    assert columns["KIND"] != "BOOLEAN" and columns["AMOUNT"] != "BOOLEAN" and columns["ID"] != "BOOLEAN"
+
+
+def test_membership_in_a_subquery_links_the_two_columns_like_a_join():
+    from fauxflake.init import SourceUse, scan_model
+
+    sources = {"RAW.T.ACTIVITY": SourceUse(), "RAW.T.SERVERS": SourceUse()}
+    joins = []
+    scan_model("""
+        with sdd as (select s.id as server_id, s.day from raw.t.servers s)
+        select a.user_id, max(a.ts) as last_seen from raw.t.activity a
+        where a.user_id in (select server_id from sdd group by 1) and a.kind not in (select kind from raw.t.servers)
+        group by 1""", sources, joins=joins)
+    assert joins == [(("RAW.T.ACTIVITY", "USER_ID", ""), ("RAW.T.SERVERS", "ID", ""))]
+
+
+def test_a_column_tested_with_a_regular_expression_gets_texts_that_match():
+    import re
+
+    from fauxflake.init import build_spec, regex_examples
+
+    assert regex_examples(r"(yahoo)|(gmail)") == ["yahoo", "gmail"]
+    assert all(re.fullmatch(r"\d+\.\d+", t) for t in regex_examples(r"\\d+\.\\d+"))  # as written in a SQL string
+    assert regex_examples("(?P<a>x)(?P=a)") == []  # beyond it: nothing rather than something wrong
+    manifest = {
+        "sources": {"source.p.s.log": {"database": "RAW", "schema": "S", "name": "log", "identifier": "log", "columns": {}}},
+        "nodes": {"model.p.m": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.M", "compiled_code": """
+            select uri, case when rlike(backend, '.*https_git$') then 'git' when regexp_like(backend, '.*registry$') then 'reg' end as kind
+            from raw.s.log where regexp_like(uri, '^/[1-9]{1,3}[.][0-9]{1,3}/.*') and not rlike(agent, 'bot.*')"""}},
+    }
+    columns = build_spec(manifest, "A")[0]["tables"]["RAW.S.LOG"]["columns"]
+    uris = [t for t in columns["URI"]["templates"] if "{" not in t]
+    assert uris and all(re.fullmatch(r"/[1-9]{1,3}[.][0-9]{1,3}/.*", t) for t in uris)
+    backends = columns["BACKEND"]["templates"]
+    assert any(t.endswith("https_git") for t in backends) and any(t.endswith("registry") for t in backends)
+    assert "templates" not in columns["AGENT"]  # a pattern rows are dropped by is not one to generate
