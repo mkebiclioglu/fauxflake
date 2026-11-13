@@ -247,6 +247,9 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     explicit[alias.upper()] = {k: v for k, v in models[_table_id(node)].items() if k not in ("*", _PATHS)}
                 elif models and _table_id(node) in models:  # another model: follow its lineage
                     renames[alias.upper()] = models[_table_id(node)]
+                elif not node.db and node.name.upper() in lineage:
+                    # `with ACCT as (...) ... join acct`: one CTE, however the two spellings are capitalised
+                    renames[alias.upper()] = lineage[node.name.upper()]
             else:  # a CTE or subquery scope
                 # `from base_receipts r`: known by the CTE's name, used by its alias
                 written = scope.selected_sources.get(alias, (None, None))[0]
@@ -291,6 +294,9 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 return renames[table].get(col.name.upper())
             if not table and len(renames) == 1 and len(selected) == 1:
                 return next(iter(renames.values())).get(col.name.upper())
+            if not table:  # next to a join: the one relation known to write a column of that name
+                having = [r for r in renames.values() if col.name.upper() in r and col.name.upper() != _PATHS]
+                return having[0][col.name.upper()] if len(having) == 1 else None
             return None
 
         # where a value sits inside a source's document, followed through models, aliases and FLATTEN
@@ -398,8 +404,9 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
             if not table and name in aliases and not isinstance(node.parent, exp.Alias):
                 return resolve_path(aliases[name], depth + 1)
             owner = table or (plain[0] if len(plain) == 1 else "")
-            if not owner and not direct:
-                # an unqualified column next to a join: the one relation known to write it
+            if not owner:
+                # an unqualified column next to a join: the one relation known to write it (were it also a
+                # column of a table read whole beside it, the SQL would not say which it meant)
                 having = [a for a in plain if name in path_maps.get(a, ()) or name in renames.get(a, ())]
                 owner = having[0] if len(having) == 1 else ""
             if name in path_maps.get(owner, ()):
@@ -665,7 +672,9 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 paths_out[proj.alias_or_name.upper()] = found
         if paths_out:
             outputs[_PATHS] = paths_out
-        name = scope.expression.parent.alias.upper() if isinstance(scope.expression.parent, exp.CTE) else None
+        holder = scope.expression.parent
+        # a CTE, or `(select * from source where kind = 'INV') inv`: known by that name from here on
+        name = holder.alias.upper() if isinstance(holder, exp.CTE) or (isinstance(holder, exp.Subquery) and holder.alias) else None
         if stars and only and not select.args.get("joins"):
             if name:  # `select *, row_number() ... as rn from source` still passes every column through
                 passthrough[name] = only

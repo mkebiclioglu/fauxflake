@@ -300,3 +300,27 @@ def test_a_joined_model_that_selects_one_tables_star_passes_that_table_through()
     use = sources["RAW.CRM.ITEM"]
     assert use.literals["PRODUCT_TYPE"] == {"Recurring"}
     assert "SFID" not in use.columns and "ID" in use.columns
+
+
+def test_a_filter_on_a_derived_table_that_is_a_star_of_a_source_reaches_the_source():
+    from fauxflake.init import SourceUse, scan_model
+
+    sources = {"RAW.NS.TX": SourceUse()}
+    scan_model("""
+        select inv.id, so.id as so_id from (select * from raw.ns.tx where kind = 'INV') inv
+        left join (select * from raw.ns.tx where kind = 'SO') so on so.ref = inv.ref
+        where inv.void = 'F'""", sources)
+    use = sources["RAW.NS.TX"]
+    assert use.literals["VOID"] == {"F"} and use.literals["KIND"] == {"INV", "SO"}
+
+
+def test_a_cte_is_found_however_it_is_capitalised_and_bare_columns_beside_a_join_are_its_own():
+    from fauxflake.init import SourceUse, scan_model
+
+    sources = {"RAW.C.ACCOUNT": SourceUse(), "RAW.C.OPP": SourceUse()}
+    out = scan_model("""
+        with ACCT as (select a.id as account_id, coalesce(a.geo, a.territory) as geo, a.gov as government from raw.c.account a),
+        master as (select o.account_id, o.amount from raw.c.opp o)
+        select master.account_id, government, geo from master left join acct on acct.account_id = master.account_id""", sources)
+    scan_model("select * from analytics.f.tx where geo = 'AMER' and government = 'Yes'", sources, {"ANALYTICS.F.TX": out})
+    assert sources["RAW.C.ACCOUNT"].literals == {"GEO": {"AMER"}, "GOV": {"Yes"}}
