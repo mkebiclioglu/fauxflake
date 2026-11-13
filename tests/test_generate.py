@@ -78,3 +78,21 @@ def test_two_columns_of_a_row_are_drawn_independently():
         pairs = emu.cursor().execute("select count(distinct (PLAN, REGION)), min(n), max(n) from "
                                      "(select PLAN, REGION, count(*) over (partition by PLAN, REGION) n from RAW.T.PAIRS)").fetchone()
     assert pairs[0] == 16 and pairs[1] > pairs[2] / 2  # all sixteen pairs, in similar numbers
+
+
+def test_ids_asked_for_by_name_are_held_by_the_first_rows_and_referred_to():
+    from fauxflake.spec import Spec
+
+    table = {"volume": {"rows_per_day": 300, "weekly": [1] * 7}, "lateness": {"p": [0, 1], "seconds": [0, 1]}}
+    spec = Spec.from_raw({"seed": 42, "start": "2025-01-01", "tables": {
+        "RAW.T.SERVERS": {**table, "columns": {"ID": {"gen": "hash_id", "named": ["93mykbogbjfrbbdqphx3zhze5c", "abc"]}}},
+        "RAW.T.EVENTS": {**table, "columns": {"EVENT_ID": {"gen": "sequence"}, "SERVER_ID": {"gen": "fk", "ref": "RAW.T.SERVERS", "skew": 1.5}}},
+    }}, ".")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 3))
+        cur = emu.cursor()
+        servers = cur.execute("select count(*), count(distinct ID), count_if(ID in ('93mykbogbjfrbbdqphx3zhze5c', 'abc')) from RAW.T.SERVERS").fetchone()
+        events = cur.execute("select count(*) from RAW.T.EVENTS where SERVER_ID = '93mykbogbjfrbbdqphx3zhze5c'").fetchone()[0]
+        orphans = cur.execute("select count(*) from RAW.T.EVENTS e left join RAW.T.SERVERS s on s.ID = e.SERVER_ID where s.ID is null").fetchone()[0]
+    assert servers[0] == servers[1] and servers[2] == 2
+    assert events > 0 and orphans == 0

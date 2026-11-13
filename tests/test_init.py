@@ -379,3 +379,50 @@ def test_names_that_run_words_together_or_carry_a_custom_field_suffix_are_still_
     assert guess("ISDELETED", None)["type"] == guess("IS_ACTIVE__C", None)["type"] == "BOOLEAN"
     assert guess("AMOUNT__C", None)["type"].startswith("DECIMAL")
     assert {guess(c, None)["gen"] for c in ("LAST_UPDATE", "CANDIDATE", "ISSUE", "GEO__C")} == {"template"}
+
+
+def test_pieces_of_a_split_text_that_rows_are_kept_by_are_generated():
+    from fauxflake.init import build_spec
+
+    manifest = {
+        "sources": {"source.p.s.log": {"database": "RAW", "schema": "S", "name": "log", "identifier": "log", "columns": {}}},
+        "nodes": {
+            "model.p.stg": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.STG", "compiled_code": """
+                with renamed as (select split_part(request, ' ', 1) as http_method, split_part(request, ' ', 2) as url,
+                                        split_part(request, ' ', 3) as protocol, status::int as status from raw.s.log)
+                select * from renamed"""},
+            "model.p.m": {"resource_type": "model", "depends_on": {"nodes": ["model.p.stg"]}, "relation_name": "A.B.M", "compiled_code": """
+                select url, count(*) from a.b.stg
+                where http_method = 'POST' and url like any ('%/api/v1/send_push', '%/api/v1/ack') and protocol != 'HTTP/1.0'
+                group by 1"""}},
+    }
+    request = build_spec(manifest, "A")[0]["tables"]["RAW.S.LOG"]["columns"]["REQUEST"]
+    assert request["gen"] == "template"
+    assert request["templates"] == ["POST {hex}/api/v1/ack {hex}", "POST {hex}/api/v1/sendxpush {hex}", "{hex} {hex} {hex}"]  # `_` in LIKE stands for any one character
+
+
+def test_an_id_asked_for_by_name_through_a_foreign_key_exists_in_the_table_it_refers_to(emu, tmp_path):
+    from fauxflake.generate import Warehouse
+    from fauxflake.init import build_spec
+
+    def source(name):
+        return {"database": "RAW", "schema": "S", "name": name, "identifier": name, "columns": {}}
+
+    def test(name, model, column, **kwargs):
+        return {"resource_type": "test", "attached_node": model, "column_name": column, "depends_on": {"nodes": kwargs.pop("nodes", [model])},
+                "test_metadata": {"name": name, "kwargs": {"column_name": column, **kwargs}}}
+
+    manifest = {
+        "sources": {"source.p.s.servers": source("servers"), "source.p.s.events": source("events")},
+        "nodes": {
+            "model.p.m": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.M", "compiled_code": """
+                select e.event_id, e.server_id, s.id from raw.s.events e join raw.s.servers s on s.id = e.server_id
+                where e.server_id = '93mykbogbjfrbbdqphx3zhze5c'"""},
+            "test.p.u": test("unique", "source.p.s.servers", "id"),
+            "test.p.r": test("relationships", "source.p.s.events", "server_id", to="source('s','servers')", field="id",
+                             nodes=["source.p.s.servers", "source.p.s.events"]),
+        },
+    }
+    spec, _ = build_spec(manifest, "A")
+    assert spec["tables"]["RAW.S.EVENTS"]["columns"]["SERVER_ID"]["gen"] == "fk"
+    assert spec["tables"]["RAW.S.SERVERS"]["columns"]["ID"] == {"gen": "hash_id", "named": ["93mykbogbjfrbbdqphx3zhze5c"]}

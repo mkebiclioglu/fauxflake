@@ -2762,6 +2762,12 @@ class Fitter:
             label = re.sub(r"~\w+|\[\]", "", name).split(".")[-1].lower()
             return gen.get("gen") == "template" and gen.get("template") == f"{label}_{{hex}}" and not gen.get("templates")
 
+        def guessed(name: str, gen: dict) -> bool:
+            """Still what its name alone suggested, whatever type a cast gave it since."""
+            plain = {k: v for k, v in gen.items() if k != "type"}
+            return unknown(name, gen) or any(plain == {k: v for k, v in init.guess(name, hint).items() if k != "type"}
+                                             for hint in (None, gen.get("type")))
+
         def told(gen: dict) -> bool:
             return gen.get("gen") in ("categorical", "pool", "fk", "link", "hash_id") or bool(gen.get("templates")) or bool(
                 gen.get("parts")) or (gen.get("gen") == "template" and "{n}" in str(gen.get("template")))
@@ -2783,10 +2789,21 @@ class Fitter:
                                 fields[path] = field
                                 changed += 1
                                 self.retyped.add(table)
-                elif (unknown(col, held) or held == init.guess(col, None)) and (told(gen) or (gen.get("gen") == "object" and gen.get("fields"))):
+                elif guessed(col, held) and (told(gen) or (gen.get("gen") == "object" and gen.get("fields"))):
                     if gen.get("gen") == "fk" and str(gen.get("ref", "")).upper() not in self.tables:
                         continue
-                    mine[col] = {**gen, **({"follows": held["follows"]} if held.get("follows") and gen.get("gen") == "template" else {})}
+                    mine[col] = {**gen, **({"follows": held["follows"]} if held.get("follows") and gen.get("gen") == "template" else {}),
+                                 **({"type": held["type"]} if held.get("type") and gen.get("gen") in ("fk", "pool") and "type" not in gen else {})}
+                    changed += 1
+                    self.retyped.add(table)
+        for table, spec in fresh.spec["tables"].items():
+            # ids the SQL asks for by name, which the table a foreign key refers to must hold
+            for col, gen in spec["columns"].items():
+                held = (self.tables.get(table, {}).get("columns") or {}).get(col)
+                if gen.get("named") and held is not None and held.get("gen") in ("sequence", "hash_id") and held.get("named") != gen["named"]:
+                    held["named"] = gen["named"]
+                    if gen.get("gen") == "hash_id":
+                        held["gen"] = "hash_id"
                     changed += 1
                     self.retyped.add(table)
         if changed:

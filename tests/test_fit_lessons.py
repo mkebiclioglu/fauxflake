@@ -357,3 +357,21 @@ def test_a_column_computed_beside_a_star_is_not_read_from_the_table():
     read = fitter().read_through(tree, "RAW.B.SUBS")
     assert "ROW_NUM" not in read and "SKU" not in read
     assert {"ID", "TX", "PRODUCT_ID", "STATE"} <= set(read)
+
+
+def test_reading_again_replaces_what_was_only_guessed_even_after_a_cast_retyped_it():
+    def source(name):
+        return {"database": "RAW", "schema": "S", "name": name, "identifier": name, "columns": {}}
+
+    manifest = {
+        "sources": {"source.p.s.events": source("events")},
+        "nodes": {"model.p.m": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.M", "compiled_code": """
+            select user_id, kind, amount from raw.s.events where kind = 'signup' and user_id = 'u_17'"""}},
+    }
+    columns = {"USER_ID": {"gen": "dist", "type": "VARCHAR", "p": [0, 1], "v": [1, 1000]},  # guessed a number, then cast to text
+               "KIND": {"gen": "template", "template": "kind_{hex}"},
+               "AMOUNT": {"gen": "dist", "type": "DECIMAL(18,2)", "p": [0, 0.5, 1], "v": [0, 20, 500]}}
+    f = fitter(spec={"dbt": {"database": "A"}}, tables={"RAW.S.EVENTS": {"columns": columns}}, log=lambda *a: None)
+    f.read_again(manifest, None)
+    assert set(columns["USER_ID"]["values"]) >= {"u_17"} and set(columns["KIND"]["values"]) >= {"signup"}
+    assert columns["AMOUNT"]["gen"] == "dist" and f.dirty and f.retyped == {"RAW.S.EVENTS"}

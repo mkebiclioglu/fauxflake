@@ -108,6 +108,15 @@ class TableSQL:
 
     def key_expr(self, table: Table, index: str) -> str:
         _col, d = table.key
+        named = d.get("named") or []
+        if named:
+            # ids the project's SQL asks for by name (`where server_id = '93myk...'`): the first rows have them
+            numeric = d["gen"] == "sequence"
+            arms = " ".join(f"when {i} then {int(v) if numeric else lit(str(v))}" for i, v in enumerate(named))
+            return f"(case {index} {arms} else {self._key_expr(table, d, index)} end)"
+        return self._key_expr(table, d, index)
+
+    def _key_expr(self, table: Table, d: dict, index: str) -> str:
         if d["gen"] == "sequence":
             # each table counts in its own range, as ids from different systems do: two tables'
             # keys never collide when a model unions them

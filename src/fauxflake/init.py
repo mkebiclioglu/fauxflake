@@ -62,6 +62,8 @@ class SourceUse:
         self.literals: dict[str, set[str]] = {}  # column -> string values the SQL compares it with
         self.patterns: dict[str, set[str]] = {}  # column -> LIKE patterns the SQL keeps rows by
         self.examples: dict[str, set[str]] = {}  # column -> texts that match the regular expressions it is tested with
+        # text column -> separator -> position -> shapes that part is kept by (`split_part(request, ' ', 1) = 'POST'`)
+        self.part_shapes: dict[str, dict[str, dict[int, set[str]]]] = {}
         self.path_literals: dict[str, dict[str, set[str]]] = {}  # variant column -> {"a.b": values it is compared with}
         self.path_patterns: dict[str, dict[str, set[str]]] = {}  # variant column -> {"a.b": LIKE patterns that keep rows}
         self.path_optional: dict[str, set[str]] = {}  # variant column -> paths a CASE / IFF tests for being there
@@ -390,6 +392,14 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 if len(marks) == 2 and isinstance(base, tuple) and not base[2]:
                     return base[0], base[1], ("~between", marks[0], marks[1])
                 return None
+            if isinstance(node, exp.SplitPart):
+                # split_part(request, ' ', 1): that piece of the text
+                mark, index = node.args.get("delimiter"), node.args.get("part_index")
+                base = resolve_path(node.this, depth + 1)
+                if isinstance(base, tuple) and not base[2] and isinstance(mark, exp.Literal) and mark.is_string and mark.name \
+                        and isinstance(index, exp.Literal) and index.is_int and int(index.name) >= 1:
+                    return base[0], base[1], ("~part", mark.name, str(int(index.name) - 1))
+                return None
             if isinstance(node, _SAME_VALUE):
                 # lower(x), replace(x, 'overage-', ''), lag(x) over (...): still one of x's values, give or take
                 # its spelling, so what the result is compared with is what x should hold
@@ -462,6 +472,34 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     if isinstance(there, tuple) and there[0] in sources and not there[2]:
                         sources[found[0]].embeds.setdefault(found[1], []).append((found[2][1], found[2][2], (there[0], there[1])))
                 continue
+            if found[2][:1] == ("~part",):
+                # a piece of a text compared with something: the text should have such a piece there
+                if len(found[2]) != 3:
+                    continue
+                held = cast if cast is not None else top
+                while isinstance(held.parent, _WRAPPERS):
+                    held = held.parent
+                test, shapes = held.parent, set()
+                if isinstance(test, (exp.EQ, exp.In)) and held in (test.this, test.args.get("expression")) \
+                        and not isinstance(test.parent, exp.Not):
+                    values = test.expressions if isinstance(test, exp.In) else [test.expression if test.this is held else test.this]
+                    shapes = {v for v in map(named_value, values) if v}
+                elif isinstance(test, (exp.Like, exp.ILike)) and test.this is held and not isinstance(test.parent, exp.Not):
+                    wanted = test.expression
+                    wanted = wanted.this if isinstance(wanted, exp.Any) else wanted  # LIKE ANY ('%a', '%b')
+                    wanted = wanted.unnest() if isinstance(wanted, (exp.Paren, exp.Subquery)) else wanted
+                    for one in (wanted.expressions if isinstance(wanted, (exp.Tuple, exp.Array)) else [wanted]):
+                        if isinstance(one, exp.Literal) and one.is_string and re.search(r"[^%_\s]", one.name):
+                            shapes.add(like_shape(one.name))
+                elif isinstance(test, exp.RegexpLike) and test.this is held and isinstance(test.expression, exp.Literal) \
+                        and not isinstance(test.parent, exp.Not):
+                    shapes = set(regex_examples(test.expression.name))
+                shapes = {v for v in shapes if found[2][1] not in v and len(v) <= 60}  # a piece cannot hold the separator
+                if shapes:
+                    sources[found[0]].part_shapes.setdefault(found[1], {}).setdefault(found[2][1], {}).setdefault(
+                        int(found[2][2]), set()).update(shapes)
+                    sources[found[0]].texts.add(found[1])
+                continue
             use, text = sources[found[0]], path_text(found[2])
             if joins is not None and "{}" not in found[2]:
                 # a.x = b.y, where either side may sit inside a document: the two must share values
@@ -471,7 +509,7 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 if isinstance(side.parent, exp.EQ):
                     other = side.parent.expression if side.parent.this is side else side.parent.this
                     there = resolve_path(other) if not isinstance(other, exp.Literal) else None
-                    if isinstance(there, tuple) and there[0] in sources and "{}" not in there[2] and "~between" not in there[2] \
+                    if isinstance(there, tuple) and there[0] in sources and "{}" not in there[2] and "~between" not in there[2] and "~part" not in there[2] \
                             and (there[0], there[1], there[2]) != found:
                         mine, theirs = (found[0], found[1], text), (there[0], there[1], path_text(there[2]))
                         if found[2] or there[2] or not resolve(node):  # two plain columns of sources are recorded below
@@ -563,7 +601,7 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     places = []
                     for owner in plain:
                         there = resolve_path(exp.column(named.name, table=owner))
-                        if isinstance(there, tuple) and there[0] in sources and "{}" not in there[2] and "~between" not in there[2]:
+                        if isinstance(there, tuple) and there[0] in sources and "{}" not in there[2] and "~between" not in there[2] and "~part" not in there[2]:
                             places.append((there[0], there[1], path_text(there[2])))
                     for one, two in zip(places, places[1:]):
                         if one != two:
@@ -577,7 +615,7 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 if not isinstance(inner, exp.Select) or isinstance(test.parent, exp.Not) or test.find_ancestor(exp.Select) is not select:
                     continue
                 mine, theirs = resolve_path(test.this), (positional.get(id(inner)) or [None])[0]
-                if isinstance(mine, tuple) and mine[0] in sources and "{}" not in mine[2] and "~between" not in mine[2] and theirs:
+                if isinstance(mine, tuple) and mine[0] in sources and "{}" not in mine[2] and "~between" not in mine[2] and "~part" not in mine[2] and theirs:
                     one, two = (mine[0], mine[1], path_text(mine[2])), (theirs if len(theirs) == 3 else (*theirs, ""))
                     if one != two:
                         joins.append((one, two))
@@ -697,7 +735,7 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
             hit = resolve(inner) if isinstance(inner, exp.Column) and not isinstance(inner.this, exp.Star) else None
             placed = None if hit or isinstance(proj, exp.Star) else resolve_path(proj.unalias())
             by_position.append(hit or ((placed[0], placed[1], path_text(placed[2])) if isinstance(placed, tuple) and placed[0] in sources
-                                       and "{}" not in placed[2] and "~between" not in placed[2] else None))
+                                       and "{}" not in placed[2] and "~between" not in placed[2] and "~part" not in placed[2] else None))
             if hit:
                 outputs[proj.alias_or_name.upper()] = hit
         paths_out: dict[str, tuple[str, str, tuple[str, ...]]] = {}
@@ -1045,6 +1083,20 @@ def regex_examples(pattern: str, count: int = 4, ignore_case: bool = False, whol
     return found
 
 
+def part_templates(shapes: dict[str, dict[int, set[str]]], casts: dict[str, dict[int, str | None]]) -> list[str]:
+    """Templates for a text the SQL takes apart and keeps rows of by its pieces: `POST {hex}/api/v1/ack`.
+    One separator is honoured (the one with most pieces named); every named shape of a piece appears."""
+    sep = max(shapes, key=lambda k: (len(shapes[k]), k))
+    named, cast = shapes[sep], casts.get(sep, {})
+    width = max(max(named) + 1, max(cast, default=0) + 1, 2)
+    choices = [sorted(named.get(i, ())) for i in range(width)]
+    out = []
+    for k in range(max(len(c) for c in choices)):
+        out.append(sep.join(c[k % len(c)] if c else ("{n}" if hint_is_number(cast.get(i)) else "{hex}") for i, c in enumerate(choices)))
+    free = sep.join("{n}" if hint_is_number(cast.get(i)) else "{hex}" for i in range(width))
+    return [*out, free]
+
+
 def like_shape(pattern: str) -> str:
     """A template whose values match the LIKE pattern: `%.pool%.near` -> `{hex}.pool{hex}.near`."""
     return pattern.replace("\\", "").replace("%", "{hex}").replace("_", "x")
@@ -1314,6 +1366,8 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 # `where name like 'tap-%'` should keep some rows: make values that fit each pattern
                 shapes = sorted(like_shape(p) for p in use.patterns.get(col, ())) + sorted(use.examples.get(col, ()))[:24]
                 out[col] = {"gen": "template", "templates": [*shapes, f"{col.lower()}_{{hex}}"]}
+            elif col in use.part_shapes and not hint_is_number(hint):
+                out[col] = {"gen": "template", "templates": part_templates(use.part_shapes[col], (use.splits.get(col) or {}).get("seps", {}))}
             elif col in use.ips and not hint_is_number(hint):
                 out[col] = {"gen": "ip", "cidr": "/" in (use.splits.get(col) or {}).get("seps", {})}  # parse_ip(network, 'INET')
             elif col in use.splits and not hint_is_number(hint):
@@ -1448,6 +1502,17 @@ def analyse(manifest: dict, database: str) -> Analysis:
     _share_union_values(tables, links)
     if joined:
         notes.append(f"{len(joined)} group(s) of columns are joined in models and generated to match, for example: {' '.join(joined[:3])}")
+    # `where server_id = '93myk...'` on a column that refers to another table's key: that table has a row with that id
+    for name, table in tables.items():
+        for col, gen in table["columns"].items():
+            asked = sorted(uses[name].literals.get(col, ())) if gen.get("gen") == "fk" and name in uses else []
+            parent = tables.get(str(gen.get("ref", "")).upper()) if asked else None
+            key = next((g for g in parent["columns"].values() if g.get("gen") in ("sequence", "hash_id")), None) if parent else None
+            if key is None:
+                continue
+            if not all(re.fullmatch(r"\d{1,18}", v) for v in asked):
+                key["gen"] = "hash_id"  # named by a text: the ids are texts
+            key["named"] = sorted(set(key.get("named") or []) | set(asked))[:50]
     # a foreign key needs its parent to have a key
     for (child, col), (parent, pcol) in fks.items():
         if child in tables and parent in tables and tables[parent]["columns"].get(pcol, {}).get("gen") not in ("sequence", "hash_id"):
