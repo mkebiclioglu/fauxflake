@@ -64,6 +64,8 @@ class SourceUse:
         self.path_literals: dict[str, dict[str, set[str]]] = {}  # variant column -> {"a.b": values it is compared with}
         self.path_patterns: dict[str, dict[str, set[str]]] = {}  # variant column -> {"a.b": LIKE patterns that keep rows}
         self.path_optional: dict[str, set[str]] = {}  # variant column -> paths a CASE / IFF tests for being there
+        self.nullable: set[str] = set()  # columns a WHERE keeps only when they are NULL
+        self.future: set[str] = set()  # time columns compared with the present from above (`expire_at >= current_date`)
         self.embeds: dict[str, list[tuple[str, str, tuple[str, str]]]] = {}  # text column -> (before, after, the column whose value sits between them)
         self.star = False
 
@@ -452,6 +454,15 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 while isinstance(held.parent, _WRAPPERS):
                     held = held.parent
                 test = held.parent
+                if isinstance(test, exp.Is) and isinstance(test.expression, exp.Null) and test.this is held \
+                        and not isinstance(test.parent, exp.Not) and test.find_ancestor(exp.Where) is not None \
+                        and test.find_ancestor(exp.Or, exp.If, exp.Case) is None:
+                    use.nullable.add(found[1])  # `where converted_at is null`: some rows have none
+                if isinstance(test, (exp.GT, exp.GTE)) and test.this is held or isinstance(test, (exp.LT, exp.LTE)) and test.expression is held:
+                    now = test.expression if test.this is held else test.this
+                    if isinstance(now, (exp.CurrentDate, exp.CurrentTimestamp)) or (
+                            isinstance(now, exp.Anonymous) and now.name.upper() in ("SYSDATE", "GETDATE", "LOCALTIMESTAMP")):
+                        use.future.add(found[1])  # `expire_at >= current_date`: some of these lie ahead
                 if isinstance(test, (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ, exp.Between)):
                     sides = [test.args.get("low"), test.args.get("high")] if isinstance(test, exp.Between) else \
                         [test.expression if test.this is held else test.this]
@@ -1180,6 +1191,11 @@ def analyse(manifest: dict, database: str) -> Analysis:
             else:
                 out[col] = guess(col, hint)
             within_bounds(out[col], use.bounds.get(col))
+            if col in use.future and out[col].get("gen") == "time_offset" and not out[col].get("format") and not out[col].get("epoch"):
+                out[col].update(p=[0, 0.3, 1], seconds=[-30 * 86400, 30 * 86400, 400 * 86400])  # from last month to next year
+            if col in use.nullable and out[col].get("gen") not in ("sequence", "hash_id", "loaded_at", "event_time", "lifecycle") \
+                    and not out[col].get("null_rate"):
+                out[col]["null_rate"] = 0.3
         for col, habit in catalog.habits(name, out).items():
             if out[col].get("gen") in ("event_time", "time_offset", "updated_at") and not out[col].get("format"):
                 out[col] = {**habit, **({"type": out[col]["type"]} if out[col].get("type") else {})}

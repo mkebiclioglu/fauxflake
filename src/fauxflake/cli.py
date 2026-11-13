@@ -404,6 +404,18 @@ def why(spec_path, project_dir, db_path, every, unique, models):
 
         counts = {name: rows(node) for name, node in built.items()} if every else {m: rows(built[m]) for m in models}
         by_id = {n["unique_id"]: n["name"] for n in built.values()}
+        reads_data: dict[str, bool] = {}
+
+        def from_sources(uid: str) -> bool:
+            """Whether a source is anywhere behind the model. One that reads none (a check of the project's own
+            graph, a list written into the SQL) holds what it holds whatever the data is."""
+            if uid not in reads_data:
+                reads_data[uid] = False  # guards against a cycle
+                parents = (nodes.get(uid) or {}).get("depends_on", {}).get("nodes", [])
+                reads_data[uid] = any(p.startswith("source.") or from_sources(p) for p in parents)
+            return reads_data[uid]
+
+        apart = 0
         for name in (models or sorted(n for n, c in counts.items() if c == 0)):
             node = built[name]
             if counts.get(name) is None:
@@ -424,6 +436,10 @@ def why(spec_path, project_dir, db_path, every, unique, models):
             parents = [by_id[p] for p in node["depends_on"]["nodes"] if p in by_id]
             if every and any(counts.get(p) == 0 for p in parents):
                 continue  # empty because a model before it is: that one is reported
+            if every and not from_sources(node["unique_id"]):
+                apart += 1
+                click.echo(f"{name}: no rows, and it reads no source: it is empty for what the project is, not for the data")
+                continue
             compiled = manifest_path.parent / "compiled" / node["package_name"] / node["original_file_path"]
             sql = (node.get("compiled_code") or (compiled.read_text() if compiled.exists() else "")).strip().rstrip(";")
             if not sql:
@@ -436,7 +452,9 @@ def why(spec_path, project_dir, db_path, every, unique, models):
             finally:
                 conn.close()
     if every:
-        click.echo(f"{empty} model(s) are where rows stop; {sum(1 for c in counts.values() if c == 0)} of {len(counts)} are empty")
+        without = sum(1 for name, c in counts.items() if c == 0 and not from_sources(built[name]["unique_id"]))
+        click.echo(f"{empty} model(s) are where rows stop; {sum(1 for c in counts.values() if c == 0)} of {len(counts)} are empty"
+                   + (f" ({without} of them read no source data)" if without else ""))
 
 
 @main.command()

@@ -263,3 +263,13 @@ def test_the_looked_up_side_of_a_join_holds_each_value_once():
     # sessions are looked up: one code each; events refer to those codes
     assert tables["RAW.T.SESSIONS"]["columns"]["SESSION_CODE"] == {"gen": "template", "template": "session_ref_{n}"}
     assert tables["RAW.T.EVENTS"]["columns"]["SESSION_REF"]["gen"] == "pool"
+
+
+def test_filters_on_null_and_on_the_future_shape_the_column():
+    uses, _, _, _, _ = _scan({
+        "db.s.stg": "select id, converted as converted_at, expires as expire_at, seen from raw.t.leads",
+        "db.s.open": "select id from db.s.stg where converted_at is null and seen is not null",
+        "db.s.live": "select id, max(expire_at) m from db.s.stg where expire_at >= current_date group by 1",
+    }, ["RAW.T.LEADS"])
+    use = uses["RAW.T.LEADS"]
+    assert use.nullable == {"CONVERTED"} and use.future == {"EXPIRES"}

@@ -2604,6 +2604,8 @@ class Fitter:
                         self.trees.pop(uid, None)
                     if n.get("relation_name") and _fq(n["relation_name"]).count(".") == 2:
                         self.by_rel[_fq(n["relation_name"])] = uid
+            if n_round == 1:
+                analysis = self.read_again(manifest, analysis)
             failed = [r for r in results if r["status"] in ("error", "fail")]
             expected = self.spec.setdefault("dbt", {}).setdefault("expected_failures", [])
             accepted = 0
@@ -2705,6 +2707,55 @@ class Fitter:
             self.spec["dbt"].pop("expected_failures", None)
         self.save()
         return summary
+
+    def read_again(self, manifest: dict, analysis):  # noqa: ANN001, ANN201
+        """Models written by macros that look at the warehouse (dbt_utils.union_relations, star, pivot) have
+        their real SQL only once a build has compiled them. Read the project again with that SQL: what those
+        models compare, join and take apart now reaches the sources, for the columns nothing was known about."""
+        from . import init
+
+        try:
+            fresh = init.analyse(manifest, str(self.spec.get("dbt", {}).get("database") or "ANALYTICS"))
+        except Exception:  # noqa: BLE001 - the first reading stands
+            return analysis
+
+        def unknown(name: str, gen: dict) -> bool:
+            label = re.sub(r"~\w+|\[\]", "", name).split(".")[-1].lower()
+            return gen.get("gen") == "template" and gen.get("template") == f"{label}_{{hex}}" and not gen.get("templates")
+
+        def told(gen: dict) -> bool:
+            return gen.get("gen") in ("categorical", "pool", "fk", "link", "hash_id") or bool(gen.get("templates")) or bool(
+                gen.get("parts")) or (gen.get("gen") == "template" and "{n}" in str(gen.get("template")))
+
+        changed = 0
+        for table, spec in fresh.spec["tables"].items():
+            mine = self.tables.get(table, {}).get("columns")
+            if mine is None:
+                continue
+            for col, gen in spec["columns"].items():
+                held = mine.get(col)
+                if held is None:
+                    continue
+                if gen.get("gen") == "object" and held.get("gen") == "object":
+                    fields = held.setdefault("fields", {})
+                    for path, field in (gen.get("fields") or {}).items():
+                        if path not in fields or (unknown(path, fields[path]) and told(field)):
+                            if fields.get(path) != field:
+                                fields[path] = field
+                                changed += 1
+                                self.retyped.add(table)
+                elif unknown(col, held) and (told(gen) or (gen.get("gen") == "object" and gen.get("fields"))):
+                    if gen.get("gen") == "fk" and str(gen.get("ref", "")).upper() not in self.tables:
+                        continue
+                    mine[col] = {**gen, **({"follows": held["follows"]} if held.get("follows") and gen.get("gen") == "template" else {})}
+                    changed += 1
+                    self.retyped.add(table)
+        if changed:
+            self.dirty = True
+            self.learned.append(f"read the project again with the SQL the build compiled: {changed} column(s) and field(s) "
+                                "take the values its models compare, join and read.")
+            self.log(f"    read again with the built SQL: {changed} column(s) and field(s) learned")
+        return fresh
 
     def recheck_expected(self, project) -> None:  # noqa: ANN001
         """A test listed in an early round is left out of the rounds after it. What the spec learned since may
