@@ -1757,6 +1757,10 @@ def analyse(manifest: dict, database: str) -> Analysis:
                         and not columns[c].get("format") and c not in times]
             if len(times) != 1 or len(entities) != 1 or len(together_here) != 2 or tables[name].get("grain"):
                 continue
+            # a table with an id of its own lists things (subscriptions, orders), each once: not readings over time.
+            # And the period is one the models or Snowflake cut the time to, not merely a date
+            if any(d.get("gen") in _KEYS for d in columns.values()) or columns[times[0]].get("trunc") not in ("hour", "day"):
+                continue
             entity, hourly = entities[0], columns[times[0]].get("trunc") == "hour"
             held = columns[entity]
             few = 4 if hourly else 20
