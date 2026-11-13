@@ -107,6 +107,22 @@ class TableSQL:
         # the same row moved together (a third of the combinations of two categories never occurred)
         return f"((hash(hash({self.base}, {lit(self.salt(salt))}{args})) >> 11)::double / 9007199254740992.0)"
 
+    def linked(self) -> list[Table]:
+        """The other tables that `link` values in this table's documents point into."""
+        found: dict[str, Table] = {}
+
+        def walk(gens: dict) -> None:
+            for d in gens.values():
+                if d.get("gen") == "link" and not d.get("layered"):
+                    other = self.spec.tables.get(".".join(str(d.get("domain", "")).split(".")[:3]).upper())
+                    if other is not None and other.name != self.t.name:
+                        found[other.name] = other
+                elif d.get("gen") == "object":
+                    walk(d.get("fields") or {})
+
+        walk(self.t.columns)
+        return list(found.values())
+
     def grain(self) -> dict[str, int]:
         """The columns of the table's `grain` that take their values in turn (listed values, or a pool's), with how
         many each has: unique together with the period (the day, or the hour when the time column is cut to hours)."""
@@ -212,6 +228,13 @@ class TableSQL:
             else:
                 node[keys[-1]] = ("leaf", path, d)
 
+        def absent(value) -> float | None:  # noqa: ANN001
+            """How often a key is left out: its own rate, or (a key with keys under it) the one all of them share."""
+            if isinstance(value, tuple):
+                return value[2].get("optional")
+            rates = [absent(v) for v in value.values()] if isinstance(value, dict) else [None]
+            return max(rates) if rates and all(rates) else None
+
         def leaf(value: tuple) -> str:
             if key_expr and value[1] != keyed_by and self.base == "g":
                 self.base = key_expr
@@ -260,7 +283,7 @@ class TableSQL:
             always, sometimes = [], []
             for key, value in node.items():
                 part = f"{lit(key)}, {build(value, f'{where}.{key}', depth)}"
-                rate = value[2].get("optional") if isinstance(value, tuple) else None
+                rate = absent(value)
                 if rate:  # a key the SQL tests for being there: present in some documents, absent in the others
                     sometimes.append(f"case when {self.u(f'{col}.{where}.{key}:there')} < {float(rate)!r} then '{{}}'::json "
                                      f"else json_object({part}) end")
@@ -305,6 +328,11 @@ class TableSQL:
                 target = f"(case when g % 3 > 0{first} then g - 1 else -1 - g * 16{f' - {inside[-1]}' if inside else ''} end)"
             else:
                 target = f"floor({draw} * {int(d.get('first', 50))})::bigint"
+                other = self.spec.tables.get(".".join(str(d.get("domain", "")).split(".")[:3]).upper())
+                if other is not None and other.name != self.t.name:
+                    # any of the rows the other table has by this row's day, not only its first few: every one of
+                    # its ids is referred to (a transaction has receipts), as far as there are rows to refer
+                    target = f"floor({draw} * greatest(_lc_{other.ident}, {int(d.get('first', 50))}))::bigint"
             for level in range(depth):
                 # the element of the row it points at: each referring field has its own (`slot`), so two fields
                 # never name the same id
@@ -438,6 +466,10 @@ class TableSQL:
         )
         # parents there before the row's day, and (for rows that take parents in turn) by the end of it
         pcs = "".join(f", coalesce(pc_{c}.cum, 0) as _pc_{c}, coalesce(pc_{c}.cum, 0) + coalesce(pc_{c}.n, 0) as _pe_{c}" for c, _ in fks)
+        # tables whose documents hold the ids this table's documents refer to: how many rows they had by the row's day
+        for other in self.linked():
+            joins += f" left join cal_{other.ident} lc_{other.ident} on lc_{other.ident}.day = c.day"
+            pcs += f", coalesce(lc_{other.ident}.cum, 0) + coalesce(lc_{other.ident}.n, 0) as _lc_{other.ident}"
 
         intraday = t.raw.get("intraday")
         second_of_day = piecewise(self.u("ev"), intraday["p"], [h * 3600 for h in intraday["hours"]]) if intraday \

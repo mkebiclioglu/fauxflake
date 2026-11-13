@@ -181,3 +181,38 @@ def test_an_hourly_series_has_every_entity_every_hour_once():
             "on m.ENTITY_ID = q.WAREHOUSE_ID and m.START_TIME = date_trunc('hour', q.AT) where q.AT < timestamp '2025-01-03'").fetchone()
     assert rows == pairs == hours * 4 and entities == 4 and hours >= 48
     assert matched == queries > 100  # every query finds its warehouse's hour
+
+
+def test_links_between_documents_reach_every_row_of_the_other_table():
+    from fauxflake.spec import Spec
+
+    table = {"volume": {"rows_per_day": 300, "weekly": [1] * 7}, "lateness": {"p": [0, 1], "seconds": [0, 1]}}
+    domain = "RAW.T.TXS.V.hash"
+    spec = Spec.from_raw({"seed": 42, "start": "2025-01-01", "tables": {
+        "RAW.T.TXS": {**table, "columns": {"V": {"gen": "object", "fields": {"hash": {"gen": "hash_id", "domain": domain}}}}},
+        "RAW.T.RECEIPTS": {**table, "columns": {"V": {"gen": "object", "fields": {
+            "id": {"gen": "hash_id", "domain": "RAW.T.RECEIPTS.V.id"}, "tx": {"gen": "link", "domain": domain, "depth": 0}}}}},
+    }}, ".")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 5))
+        cur = emu.cursor()
+        txs = cur.execute("select count(*) from RAW.T.TXS").fetchone()[0]
+        with_receipts, orphans = cur.execute(
+            "select count(distinct t.V->>'hash'), count_if(t.V is null) from RAW.T.RECEIPTS r "
+            "left join RAW.T.TXS t on t.V->>'hash' = r.V->>'tx'").fetchone()
+    assert orphans == 0 and with_receipts > txs * 0.4 > 100  # not only the first fifty
+
+
+def test_a_key_left_out_of_most_documents_is_left_out_however_it_is_read():
+    from fauxflake.spec import Spec
+
+    text = {"gen": "template", "template": "failure_{hex}", "optional": 0.95}
+    spec = Spec.from_raw({"seed": 42, "start": "2025-01-01", "tables": {"RAW.T.RECEIPTS": {
+        "volume": {"rows_per_day": 400, "weekly": [1] * 7}, "lateness": {"p": [0, 1], "seconds": [0, 1]},
+        "columns": {"V": {"gen": "object", "fields": {"id": {"gen": "template", "template": "id_{hex}"},
+                                                      "status.Failure": dict(text), "status.Failure~json": dict(text)}}}}}}, ".")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 4))
+        rows, failed = emu.cursor().execute(
+            "select count(*), count_if(json_extract(V, '$.status.Failure') is not null) from RAW.T.RECEIPTS").fetchone()
+    assert rows > 500 and 0 < failed < rows * 0.15

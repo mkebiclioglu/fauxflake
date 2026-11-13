@@ -1586,7 +1586,8 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 for path in use.path_optional.get(col, ()):
                     # the key itself, or (when deeper keys are read) every path under it
                     for field, d in out[col]["fields"].items():
-                        if field == path or field.startswith(path + "."):
+                        if field == path or field.startswith((path + ".", path + "~", path + "[")):
+                            # (also read as JSON text or as a list: the same key)
                             # there in half of the documents; a key that reports what went wrong (`status.Failure`) in few:
                             # most things succeed, and a transaction of ten receipts succeeds only if all of them do
                             wrong = re.search(r"fail|error|exception|reject|invalid|panic", re.sub(r"~\w+|\[\]", "", path).split(".")[-1], re.I)
