@@ -394,6 +394,13 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     if found is not None:
                         return found
                 return None
+            if isinstance(node, exp.Case):
+                # case when a then 'fixed' else coalesce(x, y) end: what the first answer that is a column holds
+                for value in [*(branch.args.get("true") for branch in node.args.get("ifs") or []), node.args.get("default")]:
+                    found = resolve_path(value, depth + 1) if value is not None else None
+                    if found is not None:
+                        return found
+                return None
             if isinstance(node, exp.Coalesce):
                 for value in [node.this, *node.expressions]:
                     found = resolve_path(value, depth + 1)
@@ -1556,8 +1563,9 @@ def analyse(manifest: dict, database: str) -> Analysis:
     # `where server_id = '93myk...'` on a column that refers to another table's key: that table has a row with that id
     for name, table in tables.items():
         for col, gen in table["columns"].items():
-            asked = sorted(uses[name].literals.get(col, ())) if gen.get("gen") == "fk" and name in uses else []
-            parent = tables.get(str(gen.get("ref", "")).upper()) if asked else None
+            kind = gen.get("gen")
+            asked = sorted(uses[name].literals.get(col, ())) if kind in ("fk", "sequence", "hash_id") and name in uses else []
+            parent = (table if kind != "fk" else tables.get(str(gen.get("ref", "")).upper())) if asked else None
             key = next((g for g in parent["columns"].values() if g.get("gen") in ("sequence", "hash_id")), None) if parent else None
             if key is None:
                 continue
@@ -1566,7 +1574,8 @@ def analyse(manifest: dict, database: str) -> Analysis:
             key["named"] = sorted(set(key.get("named") or []) | set(asked))[:50]
     # a foreign key needs its parent to have a key
     for (child, col), (parent, pcol) in fks.items():
-        if child in tables and parent in tables and tables[parent]["columns"].get(pcol, {}).get("gen") not in ("sequence", "hash_id"):
+        if child in tables and parent in tables and tables[parent]["columns"].get(pcol, {}).get("gen") not in ("sequence", "hash_id") \
+                and tables[child]["columns"].get(col, {}).get("gen") == "fk":  # (a key of its own table stays one)
             notes.append(f"{child}.{col}: references {parent}.{pcol}, which is not that table's key; generated as a plain column.")
             tables[child]["columns"][col] = guess(col, None)
     # INFORMATION_SCHEMA is the warehouse describing itself: the emulator answers it, nothing to generate

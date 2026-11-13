@@ -483,3 +483,11 @@ def test_a_document_field_tested_with_a_regular_expression_gets_texts_that_match
     scan_model("select id, regexp_substr(status_value, 'Success') as ok from a.b.rec where not regexp_like(id, 'x.*')",
                sources, {"A.B.REC": staged})
     assert sources["RAW.N.RECEIPTS"].path_literals == {"R": {"outcome.status": {"Success"}}}
+
+
+def test_lineage_follows_a_case_to_the_column_it_falls_back_to():
+    sources = {"RAW.T.SERVER": SourceUse()}
+    staged = scan_model("""select case when user_id = 'x1' and coalesce(inst_a, inst_b) is not null then 'fixed'
+                                       else coalesce(inst_a, inst_b) end as installation_id from raw.t.server""", sources)
+    scan_model("select * from a.b.stg where installation_id in ('abc', 'def')", sources, {"A.B.STG": staged})
+    assert sources["RAW.T.SERVER"].literals["INST_A"] == {"abc", "def"}
