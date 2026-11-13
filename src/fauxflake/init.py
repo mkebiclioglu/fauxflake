@@ -1295,12 +1295,18 @@ def analyse(manifest: dict, database: str) -> Analysis:
             table["volume"]["rows_per_day"] = rows
         notes.append(f"{len(tables)} source tables: placeholder volumes are {rows} rows a day ({rows // 1000} at the default scale) "
                      "to keep builds quick. `fauxflake profile` replaces them with what production has.")
+    # a history longer than the usual sixty days holds the same number of rows, spread thinner: the dates the SQL
+    # asks for are there, and a build costs what it did
+    start, history = history_window(dates)
+    if history and history > 60:
+        for table in tables.values():
+            table["volume"]["rows_per_day"] = max(1000, int(float(table["volume"]["rows_per_day"]) * 60 / history))
     # a shared pool as large as the table: two tables of a few thousand rows joined on a column drawn from
     # 200 values pair every row with dozens of others, and three such joins in a row fill the disk. Drawn from
     # about as many values as there are rows, each row finds a partner or two, as with real ids. (The smaller
     # table's values are the first of the larger one's, so they still meet.)
     for table in tables.values():
-        rows = int(float(table["volume"]["rows_per_day"]) * 0.001 * 60)  # at the default scale and history
+        rows = int(float(table["volume"]["rows_per_day"]) * 0.001 * (history or 60))  # at the default scale
 
         def widen(gens: dict) -> None:
             for d in gens.values():
@@ -1317,7 +1323,6 @@ def analyse(manifest: dict, database: str) -> Analysis:
         settings["target"] = os.environ["FAUXFLAKE_TARGET"]
         notes.append(f"the project names its schemas differently for the target `{settings['target']}` and refers to those names "
                      f"directly, so it is built as that target (`dbt: {{target: {settings['target']}}}`). Nothing leaves this machine.")
-    start, history = history_window(dates)
     if (start, history) != (date(2025, 1, 1), None):
         notes.append(f"the SQL compares with dates between {min(d for _, d in dates)} and {max(d for _, d in dates)}: "
                      f"the generated history starts {start}" + (f" and spans {history} days." if history else "."))
