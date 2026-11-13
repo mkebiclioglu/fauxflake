@@ -145,7 +145,7 @@ def _like_patterns(test: exp.Expression) -> list[str]:
     wanted = wanted.this if isinstance(wanted, exp.Any) else wanted
     wanted = wanted.unnest() if isinstance(wanted, (exp.Paren, exp.Subquery)) else wanted
     return [one.name for one in (wanted.expressions if isinstance(wanted, (exp.Tuple, exp.Array)) else [wanted])
-            if isinstance(one, exp.Literal) and one.is_string and len(one.name) <= 60 and re.search(r"[A-Za-z0-9]", one.name)]
+            if isinstance(one, exp.Literal) and one.is_string and len(one.name) <= 60 and re.search(r"[^%_\s]", one.name)]
 
 
 _REGEX_TESTS = tuple(getattr(exp, name) for name in ("RegexpLike", "RegexpILike", "RegexpExtract", "RegexpInstr", "RegexpCount")
@@ -1587,7 +1587,10 @@ def analyse(manifest: dict, database: str) -> Analysis:
                     # the key itself, or (when deeper keys are read) every path under it
                     for field, d in out[col]["fields"].items():
                         if field == path or field.startswith(path + "."):
-                            d["optional"] = 0.5
+                            # there in half of the documents; a key that reports what went wrong (`status.Failure`) in few:
+                            # most things succeed, and a transaction of ten receipts succeeds only if all of them do
+                            wrong = re.search(r"fail|error|exception|reject|invalid|panic", re.sub(r"~\w+|\[\]", "", path).split(".")[-1], re.I)
+                            d["optional"] = 0.95 if wrong else 0.5
                 if "id" in out[col]["fields"]:
                     out[col]["keyed_by"] = "id"  # {"id": 7, "login": "x"}: the login belongs to the id
                 if col in use.json_text:

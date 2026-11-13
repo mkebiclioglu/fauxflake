@@ -580,3 +580,16 @@ def test_a_table_matched_on_an_entity_and_its_hour_is_a_series():
     metering = tables["RAW.S.METERING"]
     assert metering["columns"]["ENTITY_ID"] == {"gen": "pool", "pool": "entity_id", "size": 4, "numeric": True}
     assert tables["RAW.S.QUERIES"]["columns"]["WAREHOUSE_ID"] == metering["columns"]["ENTITY_ID"]
+
+
+def test_a_key_that_reports_a_failure_is_there_in_few_documents():
+    from fauxflake.init import build_spec
+
+    manifest = {
+        "sources": {"source.p.s.receipts": {"database": "RAW", "schema": "S", "name": "receipts", "identifier": "receipts", "columns": {}}},
+        "nodes": {"model.p.m": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.M", "compiled_code": """
+            select v:id::string as id, iff(v:outcome.status.Failure is not null, 'Fail', 'Success') as status,
+                   iff(v:outcome.proof is not null, 1, 0) as proven from raw.s.receipts"""}},
+    }
+    fields = build_spec(manifest, "A")[0]["tables"]["RAW.S.RECEIPTS"]["columns"]["V"]["fields"]
+    assert fields["outcome.status.Failure"]["optional"] == 0.95 and fields["outcome.proof"]["optional"] == 0.5
