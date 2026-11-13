@@ -2744,7 +2744,7 @@ class Fitter:
                                 fields[path] = field
                                 changed += 1
                                 self.retyped.add(table)
-                elif unknown(col, held) and (told(gen) or (gen.get("gen") == "object" and gen.get("fields"))):
+                elif (unknown(col, held) or held == init.guess(col, None)) and (told(gen) or (gen.get("gen") == "object" and gen.get("fields"))):
                     if gen.get("gen") == "fk" and str(gen.get("ref", "")).upper() not in self.tables:
                         continue
                     mine[col] = {**gen, **({"follows": held["follows"]} if held.get("follows") and gen.get("gen") == "template" else {})}
@@ -2811,8 +2811,10 @@ class Fitter:
     def learn_from_test(self, node: dict, analysis) -> bool:  # noqa: ANN001
         """A failing generic test states a fact about the data the spec did not know."""
         meta = node.get("test_metadata")
-        if not meta or not node.get("attached_node"):
+        tested = node.get("attached_node") or next(iter(reversed(node.get("depends_on", {}).get("nodes") or [])), None)
+        if not meta or not tested:
             return False
+        node = {**node, "attached_node": tested}  # a test under a source names no attached node
         kwargs = meta["kwargs"].get("arguments") or meta["kwargs"]
         column = node.get("column_name") or kwargs.get("column_name") or meta["kwargs"].get("column_name")
         here = analysis.place(node["attached_node"], column) if column and re.fullmatch(r"\w+", str(column)) else None

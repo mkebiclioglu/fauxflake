@@ -1087,8 +1087,13 @@ def analyse(manifest: dict, database: str) -> Analysis:
     accepted: dict[tuple[str, str], list] = {}
     for node in manifest["nodes"].values():
         meta = node.get("test_metadata")
-        if node["resource_type"] != "test" or not meta or not node.get("attached_node"):
+        if node["resource_type"] != "test" or not meta:
             continue
+        # a test written under a source has no `attached_node`: what it tests is the (last) thing it depends on
+        tested = node.get("attached_node") or next(iter(reversed(node.get("depends_on", {}).get("nodes") or [])), None)
+        if not tested:
+            continue
+        node = {**node, "attached_node": tested}
         column = node.get("column_name") or meta["kwargs"].get("column_name")
         here = locate(node["attached_node"], column) if column else None
         if not here:
