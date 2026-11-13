@@ -491,3 +491,20 @@ def test_lineage_follows_a_case_to_the_column_it_falls_back_to():
                                        else coalesce(inst_a, inst_b) end as installation_id from raw.t.server""", sources)
     scan_model("select * from a.b.stg where installation_id in ('abc', 'def')", sources, {"A.B.STG": staged})
     assert sources["RAW.T.SERVER"].literals["INST_A"] == {"abc", "def"}
+
+
+def test_a_test_that_says_one_time_is_after_another_orders_them():
+    from fauxflake.init import build_spec
+
+    manifest = {
+        "sources": {"source.p.s.releases": {"database": "RAW", "schema": "S", "name": "releases", "identifier": "releases", "columns": {}}},
+        "nodes": {
+            "model.p.m": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.M", "compiled_code": """
+                select version, release_date::date as release_date, rc1_date::date as rc1_date, other_date::date as o from raw.s.releases"""},
+            "test.p.t": {"resource_type": "test", "attached_node": "model.p.m", "depends_on": {"nodes": ["model.p.m"]},
+                         "test_metadata": {"name": "expression_is_true", "namespace": "dbt_utils",
+                                           "kwargs": {"expression": "release_date > rc1_date", "model": "ref('m')"}}}},
+    }
+    columns = build_spec(manifest, "A")[0]["tables"]["RAW.S.RELEASES"]["columns"]
+    assert min(columns["RELEASE_DATE"]["seconds"]) > max(columns["RC1_DATE"]["seconds"])
+    assert columns["OTHER_DATE"]["seconds"] == columns["RC1_DATE"]["seconds"]

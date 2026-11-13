@@ -383,3 +383,17 @@ def test_a_value_of_the_wrong_kind_is_not_taken_for_sql_that_does_not_parse():
     f.columns_children_read = lambda uid: ["TICKET_ID"]
     assert not f.jinja_columns("m", 'Conversion Error: Expected ARRAY, but got VARCHAR: "custom_fields_3b22"')
     assert f.jinja_columns("m", "Parser Error: syntax error at or near 'from'") and "TICKET_ID" in f.tables["RAW.Z.TICKETS"]["columns"]
+
+
+def test_an_end_kept_in_a_document_comes_after_a_start_kept_in_a_column():
+    from fauxflake.init import WEEK, guess, periods_have_length
+
+    columns = {"CURRENT_PERIOD_START": {"gen": "time_offset", **WEEK}, "CREATED": {"gen": "time_offset", **WEEK},
+               "METADATA": {"gen": "object", "fields": {"cws-license-end-date": {"gen": "time_offset", "epoch": True, **WEEK},
+                                                        "license-start-date": {"gen": "time_offset", "format": "%Y-%m-%d", **WEEK},
+                                                        "friend": guess("friend", None)}}}
+    assert periods_have_length(columns) == ["METADATA.cws-license-end-date"]
+    fields = columns["METADATA"]["fields"]
+    assert min(fields["cws-license-end-date"]["seconds"]) > max(columns["CURRENT_PERIOD_START"]["seconds"])
+    assert fields["cws-license-end-date"]["epoch"] and fields["license-start-date"]["seconds"] == WEEK["seconds"]
+    assert columns["CREATED"]["seconds"] == WEEK["seconds"]

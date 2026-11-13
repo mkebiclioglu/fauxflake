@@ -1192,18 +1192,28 @@ LASTS = {"p": [0, 0.5, 1], "seconds": [30 * 86400, 365 * 86400, 3 * 365 * 86400]
 
 def periods_have_length(columns: dict[str, dict]) -> list[str]:
     """`term_start_date` and `term_end_date`, both known only by name: the end comes after the start,
-    by a month to a few years, as subscriptions, contracts and campaigns do. Returns the ends changed."""
+    by a month to a few years, as subscriptions, contracts and campaigns do. Any end follows any start of
+    the same row, wherever the two are kept (`current_period_start` beside `metadata:"license-end-date"`):
+    models take a period's start from one place and its end from another. Returns the ends changed."""
+    def times(holder: dict, prefix: str = ""):  # noqa: ANN202
+        for name, d in holder.items():
+            if d.get("gen") == "time_offset":
+                yield prefix + name, d
+            elif d.get("gen") == "object":
+                yield from times(d.get("fields") or {}, f"{prefix}{name}.")
+
+    def named(label: str, word: str) -> bool:
+        last = re.sub(r"~\w+|\[\]", "", label).split(".")[-1].upper().replace("-", "_")
+        return bool(re.search(rf"(?<![A-Z]){word}(?:S|ED)?(?![A-Z])|{word}DATE", last))
+
+    found = list(times(columns))
+    starts = [d for label, d in found if named(label, "START")]
     changed = []
-    for col, d in columns.items():
-        for end, start in (("END", "START"), ("ENDS", "STARTS"), ("ENDED", "STARTED")):
-            sibling = re.sub(rf"(?<![A-Z]){end}(?![A-Z])", start, col) if re.search(rf"(?<![A-Z]){end}(?![A-Z])", col) else \
-                col.replace(end + "DATE", start + "DATE") if end + "DATE" in col else col
-            other = columns.get(sibling) if sibling != col else None
-            if other and d.get("gen") == other.get("gen") == "time_offset" and d.get("seconds") == other.get("seconds") \
-                    and d.get("p") == other.get("p") and not d.get("unique"):
-                d.update(copy.deepcopy(LASTS))
-                changed.append(col)
-                break
+    for label, d in found:
+        if named(label, "END") and not d.get("unique") and any(
+                d.get("seconds") == start.get("seconds") and d.get("p") == start.get("p") for start in starts):
+            d.update(copy.deepcopy(LASTS))
+            changed.append(label)
     return changed
 
 
@@ -1338,6 +1348,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
         return None
 
     keys: dict[str, str] = {}
+    ordered: list[tuple[tuple[str, str, str], tuple[str, str, str]]] = []  # (the later, the earlier) of two times a test compares
     fks: dict[tuple[str, str], tuple[str, str]] = {}
     accepted: dict[tuple[str, str], list] = {}
     for node in manifest["nodes"].values():
@@ -1350,6 +1361,18 @@ def analyse(manifest: dict, database: str) -> Analysis:
             continue
         node = {**node, "attached_node": tested}
         column = node.get("column_name") or meta["kwargs"].get("column_name")
+        if meta["name"] == "expression_is_true" and not column:
+            # `expression: "release_date > rc1_date"`: one of the two comes after the other
+            try:
+                said = sqlglot.parse_one(str((meta["kwargs"].get("arguments") or meta["kwargs"]).get("expression") or ""), read="snowflake")
+            except Exception:  # noqa: BLE001
+                said = None
+            if isinstance(said, (exp.GT, exp.GTE, exp.LT, exp.LTE)) and isinstance(said.this, exp.Column) and isinstance(said.expression, exp.Column):
+                later, earlier = (said.this, said.expression) if isinstance(said, (exp.GT, exp.GTE)) else (said.expression, said.this)
+                ends = [place(node["attached_node"], c.name) for c in (later, earlier)]
+                if all(ends) and ends[0][0] == ends[1][0] and ends[0] != ends[1]:
+                    ordered.append((ends[0], ends[1]))
+            continue
         here = locate(node["attached_node"], column) if column else None
         if not here:
             continue
@@ -1364,6 +1387,10 @@ def analyse(manifest: dict, database: str) -> Analysis:
             there = locate(others[0], kw.get("field", "")) if others else None
             if there and there[0] != here[0]:
                 fks[here] = there
+            other = manifest["nodes"].get(others[0], {}) if others else {}
+            listed = seed_values.get((str(other.get("relation_name") or "").replace('"', "").upper(), str(kw.get("field", "")).upper()))
+            if other.get("resource_type") == "seed" and listed:
+                accepted.setdefault(here, listed[:200])  # every value must be one the seed lists: the project wrote them down
 
     tables: dict[str, dict] = {}
     assumed: list[str] = []
@@ -1560,6 +1587,19 @@ def analyse(manifest: dict, database: str) -> Analysis:
     _share_union_values(tables, links)
     if joined:
         notes.append(f"{len(joined)} group(s) of columns are joined in models and generated to match, for example: {' '.join(joined[:3])}")
+    def held_at(spot):  # noqa: ANN001, ANN202
+        column = tables.get(spot[0], {}).get("columns", {}).get(spot[1])
+        if column is None or not spot[2]:
+            return column
+        return (column.get("fields") or {}).get(spot[2]) if column.get("gen") == "object" else None
+
+    for later, earlier in ordered:
+        # a test says one time is after the other: it starts where the other's range stops
+        after, before = held_at(later), held_at(earlier)
+        if after and before and after.get("gen") == before.get("gen") == "time_offset" and not after.get("unique"):
+            top = max(before["seconds"])
+            if min(after["seconds"]) <= top:
+                after.update(p=[0, 0.5, 1], seconds=[top + 86400, top + 30 * 86400, top + 365 * 86400])
     # `where server_id = '93myk...'` on a column that refers to another table's key: that table has a row with that id
     for name, table in tables.items():
         for col, gen in table["columns"].items():
