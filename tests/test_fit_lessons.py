@@ -375,3 +375,11 @@ def test_reading_again_replaces_what_was_only_guessed_even_after_a_cast_retyped_
     f.read_again(manifest, None)
     assert set(columns["USER_ID"]["values"]) >= {"u_17"} and set(columns["KIND"]["values"]) >= {"signup"}
     assert columns["AMOUNT"]["gen"] == "dist" and f.dirty and f.retyped == {"RAW.S.EVENTS"}
+
+
+def test_a_value_of_the_wrong_kind_is_not_taken_for_sql_that_does_not_parse():
+    f = fitter(tables={"RAW.Z.TICKETS": {"columns": {}}}, sql_of={"m": 'select array_to_string(custom_fields, \',\') from "RAW".z.tickets'},
+               nodes={"m": {"name": "m", "depends_on": {"macros": []}}})
+    f.columns_children_read = lambda uid: ["TICKET_ID"]
+    assert not f.jinja_columns("m", 'Conversion Error: Expected ARRAY, but got VARCHAR: "custom_fields_3b22"')
+    assert f.jinja_columns("m", "Parser Error: syntax error at or near 'from'") and "TICKET_ID" in f.tables["RAW.Z.TICKETS"]["columns"]

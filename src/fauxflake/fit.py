@@ -1830,7 +1830,8 @@ class Fitter:
         """The model's SQL does not parse: a macro wrote it from the columns it found in the tables it
         reads (`if 'TYPE' in columns ... type not in (...)`), and they have none of them yet. Give those
         tables the columns the macro tests for by name and the ones the models downstream read."""
-        if not re.search(r"Parser Error|syntax error|Expected |Required keyword|Invalid expression", message):
+        if not re.search(r"Parser Error|syntax error|Expected |Required keyword|Invalid expression", message) \
+                or re.search(r"Conversion Error|Expected \w+, but got", message):  # "Expected ARRAY, but got VARCHAR" is about a value
             return False
         code = (self.sql_of.get(sql_key) or self.nodes.get(sql_key, {}).get("compiled_code") or "").upper().replace('"', "")
         tables = [t for t in self.tables if t in code or t.split(".", 1)[1] in code]
@@ -2554,9 +2555,10 @@ class Fitter:
             if len(self.learned) == before:
                 break
             state = (frozenset(failures), tuple(sorted(self.learned[before:])))
-            if state == getattr(self, "_last_pass", None):
-                break  # the same lessons about the same failures as the pass before: another pass would repeat them
-            self._last_pass = state
+            seen = self.__dict__.setdefault("_passes_seen", set())
+            if state in seen:
+                break  # the same lessons about the same failures as an earlier pass: more passes would go round again
+            seen.add(state)
             # next pass: what failed, what reads a source whose values changed, and everything downstream of those
             again = set(failures)
             if self.retyped:

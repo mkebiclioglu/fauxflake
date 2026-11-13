@@ -442,3 +442,10 @@ def test_a_key_the_sql_takes_apart_keeps_its_shape():
                          "test_metadata": {"name": "unique", "kwargs": {"column_name": "version"}}}},
     }
     assert build_spec(manifest, "A")[0]["tables"]["RAW.S.RELEASES"]["columns"]["VERSION"] == {"gen": "hash_id", "template": "{n}.{n}"}
+
+
+def test_a_column_handed_to_an_array_function_is_a_list():
+    sources = {"RAW.Z.TICKETS": SourceUse()}
+    scan_model("""select t.id, array_to_string(custom_fields, ',') as s, array_size(tags) as n, array_contains('x'::variant, labels) as l,
+                  upper(title) as title from raw.z.tickets t""", sources)
+    assert sources["RAW.Z.TICKETS"].arrays == {"CUSTOM_FIELDS", "TAGS", "LABELS"}

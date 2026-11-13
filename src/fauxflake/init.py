@@ -122,6 +122,11 @@ def _belongs_inside(col: exp.Column, select: exp.Select, sources: dict) -> bool:
     return any(t.db and _table_id(t) not in sources for t in tables)
 
 
+_ARRAY_READERS = tuple(getattr(exp, name) for name in (
+    "ArrayToString", "ArraySize", "ArrayContains", "ArrayOverlaps", "ArrayDistinct", "ArraySlice", "ArrayPosition", "ArrayConcat")
+    if hasattr(exp, name))
+
+
 def _is_condition(col: exp.Column) -> bool:
     """`where not is_deleted`, `iff(active, ...)`, `won = true`: the column is read as a truth value."""
     parent = col.parent
@@ -721,8 +726,9 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                         use.arrays.add(hit[1])
                 elif isinstance(parent, (exp.Split, exp.SplitPart)) and parent.this is col and _split_use(use, hit[1], parent):
                     pass  # split(col, '/')[0]::number: the text has parts, and this one is a number
-                elif isinstance(parent, exp.Bracket) or col.find_ancestor(exp.Explode, exp.Lateral, exp.Unnest) is not None:
-                    use.arrays.add(hit[1])
+                elif isinstance(parent, exp.Bracket) or col.find_ancestor(exp.Explode, exp.Lateral, exp.Unnest) is not None \
+                        or (isinstance(parent, _ARRAY_READERS) and parent.this is col):
+                    use.arrays.add(hit[1])  # array_to_string(tags, ','), array_size(tags): a list
                 elif isinstance(parent, (exp.StrToTime, exp.StrToDate, exp.TsOrDsToDate)) and parent.this is col \
                         and isinstance(parent.args.get("format"), exp.Literal):
                     use.formats[hit[1]] = parent.args["format"].name  # a text column holding dates
