@@ -2936,7 +2936,9 @@ class Fitter:
         if node.get("compiled_code"):
             return node["compiled_code"].strip().rstrip(";")
         path = project.target_path / "compiled" / node["package_name"] / node["original_file_path"]
-        return path.read_text().strip().rstrip(";") if path.exists() else None
+        if path.is_dir():  # a test declared in a .yml: dbt keeps its SQL in a folder named after the file
+            path = next((p for p in (path / f"{node.get(key)}.sql" for key in ("alias", "name")) if p.is_file()), path)
+        return path.read_text().strip().rstrip(";") if path.is_file() else None
 
     def together(self, uid: str, names: list[str], analysis, test: str) -> bool:  # noqa: ANN001
         """These columns of a model (or source) are unique together, a test says. They are looked for in the model

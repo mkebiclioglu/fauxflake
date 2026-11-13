@@ -478,3 +478,17 @@ def test_a_number_type_does_not_outlive_the_guess_that_gave_it():
     columns = tables["RAW.S.LEADS"]["columns"]
     assert "type" not in columns["LEADID"] and "type" not in columns["OWNER"]
     assert columns["RANK"]["type"] == "BIGINT" and columns["NOTE"]["type"] == "VARCHAR" and columns["N"]["type"] == "BIGINT"
+
+
+def test_the_sql_of_a_test_declared_in_a_yml_is_found_in_its_folder(tmp_path):
+    class Project:
+        target_path = tmp_path
+
+    folder = tmp_path / "compiled" / "p" / "models" / "spend.yml"
+    folder.mkdir(parents=True)
+    (folder / "unique_spend_id.sql").write_text("select 1;\n")
+    f = fitter()
+    node = {"package_name": "p", "original_file_path": "models/spend.yml", "name": "unique_spend_id", "alias": "unique_spend_id"}
+    assert f._compiled(Project, node) == "select 1"
+    assert f._compiled(Project, {**node, "name": "other", "alias": "other"}) is None
+    assert f._compiled(Project, {**node, "compiled_code": "select 2;"}) == "select 2"
