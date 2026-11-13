@@ -72,13 +72,24 @@ Reading the SQL gives each source's columns and the shape of their values:
 | `to_timestamp(v:created::string)` and `v:created::int` | an epoch number |
 | `where state = 'open'` | `open` among the values |
 | `where block_id between 9820000 and 10000000` | numbers in that range |
-| `where name like 'tap-%'` | names that fit the pattern |
+| `where name like 'tap-%'`, `like any ('tap-%', 'target-%')` | names that fit the patterns |
+| `rlike(uri, '^/[1-9]+[.][0-9]+/.*')`, `regexp_substr(status, 'Success')` | text the expression matches |
 | `split(filename, '/')[0]::number` | text whose first part is a number |
+| `split_part(request, ' ', 1) = 'POST'` | text whose first piece is `POST` |
+| `try_parse_json(replace(log, 'EVENT_JSON:')):event` | that mark, then JSON with an `event` key |
+| `iff(v:status:Failure is not null, 'Fail', 'Success')` | a `Failure` key in few of the documents |
+| `where not is_deleted`, `iff(active, 1, 0)` | a boolean |
 | `parse_ip(network, 'INET')` | IP ranges |
-| `a.account_id = b.id` | `account_id` drawn from `b`'s keys, so the join matches |
+| `a.account_id = b.id`, `a.account_id in (select id from b)` | `account_id` drawn from `b`'s keys, so the join matches |
+| `where server_id = '93my...'` on a column that refers to another table | a row with that id in the table it refers to |
+| `on q.warehouse_id = m.entity_id and q.hour = m.start_time` | a meter: one row an hour for each of a few entities |
+| `on i.created_at between r.window_start and r.release_date` | periods that follow one another, so a row falls in one |
+| `group by license_id having count(distinct seats) = 1` | one number of seats per license |
 | `sum(x)`, `x * 2`, `x > 100` | a number |
 | columns lined up by a `UNION` | one type |
 | a `unique`, `relationships` or `accepted_values` test | a key, a reference, those values |
+| `unique_combination_of_columns`, `expression_is_true: "ended_at > started_at"` | the combination once; the two times in that order |
+| a seed joined on two columns | the pairs the seed lists |
 
 Tests on marts are traced back through staging to the raw column. Sources in the `SNOWFLAKE`
 database (`ACCOUNT_USAGE`, `ORGANIZATION_USAGE`) get their real columns.
@@ -93,6 +104,10 @@ Then it runs the project and learns from what fails:
 | a model reads its own table, or a sibling's, by a hard-coded name | an empty table of that shape to start from, as production has |
 | a model reads a table nobody declared | a generated source |
 | a `unique` test fails | a column without repeats |
+| a test returns rows from `group by day, kind having count(*) > 1` | one row a day for each kind |
+| a test returns rows from `group by subscription_id having count(*) > 2` | at most two rows per subscription |
+| a test returns rows from `where started_at > ended_at` | the end after the start |
+| a model that keeps a row a day for every group runs out of memory | a handful of groups |
 | a test about production data fails | an entry under `dbt.expected_failures` |
 | the project creates a function in a hook | nothing: the function is used as written |
 
