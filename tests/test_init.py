@@ -682,3 +682,17 @@ def test_a_cte_that_joins_and_selects_one_sources_star_passes_that_source_throug
     assert whole["*"] == ("RAW.B.SUBS", "ROW_NUM")
     named = scan_model(cte + " select x.customer_id, x.sku, x.row_num from subscriptions x", uses, {}, [], [])
     assert named == {"CUSTOMER_ID": ("RAW.B.SUBS", "CUSTOMER_ID"), "SKU": ("RAW.B.PRODUCTS", "SKU")}
+
+
+def test_a_calendar_joined_to_a_rows_start_and_end_does_not_make_them_periods():
+    from fauxflake.init import build_spec
+
+    manifest = {
+        "sources": {"source.p.s.items": {"database": "RAW", "schema": "S", "name": "items", "identifier": "items", "columns": {}},
+                    "source.p.s.dates": {"database": "RAW", "schema": "S", "name": "dates", "identifier": "dates", "columns": {}}},
+        "nodes": {"model.p.m": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.M", "compiled_code": """
+            select i.id, d.date as day, i.amount / 365 as daily from raw.s.items i
+            left join raw.s.dates d on d.date::date >= i.start_date::date and d.date::date <= i.end_date::date"""}},
+    }
+    columns = build_spec(manifest, "A")[0]["tables"]["RAW.S.ITEMS"]["columns"]
+    assert "every_days" not in columns["START_DATE"] and "every_days" not in columns["END_DATE"]

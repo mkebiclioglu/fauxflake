@@ -740,6 +740,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     looked_up = [resolve_path(c) for c in probe.find_all(exp.Column)]
                     if not looked_up or not all(isinstance(spot, tuple) and spot[0] in sources for spot in looked_up):
                         continue
+                    if any(_CALENDAR.search(spot[0].rsplit(".", 1)[-1]) or spot[1] in _CALENDAR_DAYS for spot in looked_up):
+                        continue  # (a calendar that is itself a generated table: `join dates d on d.date between start and end`)
                     if len(owners) == 1 and probes and not owners & probes and "" not in owners:
                         role.setdefault(next(iter(owners)), []).append(bound)
             for owner in set(lower) & set(upper):
@@ -979,6 +981,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
 
 
 _KEYS = ("sequence", "hash_id")
+_CALENDAR = re.compile(r"(^|_)(DATES?|DAYS?|CALENDAR|DATE_SPINE|DIM_DATE|TIME_SPINE)(_|$)")
+_CALENDAR_DAYS = {"DATE", "DAY", "DATE_DAY", "CALENDAR_DATE", "DATE_ACTUAL", "DT"}
 _FREE = ("template", "dist", "categorical", "constant")  # generators with no meaning of their own
 
 
