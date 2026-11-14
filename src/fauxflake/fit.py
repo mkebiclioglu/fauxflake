@@ -2730,6 +2730,10 @@ class Fitter:
         outcome: dict[str, tuple[str, str, str]] = {}  # node -> (kind, status, message), across rounds
         os.environ["FAUXFLAKE_STATEMENT_TIMEOUT"] = "300"  # a real build, at build scale: more room than a trial run gets
         self.project = project
+        # a round builds everything on a fresh warehouse (what `fauxflake build` gives), or only what the round before
+        # left to do: what failed, and what reads a source that changed. Partial rounds cost minutes where full ones
+        # cost the whole project; the last word is always a full one.
+        fresh = True
         for n_round in range(1, rounds + 1):
             # at the scale and history `fauxflake build` uses, so that what is reported here is what a build gives
             self.generate(scale=0.001, history=int(self.spec.get("history") or 60))
@@ -2737,8 +2741,8 @@ class Fitter:
             self.retyped = set()
             results_path = project.target_path / "run_results.json"
             results_path.unlink(missing_ok=True)  # what is there is from the compile step
-            if n_round > 1:
-                # every round is the build a fresh warehouse gives (what `fauxflake build` will run): what the
+            if n_round > 1 and fresh:
+                # a full round is the build a fresh warehouse gives (what `fauxflake build` will run): what the
                 # round before left behind goes, and relations the project reads before building them
                 # start empty again
                 from .generate import existing_view
@@ -2758,8 +2762,12 @@ class Fitter:
                     except Exception:  # noqa: BLE001, S110
                         pass
             # for working on the fitter: FAUXFLAKE_FIT_SELECT="+model_a +model_b" builds only those
-            selected = ["--select", *os.environ["FAUXFLAKE_FIT_SELECT"].split()] if os.environ.get("FAUXFLAKE_FIT_SELECT") else []
-            project.build_prior(self.existing)
+            if os.environ.get("FAUXFLAKE_FIT_SELECT"):
+                selected = ["--select", *os.environ["FAUXFLAKE_FIT_SELECT"].split()]
+            elif fresh:
+                selected = []
+            if fresh:
+                project.build_prior(self.existing)
             results_path.unlink(missing_ok=True)
             project.invoke(["build", *selected], silent=True)
             if not results_path.exists():
@@ -2852,7 +2860,7 @@ class Fitter:
                 counts[f"{kind}:{status}"] = counts.get(f"{kind}:{status}", 0) + 1
             summary = {"counts": counts, "failed": [(uid, status, message) for uid, (_, status, message) in outcome.items()
                                                     if status in ("error", "fail")]}
-            self.log(f"  build {n_round}: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+            self.log(f"  build {n_round}{'' if fresh else ' (what changed)'}: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
                      + f"; {len(self.learned) - before} thing(s) learned")
             if os.environ.get("FAUXFLAKE_FIT_DEBUG"):
                 Path(os.environ["FAUXFLAKE_FIT_DEBUG"] + f".build{n_round}.json").write_text(json.dumps(
@@ -2860,6 +2868,11 @@ class Fitter:
                      "slow": sorted(((round(r.get("execution_time") or 0), r["unique_id"]) for r in results), reverse=True)[:15],
                      "learned": self.learned[before:], "statements": dict(emulator.FAILED_STATEMENTS)}, indent=1))
                 emulator.FAILED_STATEMENTS.clear()
+            if (not failed or (len(self.learned) == before and not accepted)) and not fresh and n_round < rounds:
+                # nothing left to learn from a partial round: a full build on a fresh warehouse has the last word
+                fresh, selected = True, []
+                self.log("  nothing more to fix in what was rebuilt; a full build on a fresh warehouse to confirm")
+                continue
             if not failed or (len(self.learned) == before and not accepted):
                 # before stopping: the tests listed along the way were judged with what was known then. With all that
                 # was read and learned since, some can be taught to the spec after all; those come off the list and
@@ -2873,7 +2886,7 @@ class Fitter:
                     if taught:
                         expected[:] = [name for name in expected if name not in taught]
                         self.log(f"  a second look at the listed tests: {len(taught)} can be taught to the spec; building again")
-                        selected = []
+                        fresh, selected = True, []
                         continue
                 break
             # next round: what failed, what reads a source whose values changed, and everything downstream
@@ -2894,6 +2907,7 @@ class Fitter:
                 selected = []
             else:
                 selected = ["--select", *[f"{name}+" for name in sorted(again)], *sorted(changed)]
+            fresh = not selected
         self.recheck_expected(project)
         if not self.spec["dbt"].get("expected_failures"):
             self.spec["dbt"].pop("expected_failures", None)
