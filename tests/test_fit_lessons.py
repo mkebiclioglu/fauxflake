@@ -593,3 +593,10 @@ def test_a_test_that_returns_rows_not_naming_the_row_before_makes_the_table_a_lo
     assert f.learn_from_singular({"name": "block_gaps"}, places, sql)
     assert fields["header.prev_hash"] == {"gen": "previous", "of": "header.hash"} and tables["RAW.N.BLOCKS"]["log"] is True
     assert not f.learn_from_singular({"name": "block_gaps"}, places, sql)
+
+
+def test_the_column_union_relations_writes_is_never_given_to_a_source():
+    f = fitter(tables={"RAW.P.EVENTS": {"columns": {}}})
+    f.emu = type("E", (), {"duck": type("D", (), {"execute": staticmethod(lambda *a: None)})()})()
+    assert not f.add_column("RAW.P.EVENTS", "_DBT_SOURCE_RELATION") and not f.add_column("RAW.P.EVENTS", "_DBT_SOURCE_RELATION2")
+    assert f.add_column("RAW.P.EVENTS", "RECEIVED_AT") and set(f.tables["RAW.P.EVENTS"]["columns"]) == {"RECEIVED_AT"}

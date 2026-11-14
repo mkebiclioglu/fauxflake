@@ -73,6 +73,9 @@ _HINTS = {"INT8": "BIGINT", "INT16": "BIGINT", "INT32": "BIGINT", "INT64": "BIGI
 _FREE = ("template", "pool")  # generators that only make up text: safe to retype
 
 
+_WRITTEN_BY_DBT = re.compile(r"_DBT_SOURCE_RELATION\d*$", re.I)  # the column union_relations adds to say where a row came from
+
+
 class _Readings:
     """The latest reading of the project, falling back on the ones before it for a column it lost track of
     (a model that was not compiled in the build it was read from)."""
@@ -185,8 +188,8 @@ class Fitter:
 
     def add_column(self, table: str, col: str) -> bool:
         columns = self.tables[table].setdefault("columns", {})
-        if col in columns:
-            return False
+        if col in columns or _WRITTEN_BY_DBT.match(col):
+            return False  # (there already, or what dbt_utils.union_relations writes itself: never a source's column)
         columns[col] = guess(col, None)
         self.emu.duck.execute(f'alter table {quoted(table)} add column if not exists "{col}" {duck_type(columns[col])}')
         self.learned.append(f"{table}.{col}: read by a model, added.")
@@ -1177,6 +1180,7 @@ class Fitter:
             # and the other columns its children read, in one go: each round of a build shows only one
             owner = self.by_rel.get(fq) or self.relation_owner.get(fq)
             wanted = [col, *[c for c in (self.columns_children_read(owner) if owner in self.nodes else []) if c != col]]
+            wanted = [c for c in wanted if not _WRITTEN_BY_DBT.match(c)]
             added = 0
             for name in wanted:
                 for table in self.unions[fq]:
