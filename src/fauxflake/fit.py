@@ -2322,7 +2322,10 @@ class Fitter:
                         if hint in ("DATE", "TIMESTAMP", "BOOLEAN") and not fmt:
                             self.cast_alike(sql_key, hint)
                         return True
-                return self.retype(m.group("value"), hint, fmt, only=set(self.sources_of(sql_key)))
+                # the tables the model reads; when none of them made the value (a model that reads another's
+                # table by its written-out name has no such table among its ancestors), whichever table did
+                return self.retype(m.group("value"), hint, fmt, only=set(self.sources_of(sql_key))) \
+                    or self.retype(m.group("value"), hint, fmt)
         if "Failed to cast value to numerical" in message:
             # coalesce(payload['minutes'], minutes)::float where `minutes` was generated as an object
             tree = self.tree(sql_key)
