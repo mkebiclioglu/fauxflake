@@ -2590,7 +2590,7 @@ class Fitter:
             self.log(f"    slow: {self.nodes[uid]['name']} took {time.time() - began:.0f}s")
         return failure
 
-    def learn_from_models(self, manifest: dict, database: str, passes: int = 6) -> dict[str, str]:
+    def learn_from_models(self, manifest: dict, database: str, passes: int = 12) -> dict[str, str]:
         """Returns {model: error} for the models that still fail after the spec stopped changing."""
         order = [uid for uid in self.load(manifest)]
         if self.deferred:
