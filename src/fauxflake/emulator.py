@@ -401,6 +401,38 @@ def _over_a_stand_in(cursor, tree: exp.Create):  # noqa: ANN001, ANN202
     return fq, restore
 
 
+def _variant_takes_text(cursor, tree: exp.Expression) -> None:  # noqa: ANN001
+    """INSERT or MERGE from one table into another: where the target's column is a VARIANT and the source's is text,
+    Snowflake stores the text as a string value. DuckDB would parse it as JSON and refuse `abc`. The source (dbt's
+    temporary table, in an incremental model) has that column turned into JSON strings first."""
+    target = tree.this.this if isinstance(tree.this, exp.Schema) else tree.this
+    source = tree.args.get("using") if isinstance(tree, exp.Merge) else tree.expression
+    if isinstance(source, (exp.Subquery, exp.Select)):  # `(select ... from the_one_table)`
+        inner = source.unnest()
+        tables = list(inner.find_all(exp.Table)) if isinstance(inner, exp.Select) else []
+        source = tables[0] if len(tables) == 1 and not inner.args.get("joins") else None
+    if not isinstance(target, exp.Table) or not isinstance(source, exp.Table):
+        return
+    conn, duck = cursor._conn, cursor._duck_conn
+
+    def columns(table: exp.Table) -> tuple[str, dict[str, str]]:
+        """Where the table is (a temporary one lives in DuckDB's `temp` catalog) and its columns' types."""
+        named = [(table.catalog or conn.database or "").upper(), (table.db or conn.schema or "").upper(), table.name.upper()]
+        for where in (named, ["TEMP", "MAIN", named[2]]):
+            found = duck.execute("select table_catalog, table_schema, column_name, data_type from information_schema.columns "
+                                 "where upper(table_catalog) = ? and upper(table_schema) = ? and upper(table_name) = ?", where).fetchall()
+            if found:
+                return f'"{found[0][0]}"."{found[0][1]}"."{named[2]}"', {row[2].upper(): row[3] for row in found}
+        return "", {}
+
+    try:
+        (_, wanted), (place, given) = columns(target), columns(source)
+        for name in [n for n, kind in wanted.items() if kind == "JSON" and given.get(n) == "VARCHAR"]:
+            duck.execute(f'alter table {place} alter column "{name}" type json using to_json("{name}")')
+    except Exception:  # noqa: BLE001, S110 - the statement then says what is wrong, as before
+        pass
+
+
 def _built(cursor, fq: str) -> None:  # noqa: ANN001
     STANDINS.discard(fq)
     cursor._duck_conn.execute(f"delete from {_STANDINS_TABLE} where name = ?", [fq])
@@ -701,6 +733,8 @@ def _patch_fakesnow() -> None:
     original_explode = FakeSnowflakeCursor._transform_explode
 
     def _transform_explode(self, expression):  # noqa: ANN001
+        if isinstance(expression, exp.Merge):
+            _variant_takes_text(self, expression)  # before the MERGE is taken apart into the statements that carry it out
         # ALTER TABLE t DROP COLUMN a, b (dbt's on_schema_change: sync_all_columns): one column at a time
         actions = expression.args.get("actions") or [] if isinstance(expression, exp.Alter) else []
         dropped = actions[0].args.get("tables") or [] if len(actions) == 1 and isinstance(actions[0], exp.Drop) else []
@@ -775,6 +809,8 @@ def _patch_fakesnow() -> None:
             journaled = getattr(self._conn, "_fauxflake_txn", False) and not isinstance(tree, (exp.Query, exp.Describe, exp.Show))
             kept = tree.copy() if journaled else None
             replaced = _over_a_stand_in(self, tree) if STANDINS and isinstance(tree, exp.Create) else None
+            if isinstance(tree, exp.Insert):
+                _variant_takes_text(self, tree)
             try:
                 original_execute(self, tree, params)
                 if replaced:

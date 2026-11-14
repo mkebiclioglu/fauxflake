@@ -601,3 +601,15 @@ def test_a_model_that_reads_its_own_table_builds_over_its_stand_in(run):
         "select id, name from t union all select id, name from analytics.ci.server_fact")
     assert run("select count(*) from analytics.ci.server_fact") == [(2,)]
     assert "ANALYTICS.CI.SERVER_FACT" not in emulator.STANDINS
+
+
+def test_text_inserted_or_merged_into_a_variant_column_is_stored_as_a_string(run):
+    run("create or replace table facts (id int, customer variant)")
+    run("insert into facts select 1, to_variant('first')")
+    run("create or replace temporary table facts__dbt_tmp as select 2 as id, 'cws-customer_27fe' as customer")
+    run('insert into facts ("ID", "CUSTOMER") (select "ID", "CUSTOMER" from facts__dbt_tmp)')
+    run("create or replace temporary table facts__dbt_tmp as select 1 as id, 'changed' as customer union all select 3, 'third'")
+    run("""merge into facts as DBT_INTERNAL_DEST using facts__dbt_tmp as DBT_INTERNAL_SOURCE on (DBT_INTERNAL_SOURCE.id = DBT_INTERNAL_DEST.id)
+           when matched then update set "CUSTOMER" = DBT_INTERNAL_SOURCE."CUSTOMER"
+           when not matched then insert ("ID", "CUSTOMER") values ("ID", "CUSTOMER")""")
+    assert run("select id, customer::string from facts order by id") == [(1, "changed"), (2, "cws-customer_27fe"), (3, "third")]
