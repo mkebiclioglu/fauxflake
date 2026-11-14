@@ -2967,6 +2967,11 @@ class Fitter:
                     continue
                 message = r.get("message") or ""
                 if node["resource_type"] == "test":
+                    # (whatever comes of it: dbt skipped what is downstream of the model it tests, which the next round builds)
+                    tested = nodes.get(node.get("attached_node") or "") or next(
+                        (nodes[d] for d in node["depends_on"]["nodes"] if d in nodes), None)
+                    if tested:
+                        again.add(tested["name"])
                     # a failing test either teaches the spec something, or states a fact about production
                     # data that invented data does not share: that one goes on the list of expected failures
                     if r["status"] == "error":  # the test's own SQL failed: the same lessons as for a model
@@ -2985,10 +2990,6 @@ class Fitter:
                         expected.append(node["name"])
                         accepted += 1
                         outcome.pop(r["unique_id"], None)
-                        tested = nodes.get(node.get("attached_node") or "") or next(
-                            (nodes[d] for d in node["depends_on"]["nodes"] if d in nodes), None)
-                        if tested:
-                            again.add(tested["name"])  # what dbt skipped because this test failed
                     continue
                 again.add(node["name"])
                 if "no columns found to union" in message and node.get("relation_name"):
