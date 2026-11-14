@@ -2118,9 +2118,12 @@ class Fitter:
             changed = True
         if ranged and self.fewer_groups(sql_key, tree):
             changed = True
-        if ranged and not changed:
+        thinned = self.__dict__.setdefault("_thinned", set())
+        if ranged and not changed and getattr(self, "project", None) is not None and sql_key not in thinned:
             # nothing left to narrow: the model keeps a row a day for each row it reads, for as long as the history
-            # runs. A tenth of the rows, then.
+            # runs. A tenth of the rows, then: once for a model, and only in a real build (a trial pass runs on a
+            # few hundred rows whatever the volumes say).
+            thinned.add(sql_key)
             model = self.nodes.get(sql_key, {}).get("name", sql_key)
             for table in self.sources_of(sql_key):
                 volume = self.tables[table].setdefault("volume", {})
