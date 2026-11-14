@@ -567,8 +567,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 elif isinstance(test, exp.RegexpLike) and test.this is held and isinstance(test.expression, exp.Literal) \
                         and not isinstance(test.parent, exp.Not):
                     shapes = set(regex_examples(test.expression.name))
-                if cast is not None and hint_is_number(cast.to.sql(dialect="duckdb")):
-                    shapes.add("{n}")  # split(log, ' ')[2]::number
+                if inside and cast is not None and hint_is_number(cast.to.sql(dialect="duckdb")):
+                    shapes.add("{n}")  # split(log, ' ')[2]::number (for a column of its own, `splits` records the cast)
                 shapes = {v for v in shapes if found[2][1] not in v and len(v) <= 60}  # a piece cannot hold the separator
                 if shapes and not inside:
                     sources[found[0]].part_shapes.setdefault(found[1], {}).setdefault(found[2][1], {}).setdefault(
