@@ -2266,6 +2266,19 @@ class Fitter:
 
     def learn(self, sql_key: str, message: str) -> bool:
         """Apply whatever one error message teaches. True when the spec changed."""
+        watch = os.environ.get("FAUXFLAKE_FIT_WATCH")  # for working on the fitter: TABLE.COLUMN, whose changes are written down
+        if not watch:
+            return self._learn(sql_key, message)
+        table, column = watch.upper().rsplit(".", 1)
+        before = copy.deepcopy((self.tables.get(table, {}).get("columns") or {}).get(column))
+        done = self._learn(sql_key, message)
+        after = (self.tables.get(table, {}).get("columns") or {}).get(column)
+        if after != before:
+            with open(os.environ.get("FAUXFLAKE_FIT_DEBUG", "fit") + ".watch.txt", "a") as out:
+                out.write(f"{watch}: {before} -> {after}\n  by {sql_key}: {message[:600]}\n  learned: {self.learned[-3:]}\n")
+        return done
+
+    def _learn(self, sql_key: str, message: str) -> bool:
         if self.text_into_a_document(sql_key, message):
             return True
         if self.runaway(sql_key, message) or self.looked_for(sql_key) or self.jinja_columns(sql_key, message) \
@@ -3126,10 +3139,13 @@ class Fitter:
                 elif guessed(col, held) and (told(gen) or (gen.get("gen") == "object" and gen.get("fields"))):
                     if gen.get("gen") == "fk" and str(gen.get("ref", "")).upper() not in self.tables:
                         continue
-                    mine[col] = {**gen, **({"follows": held["follows"]} if held.get("follows") and gen.get("gen") == "template" else {}),
-                                 # a cast to text the models need stays; a number the name suggested does not (the ids are texts now)
-                                 **({"type": held["type"]} if str(held.get("type") or "").upper() in ("VARCHAR", "TEXT")
-                                    and gen.get("gen") in ("fk", "pool") and "type" not in gen else {})}
+                    told_now = {**gen, **({"follows": held["follows"]} if held.get("follows") and gen.get("gen") == "template" else {}),
+                                # a cast to text the models need stays; a number the name suggested does not (the ids are texts now)
+                                **({"type": held["type"]} if str(held.get("type") or "").upper() in ("VARCHAR", "TEXT")
+                                   and gen.get("gen") in ("fk", "pool") and "type" not in gen else {})}
+                    if told_now == held:
+                        continue  # (what the name suggested is what the SQL says as well)
+                    mine[col] = told_now
                     changed += 1
                     self.retyped.add(table)
         for table, spec in fresh.spec["tables"].items():
