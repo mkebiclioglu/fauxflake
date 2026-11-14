@@ -712,3 +712,13 @@ def test_a_declared_source_that_a_model_builds_is_read_as_that_model():
     }
     tables = build_spec(manifest, "A")[0]["tables"]
     assert "A.ORGM.LEAD" not in tables and tables["RAW.S.LEAD"]["columns"]["ACTIVATED_ON"]["null_rate"] == 0.3
+
+
+def test_union_branches_listing_the_same_columns_in_another_order_are_not_lined_up_by_position():
+    uses = {"RAW.S.OLD_EVENTS": SourceUse(), "RAW.S.NEW_EVENTS": SourceUse()}
+    links: list = []
+    scan_model('''select "ID", "SENT_AT", "IS_FIRST" from raw.s.old_events
+                  union all select "IS_FIRST", "ID", "SENT_AT" from raw.s.new_events''', uses, {}, links=links)
+    assert links == []
+    scan_model("select id, sent_at from raw.s.old_events union all select event_id, sent from raw.s.new_events", uses, {}, links=links)
+    assert {("RAW.S.OLD_EVENTS", "ID"), ("RAW.S.NEW_EVENTS", "EVENT_ID")} in [set(g) for g in links]

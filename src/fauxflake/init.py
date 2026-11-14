@@ -973,7 +973,15 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
         for union in tree.find_all(exp.SetOperation):
             if isinstance(union.parent, exp.SetOperation):
                 continue
-            rows = [positional.get(id(b), []) for b in branches(union)]
+            parts = branches(union)
+            names = [[p.alias_or_name.upper() for p in b.expressions] if isinstance(b, exp.Select) else [] for b in parts]
+            if any(name and name != other[i] and name in other for one in names for other in names if other is not one
+                   for i, name in enumerate(one[:len(other)])):
+                # the same column sits at different places in two branches: lists written out from two relations whose
+                # columns are in different orders (dbt_utils.star on a table generated here and one built by dbt).
+                # In the real warehouse the two have one order; position says nothing about these
+                continue
+            rows = [positional.get(id(b), []) for b in parts]
             for aligned in zip(*rows):
                 group = {hit for hit in aligned if hit}
                 if len(group) > 1:

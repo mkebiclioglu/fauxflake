@@ -3101,6 +3101,16 @@ class Fitter:
         except Exception:  # noqa: BLE001 - the first reading stands
             return analysis
         fresh = _Readings(fresh, analysis)
+        watch = os.environ.get("FAUXFLAKE_FIT_WATCH")  # for working on the fitter: what this reading says of TABLE.COLUMN
+        if watch:
+            table, column = watch.upper().rsplit(".", 1)
+            said = (fresh.spec["tables"].get(table, {}).get("columns") or {}).get(column)
+            held = (self.tables.get(table, {}).get("columns") or {}).get(column)
+            stem = os.environ.get("FAUXFLAKE_FIT_DEBUG", "fit")
+            with open(stem + ".watch.txt", "a") as out:
+                out.write(f"{watch}: read again; held {held}; the reading says {said}\n")
+            if said != held and not os.path.exists(stem + ".watch.manifest.json"):
+                Path(stem + ".watch.manifest.json").write_text(json.dumps(filled, default=str))
 
         def unknown(name: str, gen: dict) -> bool:
             label = re.sub(r"~\w+|\[\]", "", name).split(".")[-1].lower()
