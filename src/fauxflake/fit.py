@@ -1968,7 +1968,7 @@ class Fitter:
             macros[uid] = macro.get("macro_sql") or ""
             pile += macro.get("depends_on", {}).get("macros", [])
         tested = [c for text in macros.values() for c in re.findall(r"'([A-Z][A-Z0-9_]*)'\s+(?:not\s+)?in\s+[\w.\[\]]*column", text)]
-        wanted = list(dict.fromkeys([*tested, *self.columns_children_read(sql_key)]))
+        wanted = [c for c in dict.fromkeys([*tested, *self.columns_children_read(sql_key)]) if not _WRITTEN_BY_DBT.match(c)]
         changed = False
         for table in tables:
             columns = self.tables[table].setdefault("columns", {})
