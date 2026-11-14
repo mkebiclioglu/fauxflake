@@ -519,3 +519,35 @@ def test_an_aggregate_refused_in_a_where_gives_the_stand_in_the_column_it_lacks(
     assert f.aggregate_out_of_place("m", "Binder Error: WHERE clause cannot contain aggregates!")
     assert set(f.existing["ANALYTICS.BLAPI.CUSTOMERS_BLAPI"]["columns"]) == {"ID", "UPDATED_AT"}
     assert not f.aggregate_out_of_place("m", "Binder Error: WHERE clause cannot contain aggregates!")  # once
+
+
+def test_reading_again_leaves_what_a_failed_build_taught():
+    manifest = {
+        "sources": {"source.p.s.plan": {"database": "RAW", "schema": "S", "name": "plan", "identifier": "plan", "columns": {}},
+                    "source.p.s.actual": {"database": "RAW", "schema": "S", "name": "actual", "identifier": "actual", "columns": {}}},
+        "nodes": {"model.p.m": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.M", "compiled_code": """
+            select p.month, a.total from raw.s.plan p join raw.s.actual a on a.month = p.month"""}},
+    }
+    month = {"gen": "time_offset", "type": "DATE", "p": [0, 0.5, 1], "seconds": [0, 86400, 604800]}  # a build retyped it: `month::date`
+    tables = {"RAW.S.PLAN": {"columns": {"MONTH": dict(month)}}, "RAW.S.ACTUAL": {"columns": {"MONTH": dict(month), "TOTAL": {"gen": "template", "template": "total_{hex}"}}}}
+    f = fitter(spec={"dbt": {"database": "A"}}, tables=tables, log=lambda *a: None)
+    f.read_again(manifest, None)
+    assert tables["RAW.S.PLAN"]["columns"]["MONTH"] == month and tables["RAW.S.ACTUAL"]["columns"]["MONTH"] == month
+
+
+def test_bare_columns_next_to_relations_that_list_theirs_belong_to_the_one_that_does_not():
+    tree = parse("""
+        with dates as (select d.date, v.server_id, v.first_version_date from x d join y v on 1 = 1),
+        active as (select date, server_id, count(*) as daily_active_users from z group by 1, 2)
+        select d.date, d.server_id, count(distinct coalesce(events.playbook_id, events.playbookid)) as playbooks,
+               count(distinct case when event = 'playbook' and action = 'create' then events.id end) as created,
+               count(distinct case when coalesce(currentstatus, current_status) = 'Reported' then 1 end) as reported,
+               max(daily_active_users) as dau
+        from dates d
+        left join "ANALYTICS".events.incident_response_events events on d.server_id = coalesce(events.user_id, events.anonymous_id)
+        left join active on active.date = d.date
+        group by 1, 2""")
+    f = fitter()
+    ctes = {c.alias.upper(): c.this for c in tree.find_all(sqlglot.exp.CTE)}
+    assert f.bare_columns_of(tree, ctes, "ANALYTICS.EVENTS.INCIDENT_RESPONSE_EVENTS") == ["EVENT", "ACTION", "CURRENTSTATUS", "CURRENT_STATUS"]
+    assert f.bare_columns_of(tree, ctes, "ANALYTICS.EVENTS.OTHER") == []

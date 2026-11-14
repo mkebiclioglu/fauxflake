@@ -1373,10 +1373,47 @@ class Fitter:
         elif owner in self.existing or owner in self.unions or self.passthrough(owner):
             # the same for a relation that passes a source on (`select o.* from source o ...`, read by its name):
             # every column the model reads from it is the source's, and is asked for now
-            for name in self.read_through(t, owner):
+            for name in [*self.read_through(t, owner), *self.bare_columns_of(t, ctes, owner)]:
                 if name != col and re.fullmatch(r"[\w$ ]+", name):
                     self.blame(owner, name)
         return True
+
+    def bare_columns_of(self, tree: exp.Expression, ctes: dict[str, exp.Expression], owner: str) -> list[str]:
+        """Columns written without a table in a SELECT that joins `owner` to relations whose columns are all
+        known (CTEs that list theirs, tables that exist): the ones none of those has are the owner's."""
+        out: list[str] = []
+        for select in tree.find_all(exp.Select):
+            relations = [r for r in [select.args["from_"].this if select.args.get("from_") is not None else None,
+                                     *[j.this for j in select.args.get("joins") or []]] if r is not None]
+            mine = [r for r in relations if isinstance(r, exp.Table) and r.catalog and r.db
+                    and f"{r.catalog.upper()}.{r.db.upper()}.{r.name.upper()}" == owner]
+            if len(mine) != 1 or len(relations) < 2:
+                continue
+            known: set[str] = set()
+            for r in relations:
+                if r is mine[0]:
+                    continue
+                body = ctes.get(r.name.upper()) if isinstance(r, exp.Table) and not r.db else r.this if isinstance(r, exp.Subquery) else None
+                top = body.unnest() if body is not None else None
+                while isinstance(top, exp.SetOperation):
+                    top = top.left.unnest()
+                if isinstance(top, exp.Select) and not any(
+                        isinstance(e, exp.Star) or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star)) for e in top.expressions):
+                    known |= {e.alias_or_name.upper() for e in top.expressions}
+                elif isinstance(r, exp.Table) and r.catalog and r.db:
+                    known |= {c.upper() for c in self._columns_of(f"{r.catalog.upper()}.{r.db.upper()}.{r.name.upper()}")}
+                else:
+                    known = None  # a relation that passes on columns nobody listed: no telling whose a bare one is
+                    break
+            if known is None:
+                continue
+            own = {p.alias.upper() for p in select.expressions if isinstance(p, exp.Alias)}
+            for c in select.find_all(exp.Column):
+                name = c.name.upper()
+                if not c.table and c.find_ancestor(exp.Select) is select and not isinstance(c.this, exp.Star) \
+                        and name not in known and name not in own and name not in out:
+                    out.append(name)
+        return out
 
     def read_past_a_listing(self, tree: exp.Expression, ctes: dict[str, exp.Expression], owner: str, col: str) -> list[str]:
         """`with d as (select "A", "B", max(t) as m from T group by "A", "B") select a, b, c, e from d`: the CTE
@@ -2888,10 +2925,13 @@ class Fitter:
             return gen.get("gen") == "template" and gen.get("template") == f"{label}_{{hex}}" and not gen.get("templates")
 
         def guessed(name: str, gen: dict) -> bool:
-            """Still what its name alone suggested, whatever type a cast gave it since."""
+            """Still what its name alone suggested, also when a cast to text has been noted since. (A column a
+            failed build retyped to a date or a number is known, not guessed: it stays.)"""
+            if unknown(name, gen) or gen == init.guess(name, None):
+                return True
             plain = {k: v for k, v in gen.items() if k != "type"}
-            return unknown(name, gen) or any(plain == {k: v for k, v in init.guess(name, hint).items() if k != "type"}
-                                             for hint in (None, gen.get("type")))
+            return str(gen.get("type") or "").upper() in ("VARCHAR", "TEXT") and plain == {
+                k: v for k, v in init.guess(name, None).items() if k != "type"}
 
         def told(gen: dict) -> bool:
             return gen.get("gen") in ("categorical", "pool", "fk", "link", "hash_id", "row_of") or bool(gen.get("templates")) or bool(
