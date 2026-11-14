@@ -716,6 +716,22 @@ class Fitter:
                 self.learned.append(f"{table}.{name}: read as a number; the ids it shares with other tables ({pool}) are numbers now.")
                 changed = True
                 continue
+            elif hint in ("DATE", "TIMESTAMP") and not fmt and (kind == "pool" or kind == "template" and re.fullmatch(
+                    r"\w+_\{n\}", str(gen.get("template") or "")) and not gen.get("templates")):
+                # a value shared across tables by the joins between them, read as a date (the month of a budget sheet and
+                # of the sheet of actuals): in every table that shares it, the same run of days, one per row
+                pool = str(gen.get("pool") or str(gen["template"])[: -len("_{n}")])
+                day = {"gen": "time_offset", **({"type": "DATE"} if hint == "DATE" else {}), "p": [0, 0.5, 1],
+                       "seconds": [0, 86400, 604800], "unique": True, "every_days": 1}
+                for other, spec in self.tables.items():
+                    for col, d in (spec.get("columns") or {}).items():
+                        if (d.get("gen") == "pool" and d.get("pool") == pool) or (
+                                d.get("gen") == "template" and d.get("template") == f"{pool}_{{n}}" and not d.get("templates")):
+                            spec["columns"][col] = dict(day)
+                            self.retyped.add(other)
+                self.learned.append(f"{table}.{name}: read as a date; the values it shares with other tables ({pool}) are days now.")
+                changed = True
+                continue
             elif fmt:
                 fresh = {"gen": "time_offset", "format": fmt, "p": [0, 0.5, 1], "seconds": [0, 86400, 604800]}
             elif hint == "EPOCH":
@@ -2122,12 +2138,10 @@ class Fitter:
             changed = True
         if ranged and self.fewer_groups(sql_key, tree):
             changed = True
-        thinned = self.__dict__.setdefault("_thinned", set())
-        if ranged and not changed and getattr(self, "project", None) is not None and sql_key not in thinned:
+        if ranged and not changed and getattr(self, "project", None) is not None:
             # nothing left to narrow: the model keeps a row a day for each row it reads, for as long as the history
-            # runs. A tenth of the rows, then: once for a model, and only in a real build (a trial pass runs on a
-            # few hundred rows whatever the volumes say).
-            thinned.add(sql_key)
+            # runs. A tenth of the rows, then (down to a handful a day), and only in a real build: a trial pass runs
+            # on a few hundred rows whatever the volumes say.
             model = self.nodes.get(sql_key, {}).get("name", sql_key)
             for table in self.sources_of(sql_key):
                 volume = self.tables[table].setdefault("volume", {})

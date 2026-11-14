@@ -590,3 +590,14 @@ def test_string_functions_read_a_variant_column_as_its_text(run):
     rows = run("""select split(log, ' ')[0]::string, split_part(log, ' ', 2), try_parse_json(replace(log, 'EVENT_JSON:')):event::string,
                          left(log, 1), length(log) from flat_t order by 1""")
     assert rows == [("@alice", "staking", None, "@", 19), ('EVENT_JSON:{"event":"mint"}', "", "mint", "E", 27)]
+
+
+def test_a_model_that_reads_its_own_table_builds_over_its_stand_in(run):
+    from fauxflake.generate import existing_view
+
+    emulator.stand_in(run.emu.duck, "ANALYTICS.CI.SERVER_FACT", existing_view("ANALYTICS.CI.SERVER_FACT", {"ID": "BIGINT", "NAME": "VARCHAR"}))
+    assert run("select count(*) from analytics.ci.server_fact") == [(0,)]
+    run("create or replace transient table analytics.ci.server_fact as "
+        "select id, name from t union all select id, name from analytics.ci.server_fact")
+    assert run("select count(*) from analytics.ci.server_fact") == [(2,)]
+    assert "ANALYTICS.CI.SERVER_FACT" not in emulator.STANDINS

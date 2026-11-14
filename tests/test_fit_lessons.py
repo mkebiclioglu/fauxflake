@@ -577,7 +577,8 @@ def test_a_row_a_day_model_that_still_does_not_finish_gets_a_tenth_of_the_rows()
     f.project = object()  # a real build
     assert f.runaway("m", "Out of Memory Error: could not allocate block")
     assert tables["RAW.P.EVENTS"]["volume"]["rows_per_day"] == 100 and columns["USER_ID"]["v"] == [1, 50]
-    assert not f.runaway("m", "Out of Memory Error") and tables["RAW.P.EVENTS"]["volume"]["rows_per_day"] == 100  # once for a model
+    assert f.runaway("m", "Out of Memory Error") and tables["RAW.P.EVENTS"]["volume"]["rows_per_day"] == 20  # down to a handful a day
+    assert not f.runaway("m", "Out of Memory Error")
 
 
 def test_a_test_that_returns_rows_not_naming_the_row_before_makes_the_table_a_log():
@@ -600,3 +601,15 @@ def test_the_column_union_relations_writes_is_never_given_to_a_source():
     f.emu = type("E", (), {"duck": type("D", (), {"execute": staticmethod(lambda *a: None)})()})()
     assert not f.add_column("RAW.P.EVENTS", "_DBT_SOURCE_RELATION") and not f.add_column("RAW.P.EVENTS", "_DBT_SOURCE_RELATION2")
     assert f.add_column("RAW.P.EVENTS", "RECEIVED_AT") and set(f.tables["RAW.P.EVENTS"]["columns"]) == {"RECEIVED_AT"}
+
+
+def test_a_shared_value_read_as_a_date_becomes_days_in_every_table_that_shares_it():
+    tables = {"RAW.G.BUDGET": {"columns": {"MONTH": {"gen": "template", "template": "month_{n}"}}},
+              "RAW.G.ACTUALS": {"columns": {"MONTH": {"gen": "pool", "pool": "month", "size": 600}, "TOTAL": {"gen": "template", "template": "total_{hex}"}}}}
+    f = fitter(tables=tables)
+    f.sources_of, f.origins = lambda uid: ["RAW.G.ACTUALS"], lambda uid, name, strict=False: [name]
+    assert f.retype_column("model.p.m", "MONTH", "DATE")
+    assert tables["RAW.G.BUDGET"]["columns"]["MONTH"] == tables["RAW.G.ACTUALS"]["columns"]["MONTH"]
+    assert tables["RAW.G.ACTUALS"]["columns"]["MONTH"]["type"] == "DATE" and tables["RAW.G.ACTUALS"]["columns"]["MONTH"]["every_days"] == 1
+    assert tables["RAW.G.ACTUALS"]["columns"]["TOTAL"]["gen"] == "template"
+    assert not f.retype_column("model.p.m", "MONTH", "DATE")

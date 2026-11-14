@@ -381,6 +381,17 @@ def _over_a_stand_in(cursor, tree: exp.Create):  # noqa: ANN001, ANN202
     there = duck.execute("select table_type from information_schema.tables where table_catalog = ? and table_schema = ? "
                          "and table_name = ?", [db, schema, name]).fetchone()
     restore = None
+    reads_itself = any(t is not target and t.name.upper() == name and (t.db or conn.schema or "").upper() == schema
+                       and (t.catalog or conn.database or "").upper() == db for t in tree.find_all(exp.Table))
+    if there and there[0] == "VIEW" and kind == "TABLE" and tree.args.get("replace") and reads_itself:
+        # `create or replace table x as select ... from x`: a model that reads what its last run left. The empty
+        # stand-in becomes an empty table of the same shape, which the statement reads and then replaces.
+        columns = duck.execute(f'describe "{db}"."{schema}"."{name}"').fetchall()
+        shape = ", ".join(f'null::{c[1]} as "{c[0]}"' for c in columns)
+        restore = f'create view if not exists "{db}"."{schema}"."{name}" as select {shape} where false'
+        duck.execute(f'drop view "{db}"."{schema}"."{name}"')
+        duck.execute(f'create table "{db}"."{schema}"."{name}" as select {shape} where false')
+        return fq, restore
     if there and (("VIEW" if there[0] == "VIEW" else "TABLE") != kind or not tree.args.get("replace")):
         was = "view" if there[0] == "VIEW" else "table"
         columns = duck.execute(f'describe "{db}"."{schema}"."{name}"').fetchall()
