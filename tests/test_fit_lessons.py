@@ -551,3 +551,15 @@ def test_bare_columns_next_to_relations_that_list_theirs_belong_to_the_one_that_
     ctes = {c.alias.upper(): c.this for c in tree.find_all(sqlglot.exp.CTE)}
     assert f.bare_columns_of(tree, ctes, "ANALYTICS.EVENTS.INCIDENT_RESPONSE_EVENTS") == ["EVENT", "ACTION", "CURRENTSTATUS", "CURRENT_STATUS"]
     assert f.bare_columns_of(tree, ctes, "ANALYTICS.EVENTS.OTHER") == []
+
+
+def test_a_count_star_in_a_cte_does_not_hide_the_bare_columns_a_child_reads():
+    child = parse("""
+        with active as (select day, server_id, count(*) as n from z group by 1, 2)
+        select active.day, count(distinct case when event = 'x' and action = 'create' then events.id end) as created
+        from active left join "A".e.events events on events.server_id = active.server_id group by 1""")
+    nodes = {"model.p.events": {"resource_type": "model", "relation_name": "A.E.EVENTS", "depends_on": {"nodes": []}},
+             "model.p.child": {"resource_type": "model", "relation_name": "A.E.CHILD", "depends_on": {"nodes": ["model.p.events"]}}}
+    f = fitter(nodes=nodes, trees={"model.p.child": child})
+    f.sketch = lambda uid: ""
+    assert {"EVENT", "ACTION", "ID", "SERVER_ID"} <= set(f.columns_children_read("model.p.events"))

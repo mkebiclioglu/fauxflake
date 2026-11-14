@@ -411,7 +411,9 @@ class Fitter:
                         ctes = {c.alias.upper(): c.this for c in tree.find_all(exp.CTE)}
                         others = [r for r in [select.args["from_"].this, *[j.this for j in select.args["joins"]]] if r is not tb]
                         bodies = [ctes.get(r.name.upper()) if isinstance(r, exp.Table) and not r.db else None for r in others]
-                        if all(isinstance(body, exp.Select) and not body.find(exp.Star) for body in bodies):
+                        lists = lambda body: isinstance(body, exp.Select) and not any(  # noqa: E731 - `count(*)` is not `select *`
+                            isinstance(e, exp.Star) or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star)) for e in body.expressions)
+                        if all(lists(body) for body in bodies):
                             given = {e.alias_or_name.upper() for body in bodies for e in body.expressions}
                             given |= {e.alias.upper() for e in select.expressions if isinstance(e, exp.Alias)}
                             found += [c.name.upper() for c in select.find_all(exp.Column)
