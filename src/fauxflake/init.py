@@ -1405,7 +1405,8 @@ def within_bounds(gen: dict, bounds: set[float] | None, exact: bool = False) -> 
         # several thresholds (`between 9820000 and 10000000` here, `>= 75000000` there; or `> 0` here and
         # `> 1000000` there): as many values between each pair as beyond the last, so every one of the comparisons keeps rows
         knots = sorted(bounds)
-        knots.append(knots[-1] + max((knots[-1] - knots[0]) / len(knots), 10))
+        # (a short scale stays short: scores compared with 7 and 9 go to 10, not to 19)
+        knots.append(knots[-1] + (max((knots[-1] - knots[0]) / len(knots), 10) if knots[-1] - knots[0] > 10 else 1))
         gen.update(p=[round(i / (len(knots) - 1), 6) for i in range(len(knots))], v=[int(k) if whole else k for k in knots])
         return
     gen.update(p=[0, 1], v=[int(lo), int(hi)] if whole else [lo, hi])

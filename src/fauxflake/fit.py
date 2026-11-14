@@ -121,6 +121,33 @@ def _numeric_columns(tree: exp.Expression, known: tuple[str, ...] = ()) -> set[s
     return out
 
 
+def _within_range(gen: dict, low, high) -> bool:  # noqa: ANN001
+    """dbt_utils.accepted_range(min_value, max_value) on a generated number: its values are brought inside the range.
+    False when there is nothing to change (not a number, or bounds that are not numbers: `current_date`)."""
+    def number(value):  # noqa: ANN001, ANN202
+        try:
+            return float(value) if value is not None and str(value).strip() != "" else None
+        except (TypeError, ValueError):
+            return None
+
+    low, high = number(low), number(high)
+    values = gen.get("v")
+    if gen.get("gen") != "dist" or not values or (low is None and high is None):
+        return False
+    whole = str(gen.get("type", "")).upper() != "DOUBLE"
+    inside = [v if low is None else max(v, low) for v in values]
+    inside = [v if high is None else min(v, high) for v in inside]
+    if len(set(inside)) == 1:  # everything was outside: the whole range, or from the bound up (down) to as much again
+        a = low if low is not None else min(high - 100, 0)
+        b = high if high is not None else max(low + 100, 2 * low)
+        inside = [a + (b - a) * i / (len(values) - 1) for i in range(len(values))] if len(values) > 1 else [a]
+    inside = [int(v) if whole else v for v in inside]
+    if inside == values:
+        return False
+    gen["v"] = inside
+    return True
+
+
 def _text_ids(gen: dict) -> bool:
     """A key whose ids are certainly text: some are named by the SQL, or they have a shape."""
     return bool(gen.get("template")) or any(not re.fullmatch(r"\d{1,18}", str(v)) for v in gen.get("named") or ())
@@ -3429,6 +3456,9 @@ class Fitter:
                 if not values or field.get("gen") in ("hash_id", "link"):
                     return False
                 fields[path] = {"gen": "categorical", "values": {v: round(1 / len(values), 4) for v in values}}
+            elif name == "accepted_range":
+                if not _within_range(field, kwargs.get("min_value"), kwargs.get("max_value")):
+                    return False
             else:
                 return False
             self.learned.append(f"{table}.{col}: field {path}: a `{name}` test failed; generated to pass it.")
@@ -3468,7 +3498,12 @@ class Fitter:
                 return False
             columns[col] = {"gen": "categorical", "values": {v: round(1 / len(values), 4) for v in values}}
             self.learned.append(f"{table}.{col}: an `accepted_values` test failed, now drawn from its values.")
+        elif name == "accepted_range":
+            if not _within_range(gen, kwargs.get("min_value"), kwargs.get("max_value")):
+                return False
+            self.learned.append(f"{table}.{col}: an `accepted_range` test failed, now generated within its range.")
         else:
             return False
         self.dirty = True
+        self.retyped.add(table)
         return True

@@ -656,3 +656,14 @@ def test_an_address_the_model_also_splits_by_a_slash_is_a_network():
     f.sources_of, f.origins = (lambda uid: ["RAW.G.RANGES"]), (lambda uid, name, depth=0, strict=False: [name])
     assert f.parsed_as_ip("m")
     assert tables["RAW.G.RANGES"]["columns"]["NETWORK"] == {"gen": "ip", "cidr": True}
+
+
+def test_an_accepted_range_test_brings_a_number_inside_its_range():
+    from fauxflake.fit import _within_range
+
+    score = {"gen": "dist", "type": "BIGINT", "p": [0.0, 0.25, 0.5, 0.75, 1.0], "v": [6, 7, 8, 9, 19]}
+    assert _within_range(score, 0, 10) and score["v"] == [6, 7, 8, 9, 10]
+    assert not _within_range(score, 0, 10)
+    days = {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [-500, -1]}
+    assert _within_range(days, "0", None) and days["v"] == [0, 100]
+    assert not _within_range({"gen": "time_offset", "p": [0, 1], "seconds": [0, 9]}, "current_date", None)
