@@ -761,6 +761,8 @@ class Fitter:
             elif hint in ("DATE", "TIMESTAMP"):
                 if kind in ("time_offset", "event_time", "updated_at") and not gen.get("format") and not gen.get("epoch"):
                     continue
+                if gen.get("format") and not re.search(r"%[YymdjbB]", str(gen["format"])):
+                    continue  # a time of day (`%H:%M:%S`), read next to its date: it stays one
                 fresh = {"gen": "time_offset", **({"type": "DATE"} if hint == "DATE" else {}), "p": [0, 0.5, 1], "seconds": [0, 86400, 604800]}
             else:
                 fresh = guess(name, hint)

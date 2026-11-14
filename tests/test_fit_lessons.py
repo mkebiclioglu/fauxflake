@@ -613,3 +613,13 @@ def test_a_shared_value_read_as_a_date_becomes_days_in_every_table_that_shares_i
     assert tables["RAW.G.ACTUALS"]["columns"]["MONTH"]["type"] == "DATE" and tables["RAW.G.ACTUALS"]["columns"]["MONTH"]["every_days"] == 1
     assert tables["RAW.G.ACTUALS"]["columns"]["TOTAL"]["gen"] == "template"
     assert not f.retype_column("model.p.m", "MONTH", "DATE")
+
+
+def test_a_time_of_day_is_not_retyped_to_a_date():
+    columns = {"LOGTIME": {"gen": "time_offset", "format": "%H:%M:%S", "p": [0, 0.5, 1], "seconds": [0, 86400, 604800]},
+               "LOGDAY": {"gen": "template", "template": "logday_{hex}"}}
+    f = fitter(tables={"RAW.D.LOG": {"columns": columns}})
+    f.sources_of, f.origins = lambda uid: ["RAW.D.LOG"], lambda uid, name, strict=False: [name]
+    f.bounds = {}
+    assert not f.retype_column("model.p.m", "LOGTIME", "DATE") and columns["LOGTIME"]["format"] == "%H:%M:%S"
+    assert f.retype_column("model.p.m", "LOGDAY", "DATE") and columns["LOGDAY"]["type"] == "DATE"
