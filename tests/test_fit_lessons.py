@@ -644,3 +644,6 @@ def test_columns_a_query_uses_as_numbers():
                     price * quantity as total, ended - 1 as day_before
                     from t where kind = 'x' and bots >= 1""")
     assert _numeric_columns(tree) == {"POSTS", "TEAMS", "X", "ACTIVE_USERS", "BOTS", "PRICE", "QUANTITY"}  # not the dates
+    tree = parse("select max(coalesce(r.channels - r.channels_deleted, s.channels - s.channels_deleted)) as c, ended - started as d from t")
+    assert _numeric_columns(tree) == set()
+    assert _numeric_columns(tree, ("channels_deleted",)) == {"CHANNELS", "CHANNELS_DELETED"}

@@ -91,7 +91,7 @@ class _Readings:
         return self.latest.locate(node_id, column) or (self.earlier.locate(node_id, column) if self.earlier is not None else None)
 
 
-def _numeric_columns(tree: exp.Expression) -> set[str]:
+def _numeric_columns(tree: exp.Expression, known: tuple[str, ...] = ()) -> set[str]:
     """Columns a query uses as numbers: added up, averaged, multiplied, cast to a number, compared with a number,
     or given a number to fall back on (`coalesce(posts, 0)`)."""
     number = lambda e: isinstance(e, exp.Literal) and not e.is_string  # noqa: E731
@@ -112,6 +112,12 @@ def _numeric_columns(tree: exp.Expression) -> set[str]:
         for one, other in ((node.this, node.expression), (node.expression, node.this)):
             if isinstance(one, exp.Column) and number(other):
                 out.add(one.name.upper())
+    # `channels - channels_deleted`: a number when the other side is one (two dates are subtracted as well)
+    out |= {k.upper() for k in known}
+    pairs = [{a.name.upper(), b.name.upper()} for node in tree.find_all(exp.Add, exp.Sub)
+             for a, b in [(bare(node.this), bare(node.expression))] if a is not None and b is not None]
+    while any(pair & out and not pair <= out for pair in pairs):
+        out |= {name for pair in pairs if pair & out for name in pair}
     return out
 
 
@@ -2312,7 +2318,7 @@ class Fitter:
                                  if c.to.is_type(*kinds) and isinstance(c.this, exp.Column)]
                         casts = len(alike)
                         if hint in ("DOUBLE", "BIGINT"):
-                            alike += sorted(_numeric_columns(tree))  # and the ones it adds up or compares with numbers
+                            alike += sorted(_numeric_columns(tree, (named.group(1),)))  # and the ones it adds up or compares with numbers
                         for c in dict.fromkeys(alike):
                             gens = [(self.tables[t].get("columns") or {}).get(c) for t in sources]
                             gens = [g for g in gens if g]
@@ -2387,7 +2393,8 @@ class Fitter:
                     # the error names one value; the model adds up, averages and compares a row of such columns of the
                     # same table (active users, posts, teams ...): all of them are numbers, in one round
                     tree, changed_here = self.tree(sql_key), set(self.retyped) - before or set(self.retyped)
-                    numeric = _numeric_columns(tree)
+                    made_up = re.fullmatch(r"([a-z][a-z0-9_]*)_[0-9a-f]{12}", m.group("value"))
+                    numeric = _numeric_columns(tree, (made_up.group(1),) if made_up else ())
                     for table in changed_here:
                         columns = self.tables.get(table, {}).get("columns") or {}
                         for name in sorted(numeric & set(columns)):
