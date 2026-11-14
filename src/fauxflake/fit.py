@@ -3040,12 +3040,17 @@ class Fitter:
                      "slow": sorted(((round(r.get("execution_time") or 0), r["unique_id"]) for r in results), reverse=True)[:15],
                      "learned": self.learned[before:], "statements": dict(emulator.FAILED_STATEMENTS)}, indent=1))
                 emulator.FAILED_STATEMENTS.clear()
-            if (not failed or (len(self.learned) == before and not accepted)) and not fresh and n_round < rounds:
+            # the same lessons about the same failures as an earlier round of the same kind: going round in circles
+            state = (fresh, frozenset(r["unique_id"] for r in failed), tuple(sorted(self.learned[before:])))
+            rounds_seen = self.__dict__.setdefault("_rounds_seen", set())
+            nothing_new = (len(self.learned) == before or (state in rounds_seen and bool(failed))) and not accepted
+            rounds_seen.add(state)
+            if (not failed or nothing_new) and not fresh and n_round < rounds:
                 # nothing left to learn from a partial round: a full build on a fresh warehouse has the last word
                 fresh, selected = True, []
                 self.log("  nothing more to fix in what was rebuilt; a full build on a fresh warehouse to confirm")
                 continue
-            if not failed or (len(self.learned) == before and not accepted):
+            if not failed or nothing_new:
                 # before stopping: the tests listed along the way were judged with what was known then. With all that
                 # was read and learned since, some can be taught to the spec after all; those come off the list and
                 # the build runs once more
