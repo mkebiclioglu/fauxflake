@@ -771,3 +771,20 @@ def test_a_query_string_read_key_by_key_holds_every_key_with_values_of_the_shape
     column = build_spec(manifest, "A")[0]["tables"]["RAW.D.LOG_ENTRIES"]["columns"]["CS_URI_QUERY"]
     assert column["gen"] == "template" and column["templates"][0] == "x=1&auc={n}&b=0.0.0&id={hex}"
     assert all(t.startswith("x=1&auc={n}&b=") and t.endswith("&id={hex}") for t in column["templates"])
+
+
+def test_a_column_joined_to_a_seed_that_nobody_asks_null_of_holds_only_the_seeds_values(tmp_path):
+    from fauxflake.init import build_spec
+
+    (tmp_path / "seeds").mkdir()
+    (tmp_path / "seeds" / "tokens.csv").write_text("token_id,symbol\n22132,NEAR\n87854,USN\n")
+    manifest = {
+        "sources": {"source.p.s.prices": {"database": "RAW", "schema": "S", "name": "prices", "identifier": "prices", "columns": {}}},
+        "nodes": {
+            "seed.p.tokens": {"resource_type": "seed", "relation_name": "A.SEED.TOKENS", "root_path": str(tmp_path),
+                              "original_file_path": "seeds/tokens.csv", "depends_on": {"nodes": []}},
+            "model.p.m": {"resource_type": "model", "depends_on": {"nodes": ["seed.p.tokens"]}, "relation_name": "A.B.M", "compiled_code": """
+                select p.price, t.symbol from raw.s.prices p left join a.seed.tokens t on p.token_id = t.token_id"""}},
+    }
+    values = build_spec(manifest, "A")[0]["tables"]["RAW.S.PRICES"]["columns"]["TOKEN_ID"]["values"]
+    assert set(values) == {"22132", "87854"}

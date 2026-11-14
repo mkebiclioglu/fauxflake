@@ -79,6 +79,7 @@ class SourceUse:
         self.path_patterns: dict[str, dict[str, set[str]]] = {}  # variant column -> {"a.b": LIKE patterns that keep rows}
         self.path_optional: dict[str, set[str]] = {}  # variant column -> paths a CASE / IFF tests for being there
         self.nullable: set[str] = set()  # columns a WHERE keeps only when they are NULL
+        self.null_tests: set[str] = set()  # columns the SQL asks `is null` / `is not null` of, anywhere
         self.future: set[str] = set()  # time columns compared with the present from above (`expire_at >= current_date`)
         self.embeds: dict[str, list[tuple[str, str, tuple[str, str]]]] = {}  # text column -> (before, after, the column whose value sits between them)
         self.star = False
@@ -681,6 +682,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 while isinstance(held.parent, (*_WRAPPERS, exp.Max, exp.Min)):  # `having max(expire_at) >= current_date`
                     held = held.parent
                 test = held.parent
+                if isinstance(test, exp.Is) and isinstance(test.expression, exp.Null) and test.this is held:
+                    use.null_tests.add(found[1])
                 if isinstance(test, exp.Is) and isinstance(test.expression, exp.Null) and test.this is held \
                         and not isinstance(test.parent, exp.Not) and test.find_ancestor(exp.Where) is not None \
                         and test.find_ancestor(exp.Or, exp.If, exp.Case) is None:
@@ -1881,11 +1884,13 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 holder, key = (column.get("fields") or {}), other[2]
             if key in holder and holder[key].get("gen") in _FREE:
                 known = values[:100]
-                # (most rows, not all: a LEFT JOIN to the seed is there for the rows it does not list, and
-                # `where team.user_id is null` should keep some)
-                numbers = [int(str(v)) for v in known if re.fullmatch(r"-?\d+", str(v))]
-                other = str(max(numbers) + 7919) if len(numbers) == len(known) else f"other_{key.split('.')[-1].lower()}"
-                holder[key] = {"gen": "categorical", "values": {**{v: round(0.85 / len(known), 6) for v in known}, other: 0.15}}
+                holder[key] = {"gen": "categorical", "values": {v: round(1 / len(known), 6) for v in known}}
+                if seed[0] in uses and seed[1] in uses[seed[0]].null_tests:
+                    # the models ask whether the seed had a row (`team.user_id is not null as is_team`): most rows are
+                    # listed in it, not all
+                    numbers = [int(str(v)) for v in known if re.fullmatch(r"-?\d+", str(v))]
+                    other = str(max(numbers) + 7919) if len(numbers) == len(known) else f"other_{key.split('.')[-1].lower()}"
+                    holder[key] = {"gen": "categorical", "values": {**{v: round(0.85 / len(known), 6) for v in known}, other: 0.15}}
                 joined.append(f"{'.'.join(x for x in other if x)}: joined to the seed {seed[0]} ({seed[1]}), generated from its values.")
     # two columns joined to two columns of one seed (`on t.event = p.event and t.action = p.action`): the pairs the
     # seed lists, not every combination of its values
