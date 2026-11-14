@@ -790,6 +790,8 @@ class Fitter:
             declared = list(dict.fromkeys([names[0], *self.origins(uid, names[0], strict=True)]))
             for fq in self.real_tables(tree, {c.alias.upper(): c.this for c in tree.find_all(exp.CTE)}):
                 for name in declared:
+                    if (fq, name) in self.__dict__.setdefault("_holds_text_after_all", set()):
+                        continue  # declared a document once, and then text was written into it
                     if fq in self.existing and (self.existing[fq].get("columns") or {}).get(name) not in (None, wanted):
                         self.existing[fq]["columns"][name] = wanted
                         self.create_existing(fq)
@@ -2214,8 +2216,28 @@ class Fitter:
                 changed = True
         return changed
 
+    def text_into_a_document(self, sql_key: str, message: str) -> bool:
+        """`Malformed JSON ... when casting from source column CUSTOMER_ID`, in a model that writes into its own table,
+        which started as an empty relation with that column declared a document: the declaration was wrong (it came
+        from another column of the same name). The column is text."""
+        named = re.search(r"Malformed JSON.*when casting from source column \"?(\w+)", message, re.S)
+        relation = (self.nodes.get(sql_key) or {}).get("relation_name")
+        fq = _fq(relation) if relation else None
+        if not named or fq not in self.existing:
+            return False
+        name, columns = named.group(1).upper(), self.existing[fq].get("columns") or {}
+        if columns.get(name) != "JSON":
+            return False
+        columns[name] = "VARCHAR"
+        self.__dict__.setdefault("_holds_text_after_all", set()).add((fq, name))
+        self.create_existing(fq)
+        self.learned.append(f"{fq}.{name}: declared a document, but the model writes text into it; declared VARCHAR.")
+        return True
+
     def learn(self, sql_key: str, message: str) -> bool:
         """Apply whatever one error message teaches. True when the spec changed."""
+        if self.text_into_a_document(sql_key, message):
+            return True
         if self.runaway(sql_key, message) or self.looked_for(sql_key) or self.jinja_columns(sql_key, message) \
                 or self.ambiguous_column(sql_key, message) or self.aggregate_out_of_place(sql_key, message):
             return True

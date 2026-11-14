@@ -623,3 +623,14 @@ def test_a_time_of_day_is_not_retyped_to_a_date():
     f.bounds = {}
     assert not f.retype_column("model.p.m", "LOGTIME", "DATE") and columns["LOGTIME"]["format"] == "%H:%M:%S"
     assert f.retype_column("model.p.m", "LOGDAY", "DATE") and columns["LOGDAY"]["type"] == "DATE"
+
+
+def test_text_written_into_a_column_declared_a_document_makes_it_text():
+    f = fitter(existing={"A.BLP.FACT": {"columns": {"ID": "JSON", "CUSTOMER_ID": "JSON"}, "as": "table"}},
+               nodes={"m": {"name": "fact", "relation_name": '"A".blp.fact'}})
+    f.create_existing = lambda fq: None
+    message = 'Conversion Error: Malformed JSON at byte 0 of input: unexpected character.  Input: "cws-customer_27fe" when casting from source column CUSTOMER_ID'
+    assert f.text_into_a_document("m", message)
+    assert f.existing["A.BLP.FACT"]["columns"] == {"ID": "JSON", "CUSTOMER_ID": "VARCHAR"}
+    assert not f.text_into_a_document("m", message)
+    assert not f.text_into_a_document("m", "Conversion Error: Could not convert string 'x' to INT64")
