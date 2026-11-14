@@ -70,6 +70,7 @@ class SourceUse:
         self.examples: dict[str, set[str]] = {}  # column -> texts that match the regular expressions it is tested with
         # text column -> separator -> position -> shapes that part is kept by (`split_part(request, ' ', 1) = 'POST'`)
         self.part_shapes: dict[str, dict[str, dict[int, set[str]]]] = {}
+        self.path_part_shapes: dict[str, dict[str, dict[str, dict[int, set[str]]]]] = {}  # the same, for a text inside a document
         self.path_literals: dict[str, dict[str, set[str]]] = {}  # variant column -> {"a.b": values it is compared with}
         self.path_patterns: dict[str, dict[str, set[str]]] = {}  # variant column -> {"a.b": LIKE patterns that keep rows}
         self.path_optional: dict[str, set[str]] = {}  # variant column -> paths a CASE / IFF tests for being there
@@ -406,6 +407,21 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 index = node.expressions[0] if node.expressions else None
                 if not isinstance(index, exp.Literal):
                     return None
+                taken = node.this
+                for _ in range(2):  # `split(log, ' ') as parts ... parts[1]`: through the alias, and casts
+                    while isinstance(taken, (exp.Cast, exp.TryCast, exp.Paren)):
+                        taken = taken.this
+                    if isinstance(taken, exp.Column) and not taken.table and taken.name.upper() in aliases:
+                        taken = aliases[taken.name.upper()]
+                if isinstance(taken, exp.Split) and index.is_int and isinstance(taken.expression, exp.Literal) \
+                        and taken.expression.is_string and taken.expression.name:
+                    # split(log, ' ')[1]: that piece of the text
+                    base = resolve_path(taken.this, depth + 1)
+                    if not isinstance(base, tuple) or base[0] not in sources or "{}" in base[2] or "~between" in base[2]:
+                        return None
+                    if "~part" in base[2]:  # a piece of a piece: its first part is still what a cast reads
+                        return base if int(index.name) == 0 else None
+                    return base[0], base[1], base[2] + ("~part", taken.expression.name, str(int(index.name)))
                 return into(resolve_path(node.this, depth + 1), [index.name if index.is_string else "[]"])
             if isinstance(node, exp.If):  # iff(kind = 'a', v:msg, v): what the first answer that is known holds
                 for value in (node.args.get("true"), node.args.get("false")):
@@ -448,9 +464,9 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 # split_part(request, ' ', 1): that piece of the text
                 mark, index = node.args.get("delimiter"), node.args.get("part_index")
                 base = resolve_path(node.this, depth + 1)
-                if isinstance(base, tuple) and not base[2] and isinstance(mark, exp.Literal) and mark.is_string and mark.name \
-                        and isinstance(index, exp.Literal) and index.is_int and int(index.name) >= 1:
-                    return base[0], base[1], ("~part", mark.name, str(int(index.name) - 1))
+                if isinstance(base, tuple) and not any(m in base[2] for m in ("{}", "~part", "~between")) and isinstance(mark, exp.Literal) \
+                        and mark.is_string and mark.name and isinstance(index, exp.Literal) and index.is_int and int(index.name) >= 1:
+                    return base[0], base[1], base[2] + ("~part", mark.name, str(int(index.name) - 1))
                 return None
             if isinstance(node, _REPLACE) and isinstance(node.expression, exp.Literal) and node.expression.is_string \
                     and node.expression.name and (node.args.get("replacement") is None or node.args["replacement"].name == ""):
@@ -532,10 +548,12 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     if isinstance(there, tuple) and there[0] in sources and not there[2]:
                         sources[found[0]].embeds.setdefault(found[1], []).append((found[2][1], found[2][2], (there[0], there[1])))
                 continue
-            if found[2][:1] == ("~part",):
+            if "~part" in found[2]:
                 # a piece of a text compared with something: the text should have such a piece there
-                if len(found[2]) != 3:
+                at = found[2].index("~part")
+                if len(found[2]) != at + 3:
                     continue
+                inside, found = found[2][:at], (found[0], found[1], found[2][at:])  # (the text may sit inside a document)
                 held = cast if cast is not None else top
                 while isinstance(held.parent, _WRAPPERS):
                     held = held.parent
@@ -549,11 +567,18 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 elif isinstance(test, exp.RegexpLike) and test.this is held and isinstance(test.expression, exp.Literal) \
                         and not isinstance(test.parent, exp.Not):
                     shapes = set(regex_examples(test.expression.name))
+                if cast is not None and hint_is_number(cast.to.sql(dialect="duckdb")):
+                    shapes.add("{n}")  # split(log, ' ')[2]::number
                 shapes = {v for v in shapes if found[2][1] not in v and len(v) <= 60}  # a piece cannot hold the separator
-                if shapes:
+                if shapes and not inside:
                     sources[found[0]].part_shapes.setdefault(found[1], {}).setdefault(found[2][1], {}).setdefault(
                         int(found[2][2]), set()).update(shapes)
                     sources[found[0]].texts.add(found[1])
+                elif shapes:
+                    sources[found[0]].path_part_shapes.setdefault(found[1], {}).setdefault(path_text(inside), {}).setdefault(
+                        found[2][1], {}).setdefault(int(found[2][2]), set()).update(shapes)
+                if inside:
+                    sources[found[0]].paths.setdefault(found[1], {}).setdefault(path_text(inside), None)
                 continue
             use, text = sources[found[0]], path_text(found[2])
             if joins is not None and "{}" not in found[2]:
@@ -1601,6 +1626,17 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 out[col] = {"gen": "object", "fields": {
                     path: field_gen(path, h, use.path_literals.get(col, {}).get(path), use.path_patterns.get(col, {}).get(path))
                     for path, h in sorted(use.paths[col].items())}}
+                for path, seps in use.path_part_shapes.get(col, {}).items():
+                    # a text in the document that models take apart and keep rows of by its pieces
+                    held = out[col]["fields"].get(path)
+                    if held is None or held.get("gen") not in ("template", "categorical"):
+                        continue
+                    known = list(held.get("templates") or ([held["template"]] if held.get("template") else sorted(map(str, held.get("values") or {}))))
+                    made = part_templates(seps, {})[:-1]
+                    # `log like '@%'` beside pieces read off it: the mark opens the first piece
+                    marks = [t[: -len("{hex}")] for t in known if t.endswith("{hex}") and re.fullmatch(r"[^\w\s{}]+", t[: -len("{hex}")])]
+                    made = [mark + text for mark in marks[:2] for text in made] or made
+                    out[col]["fields"][path] = {"gen": "template", "templates": list(dict.fromkeys([*made, *known]))}
                 for path, mark in use.path_prefix.get(col, {}).items():
                     if any(field.startswith(path + "~json") for field in out[col]["fields"]):
                         out[col]["fields"][path + "~prefix"] = {"gen": "constant", "value": mark}

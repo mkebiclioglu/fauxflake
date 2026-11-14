@@ -636,3 +636,21 @@ def test_a_model_read_by_a_written_out_name_is_known_whatever_the_order():
     columns = build_spec(manifest, "A")[0]["tables"]["RAW.S.LEAD"]["columns"]
     assert {"COMPANY", "STATUS", "ISDELETED", "ID", "SEQ"} <= set(columns) and "SFID" not in columns
     assert "MQL" in columns["STATUS"]["values"]
+
+
+def test_pieces_of_a_text_inside_a_document_that_rows_are_kept_by():
+    from fauxflake.init import build_spec
+
+    manifest = {
+        "sources": {"source.p.s.r": {"database": "RAW", "schema": "S", "name": "r", "identifier": "r", "columns": {}}},
+        "nodes": {
+            "model.p.ev": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.EV", "compiled_code": """
+                select r:id::string as id, value as log from raw.s.r, lateral flatten(r:outcome.logs)"""},
+            "model.p.m": {"resource_type": "model", "depends_on": {"nodes": ["model.p.ev"]}, "relation_name": "A.B.M", "compiled_code": """
+                select id, log, split(log, ' ') as log_parts, split(log_parts[0]::string, '@')[1]::string as signer,
+                       log_parts[1]::string as action, split(log_parts[2]::string, '.')[0]::number as amount_raw
+                from a.b.ev where log like '@%' and log_parts[1]::string in ('staking', 'unstaking')"""}},
+    }
+    logs = build_spec(manifest, "A")[0]["tables"]["RAW.S.R"]["columns"]["R"]["fields"]["outcome.logs[]"]
+    assert logs["gen"] == "template"
+    assert logs["templates"][:2] == ["@{hex} staking {n}", "@{hex} unstaking {n}"] and "@{hex}" in logs["templates"]
