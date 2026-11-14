@@ -2310,11 +2310,14 @@ class Fitter:
                         sources = self.sources_of(sql_key)
                         alike = [c.this.name.upper() for c in tree.find_all(exp.Cast, exp.TryCast)
                                  if c.to.is_type(*kinds) and isinstance(c.this, exp.Column)]
+                        casts = len(alike)
                         if hint in ("DOUBLE", "BIGINT"):
                             alike += sorted(_numeric_columns(tree))  # and the ones it adds up or compares with numbers
                         for c in dict.fromkeys(alike):
                             gens = [(self.tables[t].get("columns") or {}).get(c) for t in sources]
                             gens = [g for g in gens if g]
+                            if not gens and c not in alike[:casts]:
+                                continue  # a name the model gave to something it worked out (`term_days`), not a column it reads
                             if any(g.keys() & {"format", "epoch"} for g in gens):
                                 continue  # already learned how this one is written
                             if hint in ("DOUBLE", "BIGINT", "BOOLEAN") and not all(g.get("gen") in _FREE for g in gens):
