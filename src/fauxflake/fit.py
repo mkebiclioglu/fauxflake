@@ -2373,6 +2373,17 @@ class Fitter:
                                 continue  # already learned how this one is written
                             if hint in ("DOUBLE", "BIGINT", "BOOLEAN") and not all(g.get("gen") in _FREE for g in gens):
                                 continue  # a key or a reference read as a number is a lesson of its own
+                            if c not in alike[:casts]:
+                                # (used as a number, not cast to one: only the column of that very name in a table the
+                                # model reads, while nothing is known about it; `date` here is not `logdate` upstream)
+                                for t in sources:
+                                    held = (self.tables[t].get("columns") or {}).get(c)
+                                    if held and held.get("gen") == "template" and held.get("template") == f"{c.lower()}_{{hex}}" \
+                                            and not held.get("templates"):
+                                        self.tables[t]["columns"][c] = guess(c, hint)
+                                        self.retyped.add(t)
+                                        self.learned.append(f"{t}.{c}: used as {hint} beside the column that failed, retyped.")
+                                continue
                             self.retype_column(sql_key, c, hint)
                     return True  # DuckDB named the column it was reading
                 if named and not fmt and self.tree(sql_key) is not None:
