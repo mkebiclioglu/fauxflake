@@ -582,3 +582,11 @@ def test_a_seed_written_out_in_its_insert_is_not_refused_for_its_size():
     assert emulator._ROWS_WRITTEN_OUT.match(seed.replace("insert into", "insert overwrite into"))  # a seed loaded again
     with pytest.raises(ProgrammingError, match="1 MB"):
         emulator.rewrite("select " + ", ".join(["'x' as c"] * 120000))
+
+
+def test_string_functions_read_a_variant_column_as_its_text(run):
+    run("""create or replace table logs_t as select parse_json('{"logs": ["@alice staking 12.5", "EVENT_JSON:{\\\\"event\\\\":\\\\"mint\\\\"}"]}') as v""")
+    run("create or replace table flat_t as select value as log from logs_t, lateral flatten(input => v:logs)")
+    rows = run("""select split(log, ' ')[0]::string, split_part(log, ' ', 2), try_parse_json(replace(log, 'EVENT_JSON:')):event::string,
+                         left(log, 1), length(log) from flat_t order by 1""")
+    assert rows == [("@alice", "staking", None, "@", 19), ('EVENT_JSON:{"event":"mint"}', "", "mint", "E", 27)]

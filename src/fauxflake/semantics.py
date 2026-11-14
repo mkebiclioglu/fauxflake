@@ -584,8 +584,10 @@ def _fix(node: exp.Expression) -> exp.Expression:
                 node.set(key, _text(arg))
         if isinstance(node, (exp.Concat, exp.ConcatWs)):
             node.set("expressions", [_text(e) if isinstance(e, _VARIANT_ACCESS) else e for e in node.expressions])
-        if isinstance(node, _REGEX_FUNCTIONS) and isinstance(node.this, exp.Column):
-            node.set("this", exp.cast(node.this, "varchar"))  # REGEXP_SUBSTR(number_column, ...) reads the number as text
+        elif isinstance(node.this, exp.Column) and not isinstance(node, exp.DPipe):
+            # a column may be a VARIANT (FLATTEN's VALUE, or one carried through a table): SPLIT(value, ' ') and
+            # REPLACE(value, 'EVENT_JSON:') read its text, without JSON quotes. A number is read as its text too.
+            node.set("this", _fn("_sf_text", node.this))
     if isinstance(node, exp.Randstr):
         # sqlglot writes RANDSTR as a correlated subquery, which the planner chokes on once it is repeated
         seed = node.args.get("generator") or exp.Rand()
