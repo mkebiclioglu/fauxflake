@@ -655,3 +655,18 @@ def test_pieces_of_a_text_inside_a_document_that_rows_are_kept_by():
     logs = build_spec(manifest, "A")[0]["tables"]["RAW.S.R"]["columns"]["R"]["fields"]["outcome.logs[]"]
     assert logs["gen"] == "template"
     assert logs["templates"][:2] == ["@{hex} staking {n}", "@{hex} unstaking {n}"] and "@{hex}" in logs["templates"]
+
+
+def test_the_range_the_table_s_own_reader_keeps_is_the_range_generated():
+    from fauxflake.init import build_spec
+
+    manifest = {
+        "sources": {"source.p.s.shards": {"database": "RAW", "schema": "S", "name": "shards", "identifier": "shards", "columns": {}}},
+        "nodes": {
+            "model.p.load": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.LOAD", "compiled_code": """
+                select block_number, value from raw.s.shards where block_number between 9820000 and 10000000"""},
+            "model.p.social": {"resource_type": "model", "depends_on": {"nodes": ["model.p.load"]}, "relation_name": "A.B.SOCIAL", "compiled_code": """
+                select * from a.b.load where block_number >= 75000000"""}},
+    }
+    number = build_spec(manifest, "A")[0]["tables"]["RAW.S.SHARDS"]["columns"]["BLOCK_NUMBER"]
+    assert number["v"] == [9820000, 10000000] and number["p"] == [0, 1]

@@ -66,6 +66,8 @@ class SourceUse:
         self.path_prefix: dict[str, dict[str, str]] = {}  # variant column -> path -> text stripped off before the rest is parsed
         self.truncs: dict[str, str] = {}  # time column -> the unit a model cuts it to before matching on it (`date_trunc('hour', at)`)
         self.series: set[frozenset[str]] = set()  # columns a join matches on together (`on a.id = b.id and a.hour = b.hour`)
+        self.read_bounds: dict[str, set[float]] = {}  # number column -> what the models that read the table itself compare it with
+        self.windows: dict[str, set[float]] = {}  # number column -> the range the model that reads the table itself keeps (`between a and b`)
         self.depends: dict[str, str] = {}  # column -> the column that decides it (`group by id having count(distinct seats) = 1`)
         self.examples: dict[str, set[str]] = {}  # column -> texts that match the regular expressions it is tested with
         # text column -> separator -> position -> shapes that part is kept by (`split_part(request, ' ', 1) = 'POST'`)
@@ -317,6 +319,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     renames[alias_name] = lineage[name]
                 elif id(getattr(node, "expression", None)) in outputs_of:
                     renames[alias_name] = outputs_of[id(node.expression)]  # `(select ...) as t`: what the subquery wrote
+        # the generated tables this SELECT reads by their own name (not through a model or a CTE)
+        read_here = {_table_id(node) for node in selected.values() if isinstance(node, exp.Table) and _table_id(node) in sources}
         # a lateral FLATTEN next to the table only contributes its own fixed columns
         laterals = {a.upper() for a, src in selected.items() if getattr(src, "is_udtf", False)}
         others = {a.upper() for a in selected} - set(direct) - laterals
@@ -795,14 +799,21 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     # `where block_number between 9820000 and 10000000`: the numbers that should select something
                     sides = [parent.args.get("low"), parent.args.get("high")] if isinstance(parent, exp.Between) else \
                         [parent.expression if parent.this is col else parent.this]
+                    read = []
                     for side in sides:
                         negative = isinstance(side, exp.Neg)
                         number = side.this if negative else side
                         if isinstance(number, exp.Literal) and not number.is_string:
                             try:
-                                use.bounds.setdefault(hit[1], set()).add(-float(number.name) if negative else float(number.name))
+                                read.append(-float(number.name) if negative else float(number.name))
                             except ValueError:
                                 pass
+                    use.bounds.setdefault(hit[1], set()).update(read)
+                    if hit[0] in read_here:
+                        use.read_bounds.setdefault(hit[1], set()).update(read)
+                    if isinstance(parent, exp.Between) and len(read) == 2 and hit[0] in read_here and not isinstance(parent.parent, exp.Not):
+                        # the model that reads the table itself takes only this range: nothing outside it gets any further
+                        use.windows.setdefault(hit[1], set()).update(read)
                 if (isinstance(parent, exp.ParseIp) and parent.this is col) or (
                         isinstance(parent, exp.Anonymous) and parent.name.upper() == "PARSE_IP" and parent.expressions[0] is col):
                     use.ips.add(hit[1])
@@ -1669,7 +1680,12 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 out[col] = {"gen": "updated_at", **({"type": "DATE"} if declared.get(col) == "DATE" else {})}
             else:
                 out[col] = guess(col, hint)
-            within_bounds(out[col], use.bounds.get(col))
+            window = use.windows.get(col)
+            # (what the table's own reader keeps is all that goes anywhere: thresholds beyond it, asked for downstream,
+            # cannot be met on a first run, with these rows or with real ones)
+            if window and not all(min(window) <= b <= max(window) for b in use.read_bounds.get(col, ())):
+                window = None  # another model reads the table itself and asks for something outside it
+            within_bounds(out[col], {min(window), max(window)} if window and len(window) >= 2 else use.bounds.get(col))
             if col in use.future and out[col].get("gen") == "time_offset" and not out[col].get("format") and not out[col].get("epoch"):
                 out[col].update(p=[0, 0.3, 1], seconds=[-30 * 86400, 30 * 86400, 400 * 86400])  # from last month to next year
             if col in use.nullable and out[col].get("gen") not in ("sequence", "hash_id", "loaded_at", "event_time", "lifecycle") \
