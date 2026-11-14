@@ -2803,12 +2803,15 @@ class Fitter:
 
                 for uid in redo:
                     fq = _fq(self.nodes[uid]["relation_name"]) if uid in self.nodes and self.nodes[uid].get("relation_name") else None
-                    if fq in self.existing:
+                    if fq and fq.count(".") == 2:
+                        # (whatever an earlier round built of a model that fails now goes too: an incremental model
+                        # would otherwise run against a table shaped by what was known then)
                         for kind in ("table", "view"):
                             try:
                                 self.emu.duck.execute(f"drop {kind} if exists {quoted(fq)}")
                             except Exception:  # noqa: BLE001, S110 - it is the other kind
                                 pass
+                    if fq in self.existing:
                         try:
                             emulator.stand_in(self.emu.duck, fq, existing_view(fq, self.existing[fq].get("columns") or {},
                                                                                table=self.existing[fq].get("as") == "table"))
