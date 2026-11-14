@@ -1343,11 +1343,13 @@ def part_templates(shapes: dict[str, dict[int, set[str]]], casts: dict[str, dict
 
 
 def param_templates(params: dict[str, set[str]]) -> list[str]:
-    """Templates for a query string the SQL reads key by key: `x=1&auc={n}&b=2.2.2&id={hex}`. Every key is there in
+    """Templates for a query string the SQL reads key by key: `x=1&auc={n}&b=2.2.2&id={n}`. Every key is there in
     every row, after an `&` (the patterns ask for one, and the SUBSTRING that drops `&id=` counts on it); the
     shapes a value is tested for take turns."""
     keys = sorted(params)
-    choices = {k: sorted(v for v in params[k] if v != "{n}") or (["{n}"] if "{n}" in params[k] else ["{hex}"]) for k in keys}
+    # (a value nothing is known about is written in digits: an id of that kind can be read as text and as a number,
+    # whichever the columns it meets downstream are)
+    choices = {k: sorted(v for v in params[k] if v != "{n}") or ["{n}"] for k in keys}
     width = min(max(len(c) for c in choices.values()), 6)
     return ["&".join(["x=1", *[f"{k}={choices[k][i % len(choices[k])]}" for k in keys]]) for i in range(width)]
 
