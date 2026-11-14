@@ -20,7 +20,7 @@ def test_init_learns_the_spec_by_running_the_project(tmp_path):
     # the source is only read with `select *`: its columns come from the models downstream
     assert {"EVENT_ID", "ACCOUNT_ID", "AMOUNT", "CREATED", "PAYLOAD", "PATH", "KIND", "REGION_CODE"} <= set(columns)
     assert columns["KIND"]["gen"] == "categorical" and "purchase" in columns["KIND"]["values"]  # `where kind = 'purchase'`
-    assert columns["REGION_CODE"]["v"] == [40, 60]  # `between 40 and 60` keeps rows
+    assert columns["REGION_CODE"]["v"] == [40, 60, 70]  # `between 40 and 60` keeps rows (and some lie beyond: two thresholds look the same)
     assert columns["PATH"]["template"].startswith("{n}/")  # split(path, '/')[0]::number
     assert columns["CREATED"]["gen"] in ("time_offset", "event_time")  # to_timestamp_ntz(created)
     assert columns["PAYLOAD"]["gen"] == "object"
@@ -52,5 +52,5 @@ def test_fit_updates_a_spec_without_losing_edits(tmp_path):
     out = runner.invoke(main, ["fit", "--project-dir", str(PROJECT), "--spec", str(spec_path)])
     assert out.exit_code == 0, out.output
     after = yaml.safe_load(spec_path.read_text())["tables"]["RAW.APP.EVENTS"]
-    assert after["columns"]["REGION_CODE"]["v"] == [40, 60] and after["volume"]["rows_per_day"] == 123
+    assert after["columns"]["REGION_CODE"]["v"] == [40, 60, 70] and after["volume"]["rows_per_day"] == 123
     assert "RAW.APP.EVENTS.REGION_CODE" in out.output

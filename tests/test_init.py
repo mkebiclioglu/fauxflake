@@ -722,3 +722,14 @@ def test_union_branches_listing_the_same_columns_in_another_order_are_not_lined_
     assert links == []
     scan_model("select id, sent_at from raw.s.old_events union all select event_id, sent from raw.s.new_events", uses, {}, links=links)
     assert {("RAW.S.OLD_EVENTS", "ID"), ("RAW.S.NEW_EVENTS", "EVENT_ID")} in [set(g) for g in links]
+
+
+def test_two_thresholds_leave_values_beyond_the_larger_one():
+    from fauxflake.init import within_bounds
+
+    gen = {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000]}
+    within_bounds(gen, {0, 1000000})  # `bytes > 0` in one model, `bytes > 1000000` in another
+    assert gen["v"] == [0, 1000000, 1500000] and gen["p"] == [0.0, 0.5, 1.0]
+    kept = {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000]}
+    within_bounds(kept, {40, 60}, exact=True)  # the one range the table's reader keeps
+    assert kept["v"] == [40, 60]

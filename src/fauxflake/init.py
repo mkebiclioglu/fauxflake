@@ -1392,7 +1392,7 @@ def unique_together(table: dict, names: list[str]) -> str | None:
     return None
 
 
-def within_bounds(gen: dict, bounds: set[float] | None) -> None:
+def within_bounds(gen: dict, bounds: set[float] | None, exact: bool = False) -> None:
     """Make a numeric column's values straddle the numbers the SQL compares it with, so that
     `where block_number between 9820000 and 10000000` keeps rows."""
     if not bounds or gen.get("gen") != "dist" or str(gen.get("type", "")).upper() not in ("BIGINT", "DOUBLE", ""):
@@ -1401,9 +1401,9 @@ def within_bounds(gen: dict, bounds: set[float] | None) -> None:
     whole = str(gen.get("type", "")).upper() == "BIGINT"
     if lo == hi:  # one threshold: values on both sides of it
         lo, hi = (0, max(2 * hi, 10)) if hi >= 0 else (2 * lo, 0)
-    elif len(bounds) > 2:
-        # several thresholds (`between 9820000 and 10000000` here, `>= 75000000` there): as many values
-        # between each pair as beyond the last, so every one of the comparisons keeps rows
+    elif not (exact and len(bounds) == 2):  # (`exact`: the two ends of the one range a reader keeps)
+        # several thresholds (`between 9820000 and 10000000` here, `>= 75000000` there; or `> 0` here and
+        # `> 1000000` there): as many values between each pair as beyond the last, so every one of the comparisons keeps rows
         knots = sorted(bounds)
         knots.append(knots[-1] + max((knots[-1] - knots[0]) / len(knots), 10))
         gen.update(p=[round(i / (len(knots) - 1), 6) for i in range(len(knots))], v=[int(k) if whole else k for k in knots])
@@ -1706,7 +1706,8 @@ def analyse(manifest: dict, database: str) -> Analysis:
             # cannot be met on a first run, with these rows or with real ones)
             if window and not all(min(window) <= b <= max(window) for b in use.read_bounds.get(col, ())):
                 window = None  # another model reads the table itself and asks for something outside it
-            within_bounds(out[col], {min(window), max(window)} if window and len(window) >= 2 else use.bounds.get(col))
+            ranged = bool(window and len(window) >= 2)
+            within_bounds(out[col], {min(window), max(window)} if ranged else use.bounds.get(col), exact=ranged)
             if col in use.future and out[col].get("gen") == "time_offset" and not out[col].get("format") and not out[col].get("epoch"):
                 out[col].update(p=[0, 0.3, 1], seconds=[-30 * 86400, 30 * 86400, 400 * 86400])  # from last month to next year
             if col in use.nullable and out[col].get("gen") not in ("sequence", "hash_id", "loaded_at", "event_time", "lifecycle") \
