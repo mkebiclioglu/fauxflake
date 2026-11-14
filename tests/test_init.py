@@ -696,3 +696,19 @@ def test_a_calendar_joined_to_a_rows_start_and_end_does_not_make_them_periods():
     }
     columns = build_spec(manifest, "A")[0]["tables"]["RAW.S.ITEMS"]["columns"]
     assert "every_days" not in columns["START_DATE"] and "every_days" not in columns["END_DATE"]
+
+
+def test_a_declared_source_that_a_model_builds_is_read_as_that_model():
+    from fauxflake.init import build_spec
+
+    manifest = {
+        "sources": {"source.p.raw.lead": {"database": "RAW", "schema": "S", "name": "lead", "identifier": "lead", "columns": {}},
+                    "source.p.orgm.lead": {"database": "A", "schema": "ORGM", "name": "lead", "identifier": "lead", "columns": {}}},
+        "nodes": {
+            "model.p.lead": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.ORGM.LEAD",
+                             "compiled_code": "select * from raw.s.lead"},
+            "model.p.m": {"resource_type": "model", "depends_on": {"nodes": ["model.p.lead"]}, "relation_name": "A.B.M",
+                          "compiled_code": "select l.id from a.orgm.lead l where l.activated_on is null"}},
+    }
+    tables = build_spec(manifest, "A")[0]["tables"]
+    assert "A.ORGM.LEAD" not in tables and tables["RAW.S.LEAD"]["columns"]["ACTIVATED_ON"]["null_rate"] == 0.3

@@ -290,7 +290,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
         selected.update({a: src for a, src in getattr(scope, "lateral_sources", {}).items() if a not in selected})
         for alias, node in selected.items():
             if isinstance(node, exp.Table):
-                if _table_id(node) in sources:
+                if _table_id(node) in sources and not (models and _table_id(node) in models):
+                    # (a relation declared as a source that a model builds is read as that model, below)
                     direct[alias.upper()] = _table_id(node)
                 elif node.name.upper() in passthrough:
                     direct[alias.upper()] = passthrough[node.name.upper()]
