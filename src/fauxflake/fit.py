@@ -705,13 +705,15 @@ class Fitter:
                 return out
         return fmt
 
-    def retype_column(self, uid: str, name: str, hint: str, fmt: str | None = None) -> bool:
-        """The model converts column `name` to `hint`: make the sources it reads generate that."""
+    def retype_column(self, uid: str, name: str, hint: str, fmt: str | None = None, direct: bool = False) -> bool:
+        """The model converts column `name` to `hint`: make the sources it reads generate that. `direct`: the name is a
+        source column's own (it was read off a generated value), not one to follow back through the models."""
         changed = False
         tables = self.sources_of(uid)
         # and the source columns an output column is made from
-        # a date to add days to, or text to compare with text: only the columns whose value it is
-        names = list(dict.fromkeys([name, *self.origins(uid, name, strict=hint in ("DAY", "TEXT", "VARIANT"))]))
+        # a date to add days to, text to compare with text, a number: only the columns whose value it is
+        names = [name] if direct else list(dict.fromkeys(
+            [name, *self.origins(uid, name, strict=hint in ("DAY", "TEXT", "VARIANT", "BIGINT", "DOUBLE"))]))
         for table, name in [(t, n) for t in tables for n in names]:
             columns = self.tables[table].get("columns") or {}
             if name not in columns:  # "Sum of Open Opportunities" is sum_of_open_opportunities in generated text
@@ -2434,7 +2436,7 @@ class Fitter:
                     self.array_values(sql_key)
                     return True
                 for token in m.group("value").split():  # generated text starts with its column's name
-                    if "_" in token and self.retype_column(sql_key, token.rsplit("_", 1)[0].upper(), hint, fmt):
+                    if "_" in token and self.retype_column(sql_key, token.rsplit("_", 1)[0].upper(), hint, fmt, direct=True):
                         if hint in ("DATE", "TIMESTAMP", "BOOLEAN") and not fmt:
                             self.cast_alike(sql_key, hint)
                         return True
