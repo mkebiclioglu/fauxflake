@@ -1305,9 +1305,10 @@ def unique_together(table: dict, names: list[str]) -> str | None:
     if not names or any(g is None for g in gens.values()):
         return None
     free = lambda n, g: g["gen"] == "template" and g.get("template") == f"{n.lower()}_{{hex}}" and not g.get("templates")  # noqa: E731
+    grain = table.get("grain") or []
     if any(g["gen"] in ("sequence", "hash_id") or g.get("unique") or g.get("per_parent") == 1 or (free(n, g) and not g.get("follows"))
-           for n, g in gens.items()) or set(table.get("grain") or ()) >= set(names) and table.get("grain"):
-        return None  # one of them is unique by itself already
+           for n, g in gens.items()) or (grain and set(names) >= set(grain)):
+        return None  # one of them is unique by itself already, or the table's grain is among them
     for n, g in gens.items():
         if g["gen"] == "dist" and str(g.get("type", "BIGINT")).upper().startswith(("BIGINT", "INT")):
             columns[n] = {**g, "unique": True}
