@@ -1032,9 +1032,11 @@ def _share_join_values(tables: dict[str, dict], joins: list, notes: list[str], l
             key = ids[0]
             domain = f"{key[0]}.{key[1]}.{key[2]}"
             put(key, {"gen": "hash_id", "domain": domain})
+            held_in = key[2][: key[2].rfind("[]") + 2] if "[]" in key[2] else ""  # the list whose elements have the id
             for slot, m in enumerate(m for m in free if m != key):
                 put(m, {"gen": "link", "domain": domain, "depth": key[2].count("[]"),
-                        **({"layered": True, "slot": slot} if m[0] == key[0] else {})})
+                        **({"layered": True, "slot": slot, "tree": True, **({"within": True} if held_in and m[2].startswith(held_in) else {})}
+                           if m[0] == key[0] else {})})
             notes.append(f"{name(key)}: an id that {', '.join(name(m) for m in free if m != key)} refer to; generated as one.")
             continue
         named = [gen[m] for m in free if gen[m]["gen"] == "categorical"]

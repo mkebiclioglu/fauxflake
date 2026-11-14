@@ -228,3 +228,34 @@ def test_less_than_a_row_a_day_is_a_row_every_few_days():
         Warehouse(emu, spec, 0.001).advance_to(datetime(2025, 4, 11))  # a hundred days at a tenth of a row a day
         rows, ids, first = emu.cursor().execute('select count(*), count(distinct ID), min("AT")::date from RAW.T.SMALL').fetchone()
     assert 9 <= rows <= 12 and ids == rows and str(first) == "2025-01-01"
+
+
+def test_ids_in_a_document_and_the_lists_that_name_them_form_trees():
+    from fauxflake.spec import Spec
+
+    domain = "RAW.T.SHARDS.V.receipts[].receipt_id"
+    link = {"gen": "link", "domain": domain, "depth": 1, "layered": True, "tree": True}
+    spec = Spec.from_raw({"seed": 42, "start": "2025-01-01", "tables": {"RAW.T.SHARDS": {
+        "volume": {"rows_per_day": 200, "weekly": [1] * 7}, "lateness": {"p": [0, 1], "seconds": [0, 1]},
+        "columns": {"V": {"gen": "object", "fields": {
+            "receipts[].receipt_id": {"gen": "hash_id", "domain": domain},
+            "receipts[].outcome.receipt_ids[]": {**link, "slot": 0, "within": True},
+            "txs[].hash": {"gen": "hash_id", "domain": "RAW.T.SHARDS.V.txs[].hash"},
+            "txs[].outcome.receipt_ids[]": {**link, "slot": 1}}}}}}}, ".")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 4))
+        cur = emu.cursor()
+        cur.execute("""create temp table ids as select r.unnest->>'receipt_id' as id from RAW.T.SHARDS, unnest(from_json(V->'receipts', '["json"]')) r""")
+        cur.execute("""create temp table refs as
+            select 'tx' as who, t.unnest->>'hash' as parent, c.unnest::varchar as child
+            from RAW.T.SHARDS, unnest(from_json(V->'txs', '["json"]')) t, unnest(from_json(t.unnest->'outcome'->'receipt_ids', '["varchar"]')) c
+            union all
+            select 'receipt', r.unnest->>'receipt_id', c.unnest::varchar
+            from RAW.T.SHARDS, unnest(from_json(V->'receipts', '["json"]')) r, unnest(from_json(r.unnest->'outcome'->'receipt_ids', '["varchar"]')) c""")
+        total = cur.execute("select count(*), count(distinct id) from ids").fetchone()
+        reached = cur.execute("select count(distinct child) from refs join ids on ids.id = refs.child").fetchone()[0]
+        twice = cur.execute("select count(*) from (select child from refs join ids on ids.id = refs.child group by 1 having count(*) > 1)").fetchone()[0]
+        txs, rooted = cur.execute("select count(distinct parent), count(distinct case when ids.id is not null then parent end) "
+                                  "from refs left join ids on ids.id = refs.child where who = 'tx'").fetchone()
+    assert total[0] == total[1] > 500 and twice == 0
+    assert reached > total[0] * 0.5 and rooted > txs * 0.5

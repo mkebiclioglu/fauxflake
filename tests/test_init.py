@@ -233,9 +233,10 @@ def test_ids_inside_documents_are_keys_and_links_not_a_shared_pool():
     fields = tables["RAW.T.DOCS"]["columns"]["V"]["fields"]
     assert fields["receipts[].receipt_id"]["gen"] == "hash_id"
     # each referring field points at its own element of the row before (`slot`): an id has one parent at most
+    # a small tree in every row: the transactions name ids of the list, which name the next one as their child
     assert fields["txs[].outcome.receipt_ids[]"] == {"gen": "link", "domain": fields["receipts[].receipt_id"]["domain"],
-                                                     "depth": 1, "layered": True, "slot": 1}
-    assert fields["receipts[].outcome.receipt_ids[]"]["slot"] == 0
+                                                     "depth": 1, "layered": True, "slot": 1, "tree": True}
+    assert fields["receipts[].outcome.receipt_ids[]"]["slot"] == 0 and fields["receipts[].outcome.receipt_ids[]"]["within"]
 
 
 def test_the_looked_up_side_of_a_join_holds_each_value_once():

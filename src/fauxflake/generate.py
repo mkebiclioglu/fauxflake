@@ -323,7 +323,19 @@ class TableSQL:
             # a hierarchy) of a row a little earlier and one level up, so that chains end and never loop
             draw = self.u(col)
             depth, slot = int(d.get("depth", 0)), int(d.get("slot", 0))
-            if d.get("layered"):
+            if d.get("layered") and d.get("tree") and depth == 1:
+                # ids and the lists that refer to them, in one document: a small tree in every row. The elements of
+                # another list (transactions) name the even-numbered ids, each of which names the id after it as its
+                # child. An id has one parent at most, nothing loops, and most ids are reached.
+                inside = list(dict.fromkeys(re.findall(r"_i\d+", self.base)))
+                arrays = col.count("[]")
+                own, last = (inside[0], inside[-1]) if arrays >= 2 and len(inside) >= 2 else \
+                    ("0", inside[0]) if inside and col.endswith("[]") else (inside[0] if inside else "0", "0")
+                wanted, index = (f"{last} = 0 and {own} % 2 = 0", f"{own} + 1") if d.get("within") else (f"{last} = 0", f"{own} * 2")
+                expr = (f"md5(concat({lit(f'{self.spec.seed}:{d['domain']}:')}, case when {wanted} then hash(g, {index}) "
+                        f"else hash(-1 - g, {own} * 16 + {last}) end))")
+                depth = -1  # (done: skip the steps below)
+            elif d.get("layered"):
                 # the row before, one level up, and only from the first element of a list: an id has at most one
                 # row referring to it through this field, as a child has one parent. The rest point nowhere.
                 inside = re.findall(r"_i\d+", self.base)
@@ -340,7 +352,8 @@ class TableSQL:
                 # the element of the row it points at: each referring field has its own (`slot`), so two fields
                 # never name the same id
                 target = f"hash({target}, {slot if level == depth - 1 else 0})"
-            expr = f"md5(concat({lit(f'{self.spec.seed}:{d['domain']}:')}, {target}))"
+            if depth >= 0:
+                expr = f"md5(concat({lit(f'{self.spec.seed}:{d['domain']}:')}, {target}))"
         elif gen == "fk":
             parent = self.spec.tables[d["ref"].upper()]
             skew = float(d.get("skew", 1.0))
