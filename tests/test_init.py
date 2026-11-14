@@ -670,3 +670,15 @@ def test_the_range_the_table_s_own_reader_keeps_is_the_range_generated():
     }
     number = build_spec(manifest, "A")[0]["tables"]["RAW.S.SHARDS"]["columns"]["BLOCK_NUMBER"]
     assert number["v"] == [9820000, 10000000] and number["p"] == [0, 1]
+
+
+def test_a_cte_that_joins_and_selects_one_sources_star_passes_that_source_through():
+    uses = {"RAW.B.SUBS": SourceUse(), "RAW.B.PRODUCTS": SourceUse()}
+    cte = """with subscriptions as (
+               select s.*, p.sku, row_number() over (partition by s.id order by s.version desc) as row_num
+               from raw.b.subs s join raw.b.products p on s.product_id = p.id)"""
+    whole = scan_model(cte + " select * from subscriptions where row_num = 1", uses, {}, [], [])
+    assert whole["SKU"] == ("RAW.B.PRODUCTS", "SKU")
+    assert whole["*"] == ("RAW.B.SUBS", "ROW_NUM")
+    named = scan_model(cte + " select x.customer_id, x.sku, x.row_num from subscriptions x", uses, {}, [], [])
+    assert named == {"CUSTOMER_ID": ("RAW.B.SUBS", "CUSTOMER_ID"), "SKU": ("RAW.B.PRODUCTS", "SKU")}

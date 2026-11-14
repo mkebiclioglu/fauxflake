@@ -349,13 +349,21 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     return None  # computed in the CTE (a row_number, say), not a source column
                 return (direct.get(table) or only), col.name.upper()
             if table in renames:
-                return renames[table].get(col.name.upper())
+                return through_star(renames[table], col.name.upper())
             if not table and len(renames) == 1 and len(selected) == 1:
-                return next(iter(renames.values())).get(col.name.upper())
+                return through_star(next(iter(renames.values())), col.name.upper())
             if not table:  # next to a join: the one relation known to write a column of that name
                 having = [r for r in renames.values() if col.name.upper() in r and col.name.upper() != _PATHS]
                 return having[0][col.name.upper()] if len(having) == 1 else None
             return None
+
+        def through_star(known: dict, name: str):  # noqa: ANN202
+            """What a CTE says of a column: one it wrote out, or one of the source it passes through whole
+            (`select s.*, p.sku from source s join products p ...`)."""
+            hit = known.get(name)
+            if hit is None and "*" in known and name not in (_PATHS, "*") and name not in known["*"][1].split("|"):
+                return known["*"][0], name
+            return hit
 
         # where a value sits inside a source's document, followed through models, aliases and FLATTEN
         path_maps = {a: r[_PATHS] for a, r in renames.items() if _PATHS in r}
@@ -925,8 +933,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 sources[only].star = True
                 extra = {p.alias_or_name.upper() for p in select.expressions if p not in stars} | added.get(next(iter(direct)), set())
                 outputs["*"] = (only, "|".join(sorted(extra)))  # the whole model passes the source through
-        elif len(stars) == 1 and not name and isinstance(stars[0], exp.Column) and stars[0].table.upper() in direct \
-                and scope.is_root and not isinstance(select.parent, exp.SetOperation):
+        elif len(stars) == 1 and isinstance(stars[0], exp.Column) and stars[0].table.upper() in direct \
+                and (name or scope.is_root) and not isinstance(select.parent, exp.SetOperation):
             # `select o.id as sfid, o.* from source o join (latest per id) oo on ...`: still every column of `o`
             owner = stars[0].table.upper()
             sources[direct[owner]].star = True
