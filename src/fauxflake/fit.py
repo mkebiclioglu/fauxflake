@@ -95,7 +95,13 @@ def _numeric_columns(tree: exp.Expression) -> set[str]:
     """Columns a query uses as numbers: added up, averaged, multiplied, cast to a number, compared with a number,
     or given a number to fall back on (`coalesce(posts, 0)`)."""
     number = lambda e: isinstance(e, exp.Literal) and not e.is_string  # noqa: E731
-    out = {c.name.upper() for node in tree.find_all(exp.Sum, exp.Avg, exp.Add, exp.Sub, exp.Mul, exp.Div) for c in node.find_all(exp.Column)}
+    def bare(e):  # noqa: ANN001, ANN202 - the column itself, not one a function is called on first (`datediff('day', a, b) / 30`)
+        while isinstance(e, (exp.Paren, exp.Cast, exp.TryCast)):
+            e = e.this
+        return e if isinstance(e, exp.Column) else None
+
+    out = {c.name.upper() for node in tree.find_all(exp.Sum, exp.Avg, exp.Mul, exp.Div)
+           for c in (bare(node.this), bare(node.args.get("expression"))) if c is not None}
     out |= {c.this.name.upper() for c in tree.find_all(exp.Cast, exp.TryCast)
             if isinstance(c.this, exp.Column) and c.to.is_type("float", "double", "decimal", "int", "bigint")}
     for node in tree.find_all(exp.Coalesce, exp.Greatest, exp.Least):

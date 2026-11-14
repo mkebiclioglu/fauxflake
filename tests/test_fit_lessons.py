@@ -640,5 +640,7 @@ def test_columns_a_query_uses_as_numbers():
     from fauxflake.fit import _numeric_columns
 
     tree = parse("""select max(name) as n, sum(posts) as p, coalesce(teams, 0) as t, greatest(a, b) as g, x::float as x,
-                    case when active_users > 10 then 'big' end as size from t where kind = 'x' and bots >= 1""")
-    assert _numeric_columns(tree) == {"POSTS", "TEAMS", "X", "ACTIVE_USERS", "BOTS"}
+                    case when active_users > 10 then 'big' end as size, round(datediff('day', started, ended) / 30, 0) as term,
+                    price * quantity as total, ended - 1 as day_before
+                    from t where kind = 'x' and bots >= 1""")
+    assert _numeric_columns(tree) == {"POSTS", "TEAMS", "X", "ACTIVE_USERS", "BOTS", "PRICE", "QUANTITY"}  # not the dates
