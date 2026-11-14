@@ -539,6 +539,11 @@ class TableSQL:
         ts = "case k.k " + " ".join(f"when {i} then {x}" for i, x in enumerate(times)) + " end"
 
         late = piecewise(self.u("late", "k"), t.lateness["p"], t.lateness["seconds"])
+        if t.raw.get("log"):
+            # a log arrives in the order it was written: what has not been loaded yet is its end, never a row in the
+            # middle (a block missing from a chain)
+            second_of_day = "(_n * 86400.0 / greatest(_dn, 1))"
+            late = repr(float(min(t.lateness["seconds"])))
         dup_rate = repr(float(t.raw.get("duplicate_rate", 0.0)))
         arrived = f"_l0 + {ms(f"dup.d * (1 + {self.u('redeliver', 'k')} * 600)")}"
         if self.sc:

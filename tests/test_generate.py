@@ -284,3 +284,19 @@ def test_a_log_keeps_its_rows_in_order_and_each_names_the_one_before():
                              "from b where PART between 100 and 200)").fetchone()
     assert rows[0] == rows[1] > 300 and breaks == 0
     assert inside[0] > 100 and inside[1] == 0
+
+
+def test_a_log_loaded_part_way_through_a_day_has_no_row_missing_in_the_middle():
+    from fauxflake.spec import Spec
+
+    spec = Spec.from_raw({"seed": 7, "start": "2025-01-01", "history": 4, "tables": {"RAW.T.BLOCKS": {
+        "volume": {"rows_per_day": 200, "weekly": [1] * 7}, "lateness": {"p": [0, 0.9, 1], "seconds": [30, 3600, 86400]}, "log": True,
+        "columns": {"HEIGHT": {"gen": "sequence"}, "HASH": {"gen": "template", "template": "hash_{hex}"},
+                    "PREV_HASH": {"gen": "previous", "of": "HASH"}}}}}, ".")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 4, 15, 30))
+        cur = emu.cursor()
+        count, low, high = cur.execute("select count(*), min(HEIGHT), max(HEIGHT) from RAW.T.BLOCKS").fetchone()
+        breaks = cur.execute("select count(*) from (select PREV_HASH, lag(HASH) over (order by HEIGHT) as prior from RAW.T.BLOCKS) "
+                             "where prior <> PREV_HASH").fetchone()[0]
+    assert count == high - low + 1 > 600 and breaks == 0
