@@ -1370,7 +1370,7 @@ class Fitter:
             for name in [*self.read_through(t, owner), *self.read_past_a_listing(t, ctes, owner, col)]:
                 if name != col and re.fullmatch(r"[\w$ ]+", name):
                     self.add_column(owner, name)
-        elif owner in self.existing or self.passthrough(owner):
+        elif owner in self.existing or owner in self.unions or self.passthrough(owner):
             # the same for a relation that passes a source on (`select o.* from source o ...`, read by its name):
             # every column the model reads from it is the source's, and is asked for now
             for name in self.read_through(t, owner):
