@@ -2960,8 +2960,9 @@ class Fitter:
                     if n.get("relation_name") and _fq(n["relation_name"]).count(".") == 2:
                         self.by_rel[_fq(n["relation_name"])] = uid
             # every round: a model skipped in one (its parent failed) is compiled in a later one
-            analysis = self.read_again(manifest, analysis)
             failed = [r for r in results if r["status"] in ("error", "fail")]
+            # (a full build with nothing failing is the answer: the spec that gave it is kept as it is)
+            analysis = self.read_again(manifest, analysis, keep=fresh and not failed)
             redo = {r["unique_id"] for r in failed if r["unique_id"].startswith(("model.", "snapshot."))}
             expected = self.spec.setdefault("dbt", {}).setdefault("expected_failures", [])
             accepted = 0
@@ -3091,7 +3092,7 @@ class Fitter:
         self.save()
         return summary
 
-    def read_again(self, manifest: dict, analysis):  # noqa: ANN001, ANN201
+    def read_again(self, manifest: dict, analysis, keep: bool = False):  # noqa: ANN001, ANN201
         """Models written by macros that look at the warehouse (dbt_utils.union_relations, star, pivot) have
         their real SQL only once a build has compiled them. Read the project again with that SQL: what those
         models compare, join and take apart now reaches the sources, for the columns nothing was known about."""
@@ -3140,6 +3141,9 @@ class Fitter:
             return gen.get("gen") in ("categorical", "pool", "fk", "link", "hash_id", "row_of") or bool(gen.get("templates")) or bool(
                 gen.get("parts")) or (gen.get("gen") == "template" and "{n}" in str(gen.get("template")))
 
+        if keep:
+            return fresh  # read for what the tests' lessons need; the spec stays as the build that passed had it
+        gave = self.__dict__.setdefault("_read_gave", {})  # what a reading put in place of a guess, by (table, column)
         changed = 0
         for table, spec in fresh.spec["tables"].items():
             mine = self.tables.get(table, {}).get("columns")
@@ -3166,7 +3170,9 @@ class Fitter:
                                    and gen.get("gen") in ("fk", "pool") and "type" not in gen else {})}
                     if told_now == held:
                         continue  # (what the name suggested is what the SQL says as well)
-                    mine[col] = told_now
+                    if (table, col) in gave and gave[(table, col)] != held:
+                        continue  # a failed build has corrected what an earlier reading put here: the build knows better
+                    mine[col] = gave[(table, col)] = told_now
                     changed += 1
                     self.retyped.add(table)
         for table, spec in fresh.spec["tables"].items():
