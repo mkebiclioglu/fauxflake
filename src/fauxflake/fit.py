@@ -2822,7 +2822,12 @@ class Fitter:
                 # then. It starts again from the empty relation, which has the ones learned since.
                 from .generate import existing_view
 
-                for uid in redo:
+                # and so does every incremental model the round rebuilds: the rows an earlier round left in it were
+                # made from data the spec has changed since
+                again_now = {uid for uid in (self._selected(selected) or ()) if uid in self.nodes
+                             and self.nodes[uid].get("resource_type") == "model"
+                             and (self.nodes[uid].get("config") or {}).get("materialized") == "incremental"}
+                for uid in redo | again_now:
                     fq = _fq(self.nodes[uid]["relation_name"]) if uid in self.nodes and self.nodes[uid].get("relation_name") else None
                     if fq and fq.count(".") == 2:
                         # (whatever an earlier round built of a model that fails now goes too: an incremental model
@@ -2839,9 +2844,7 @@ class Fitter:
                         except Exception:  # noqa: BLE001, S110
                             pass
             results_path.unlink(missing_ok=True)
-            # (in a partial round, incremental models are rebuilt whole: what an earlier round left in them was made
-            # from data the spec has changed since)
-            project.invoke(["build", *([] if fresh else ["--full-refresh"]), *selected], silent=True)
+            project.invoke(["build", *selected], silent=True)
             if not results_path.exists():
                 self.log(f"  dbt build did not run: {project.last_error[:600] or 'no results were written'}")
                 return {"error": project.last_error or "dbt build wrote no results"}
