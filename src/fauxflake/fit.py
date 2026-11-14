@@ -1185,7 +1185,11 @@ class Fitter:
                             added += 1
                         continue
                     if name not in self.tables[table].setdefault("columns", {}):
-                        self.tables[table]["columns"][name] = guess(name, None)
+                        # stacked tables share a shape: what a sister table learned about the column holds here too
+                        known = next((self.tables[t]["columns"][name] for t in self.unions[fq]
+                                      if t in self.tables and name in (self.tables[t].get("columns") or {})
+                                      and self.tables[t]["columns"][name].get("gen") not in ("sequence", "hash_id", "fk")), None)
+                        self.tables[table]["columns"][name] = copy.deepcopy(known) if known else guess(name, None)
                         self.retyped.add(table)
                         added += 1
             if added:
@@ -2743,7 +2747,7 @@ class Fitter:
 
     # --- loop 2: the real dbt build
 
-    def learn_from_build(self, project, analysis, rounds: int = 14) -> dict:  # noqa: ANN001
+    def learn_from_build(self, project, analysis, rounds: int = 30) -> dict:  # noqa: ANN001
         """Run `dbt build`, read the results, fix what the spec can fix. Returns the last summary."""
         summary: dict = {}
         selected: list[str] = []
@@ -2754,6 +2758,7 @@ class Fitter:
         # left to do: what failed, and what reads a source that changed. Partial rounds cost minutes where full ones
         # cost the whole project; the last word is always a full one.
         fresh = True
+        redo: set[str] = set()  # models that failed in the round before
         for n_round in range(1, rounds + 1):
             # at the scale and history `fauxflake build` uses, so that what is reported here is what a build gives
             self.generate(scale=0.001, history=int(self.spec.get("history") or 60))
@@ -2788,6 +2793,24 @@ class Fitter:
                 selected = []
             if fresh:
                 project.build_prior(self.existing)
+            else:
+                # a model that failed and reads its own table: what the round before left of it has the columns of
+                # then. It starts again from the empty relation, which has the ones learned since.
+                from .generate import existing_view
+
+                for uid in redo:
+                    fq = _fq(self.nodes[uid]["relation_name"]) if uid in self.nodes and self.nodes[uid].get("relation_name") else None
+                    if fq in self.existing:
+                        for kind in ("table", "view"):
+                            try:
+                                self.emu.duck.execute(f"drop {kind} if exists {quoted(fq)}")
+                            except Exception:  # noqa: BLE001, S110 - it is the other kind
+                                pass
+                        try:
+                            emulator.stand_in(self.emu.duck, fq, existing_view(fq, self.existing[fq].get("columns") or {},
+                                                                               table=self.existing[fq].get("as") == "table"))
+                        except Exception:  # noqa: BLE001, S110
+                            pass
             results_path.unlink(missing_ok=True)
             project.invoke(["build", *selected], silent=True)
             if not results_path.exists():
@@ -2812,6 +2835,7 @@ class Fitter:
             # every round: a model skipped in one (its parent failed) is compiled in a later one
             analysis = self.read_again(manifest, analysis)
             failed = [r for r in results if r["status"] in ("error", "fail")]
+            redo = {r["unique_id"] for r in failed if r["unique_id"].startswith(("model.", "snapshot."))}
             expected = self.spec.setdefault("dbt", {}).setdefault("expected_failures", [])
             accepted = 0
             again: set[str] = set()  # models to build in the next round, with everything downstream

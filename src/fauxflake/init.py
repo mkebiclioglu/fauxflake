@@ -1149,7 +1149,7 @@ def guess(column: str, hint: str | None) -> dict:
         return {"gen": "categorical", "type": "BOOLEAN", "values": {True: 0.5, False: 0.5}}
     if h == "DATE" or (not h.startswith("TIMESTAMP") and (c.endswith(("_DATE", "_DAY")) or _RUN_ON_DATE.search(c))):
         return {"gen": "time_offset", "type": "DATE", **WEEK}
-    if h.startswith("TIMESTAMP") or c.endswith(("_AT", "_TS", "_TIME", "_TIMESTAMP")) or c == "SYSTEMMODSTAMP":
+    if h.startswith("TIMESTAMP") or c.endswith(("_AT", "_TS", "_TIME", "_TIMESTAMP")) or c in ("SYSTEMMODSTAMP", "TIMESTAMP", "DATETIME"):
         return {"gen": "time_offset", **({"type": "TIMESTAMPTZ"} if h == "TIMESTAMPTZ" else {}), **WEEK}
     if h in ("VARCHAR", "TEXT"):
         return {"gen": "template", "template": f"{column.lower()}_{{hex}}"}
