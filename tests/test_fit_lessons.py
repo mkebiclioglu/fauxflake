@@ -492,3 +492,20 @@ def test_the_sql_of_a_test_declared_in_a_yml_is_found_in_its_folder(tmp_path):
     assert f._compiled(Project, node) == "select 1"
     assert f._compiled(Project, {**node, "name": "other", "alias": "other"}) is None
     assert f._compiled(Project, {**node, "compiled_code": "select 2;"}) == "select 2"
+
+
+def test_a_shared_id_read_as_a_number_becomes_numbers_in_every_table_that_shares_it():
+    tables = {
+        "RAW.S.MEMBERS": {"columns": {"LEADID": {"gen": "pool", "pool": "sfid", "size": 600}}},
+        "RAW.S.LEADS": {"columns": {"SFID": {"gen": "template", "template": "sfid_{n}"}, "NAME": {"gen": "template", "template": "name_{hex}"}}},
+        "RAW.S.TASKS": {"columns": {"WHO": {"gen": "pool", "pool": "sfid", "size": 600}, "OWNER": {"gen": "pool", "pool": "owner", "size": 200}}},
+    }
+    f = fitter(tables=tables)
+    f.sources_of, f.origins = lambda uid: ["RAW.S.MEMBERS"], lambda uid, name, strict=False: [name]
+    assert f.retype_column("model.p.m", "LEADID", "BIGINT")
+    assert tables["RAW.S.MEMBERS"]["columns"]["LEADID"] == {"gen": "pool", "pool": "sfid", "size": 600, "numeric": True}
+    assert tables["RAW.S.TASKS"]["columns"]["WHO"]["numeric"] and "numeric" not in tables["RAW.S.TASKS"]["columns"]["OWNER"]
+    assert tables["RAW.S.LEADS"]["columns"]["SFID"] == {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000], "unique": True}
+    assert tables["RAW.S.LEADS"]["columns"]["NAME"]["gen"] == "template"
+    assert f.retyped == {"RAW.S.MEMBERS", "RAW.S.LEADS", "RAW.S.TASKS"}
+    assert not f.retype_column("model.p.m", "LEADID", "BIGINT")  # once

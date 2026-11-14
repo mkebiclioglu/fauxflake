@@ -691,7 +691,25 @@ class Fitter:
                 self.learned.append(f"{gen['ref']}.{key}: read as a number through {table}.{name}, now a sequence.")
                 changed = True
                 continue
-            elif numeric and kind in ("sequence", "dist"):
+            elif numeric and (kind in ("sequence", "dist") or (kind == "pool" and gen.get("numeric"))):
+                continue
+            elif numeric and (kind == "pool" and not gen.get("numeric") or kind == "template" and re.fullmatch(
+                    r"\w+_\{n\}", str(gen.get("template") or "")) and not gen.get("templates")):
+                # an id shared across tables by the joins between them, read as a number: every column that shares
+                # it holds numbers from here on, so the joins still match
+                pool = str(gen.get("pool") or str(gen["template"])[: -len("_{n}")])
+                for other, spec in self.tables.items():
+                    for col, d in (spec.get("columns") or {}).items():
+                        if d.get("gen") == "pool" and d.get("pool") == pool and not d.get("numeric"):
+                            d["numeric"] = True
+                            d.pop("type", None)
+                            self.retyped.add(other)
+                        elif d.get("gen") == "template" and d.get("template") == f"{pool}_{{n}}" and not d.get("templates"):
+                            spec["columns"][col] = {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000], "unique": True,
+                                                    **({"follows": d["follows"]} if d.get("follows") else {})}
+                            self.retyped.add(other)
+                self.learned.append(f"{table}.{name}: read as a number; the ids it shares with other tables ({pool}) are numbers now.")
+                changed = True
                 continue
             elif fmt:
                 fresh = {"gen": "time_offset", "format": fmt, "p": [0, 0.5, 1], "seconds": [0, 86400, 604800]}
