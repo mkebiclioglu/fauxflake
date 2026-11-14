@@ -72,11 +72,17 @@ class Table:
         growth = float(vol.get("growth_per_year", 0.0))
         noise = float(vol.get("noise", 0.0))
         anchor = _date(vol.get("as_of", start))
-        out, cum, day = [], 0, start
+        out, cum, day, carry = [], 0, start, 0.0
         while day <= end:
             rng = random.Random(f"{seed}:{self.name}:{day.isoformat()}")
             level = base * (1 + growth) ** ((day - anchor).days / 365.0) * weekly[day.weekday()]
-            n = max(1, round(level * max(0.0, 1 + noise * rng.gauss(0, 1))))
+            if base < 1:
+                # less than a row a day (a long history of a small table): a row every few days, the first on day one
+                carry += level * max(0.0, 1 + noise * rng.gauss(0, 1))
+                n = int(carry) or (1 if day == start else 0)
+                carry -= int(carry)
+            else:
+                n = max(1, round(level * max(0.0, 1 + noise * rng.gauss(0, 1))))
             if scenario and scenario.start <= day <= scenario.end:
                 n = round(n * scenario.volume_factor)
             out.append((day, cum, n))

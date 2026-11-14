@@ -216,3 +216,15 @@ def test_a_key_left_out_of_most_documents_is_left_out_however_it_is_read():
         rows, failed = emu.cursor().execute(
             "select count(*), count_if(json_extract(V, '$.status.Failure') is not null) from RAW.T.RECEIPTS").fetchone()
     assert rows > 500 and 0 < failed < rows * 0.15
+
+
+def test_less_than_a_row_a_day_is_a_row_every_few_days():
+    from fauxflake.spec import Spec
+
+    spec = Spec.from_raw({"seed": 42, "start": "2025-01-01", "tables": {"RAW.T.SMALL": {
+        "volume": {"rows_per_day": 100, "weekly": [1] * 7}, "lateness": {"p": [0, 1], "seconds": [0, 1]},
+        "columns": {"ID": {"gen": "sequence"}, "AT": {"gen": "event_time"}}}}}, ".")
+    with serve() as emu:
+        Warehouse(emu, spec, 0.001).advance_to(datetime(2025, 4, 11))  # a hundred days at a tenth of a row a day
+        rows, ids, first = emu.cursor().execute('select count(*), count(distinct ID), min("AT")::date from RAW.T.SMALL').fetchone()
+    assert 9 <= rows <= 12 and ids == rows and str(first) == "2025-01-01"

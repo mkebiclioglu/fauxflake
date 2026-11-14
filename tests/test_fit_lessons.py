@@ -563,3 +563,17 @@ def test_a_count_star_in_a_cte_does_not_hide_the_bare_columns_a_child_reads():
     f = fitter(nodes=nodes, trees={"model.p.child": child})
     f.sketch = lambda uid: ""
     assert {"EVENT", "ACTION", "ID", "SERVER_ID"} <= set(f.columns_children_read("model.p.events"))
+
+
+def test_a_row_a_day_model_that_still_does_not_finish_gets_a_tenth_of_the_rows():
+    tree = parse("""
+        with firsts as (select user_id as server_id, min(ts) as first_seen from "RAW".p.events group by 1)
+        select d.date, f.server_id, count(*) from analytics.util.dates d join firsts f on d.date >= f.first_seen group by 1, 2""")
+    columns = {"USER_ID": {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 50]}, "TS": {"gen": "event_time"}}
+    tables = {"RAW.P.EVENTS": {"columns": columns, "volume": {"rows_per_day": 1000}}}
+    f = fitter(trees={"m": tree}, tables=tables, nodes={"m": {"name": "daily"}})
+    f.sources_of, f.origins = lambda uid: ["RAW.P.EVENTS"], lambda uid, name: [name]
+    assert f.runaway("m", "Out of Memory Error: could not allocate block")
+    assert tables["RAW.P.EVENTS"]["volume"]["rows_per_day"] == 100 and columns["USER_ID"]["v"] == [1, 50]
+    assert f.runaway("m", "Out of Memory Error") and tables["RAW.P.EVENTS"]["volume"]["rows_per_day"] == 20
+    assert not f.runaway("m", "Out of Memory Error")

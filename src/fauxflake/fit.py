@@ -1147,7 +1147,7 @@ class Fitter:
         return bool(node) and getattr(self, "project", None) is not None \
             and bool(re.search(r"union_relations|star\(", node.get("raw_code") or ""))
 
-    def through_listed_columns(self, fq: str, col: str) -> bool:
+    def through_listed_columns(self, fq: str, col: str, depth: int = 0) -> bool:
         """A model that writes out the columns it finds (`union_relations`, `star`) was promised a column
         while it could not be compiled; once it is built it has only what its tables have. The tables
         it turned out to read get the column."""
@@ -1163,7 +1163,12 @@ class Fitter:
         read = {f"{t.catalog.upper()}.{t.db.upper()}.{t.name.upper()}" for t in tree.find_all(exp.Table) if t.catalog and t.db}
         # everything it was promised and everything read from it, in one round
         wanted = list(dict.fromkeys([col, *self.pending.get(fq, {}), *self.columns_children_read(owner)]))
-        return any([self.add_column(t, c) for t in sorted(read) if t in self.tables for c in wanted])
+        added = any([self.add_column(t, c) for t in sorted(read) if t in self.tables for c in wanted])
+        # a union of models that are unions themselves (events of every app, stacked): the column is asked of each
+        for t in sorted(read):
+            if t not in self.tables and t != fq and depth <= 6 and self.blameable(t, depth + 1) and self.blame(t, col, depth + 1):
+                added = True
+        return added
 
     def blame(self, fq: str, col: str, depth: int = 0) -> bool:
         if fq in self.tables:
@@ -1204,6 +1209,8 @@ class Fitter:
             parent = self.passthrough(fq) if depth <= 8 else None
             if parent and parent != fq and self.blameable(parent, depth + 1) and self.blame(parent, col, depth + 1):
                 added = True
+            elif not parent and self.through_listed_columns(fq, col, depth):
+                added = True  # (a union the project also reads by name: its own tables need the column)
             return added
         if self.lists_columns(fq) and self.through_listed_columns(fq, col):
             return True
@@ -2107,6 +2114,19 @@ class Fitter:
             changed = True
         if ranged and self.fewer_groups(sql_key, tree):
             changed = True
+        if ranged and not changed:
+            # nothing left to narrow: the model keeps a row a day for each row it reads, for as long as the history
+            # runs. A tenth of the rows, then.
+            model = self.nodes.get(sql_key, {}).get("name", sql_key)
+            for table in self.sources_of(sql_key):
+                volume = self.tables[table].setdefault("volume", {})
+                rows = float(volume.get("rows_per_day", 1000))
+                if rows > 20:
+                    volume["rows_per_day"] = max(20, int(rows / 10))
+                    self.retyped.add(table)
+                    changed = True
+            if changed:
+                self.learned.append(f"{model}: did not finish with a handful of groups either; the tables it reads hold a tenth of the rows.")
         self.dirty |= changed
         return changed
 
