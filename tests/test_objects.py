@@ -613,3 +613,22 @@ def test_text_inserted_or_merged_into_a_variant_column_is_stored_as_a_string(run
            when matched then update set "CUSTOMER" = DBT_INTERNAL_SOURCE."CUSTOMER"
            when not matched then insert ("ID", "CUSTOMER") values ("ID", "CUSTOMER")""")
     assert run("select id, customer::string from facts order by id") == [(1, "changed"), (2, "cws-customer_27fe"), (3, "third")]
+
+
+def test_merge_from_a_view_that_mixes_text_and_variant(run):
+    """dbt's incremental MERGE reads the model through a temporary view."""
+    run("create or replace table licenses (id varchar, account varchar, customer variant)")
+    run("""insert into licenses select 'a', 'acme', to_variant('c-1') union all select 'b', null, to_variant('c-2')""")
+    run("create or replace table facts (id varchar, customer variant)")
+    run("create or replace temporary view facts__dbt_tmp as (select id, coalesce(account, customer) as customer from licenses)")
+    run("begin")
+    run("""merge into facts as DBT_INTERNAL_DEST using facts__dbt_tmp as DBT_INTERNAL_SOURCE on ((DBT_INTERNAL_SOURCE.id = DBT_INTERNAL_DEST.id))
+           when matched then update set "CUSTOMER" = DBT_INTERNAL_SOURCE."CUSTOMER"
+           when not matched then insert ("ID", "CUSTOMER") values ("ID", "CUSTOMER")""")
+    run("commit")
+    assert run("select id, customer::string from facts order by id") == [("a", "acme"), ("b", "c-2")]
+    run("create or replace temporary view facts__dbt_tmp as (select id, id || '-text' as customer from licenses)")
+    run("""merge into facts as DBT_INTERNAL_DEST using facts__dbt_tmp as DBT_INTERNAL_SOURCE on ((DBT_INTERNAL_SOURCE.id = DBT_INTERNAL_DEST.id))
+           when matched then update set "CUSTOMER" = DBT_INTERNAL_SOURCE."CUSTOMER"
+           when not matched then insert ("ID", "CUSTOMER") values ("ID", "CUSTOMER")""")
+    assert run("select id, customer::string from facts order by id") == [("a", "a-text"), ("b", "b-text")]

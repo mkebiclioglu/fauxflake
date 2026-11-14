@@ -1882,6 +1882,33 @@ def text_beside_variant(transformed: exp.Expression, conn) -> exp.Expression | N
     return tree if changed else None
 
 
+def text_beside_variant_in_views(transformed: exp.Expression, conn) -> exp.Expression | None:  # noqa: ANN001
+    """The same, where the statement itself has nothing to wrap but reads a view that has (dbt's incremental MERGE
+    reads the model through a temporary view): the view is defined again with its text wrapped. Returns the
+    statement, to be run again, or None when no view changed."""
+    names = {t.name.upper() for t in transformed.find_all(exp.Table)}
+    changed = False
+    try:
+        views = conn.execute("select view_name, sql from duckdb_views() where not internal").fetchall()
+    except Exception:  # noqa: BLE001
+        return None
+    for name, sql in views:
+        if name.upper() not in names or not sql:
+            continue
+        try:
+            create = sqlglot.parse_one(sql, dialect="duckdb")
+            body = text_beside_variant(create.expression, conn) if isinstance(create, exp.Create) else None
+            if body is None:
+                continue
+            create.set("expression", body)
+            create.set("replace", True)
+            conn.execute(create.sql(dialect="duckdb"))
+            changed = True
+        except Exception:  # noqa: BLE001, S112 - a view that cannot be read back or defined again stays as it is
+            continue
+    return transformed.copy() if changed else None
+
+
 # --- ARRAY and OBJECT columns. DuckDB holds every semi-structured value as JSON; Snowflake types an expression
 # as ARRAY, OBJECT or VARIANT when the statement is written, and DESCRIBE / INFORMATION_SCHEMA say which.
 _ARRAY_MAKERS = {

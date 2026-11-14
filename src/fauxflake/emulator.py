@@ -407,6 +407,8 @@ def _variant_takes_text(cursor, tree: exp.Expression) -> None:  # noqa: ANN001
     temporary table, in an incremental model) has that column turned into JSON strings first."""
     target = tree.this.this if isinstance(tree.this, exp.Schema) else tree.this
     source = tree.args.get("using") if isinstance(tree, exp.Merge) else tree.expression
+    if isinstance(tree, exp.Update):  # `update t set ... from candidates`: a MERGE's matched rows
+        source = tree.args.get("from_").this if tree.args.get("from_") is not None else None
     if isinstance(source, (exp.Subquery, exp.Select)):  # `(select ... from the_one_table)`
         inner = source.unnest()
         tables = list(inner.find_all(exp.Table)) if isinstance(inner, exp.Select) else []
@@ -809,7 +811,7 @@ def _patch_fakesnow() -> None:
             journaled = getattr(self._conn, "_fauxflake_txn", False) and not isinstance(tree, (exp.Query, exp.Describe, exp.Show))
             kept = tree.copy() if journaled else None
             replaced = _over_a_stand_in(self, tree) if STANDINS and isinstance(tree, exp.Create) else None
-            if isinstance(tree, exp.Insert):
+            if isinstance(tree, (exp.Insert, exp.Update)):
                 _variant_takes_text(self, tree)
             try:
                 original_execute(self, tree, params)
@@ -857,7 +859,9 @@ def _patch_fakesnow() -> None:
                 "by_name": lambda e: semantics.view_past_a_schema_named_like_a_database(transformed, e),
                 "grouped": lambda e: semantics.group_by_all_written_out(transformed) if "Cannot mix aggregates" in e else None,
                 "unshadowed": lambda e: semantics.aliases_over_tables(transformed) if "STRUCT(" in e else None,
-                "variants": lambda e: semantics.text_beside_variant(transformed, self._duck_conn) if "Malformed JSON" in e else None,
+                "variants": lambda e: (semantics.text_beside_variant(transformed, self._duck_conn)
+                                       or semantics.text_beside_variant_in_views(transformed, self._duck_conn))
+                if "Malformed JSON" in e else None,
                 "types": lambda e: semantics.repair_types(transformed, self._duck_conn, params)
                 if "No function matches" in e or "Could not choose a best candidate" in e else None,
             }
