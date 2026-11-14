@@ -2839,7 +2839,9 @@ class Fitter:
                         except Exception:  # noqa: BLE001, S110
                             pass
             results_path.unlink(missing_ok=True)
-            project.invoke(["build", *selected], silent=True)
+            # (in a partial round, incremental models are rebuilt whole: what an earlier round left in them was made
+            # from data the spec has changed since)
+            project.invoke(["build", *([] if fresh else ["--full-refresh"]), *selected], silent=True)
             if not results_path.exists():
                 self.log(f"  dbt build did not run: {project.last_error[:600] or 'no results were written'}")
                 return {"error": project.last_error or "dbt build wrote no results"}
