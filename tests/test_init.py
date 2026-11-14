@@ -733,3 +733,20 @@ def test_two_thresholds_leave_values_beyond_the_larger_one():
     kept = {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000]}
     within_bounds(kept, {40, 60}, exact=True)  # the one range the table's reader keeps
     assert kept["v"] == [40, 60]
+
+
+def test_a_column_joined_to_a_seed_holds_its_values_and_a_few_rows_outside_them(tmp_path):
+    from fauxflake.init import build_spec
+
+    (tmp_path / "seeds").mkdir()
+    (tmp_path / "seeds" / "team.csv").write_text("user_id,start_date\n22132,2020-01-01\n87854,2021-06-01\n")
+    manifest = {
+        "sources": {"source.p.s.issues": {"database": "RAW", "schema": "S", "name": "issues", "identifier": "issues", "columns": {}}},
+        "nodes": {
+            "seed.p.team": {"resource_type": "seed", "relation_name": "A.SEED.TEAM", "root_path": str(tmp_path),
+                            "original_file_path": "seeds/team.csv", "depends_on": {"nodes": []}},
+            "model.p.m": {"resource_type": "model", "depends_on": {"nodes": ["seed.p.team"]}, "relation_name": "A.B.M", "compiled_code": """
+                select i.id, (t.user_id is not null) as is_team from raw.s.issues i left join a.seed.team t on i.author_id = t.user_id"""}},
+    }
+    values = build_spec(manifest, "A")[0]["tables"]["RAW.S.ISSUES"]["columns"]["AUTHOR_ID"]["values"]
+    assert set(values) == {"22132", "87854", "95773"} and values["95773"] == 0.15

@@ -1811,7 +1811,11 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 holder, key = (column.get("fields") or {}), other[2]
             if key in holder and holder[key].get("gen") in _FREE:
                 known = values[:100]
-                holder[key] = {"gen": "categorical", "values": {v: round(1 / len(known), 6) for v in known}}
+                # (most rows, not all: a LEFT JOIN to the seed is there for the rows it does not list, and
+                # `where team.user_id is null` should keep some)
+                numbers = [int(str(v)) for v in known if re.fullmatch(r"-?\d+", str(v))]
+                other = str(max(numbers) + 7919) if len(numbers) == len(known) else f"other_{key.split('.')[-1].lower()}"
+                holder[key] = {"gen": "categorical", "values": {**{v: round(0.85 / len(known), 6) for v in known}, other: 0.15}}
                 joined.append(f"{'.'.join(x for x in other if x)}: joined to the seed {seed[0]} ({seed[1]}), generated from its values.")
     # two columns joined to two columns of one seed (`on t.event = p.event and t.action = p.action`): the pairs the
     # seed lists, not every combination of its values
