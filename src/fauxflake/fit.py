@@ -91,6 +91,24 @@ class _Readings:
         return self.latest.locate(node_id, column) or (self.earlier.locate(node_id, column) if self.earlier is not None else None)
 
 
+def _numeric_columns(tree: exp.Expression) -> set[str]:
+    """Columns a query uses as numbers: added up, averaged, multiplied, cast to a number, compared with a number,
+    or given a number to fall back on (`coalesce(posts, 0)`)."""
+    number = lambda e: isinstance(e, exp.Literal) and not e.is_string  # noqa: E731
+    out = {c.name.upper() for node in tree.find_all(exp.Sum, exp.Avg, exp.Add, exp.Sub, exp.Mul, exp.Div) for c in node.find_all(exp.Column)}
+    out |= {c.this.name.upper() for c in tree.find_all(exp.Cast, exp.TryCast)
+            if isinstance(c.this, exp.Column) and c.to.is_type("float", "double", "decimal", "int", "bigint")}
+    for node in tree.find_all(exp.Coalesce, exp.Greatest, exp.Least):
+        parts = [node.this, *node.expressions]
+        if any(number(e) for e in parts):
+            out |= {e.name.upper() for e in parts if isinstance(e, exp.Column)}
+    for node in tree.find_all(exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ, exp.NEQ):
+        for one, other in ((node.this, node.expression), (node.expression, node.this)):
+            if isinstance(one, exp.Column) and number(other):
+                out.add(one.name.upper())
+    return out
+
+
 def _text_ids(gen: dict) -> bool:
     """A key whose ids are certainly text: some are named by the SQL, or they have a shape."""
     return bool(gen.get("template")) or any(not re.fullmatch(r"\d{1,18}", str(v)) for v in gen.get("named") or ())
@@ -2284,8 +2302,11 @@ class Fitter:
                     if kinds and not fmt and tree is not None:
                         # `a::date ... b::date ... c::date`: the error names one; the model casts the others the same way
                         sources = self.sources_of(sql_key)
-                        for c in dict.fromkeys(c.this.name.upper() for c in tree.find_all(exp.Cast, exp.TryCast)
-                                               if c.to.is_type(*kinds) and isinstance(c.this, exp.Column)):
+                        alike = [c.this.name.upper() for c in tree.find_all(exp.Cast, exp.TryCast)
+                                 if c.to.is_type(*kinds) and isinstance(c.this, exp.Column)]
+                        if hint in ("DOUBLE", "BIGINT"):
+                            alike += sorted(_numeric_columns(tree))  # and the ones it adds up or compares with numbers
+                        for c in dict.fromkeys(alike):
                             gens = [(self.tables[t].get("columns") or {}).get(c) for t in sources]
                             gens = [g for g in gens if g]
                             if any(g.keys() & {"format", "epoch"} for g in gens):
@@ -2357,10 +2378,7 @@ class Fitter:
                     # the error names one value; the model adds up, averages and compares a row of such columns of the
                     # same table (active users, posts, teams ...): all of them are numbers, in one round
                     tree, changed_here = self.tree(sql_key), set(self.retyped) - before or set(self.retyped)
-                    numeric = {c.name.upper() for node in tree.find_all(exp.Sum, exp.Avg, exp.Add, exp.Sub, exp.Mul, exp.Div)
-                               for c in node.find_all(exp.Column)}
-                    numeric |= {c.this.name.upper() for c in tree.find_all(exp.Cast, exp.TryCast)
-                                if isinstance(c.this, exp.Column) and c.to.is_type("float", "double", "decimal", "int", "bigint")}
+                    numeric = _numeric_columns(tree)
                     for table in changed_here:
                         columns = self.tables.get(table, {}).get("columns") or {}
                         for name in sorted(numeric & set(columns)):

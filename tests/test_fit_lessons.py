@@ -634,3 +634,11 @@ def test_text_written_into_a_column_declared_a_document_makes_it_text():
     assert f.existing["A.BLP.FACT"]["columns"] == {"ID": "JSON", "CUSTOMER_ID": "VARCHAR"}
     assert not f.text_into_a_document("m", message)
     assert not f.text_into_a_document("m", "Conversion Error: Could not convert string 'x' to INT64")
+
+
+def test_columns_a_query_uses_as_numbers():
+    from fauxflake.fit import _numeric_columns
+
+    tree = parse("""select max(name) as n, sum(posts) as p, coalesce(teams, 0) as t, greatest(a, b) as g, x::float as x,
+                    case when active_users > 10 then 'big' end as size from t where kind = 'x' and bots >= 1""")
+    assert _numeric_columns(tree) == {"POSTS", "TEAMS", "X", "ACTIVE_USERS", "BOTS"}
