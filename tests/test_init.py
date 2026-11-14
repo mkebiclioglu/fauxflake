@@ -750,3 +750,24 @@ def test_a_column_joined_to_a_seed_holds_its_values_and_a_few_rows_outside_them(
     }
     values = build_spec(manifest, "A")[0]["tables"]["RAW.S.ISSUES"]["columns"]["AUTHOR_ID"]["values"]
     assert set(values) == {"22132", "87854", "95773"} and values["95773"] == 0.15
+
+
+def test_a_query_string_read_key_by_key_holds_every_key_with_values_of_the_shapes_tested():
+    from fauxflake.init import build_spec
+
+    manifest = {
+        "sources": {"source.p.d.log": {"database": "RAW", "schema": "D", "name": "log_entries", "identifier": "log_entries", "columns": {}}},
+        "nodes": {
+            "model.p.security": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.E.SECURITY", "compiled_code": """
+                select substring(regexp_substr(cs_uri_query, '(^|&)id=([^&]*)'), 5, 100) as server_id,
+                       coalesce(case when split_part(regexp_substr(cs_uri_query, 'auc=[0-9]{1,10}'), '=', 2) = '' then null
+                                     else split_part(regexp_substr(cs_uri_query, 'auc=[0-9]{1,10}'), '=', 2)::int end, 0) as active_users,
+                       substring(regexp_substr(cs_uri_query, '(^|&)b=([^&]*)'), 4, 100) as version
+                from raw.d.log_entries where uri = '/security'"""},
+            "model.p.details": {"resource_type": "model", "depends_on": {"nodes": ["model.p.security"]}, "relation_name": "A.E.DETAILS",
+                                "compiled_code": """select sec.server_id, sec.version from a.e.security sec
+                                                    where regexp_substr(sec.version, '^[0-9]{1,2}[.][0-9]{1,2}[.][0-9]{1,2}$') is not null"""}},
+    }
+    column = build_spec(manifest, "A")[0]["tables"]["RAW.D.LOG_ENTRIES"]["columns"]["CS_URI_QUERY"]
+    assert column["gen"] == "template" and column["templates"][0] == "x=1&auc={n}&b=0.0.0&id={hex}"
+    assert all(t.startswith("x=1&auc={n}&b=") and t.endswith("&id={hex}") for t in column["templates"])
