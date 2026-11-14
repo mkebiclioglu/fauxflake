@@ -509,3 +509,13 @@ def test_a_shared_id_read_as_a_number_becomes_numbers_in_every_table_that_shares
     assert tables["RAW.S.LEADS"]["columns"]["NAME"]["gen"] == "template"
     assert f.retyped == {"RAW.S.MEMBERS", "RAW.S.LEADS", "RAW.S.TASKS"}
     assert not f.retype_column("model.p.m", "LEADID", "BIGINT")  # once
+
+
+def test_an_aggregate_refused_in_a_where_gives_the_stand_in_the_column_it_lacks():
+    tree = parse("""select * from "RAW".b.customers where updated_at >= (select max(updated_at) from "ANALYTICS".blapi.customers_blapi)""")
+    f = fitter(trees={"m": tree}, existing={"ANALYTICS.BLAPI.CUSTOMERS_BLAPI": {"columns": {"ID": "BIGINT"}}}, nodes={"m": {"name": "customers_blapi"}})
+    f.create_existing = lambda fq: None
+    assert not f.aggregate_out_of_place("m", "Binder Error: something else")
+    assert f.aggregate_out_of_place("m", "Binder Error: WHERE clause cannot contain aggregates!")
+    assert set(f.existing["ANALYTICS.BLAPI.CUSTOMERS_BLAPI"]["columns"]) == {"ID", "UPDATED_AT"}
+    assert not f.aggregate_out_of_place("m", "Binder Error: WHERE clause cannot contain aggregates!")  # once

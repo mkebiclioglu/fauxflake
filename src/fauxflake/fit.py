@@ -2097,10 +2097,35 @@ class Fitter:
                 changed = True
         return changed
 
+    def aggregate_out_of_place(self, sql_key: str, message: str) -> bool:
+        """`where updated_at >= (select max(updated_at) from {{ this }})`, with an empty relation standing in for
+        `this` that has no such column: the name falls through to the outer query, and the engine refuses an
+        aggregate in a WHERE. The stand-in gets the columns the model reads from it."""
+        if not re.search(r"cannot contain aggregates", message):
+            return False
+        tree = self.tree(sql_key)
+        if tree is None:
+            return False
+        changed = False
+        for tb in tree.find_all(exp.Table):
+            fq = ".".join(part.upper() for part in (tb.catalog, tb.db, tb.name) if part)
+            if fq not in self.existing:
+                continue
+            columns = self.existing[fq].setdefault("columns", {})
+            missing = [c for c in self.columns_read(tree, tb) if c not in columns]
+            for c in missing:
+                columns[c] = duck_type(guess(c, None))
+            if missing:
+                self.create_existing(fq)
+                self.learned.append(f"{fq}: {self.nodes.get(sql_key, {}).get('name', sql_key)} reads {', '.join(missing[:6])} from it "
+                                    "before it is built; the empty relation it starts as has them now.")
+                changed = True
+        return changed
+
     def learn(self, sql_key: str, message: str) -> bool:
         """Apply whatever one error message teaches. True when the spec changed."""
         if self.runaway(sql_key, message) or self.looked_for(sql_key) or self.jinja_columns(sql_key, message) \
-                or self.ambiguous_column(sql_key, message):
+                or self.ambiguous_column(sql_key, message) or self.aggregate_out_of_place(sql_key, message):
             return True
         if self.udf_input(sql_key, message) or self.pivot_values(sql_key, message) or self.pivoted_upstream(sql_key, message) \
                 or self.missing_column(sql_key, message) or self.missing_relation(sql_key, message) \
