@@ -647,3 +647,12 @@ def test_columns_a_query_uses_as_numbers():
     tree = parse("select max(coalesce(r.channels - r.channels_deleted, s.channels - s.channels_deleted)) as c, ended - started as d from t")
     assert _numeric_columns(tree) == set()
     assert _numeric_columns(tree, ("channels_deleted",)) == {"CHANNELS", "CHANNELS_DELETED"}
+
+
+def test_an_address_the_model_also_splits_by_a_slash_is_a_network():
+    tree = parse("select cast(split_part(network, '/', 2) as int) as size, parse_ip(network, 'INET'):ipv4_range_start as s from ranges")
+    tables = {"RAW.G.RANGES": {"columns": {"NETWORK": {"gen": "template", "template": "network_{hex}"}}}}
+    f = fitter(trees={"m": tree}, tables=tables)
+    f.sources_of, f.origins = (lambda uid: ["RAW.G.RANGES"]), (lambda uid, name, depth=0, strict=False: [name])
+    assert f.parsed_as_ip("m")
+    assert tables["RAW.G.RANGES"]["columns"]["NETWORK"] == {"gen": "ip", "cidr": True}

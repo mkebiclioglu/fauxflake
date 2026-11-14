@@ -852,7 +852,12 @@ class Fitter:
                 if name in columns and columns[name].get("gen") != "ip":
                     if columns[name].get("gen") in ("sequence", "hash_id"):
                         self._unkey(table)
-                    columns[name] = {"gen": "ip"}
+                    # `split_part(network, '/', 2)::int` beside it: networks, written 10.2.3.0/24
+                    cidr = any(isinstance(cut.this.unnest(), exp.Column) and cut.this.unnest().name.upper() == arg.name.upper()
+                               and isinstance(cut.args.get("delimiter") or cut.args.get("expression"), exp.Literal)
+                               and (cut.args.get("delimiter") or cut.args.get("expression")).name == "/"
+                               for cut in tree.find_all(exp.SplitPart, exp.Split))
+                    columns[name] = {"gen": "ip", **({"cidr": True} if cidr else {})}
                     self.retyped.add(table)
                     self.learned.append(f"{table}.{name}: read with PARSE_IP, generated as addresses.")
                     changed = True
