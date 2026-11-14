@@ -579,5 +579,6 @@ def test_a_seed_written_out_in_its_insert_is_not_refused_for_its_size():
     rows = ", ".join(["('a city with a long name', 1.5, 2.5)"] * 40000)
     seed = '/* {"app": "dbt", "node_id": "seed.p.world_cities"} */\n  insert into a.b.world_cities (name, lat, lon) values ' + rows
     assert len(seed) > emulator.MAX_STATEMENT and emulator._ROWS_WRITTEN_OUT.match(seed)
+    assert emulator._ROWS_WRITTEN_OUT.match(seed.replace("insert into", "insert overwrite into"))  # a seed loaded again
     with pytest.raises(ProgrammingError, match="1 MB"):
         emulator.rewrite("select " + ", ".join(["'x' as c"] * 120000))
