@@ -2326,8 +2326,27 @@ class Fitter:
                         return True
                 # the tables the model reads; when none of them made the value (a model that reads another's
                 # table by its written-out name has no such table among its ancestors), whichever table did
-                return self.retype(m.group("value"), hint, fmt, only=set(self.sources_of(sql_key))) \
-                    or self.retype(m.group("value"), hint, fmt)
+                if self.retype(m.group("value"), hint, fmt, only=set(self.sources_of(sql_key))):
+                    return True
+                before = set(self.retyped)
+                if not self.retype(m.group("value"), hint, fmt):
+                    return False
+                if hint in ("BIGINT", "DOUBLE") and self.tree(sql_key) is not None:
+                    # the error names one value; the model adds up, averages and compares a row of such columns of the
+                    # same table (active users, posts, teams ...): all of them are numbers, in one round
+                    tree, changed_here = self.tree(sql_key), set(self.retyped) - before or set(self.retyped)
+                    numeric = {c.name.upper() for node in tree.find_all(exp.Sum, exp.Avg, exp.Add, exp.Sub, exp.Mul, exp.Div)
+                               for c in node.find_all(exp.Column)}
+                    numeric |= {c.this.name.upper() for c in tree.find_all(exp.Cast, exp.TryCast)
+                                if isinstance(c.this, exp.Column) and c.to.is_type("float", "double", "decimal", "int", "bigint")}
+                    for table in changed_here:
+                        columns = self.tables.get(table, {}).get("columns") or {}
+                        for name in sorted(numeric & set(columns)):
+                            gen = columns[name]
+                            if gen.get("gen") == "template" and gen.get("template") == f"{name.lower()}_{{hex}}" and not gen.get("templates"):
+                                columns[name] = guess(name, hint)
+                                self.learned.append(f"{table}.{name}: used as {hint} beside the column that failed, retyped.")
+                return True
         if "Failed to cast value to numerical" in message:
             # coalesce(payload['minutes'], minutes)::float where `minutes` was generated as an object
             tree = self.tree(sql_key)
