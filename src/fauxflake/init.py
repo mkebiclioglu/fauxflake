@@ -1427,6 +1427,12 @@ def analyse(manifest: dict, database: str) -> Analysis:
 
     for uid in manifest["nodes"]:
         scan(uid)
+    # once more, now that every model's outputs are known: a model that reads another by a written-out name
+    # (no ref(), so dbt orders nothing) may have been read before the one it reads
+    outputs.clear()
+    links.clear(), joins.clear(), dates.clear(), lookups.clear()
+    for uid in manifest["nodes"]:
+        scan(uid)
     # a test the project wrote out as a query joins what must match (a tracking plan with the events that
     # arrive): the joins count; what it filters on does not (it looks for the rows that should not be there)
     scratch = {name: SourceUse() for name in uses}

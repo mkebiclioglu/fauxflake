@@ -619,3 +619,20 @@ def test_table_flatten_and_a_mark_stripped_before_json_is_parsed(tmp_path):
         Warehouse(emu, Spec.from_raw({**spec, "start": "2025-01-01"}, "."), 0.01).advance_to(datetime(2025, 1, 3))
         logs = [row[0] for row in emu.cursor().execute("select R->'outcome'->'logs'->>0 from RAW.S.R limit 50").fetchall()]
     assert logs and all(text.startswith('EVENT_JSON:{"event":') for text in logs)
+
+
+def test_a_model_read_by_a_written_out_name_is_known_whatever_the_order():
+    from fauxflake.init import build_spec
+
+    manifest = {
+        "sources": {"source.p.s.lead": {"database": "RAW", "schema": "S", "name": "lead", "identifier": "lead", "columns": {}}},
+        "nodes": {  # the reader comes first and names no dependency
+            "model.p.a_reader": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.READER", "compiled_code": """
+                select lead.sfid, lead.company from a.orgm.lead where lead.status = 'MQL' and not lead.isdeleted"""},
+            "model.p.lead": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.ORGM.LEAD", "compiled_code": """
+                select distinct o.id as sfid, o.* from raw.s.lead o
+                join (select id, max(seq) as seq from raw.s.lead group by id) oo on o.id = oo.id and o.seq = oo.seq"""}},
+    }
+    columns = build_spec(manifest, "A")[0]["tables"]["RAW.S.LEAD"]["columns"]
+    assert {"COMPANY", "STATUS", "ISDELETED", "ID", "SEQ"} <= set(columns) and "SFID" not in columns
+    assert "MQL" in columns["STATUS"]["values"]
