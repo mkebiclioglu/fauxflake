@@ -96,7 +96,7 @@ class TableSQL:
     base = "g"  # what a column's randomness is keyed on: the row, or another column's value (`follows`)
 
     def salt(self, name: str) -> str:
-        if self.base == "g":
+        if self.base in ("g", "(g - 1)"):  # the row, or (for a value that repeats the row before) the one before it
             return f"{self.spec.seed}:{self.t.name}:{name}"
         # keyed on an entity's id: the same id must give the same attributes in every table
         return f"{self.spec.seed}:entity:{name.split('.')[-1].lower()}"
@@ -122,6 +122,22 @@ class TableSQL:
 
         walk(self.t.columns)
         return list(found.values())
+
+    def in_order(self) -> bool:
+        """A table marked as a log (`log: true`): its rows come one after the other, each later than the one before
+        (blocks of a chain, entries of a ledger). Times and the numbers that grow with them follow the row order."""
+        return bool(self.t.raw.get("log")) and self.base == "g"
+
+    @staticmethod
+    def log_moment() -> str:
+        """The row's moment in a log: the day's rows spread evenly over the day, in order."""
+        return "(day::timestamp + to_microseconds((_n * 86400000000 // greatest(_dn, 1))::bigint))"
+
+    def log_fraction(self) -> str:
+        """How far through the history the row is (0 to 1): what an ever-growing number of a log follows."""
+        days = int(self.spec.history or 60)
+        return (f"least(0.999999, greatest(0.0, (date_diff('day', date '{self.spec.start:%Y-%m-%d}', day) "
+                f"+ _n::double / greatest(_dn, 1)) / {days}.0))")
 
     def grain(self) -> dict[str, int]:
         """The columns of the table's `grain` that take their values in turn (listed values, or a pool's), with how
@@ -236,6 +252,13 @@ class TableSQL:
             return max(rates) if rates and all(rates) else None
 
         def leaf(value: tuple) -> str:
+            if value[2].get("gen") == "previous" and value[2].get("of") in fields and self.base == "g":
+                # what another field held in the row before: `prev_hash` is the hash of the block before
+                self.base = "(g - 1)"
+                try:
+                    return self._expr(f"{col}.{value[2]['of']}", fields[value[2]["of"]])
+                finally:
+                    self.base = "g"
             if key_expr and value[1] != keyed_by and self.base == "g":
                 self.base = key_expr
                 try:
@@ -390,7 +413,8 @@ class TableSQL:
             n = f"floor({self.u(col)} * {int(d.get('size', 200))})::bigint"
             expr = f"({n} + 1)" if d.get("numeric") else f"concat({lit(str(d['pool']) + '_')}, {n})"
         elif gen == "dist":
-            expr = piecewise(self.u(col), d["p"], d["v"])
+            # (in a log, a number filtered by ranges grows with time: a range is a stretch of consecutive rows)
+            expr = piecewise(self.log_fraction() if self.in_order() and len(d["p"]) > 2 and "." not in col else self.u(col), d["p"], d["v"])
             if d.get("unique") and self.base == "g":
                 expr = "(g + 1)"  # a `unique` test covers it: one value per row
             if "round" in d:
@@ -405,7 +429,7 @@ class TableSQL:
                         # another generator's value inside the text: an id a model parses back out of it
                         parts.append(f"({self._expr(f'{col}:{chunk}', d['parts'][int(chunk[4:])])})::varchar")
                     elif chunk == "n":
-                        parts.append(f"({self.base} + 1)::varchar" if self.base == "g" else f"({self.base})::varchar")
+                        parts.append(f"({self.base} + 1)::varchar" if self.base in ("g", "(g - 1)") else f"({self.base})::varchar")
                     elif chunk == "hex":
                         parts.append(f"substr(md5(concat({lit(self.salt(col) + ':')}, {self.base})), 1, 12)")
                     elif chunk:
@@ -418,6 +442,8 @@ class TableSQL:
                 f"case {pick} {' '.join(f'when {i} then {fill(t)}' for i, t in enumerate(shapes))} end"
         elif gen == "time_offset":
             expr = f"_ev + {ms(piecewise(self.u(col), d['p'], d['seconds']))}"
+            if self.in_order() and min(d["seconds"]) >= 0 and max(d["seconds"]) <= 7 * 86400:
+                expr = self.log_moment()  # a log's own time (not an end date far ahead): in the order of the rows
             if d.get("unique") and self.base == "g":
                 expr = "(timestamp '2000-01-01' + to_days(g::integer))"  # a `unique` test covers it: one day per row
                 if d.get("every_days"):  # periods that follow one another from the start of the history
@@ -445,7 +471,7 @@ class TableSQL:
             else:
                 expr = f"to_json(list_transform(range({n}), lambda i: concat({lit(col.lower() + '_')}, i)))::JSON"
         elif gen == "event_time":
-            expr = "_ev"
+            expr = self.log_moment() if self.in_order() else "_ev"
         elif gen == "updated_at":
             expr = "_ts"
         elif gen == "loaded_at":
@@ -453,6 +479,16 @@ class TableSQL:
         elif gen == "lifecycle":
             states = [d["initial"]] + [s["to"] for s in d["steps"]]
             expr = f"case k {' '.join(f'when {i} then {lit(s)}' for i, s in enumerate(states))} end"
+        elif gen == "previous":
+            other = self.t.columns.get(str(d.get("of")))
+            if other is None or self.base != "g":
+                expr = "NULL"
+            else:  # a column's value in the row before
+                self.base = "(g - 1)"
+                try:
+                    expr = self._expr(str(d["of"]), other)
+                finally:
+                    self.base = "g"
         elif gen == "constant":
             expr = lit(d.get("value"))
         else:
@@ -522,7 +558,7 @@ class TableSQL:
             cols += f',\n  case when _loaded >= {since} then \'v2\' end as "{self.sc.new_column}"'
         return f"""
 with b as (
-  select r.g, c.day, r.g - c.cum as _n{pcs}
+  select r.g, c.day, r.g - c.cum as _n, c.n as _dn{pcs}
   from range($lo, $hi) r(g)
   asof join (select * from cal_{t.ident} where n > 0) c on r.g >= c.cum{joins}
 ),

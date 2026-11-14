@@ -259,3 +259,28 @@ def test_ids_in_a_document_and_the_lists_that_name_them_form_trees():
                                   "from refs left join ids on ids.id = refs.child where who = 'tx'").fetchone()
     assert total[0] == total[1] > 500 and twice == 0
     assert reached > total[0] * 0.5 and rooted > txs * 0.5
+
+
+def test_a_log_keeps_its_rows_in_order_and_each_names_the_one_before():
+    from fauxflake.spec import Spec
+
+    spec = Spec.from_raw({"seed": 42, "start": "2025-01-01", "history": 4, "tables": {"RAW.T.BLOCKS": {
+        "volume": {"rows_per_day": 100, "weekly": [1] * 7}, "lateness": {"p": [0, 1], "seconds": [0, 1]}, "log": True,
+        "columns": {"PART": {"gen": "dist", "type": "BIGINT", "p": [0, 0.5, 1], "v": [100, 200, 900]},
+                    "V": {"gen": "object", "fields": {
+                        "header.height": {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000], "unique": True},
+                        "header.hash": {"gen": "template", "template": "hash_{hex}"},
+                        "header.prev_hash": {"gen": "previous", "of": "header.hash"},
+                        "header.timestamp": {"gen": "time_offset", "p": [0, 0.5, 1], "seconds": [0, 86400, 604800]}}}}}}}, ".")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 5))
+        cur = emu.cursor()
+        cur.execute("""create temp table b as select (V->'header'->>'height')::bigint as height, V->'header'->>'hash' as hash,
+                       V->'header'->>'prev_hash' as prev_hash, (V->'header'->>'timestamp')::timestamp as ts, PART from RAW.T.BLOCKS""")
+        rows = cur.execute("select count(*), count(distinct ts) from b").fetchone()
+        breaks = cur.execute("select count(*) from (select prev_hash, lag(hash) over (order by ts, height) as prior from b) where prior <> prev_hash").fetchone()[0]
+        # a range of the growing number is a stretch of consecutive rows: the chain holds inside it too
+        inside = cur.execute("select count(*), count_if(prior <> prev_hash) from (select prev_hash, lag(hash) over (order by ts, height) as prior "
+                             "from b where PART between 100 and 200)").fetchone()
+    assert rows[0] == rows[1] > 300 and breaks == 0
+    assert inside[0] > 100 and inside[1] == 0

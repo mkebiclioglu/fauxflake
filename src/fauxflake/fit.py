@@ -3092,6 +3092,50 @@ class Fitter:
             pile += [d for d in (self.nodes.get(here) or {}).get("depends_on", {}).get("nodes", []) if d.startswith(("model.", "snapshot.", "source."))]
         return False
 
+    def chain_of_rows(self, node: dict, analysis, tree: exp.Expression) -> bool:  # noqa: ANN001
+        """`lag(block_hash) over (order by block_timestamp) as prior_hash ... where prior_hash <> prev_hash`: the test
+        returns the rows that do not name the row before them. The table is a log: its rows come in order, and the
+        one field holds what the other held in the row before."""
+        lagged = {}  # alias -> the column LAG reads
+        for alias in tree.find_all(exp.Alias):
+            inner = alias.this
+            while isinstance(inner, (exp.Window, exp.IgnoreNulls, exp.RespectNulls, exp.Paren)):
+                inner = inner.this
+            if isinstance(inner, exp.Lag) and isinstance(inner.this, exp.Column):
+                lagged[alias.alias.upper()] = inner.this.name
+        if not lagged:
+            return False
+        owners = []
+        for tb in tree.find_all(exp.Table):
+            fq = ".".join(part.upper() for part in (tb.catalog, tb.db, tb.name) if part)
+            uid = (self.by_rel.get(fq) or self.relation_owner.get(fq)) if tb.db else None
+            if uid and uid not in owners:
+                owners.append(uid)
+        for test in tree.find_all(exp.NEQ):
+            sides = [test.this, test.expression]
+            if not all(isinstance(side, exp.Column) for side in sides):
+                continue
+            prior = next((side for side in sides if side.name.upper() in lagged), None)
+            other = next((side for side in sides if side is not prior), None)
+            if prior is None or other is None or len(owners) != 1:
+                continue
+            was, now = analysis.place(owners[0], lagged[prior.name.upper()]), analysis.place(owners[0], other.name)
+            if not was or not now or was[:2] != now[:2] or was == now or was[0] not in self.tables or bool(was[2]) != bool(now[2]):
+                continue
+            table = self.tables[was[0]]
+            column = table.get("columns", {}).get(was[1]) or {}
+            holder, of, key = (column.get("fields"), was[2], now[2]) if was[2] else (table.get("columns"), was[1], now[1])
+            if not holder or of not in holder or key not in holder or holder[key] == {"gen": "previous", "of": of}:
+                continue
+            holder[key] = {"gen": "previous", "of": of}
+            table["log"] = True
+            self.retyped.add(was[0])
+            self.dirty = True
+            self.learned.append(f"{was[0]}: test {node['name']} wants every row to name the one before it; generated as a log, "
+                                f"in order, with {key} holding the {of} of the row before.")
+            return True
+        return False
+
     def learn_from_singular(self, node: dict, analysis, compiled: str | None) -> bool:  # noqa: ANN001
         """A failing test the project wrote out as a query returns the rows that break a rule. Two rules are
         read off the query: `group by subscription_id having count(*) > 2` (no more than two rows for one
@@ -3124,6 +3168,8 @@ class Fitter:
                 return gen
             return (gen.get("fields") or {}).get(place[2]) if gen.get("gen") == "object" else None
 
+        if self.chain_of_rows(node, analysis, tree):
+            return True
         having, group = select.args.get("having"), select.args.get("group")
         if having is not None and group is not None and isinstance(having.this, exp.GT) and isinstance(having.this.this, exp.Count) \
                 and isinstance(having.this.expression, exp.Literal) and having.this.expression.name == "1" and len(relations) == 1:

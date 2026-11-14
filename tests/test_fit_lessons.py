@@ -577,3 +577,18 @@ def test_a_row_a_day_model_that_still_does_not_finish_gets_a_tenth_of_the_rows()
     assert tables["RAW.P.EVENTS"]["volume"]["rows_per_day"] == 100 and columns["USER_ID"]["v"] == [1, 50]
     assert f.runaway("m", "Out of Memory Error") and tables["RAW.P.EVENTS"]["volume"]["rows_per_day"] == 20
     assert not f.runaway("m", "Out of Memory Error")
+
+
+def test_a_test_that_returns_rows_not_naming_the_row_before_makes_the_table_a_log():
+    fields = {"header.hash": {"gen": "template", "template": "hash_{hex}"}, "header.prev_hash": {"gen": "template", "template": "prev_hash_{hex}"}}
+    tables = {"RAW.N.BLOCKS": {"columns": {"VALUE": {"gen": "object", "fields": fields}}}}
+    f = fitter(tables=tables, by_rel={"A.SILVER.BLOCKS": "model.p.blocks"})
+    places = _Places({("model.p.blocks", "BLOCK_HASH"): ("RAW.N.BLOCKS", "VALUE", "header.hash"),
+                      ("model.p.blocks", "PREV_HASH"): ("RAW.N.BLOCKS", "VALUE", "header.prev_hash")})
+    sql = """with silver_blocks as (
+               select block_id, block_hash, prev_hash, lag(block_hash) over (order by block_timestamp asc, block_id asc) as prior_hash
+               from a.silver.blocks where block_timestamp::date < current_date)
+             select * from silver_blocks where prior_hash <> prev_hash"""
+    assert f.learn_from_singular({"name": "block_gaps"}, places, sql)
+    assert fields["header.prev_hash"] == {"gen": "previous", "of": "header.hash"} and tables["RAW.N.BLOCKS"]["log"] is True
+    assert not f.learn_from_singular({"name": "block_gaps"}, places, sql)
