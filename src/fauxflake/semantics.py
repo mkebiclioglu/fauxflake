@@ -1895,6 +1895,32 @@ def text_beside_variant(transformed: exp.Expression, conn) -> exp.Expression | N
     return tree if changed else None
 
 
+def dates_in_time_zones(transformed: exp.Expression, conn) -> exp.Expression | None:  # noqa: ANN001
+    """`convert_timezone('UTC', a_date)`: Snowflake takes the date as midnight. DuckDB's `date AT TIME ZONE` gives a
+    type it cannot cast onwards. The dates among the arguments (asked of DuckDB, one SELECT at a time) are made
+    timestamps first. None when there is none."""
+    tree, changed = transformed.copy(), False
+    for node in list(tree.find_all(exp.AtTimeZone, exp.ConvertTimezone)):
+        slot = "timestamp" if isinstance(node, exp.ConvertTimezone) else "this"
+        value = node.args.get(slot)
+        select = node.find_ancestor(exp.Select)
+        if value is None or select is None or select.args.get("from_") is None \
+                or (isinstance(value, (exp.Cast, exp.TryCast)) and value.to.is_type("timestamp")):
+            continue
+        probe = exp.Select(expressions=[exp.alias_(value.copy(), "_k")])
+        probe.set("from_", select.args["from_"].copy())
+        if select.args.get("joins"):
+            probe.set("joins", [j.copy() for j in select.args["joins"]])
+        try:
+            kind = conn.execute("describe " + _cte_prefix(select) + probe.sql(dialect="duckdb")).fetchall()[0][1]
+        except Exception:  # noqa: BLE001, S112 - an argument that only binds in its place
+            continue
+        if kind == "DATE":
+            node.set(slot, exp.cast(value.copy(), "timestamp"))
+            changed = True
+    return tree if changed else None
+
+
 def text_beside_variant_in_views(transformed: exp.Expression, conn, define=None) -> exp.Expression | None:  # noqa: ANN001
     """The same, where the statement itself has nothing to wrap but reads a view that has (dbt's incremental MERGE
     reads the model through a temporary view): the view is defined again with its text wrapped. Returns the

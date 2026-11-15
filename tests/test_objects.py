@@ -662,3 +662,11 @@ def test_a_view_with_layers_of_text_beside_variant_is_repaired_in_full(run):
            when not matched then insert ("ID", "REF") values ("ID", "REF")""")
     run("commit")
     assert run("select id, ref::string from facts order by id") == [("a", "r-1"), ("b", "r-2"), ("c", "z")]
+
+
+def test_convert_timezone_takes_a_date_as_midnight(run):
+    run("create or replace table charges (created date, updated timestamp_ntz)")
+    run("insert into charges select '2024-01-02'::date, '2024-01-02 03:04:05'::timestamp_ntz")
+    rows = run("""select to_timestamp(convert_timezone('UTC', created))::timestamp::string,
+                         to_timestamp(convert_timezone('UTC', updated))::timestamp::string from charges""")
+    assert rows == [("2024-01-02 00:00:00.000", "2024-01-02 03:04:05.000")]

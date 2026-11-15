@@ -685,6 +685,12 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 flag = test.args.get("flag") or test.args.get("parameters")
                 named |= set(regex_examples(test.expression.name, whole=isinstance(test, exp.RegexpLike),
                                             ignore_case=isinstance(test, exp.RegexpILike) or (flag is not None and "i" in flag.name)))
+            previous = known.get(text)
+            if previous and hint and previous != "[]" and {hint_is_number(previous), hint_is_number(hint)} == {True, False} \
+                    and (hint if hint_is_number(previous) else previous).upper().startswith(("TIMESTAMP", "DATE", "EPOCH")):
+                hint = "EPOCH"  # `point[0]::float` and `point[1]::timestamp`: numbers, one of them seconds since 1970
+            if previous == "EPOCH":
+                hint = "EPOCH"
             if (hint or text not in known) and not (known.get(text) and str(hint or "").upper() in ("TEXT", "VARCHAR", "STRING")):
                 # (a cast to text says little, and never unsays a cast to a number or a date: a surrogate key
                 # casts every column it hashes to text)
@@ -1668,7 +1674,9 @@ def analyse(manifest: dict, database: str) -> Analysis:
             elif col in use.paths:
                 out[col] = {"gen": "object", "fields": {
                     path: field_gen(path, h, use.path_literals.get(col, {}).get(path), use.path_patterns.get(col, {}).get(path))
-                    for path, h in sorted(use.paths[col].items())}}
+                    for path, h in sorted(use.paths[col].items())
+                    # (an element that has elements of its own is a list, not a value: `points[]` beside `points[][]`)
+                    if not (path.endswith("[]") and h is None and any(other.startswith(path + "[") for other in use.paths[col]))}}
                 for path, seps in use.path_part_shapes.get(col, {}).items():
                     # a text in the document that models take apart and keep rows of by its pieces
                     held = out[col]["fields"].get(path)
