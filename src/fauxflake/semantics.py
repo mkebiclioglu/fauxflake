@@ -1860,11 +1860,7 @@ def text_beside_variant(transformed: exp.Expression, conn) -> exp.Expression | N
             branch.replace(outer)
             changed = True
     # `coalesce(account_id, customer_id)` with a text and a VARIANT argument: the same, per argument
-    for node in list(tree.find_all(exp.Coalesce))[:200]:
-        select = node.find_ancestor(exp.Select)
-        args = [node.this, *node.expressions]
-        if select is None or select.args.get("from_") is None or len(args) < 2:
-            continue
+    def kinds_of(select: exp.Select, args: list[exp.Expression]) -> list[str] | None:
         probe = exp.Select(expressions=[exp.alias_(a.copy(), f"_k{i}") for i, a in enumerate(args)])
         probe.set("from_", select.args["from_"].copy())
         if select.args.get("joins"):
@@ -1872,13 +1868,30 @@ def text_beside_variant(transformed: exp.Expression, conn) -> exp.Expression | N
         try:
             kinds = [row[1] for row in conn.execute("describe " + _cte_prefix(select) + probe.sql(dialect="duckdb")).fetchall()]
         except Exception:  # noqa: BLE001 - an argument that only binds in its place
-            continue
-        if len(kinds) != len(args) or "JSON" not in kinds:
-            continue
-        for arg, kind in zip(args, kinds):
-            if kind == "VARCHAR":
-                arg.replace(exp.func("to_json", arg.copy()))
-                changed = True
+            return None
+        return kinds if len(kinds) == len(args) else None
+
+    by_select: dict[int, tuple[exp.Select, list[list[exp.Expression]]]] = {}
+    for node in tree.find_all(exp.Coalesce):
+        select = node.find_ancestor(exp.Select)
+        args = [node.this, *node.expressions]
+        if select is not None and select.args.get("from_") is not None and len(args) >= 2:
+            by_select.setdefault(id(select), (select, []))[1].append(args)
+    for select, calls in by_select.values():
+        # every COALESCE of one SELECT in one question (a model can hold hundreds); one by one where that does not bind
+        flat = [a for args in calls for a in args]
+        kinds = kinds_of(select, flat)
+        typed, at = [], 0
+        for args in calls if kinds is not None else calls[:200]:
+            typed.append((args, kinds[at:at + len(args)] if kinds is not None else kinds_of(select, args)))
+            at += len(args)
+        for args, their in typed:
+            if not their or "JSON" not in their:
+                continue
+            for arg, kind in zip(args, their):
+                if kind == "VARCHAR":
+                    arg.replace(exp.func("to_json", arg.copy()))
+                    changed = True
     return tree if changed else None
 
 

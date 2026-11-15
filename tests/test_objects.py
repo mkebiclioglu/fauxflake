@@ -632,3 +632,12 @@ def test_merge_from_a_view_that_mixes_text_and_variant(run):
            when matched then update set "CUSTOMER" = DBT_INTERNAL_SOURCE."CUSTOMER"
            when not matched then insert ("ID", "CUSTOMER") values ("ID", "CUSTOMER")""")
     assert run("select id, customer::string from facts order by id") == [("a", "a-text"), ("b", "b-text")]
+
+
+def test_text_beside_a_variant_is_found_among_hundreds_of_coalesces(run):
+    run("create or replace table licenses (id varchar, account varchar, company varchar, customer variant)")
+    run("insert into licenses select 'a', 'acme', 'Acme', to_variant('c-1') union all select 'b', null, null, to_variant('c-2')")
+    many = ", ".join(f"coalesce(account, company) as c{i}" for i in range(260))
+    rows = run(f"select id, {many}, max(id) over (partition by coalesce(customer, id)) as last, coalesce(account, customer)::string as who "
+               "from licenses order by id")
+    assert [(r[0], r[-2], r[-1]) for r in rows] == [("a", "a", "acme"), ("b", "b", "c-2")]
