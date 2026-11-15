@@ -685,7 +685,9 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 flag = test.args.get("flag") or test.args.get("parameters")
                 named |= set(regex_examples(test.expression.name, whole=isinstance(test, exp.RegexpLike),
                                             ignore_case=isinstance(test, exp.RegexpILike) or (flag is not None and "i" in flag.name)))
-            if hint or text not in known:
+            if (hint or text not in known) and not (known.get(text) and str(hint or "").upper() in ("TEXT", "VARCHAR", "STRING")):
+                # (a cast to text says little, and never unsays a cast to a number or a date: a surrogate key
+                # casts every column it hashes to text)
                 known[text] = hint or known.get(text)
             if named:
                 use.path_literals.setdefault(found[1], {}).setdefault(text, set()).update(named)
@@ -890,7 +892,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                         if previous and hint and {hint_is_number(previous), hint_is_number(hint)} == {True, False} \
                                 and (hint if hint_is_number(previous) else previous).upper().startswith(("TIMESTAMP", "DATE", "EPOCH")):
                             hint = "EPOCH"  # cast to a number here, read as a point in time there: seconds since 1970
-                        known[".".join(keys)] = "EPOCH" if previous == "EPOCH" else (hint or previous)
+                        weak = previous and str(hint or "").upper() in ("TEXT", "VARCHAR", "STRING")
+                        known[".".join(keys)] = "EPOCH" if previous == "EPOCH" else (previous if weak else hint or previous)
                     elif not any(isinstance(k, exp.JSONPathSubscript) for k in parent.expression.expressions):
                         use.arrays.add(hit[1])
                 elif isinstance(parent, (exp.Split, exp.SplitPart)) and parent.this is col and _split_use(use, hit[1], parent):

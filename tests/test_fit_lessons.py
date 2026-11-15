@@ -667,3 +667,16 @@ def test_an_accepted_range_test_brings_a_number_inside_its_range():
     days = {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [-500, -1]}
     assert _within_range(days, "0", None) and days["v"] == [0, 100]
     assert not _within_range({"gen": "time_offset", "p": [0, 1], "seconds": [0, 9]}, "current_date", None)
+
+
+def test_a_time_by_name_that_the_model_casts_to_a_number_is_a_number():
+    tree = parse("select payload:fields.fabrication_time::number as t, wait_time::int as w, payload:time::timestamp as at from stats")
+    time = {"gen": "time_offset", "p": [0, 0.5, 1], "seconds": [0, 86400, 604800]}
+    tables = {"RAW.E.STATS": {"columns": {"WAIT_TIME": dict(time), "PAYLOAD": {"gen": "object", "fields": {
+        "fields.fabrication_time": dict(time), "time": dict(time)}}}}}
+    f = fitter(trees={"m": tree}, tables=tables)
+    f.sources_of = lambda uid: ["RAW.E.STATS"]
+    assert f.a_time_read_as_a_number("m")
+    columns = tables["RAW.E.STATS"]["columns"]
+    assert columns["WAIT_TIME"]["gen"] == "dist" and columns["PAYLOAD"]["fields"]["fields.fabrication_time"]["gen"] == "dist"
+    assert columns["PAYLOAD"]["fields"]["time"] == time

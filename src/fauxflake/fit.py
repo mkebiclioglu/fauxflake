@@ -2420,6 +2420,9 @@ class Fitter:
                         return True
                 if hint == "TIMESTAMP" and re.fullmatch(r"\d{4}-\d\d-\d\d \d{4}-\d\d-\d\d[ T][\d:.]+", m.group("value")):
                     return any([self.retype_column(sql_key, c, "TIMESTAMP", "%H:%M:%S") for c in self.columns_used(sql_key, "time_of_day")])
+                if hint in ("BIGINT", "DOUBLE") and re.fullmatch(r"\d{4}-\d\d-\d\d(?:[ T][\d:.]+)?", m.group("value")) \
+                        and self.a_time_read_as_a_number(sql_key):
+                    return True
                 if hint in ("BIGINT", "DOUBLE") and named and self.split_number(sql_key, named.group(1).upper()):
                     return True
                 if m.group("value") == "" and hint in ("BIGINT", "DOUBLE") and self.split_numbers(sql_key):
@@ -2550,8 +2553,31 @@ class Fitter:
             if gens and all(g.get("gen") == "template" and not g.get("type") for g in gens):
                 self.retype_column(uid, name, hint)
 
-    def retype_field(self, uid: str, access: exp.JSONExtract, hint: str) -> bool:
-        """`col:field::int` on an object column whose field was generated as text."""
+    def a_time_read_as_a_number(self, sql_key: str) -> bool:
+        """`Could not convert string '2017-12-07 07:58:43' to INT64`: something the model casts to a number was generated
+        as a time, on the strength of its name (`fabrication_time`, `duration_time`). It is a number."""
+        tree = self.tree(sql_key)
+        changed = False
+        for cast in (tree.find_all(exp.Cast, exp.TryCast) if tree is not None else []):
+            if not cast.to.is_type("float", "double", "decimal", "int", "bigint"):
+                continue
+            for leaf in self._cast_reads(cast.this):
+                if isinstance(leaf, exp.JSONExtract) and isinstance(leaf.this, exp.Column):
+                    changed |= self.retype_field(sql_key, leaf, "DOUBLE", times=True)
+                elif isinstance(leaf, exp.Column):
+                    for table in self.sources_of(sql_key):
+                        columns = self.tables[table].get("columns") or {}
+                        gen = columns.get(leaf.name.upper())
+                        if gen and gen.get("gen") == "time_offset" and not (gen.keys() & {"format", "epoch", "type", "unique"}):
+                            columns[leaf.name.upper()] = {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000]}
+                            self.retyped.add(table)
+                            self.learned.append(f"{table}.{leaf.name.upper()}: generated as a time for its name, cast to a number; a number.")
+                            changed = True
+        self.dirty |= changed
+        return changed
+
+    def retype_field(self, uid: str, access: exp.JSONExtract, hint: str, times: bool = False) -> bool:
+        """`col:field::int` on an object column whose field was generated as text (`times`: or as a time, for its name)."""
         keys = [str(k.this) for k in access.expression.expressions if isinstance(k, exp.JSONPathKey)] \
             if isinstance(access.expression, exp.JSONPath) else []
         if not keys:
@@ -2561,7 +2587,11 @@ class Fitter:
             gen = (self.tables[table].get("columns") or {}).get(col)
             fields = gen.get("fields") if gen and gen.get("gen") == "object" else None
             for path, field in list((fields or {}).items()):
-                if path.lower() not in (".".join(keys).lower(), keys[-1].lower()) or field.get("gen") not in _FREE or field.get("format"):
+                timed = times and field.get("gen") == "time_offset" and not (field.keys() & {"format", "epoch", "type", "unique"})
+                if path.lower() not in (".".join(keys).lower(), keys[-1].lower()) or (field.get("gen") not in _FREE and not timed) \
+                        or field.get("format"):
+                    continue
+                if times and not timed:
                     continue
                 fresh = {"gen": "categorical", "type": "BOOLEAN", "values": {True: 0.5, False: 0.5}} if hint == "BOOLEAN" \
                     else {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000]}
