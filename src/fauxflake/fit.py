@@ -102,8 +102,13 @@ def _numeric_columns(tree: exp.Expression, known: tuple[str, ...] = ()) -> set[s
 
     out = {c.name.upper() for node in tree.find_all(exp.Sum, exp.Avg, exp.Mul, exp.Div)
            for c in (bare(node.this), bare(node.args.get("expression"))) if c is not None}
-    out |= {c.this.name.upper() for c in tree.find_all(exp.Cast, exp.TryCast)
-            if isinstance(c.this, exp.Column) and c.to.is_type("float", "double", "decimal", "int", "bigint")}
+    def through_nullif(e):  # noqa: ANN001, ANN202 - `nullif("Count", '')::float`: the sheet's empty cells set aside first
+        while isinstance(e, (exp.Paren, exp.Nullif)):
+            e = e.this
+        return e if isinstance(e, exp.Column) else None
+
+    out |= {through_nullif(c.this).name.upper() for c in tree.find_all(exp.Cast, exp.TryCast)
+            if through_nullif(c.this) is not None and c.to.is_type("float", "double", "decimal", "int", "bigint")}
     for node in tree.find_all(exp.Coalesce, exp.Greatest, exp.Least):
         parts = [node.this, *node.expressions]
         if any(number(e) for e in parts):
@@ -2466,6 +2471,17 @@ class Fitter:
                     if "_" in token and self.retype_column(sql_key, token.rsplit("_", 1)[0].upper(), hint, fmt, direct=True):
                         if hint in ("DATE", "TIMESTAMP", "BOOLEAN") and not fmt:
                             self.cast_alike(sql_key, hint)
+                        if hint in ("BIGINT", "DOUBLE") and self.tree(sql_key) is not None:
+                            # a sheet of thirty columns each cast to a number: all of them in one go
+                            beside = _numeric_columns(self.tree(sql_key), (token.rsplit("_", 1)[0],))
+                            for table in self.sources_of(sql_key):
+                                columns = self.tables[table].get("columns") or {}
+                                for name in sorted(beside & set(columns)):
+                                    gen = columns[name]
+                                    if gen.get("gen") == "template" and gen.get("template") == f"{name.lower()}_{{hex}}" and not gen.get("templates"):
+                                        columns[name] = guess(name, hint)
+                                        self.retyped.add(table)
+                                        self.learned.append(f"{table}.{name}: used as {hint} beside the column that failed, retyped.")
                         return True
                 # the tables the model reads; when none of them made the value (a model that reads another's
                 # table by its written-out name has no such table among its ancestors), whichever table did
