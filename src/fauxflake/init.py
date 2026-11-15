@@ -379,6 +379,12 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
             if isinstance(call, exp.Explode):
                 given = call.this.expression if isinstance(call.this, exp.Kwarg) else call.this
                 named = next((k.expression for k in call.find_all(exp.Kwarg) if k.this.name.upper() == "INPUT"), None)
+                recursive = next((k.expression for k in call.find_all(exp.Kwarg) if k.this.name.upper() == "RECURSIVE"), None)
+                if recursive is not None and recursive.sql().upper() == "TRUE":
+                    # every value at every depth, containers included: where a value read from it sits is not
+                    # something its place in the SQL says. Nothing is made up for it
+                    flatten_inputs[alias.upper() or "_FLATTENED"] = exp.Null()
+                    continue
                 flatten_inputs[alias.upper() or "_FLATTENED"] = named if named is not None else given
 
         def into(base, keys):  # noqa: ANN001, ANN202
@@ -405,6 +411,12 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 # value is written; what is read under them is its content
                 base = resolve_path(node.this, depth + 1)
                 mark = "~json" if isinstance(node, exp.ParseJSON) else "~b64"
+                inner = node.this
+                while isinstance(inner, exp.Paren):
+                    inner = inner.this
+                if isinstance(node, exp.ParseJSON) and isinstance(inner, (exp.Cast, exp.TryCast)) \
+                        and inner.to.is_type("float", "double", "decimal", "int", "bigint"):
+                    return base  # parse_json(point[0]::float): a number read back as a VARIANT, not text holding JSON
                 if isinstance(base, tuple) and base[2] and base[2][-1] != mark and "{}" not in base[2]:
                     return base[0], base[1], base[2] + (mark,)
                 return base

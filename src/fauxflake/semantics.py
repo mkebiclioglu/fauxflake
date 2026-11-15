@@ -1898,9 +1898,15 @@ def text_beside_variant(transformed: exp.Expression, conn) -> exp.Expression | N
                     literal.replace(exp.func("to_json", literal.copy()))
                 changed = True
     by_select: dict[int, tuple[exp.Select, list[list[exp.Expression]]]] = {}
-    for node in tree.find_all(exp.Coalesce):
+    for node in tree.find_all(exp.Coalesce, exp.Case, exp.If):
         select = node.find_ancestor(exp.Select)
-        args = [node.this, *node.expressions]
+        if isinstance(node, exp.Case):  # `case when v = 'x' then v else 'Other' end`: what the branches give
+            args = [i.args.get("true") for i in node.args.get("ifs") or []] + [node.args.get("default")]
+        elif isinstance(node, exp.If):
+            args = [] if isinstance(node.parent, exp.Case) else [node.args.get("true"), node.args.get("false")]
+        else:
+            args = [node.this, *node.expressions]
+        args = [a for a in args if a is not None and not isinstance(a, exp.Null)]
         if select is not None and select.args.get("from_") is not None and len(args) >= 2:
             by_select.setdefault(id(select), (select, []))[1].append(args)
     for select, calls in by_select.values():

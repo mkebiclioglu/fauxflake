@@ -697,3 +697,12 @@ def test_a_variant_column_compared_with_a_string(run):
     assert run("select id from audits where audit_field in ('sla_policy', 'priority') order by id") == [(1,)]
     assert run("select id from audits where audit_field = 'other'") == [(2,)]
     assert run("select id from audits where audit_field != 'other'") == [(1,)]
+
+
+def test_a_case_that_gives_a_variant_in_one_branch_and_text_in_another(run):
+    run("create or replace table events (id int, payload variant)")
+    run("""insert into events select 1, parse_json('{"v":"Emergency Support"}') union all select 2, parse_json('{"v":"other"}')""")
+    run("create or replace table audits as select id, payload['v'] as audit_value from events")
+    rows = run("""select id, (case when audit_value = 'Emergency Support' then audit_value else 'Priority Support - FRT' end)::string,
+                         iff(id = 1, audit_value, 'none')::string from audits order by id""")
+    assert rows == [(1, "Emergency Support", "Emergency Support"), (2, "Priority Support - FRT", "none")]
