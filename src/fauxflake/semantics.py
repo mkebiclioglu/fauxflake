@@ -1895,10 +1895,12 @@ def text_beside_variant(transformed: exp.Expression, conn) -> exp.Expression | N
     return tree if changed else None
 
 
-def text_beside_variant_in_views(transformed: exp.Expression, conn) -> exp.Expression | None:  # noqa: ANN001
+def text_beside_variant_in_views(transformed: exp.Expression, conn, define=None) -> exp.Expression | None:  # noqa: ANN001
     """The same, where the statement itself has nothing to wrap but reads a view that has (dbt's incremental MERGE
     reads the model through a temporary view): the view is defined again with its text wrapped. Returns the
-    statement, to be run again, or None when no view changed."""
+    statement, to be run again, or None when no view changed. `define` runs the new definition (the emulator
+    does it outside the session's transaction, so that a later rollback does not undo it)."""
+    define = define or conn.execute
     names = {t.name.upper() for t in transformed.find_all(exp.Table)}
     changed = False
     try:
@@ -1910,13 +1912,16 @@ def text_beside_variant_in_views(transformed: exp.Expression, conn) -> exp.Expre
             continue
         try:
             create = sqlglot.parse_one(sql, dialect="duckdb")
-            body = text_beside_variant(create.expression, conn) if isinstance(create, exp.Create) else None
-            if body is None:
+            if not isinstance(create, exp.Create):
                 continue
-            create.set("expression", body)
             create.set("replace", True)
-            conn.execute(create.sql(dialect="duckdb"))
-            changed = True
+            for _ in range(4):  # wrapping one layer changes the types of the next: until nothing is left to wrap
+                body = text_beside_variant(create.expression, conn)
+                if body is None:
+                    break
+                create.set("expression", body)
+                define(create.sql(dialect="duckdb"))
+                changed = True
         except Exception:  # noqa: BLE001, S112 - a view that cannot be read back or defined again stays as it is
             continue
     return transformed.copy() if changed else None

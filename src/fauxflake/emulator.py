@@ -779,6 +779,28 @@ def _patch_fakesnow() -> None:
         finally:
             conn._fauxflake_healing = False
 
+    def _outside_transaction(self, sql: str) -> None:  # noqa: ANN001
+        """Run a statement of the emulator's own (a view defined again) so that it stays whatever becomes of the
+        session's transaction: the transaction is set aside, the statement runs, and what the transaction had
+        done so far is repeated in a new one."""
+        conn = self._conn
+        if not getattr(conn, "_fauxflake_txn", False) or getattr(conn, "_fauxflake_healing", False):
+            self._duck_conn.execute(sql)
+            return
+        conn._fauxflake_healing = True
+        try:
+            self._duck_conn.execute("rollback")
+            self._duck_conn.execute(sql)
+            self._duck_conn.execute("begin transaction")
+            for tree, values in list(getattr(conn, "_fauxflake_journal", [])):
+                original_execute(self, tree.copy(), values)
+        except Exception:  # noqa: BLE001 - what it had done cannot be repeated: the transaction is over, rolled back
+            conn._fauxflake_txn, conn._fauxflake_journal = False, []
+            with contextlib.suppress(Exception):
+                self._duck_conn.execute("rollback")
+        finally:
+            conn._fauxflake_healing = False
+
     def _execute(self, transformed, params=None):  # noqa: ANN001
         def run(tree) -> None:  # noqa: ANN001
             conn = self._conn
@@ -860,7 +882,8 @@ def _patch_fakesnow() -> None:
                 "grouped": lambda e: semantics.group_by_all_written_out(transformed) if "Cannot mix aggregates" in e else None,
                 "unshadowed": lambda e: semantics.aliases_over_tables(transformed) if "STRUCT(" in e else None,
                 "variants": lambda e: (semantics.text_beside_variant(transformed, self._duck_conn)
-                                       or semantics.text_beside_variant_in_views(transformed, self._duck_conn))
+                                       or semantics.text_beside_variant_in_views(transformed, self._duck_conn,
+                                                                                 lambda sql: _outside_transaction(self, sql)))
                 if "Malformed JSON" in e else None,
                 "types": lambda e: semantics.repair_types(transformed, self._duck_conn, params)
                 if "No function matches" in e or "Could not choose a best candidate" in e else None,

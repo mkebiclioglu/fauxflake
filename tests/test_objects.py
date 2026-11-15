@@ -641,3 +641,24 @@ def test_text_beside_a_variant_is_found_among_hundreds_of_coalesces(run):
     rows = run(f"select id, {many}, max(id) over (partition by coalesce(customer, id)) as last, coalesce(account, customer)::string as who "
                "from licenses order by id")
     assert [(r[0], r[-2], r[-1]) for r in rows] == [("a", "a", "acme"), ("b", "b", "c-2")]
+
+
+def test_a_view_with_layers_of_text_beside_variant_is_repaired_in_full(run):
+    """Each layer wrapped changes the types of the next (a UNION, then COALESCE over COALESCE), and a MERGE inside
+    a transaction reads the view: one repair does all of it, and it outlives the transaction's rollbacks."""
+    run("create or replace table old_ids (id varchar, ref variant, name varchar, alt varchar)")
+    run("create or replace table new_ids (id varchar, ref varchar, name varchar, alt varchar)")
+    run("insert into old_ids select 'a', to_variant('r-1'), 'n-a', 'x'")
+    run("insert into new_ids select 'b', 'r-2', 'n-b', 'y' union all select 'c', null, null, 'z'")
+    run("create or replace table facts (id varchar, ref variant)")
+    run("""create or replace view facts__dbt_tmp as (
+             with u as (select * from old_ids union all select * from new_ids),
+                  one as (select id, coalesce(ref, name) as ref, alt from u),
+                  two as (select id, coalesce(ref, alt) as ref from one)
+             select id, coalesce(ref, id) as ref from two)""")
+    run("begin")
+    run("""merge into facts as DBT_INTERNAL_DEST using facts__dbt_tmp as DBT_INTERNAL_SOURCE on ((DBT_INTERNAL_SOURCE.id = DBT_INTERNAL_DEST.id))
+           when matched then update set "REF" = DBT_INTERNAL_SOURCE."REF"
+           when not matched then insert ("ID", "REF") values ("ID", "REF")""")
+    run("commit")
+    assert run("select id, ref::string from facts order by id") == [("a", "r-1"), ("b", "r-2"), ("c", "z")]
