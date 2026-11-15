@@ -777,3 +777,5 @@ def test_a_flattened_place_that_also_has_named_keys_is_an_object():
     assert flattened_objects(paths) == {
         "q.body.data.result[]": None, "q.body.data.result[].value[]": "DOUBLE", "q.message": "TEXT", "q.success": "BOOLEAN",
         "q.body.data.resultType": "TEXT", "q.body.status": "TEXT", "tags[]": None, "tags[].name": "TEXT"}
+    mixed = {"[].factor": "DOUBLE", "[].factor[]": None, "[].factor[].name": "TEXT", "[].name": "TEXT"}
+    assert flattened_objects(mixed) == {"[].factor": "DOUBLE", "[].name": "TEXT"}

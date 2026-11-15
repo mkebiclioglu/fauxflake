@@ -1319,6 +1319,13 @@ def flattened_objects(paths: dict[str, str | None]) -> dict[str, str | None]:
                     out.setdefault(f"{base}.{k}{rest}", paths[path])
                 break
             at = path.find("[]", at + 2)
+    # a place the SQL casts to a number, a date or a boolean and also takes apart (a `factor` that is a number in
+    # one shape of the document and a list of sub-locations in another): generated as the plain value. Taking a
+    # number apart gives no rows; casting a list to a number is an error
+    plain = [p for p, h in out.items() if h and h != "[]" and (hint_is_number(h) or h.upper().startswith(("TIMESTAMP", "DATE", "BOOL", "EPOCH")))]
+    for path in plain:
+        for other in [o for o in out if o.startswith(path + "[") or o.startswith(path + ".")]:
+            out.pop(other)
     return out
 
 

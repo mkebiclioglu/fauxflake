@@ -977,12 +977,52 @@ def free_port() -> int:
 TEMP_DIRS: list[str] = []  # removed when the process is told to stop and cannot leave normally
 
 
+_OWNER = ".fauxflake-pid"
+
+
+def _mark(path: str | Path) -> None:
+    """Say which process a temporary directory belongs to, so that a later run can tell when it was left behind."""
+    with contextlib.suppress(OSError):
+        (Path(path) / _OWNER).write_text(str(os.getpid()))
+
+
+def sweep_stale(root: str | Path | None = None, older_than: float = 12 * 3600) -> list[str]:
+    """Remove the temporary directories of runs that were killed before they could clean up (a CI job cancelled, a
+    laptop out of memory): `fauxflake-*` in the system's temporary directory whose process is gone, or, where no
+    process is named, that nothing has touched for half a day. Returns what was removed."""
+    import tempfile
+
+    removed = []
+    for path in Path(root or tempfile.gettempdir()).glob("fauxflake-*"):
+        try:
+            if not path.is_dir() or path.is_symlink():
+                continue
+            marker = path / _OWNER
+            if marker.is_file():
+                pid = int(marker.read_text().strip() or 0)
+                try:
+                    os.kill(pid, 0)
+                    continue  # its process is alive
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    continue  # there, but not ours to ask
+            elif time.time() - path.stat().st_mtime < older_than:
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+            removed.append(str(path))
+        except (OSError, ValueError):
+            continue
+    return removed
+
+
 def _spill_directory(duck: duckdb.DuckDBPyConnection) -> str:
     """Where DuckDB writes what does not fit in memory. Its default is `.tmp` in the working directory,
     which is the user's dbt repository: use a private directory outside it, removed on exit."""
     import tempfile
 
     path = tempfile.mkdtemp(prefix="fauxflake-spill-")
+    _mark(path)
     TEMP_DIRS.append(path)
     duck.execute("set temp_directory = '" + path.replace("'", "''") + "'")
     # A query that explodes on generated data (a join on a key that is always the same) would
@@ -1045,6 +1085,9 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
     _patch_fakesnow()
     if not verbose:
         logging.getLogger("fakesnow.server").setLevel(logging.WARNING)
+    sweep_stale()
+    if db_path and Path(db_path).name.startswith("fauxflake-"):
+        _mark(db_path)
     if db_path and not keep:
         Path(db_path).mkdir(parents=True, exist_ok=True)
         for stale in [*Path(db_path).glob("*.db"), *Path(db_path).glob("*.db.wal"), *Path(db_path).glob(objects.FUNCTIONS_FILE)]:

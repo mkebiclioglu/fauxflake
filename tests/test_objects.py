@@ -670,3 +670,30 @@ def test_convert_timezone_takes_a_date_as_midnight(run):
     rows = run("""select to_timestamp(convert_timezone('UTC', created))::timestamp::string,
                          to_timestamp(convert_timezone('UTC', updated))::timestamp::string from charges""")
     assert rows == [("2024-01-02 00:00:00.000", "2024-01-02 03:04:05.000")]
+
+
+def test_directories_left_by_killed_runs_are_swept(tmp_path):
+    import os
+    import time
+
+    from fauxflake.emulator import sweep_stale
+
+    dead, alive, old, fresh, other = (tmp_path / n for n in ("fauxflake-dead", "fauxflake-alive", "fauxflake-old", "fauxflake-new", "elsewhere"))
+    for d in (dead, alive, old, fresh, other):
+        d.mkdir()
+        (d / "data.db").write_text("x")
+    (dead / ".fauxflake-pid").write_text("999999")  # no such process
+    (alive / ".fauxflake-pid").write_text(str(os.getpid()))
+    os.utime(old, (time.time() - 86400, time.time() - 86400))
+    removed = sweep_stale(tmp_path)
+    assert sorted(os.path.basename(p) for p in removed) == ["fauxflake-dead", "fauxflake-old"]
+    assert alive.exists() and fresh.exists() and other.exists() and not dead.exists() and not old.exists()
+
+
+def test_a_variant_column_compared_with_a_string(run):
+    run("create or replace table events (id int, payload variant)")
+    run("""insert into events select 1, parse_json('{"field":"sla_policy","v":1}') union all select 2, parse_json('{"field":"other","v":2}')""")
+    run("create or replace table audits as select id, payload['field'] as audit_field from events")
+    assert run("select id from audits where audit_field in ('sla_policy', 'priority') order by id") == [(1,)]
+    assert run("select id from audits where audit_field = 'other'") == [(2,)]
+    assert run("select id from audits where audit_field != 'other'") == [(1,)]

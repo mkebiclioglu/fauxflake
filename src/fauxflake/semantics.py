@@ -1871,6 +1871,32 @@ def text_beside_variant(transformed: exp.Expression, conn) -> exp.Expression | N
             return None
         return kinds if len(kinds) == len(args) else None
 
+    # `where audit_field in ('sla_policy', 'priority')` on a VARIANT column: Snowflake compares the string it holds.
+    # DuckDB would read the literal as JSON. The literals become JSON strings
+    compared: dict[int, tuple[exp.Select, list[tuple[exp.Expression, list[exp.Expression]]]]] = {}
+    for node in tree.find_all(exp.EQ, exp.NEQ, exp.In):
+        select = node.find_ancestor(exp.Select)
+        if select is None or select.args.get("from_") is None:
+            continue
+        if isinstance(node, exp.In):
+            value, literals = node.this, [e for e in node.expressions if isinstance(e, exp.Literal) and e.is_string]
+            if len(literals) != len(node.expressions) or not literals:
+                continue
+        else:
+            sides = [node.this, node.expression]
+            literals = [e for e in sides if isinstance(e, exp.Literal) and e.is_string]
+            if len(literals) != 1:
+                continue
+            value = sides[1] if sides[0] is literals[0] else sides[0]
+        if isinstance(value, exp.Column):  # (a plain column: the one case a literal meets a stored VARIANT as it is)
+            compared.setdefault(id(select), (select, []))[1].append((value, literals))
+    for select, tests in compared.values():
+        kinds = kinds_of(select, [value for value, _ in tests])
+        for (value, literals), kind in zip(tests, kinds or []):
+            if kind == "JSON":
+                for literal in literals:
+                    literal.replace(exp.func("to_json", literal.copy()))
+                changed = True
     by_select: dict[int, tuple[exp.Select, list[list[exp.Expression]]]] = {}
     for node in tree.find_all(exp.Coalesce):
         select = node.find_ancestor(exp.Select)

@@ -735,8 +735,10 @@ class Fitter:
             reads = {"BIGINT": ("sequence", "dist", "fk"), "DOUBLE": ("sequence", "dist", "fk"),
                      "DATE": ("time_offset", "event_time", "updated_at"), "TIMESTAMP": ("time_offset", "event_time", "updated_at"),
                      "EPOCH": ("sequence", "dist"), "BOOLEAN": ("categorical",)}.get(hint)
-            if as_text and hint != "TEXT" and not fmt and (reads is None or kind in reads):
-                continue  # already holds numbers, dates or booleans as text: a cast reads them
+            hashed = kind == "fk" and any(d.get("gen") == "hash_id" for d in (
+                self.tables.get(str(gen.get("ref", "")).upper(), {}).get("columns") or {}).values())
+            if as_text and hint != "TEXT" and not fmt and (reads is None or kind in reads) and not (numeric and hashed):
+                continue  # already holds numbers, dates or booleans as text: a cast reads them (a reference to hashes does not)
             if kind in ("lifecycle", "loaded_at"):
                 continue
             if kind in ("object", "array") and (gen.get("fields") or kind == "array") and hint not in ("VARIANT", "ARRAY", "TEXT"):
@@ -816,11 +818,14 @@ class Fitter:
             elif hint == "TEXT":
                 # the SQL treats it as text (compares it with '', or with a word) and may still cast it:
                 # keep what it generates and hold it as text
-                if kind in ("hash_id", "template", "pool", "object", "array") or str(gen.get("type", "")).upper() in ("VARCHAR", "TEXT", "STRING"):
+                if kind == "pool" and gen.get("numeric") and not gen.get("type"):
+                    fresh = {**gen, "type": "VARCHAR"}  # ids shared as numbers, compared with '' here: the same digits, held as text
+                elif kind in ("hash_id", "template", "pool", "object", "array") or str(gen.get("type", "")).upper() in ("VARCHAR", "TEXT", "STRING"):
                     continue
-                if kind == "categorical" and str(gen.get("type", "")).upper() != "BOOLEAN":
+                elif kind == "categorical" and str(gen.get("type", "")).upper() != "BOOLEAN":
                     continue
-                fresh = {**gen, "type": "VARCHAR"}
+                else:
+                    fresh = {**gen, "type": "VARCHAR"}
             elif hint == "ARRAY":
                 if kind == "array":
                     continue
@@ -2249,6 +2254,10 @@ class Fitter:
                 names |= {c.name.upper() for c in e.find_all(exp.Column)}
         changed = False
         model = self.nodes.get(sql_key, {}).get("name", sql_key)
+        if "_parsed_names" not in self.__dict__:  # columns some model hands to PARSE_JSON: text that must stay JSON
+            self._parsed_names = {m.upper() for code in self.sql_of.values()
+                                  for m in re.findall(r"(?i)parse_json\(\s*(?:\w+\.)?\"?(\w+)\"?\s*\)", code)}
+        names -= self._parsed_names
         for table in self.sources_of(sql_key):
             columns = self.tables[table].get("columns") or {}
             key = self.tables[table].get("key") or []
@@ -2359,7 +2368,9 @@ class Fitter:
                 if hint in ("BIGINT", "DOUBLE") and re.search(r"DBT_INTERNAL_DEST|__FX_MERGE", message) and self.text_merge_key(sql_key):
                     return True
                 if named and hint in ("BIGINT", "DOUBLE") and re.fullmatch(r"[0-9a-f]{32}", m.group("value")) \
+                        and not self.cast_to_a_number(sql_key, named.group(1).upper()) \
                         and self.compared_with_a_hash(sql_key, named.group(1).upper()):
+                    # (`run_id::float` written out in the model is no comparison: the column holds numbers)
                     return True
                 if named and hint in ("BIGINT", "DOUBLE") and re.fullmatch(r"[a-z][a-z0-9_]*_[0-9a-f]{12}", m.group("value")) \
                         and not self.cast_to_a_number(sql_key, named.group(1).upper()) \
@@ -2487,7 +2498,7 @@ class Fitter:
                 for leaf in self._cast_reads(cast.this) if hint else []:
                     if isinstance(leaf, exp.Column) and hint == "DOUBLE":
                         names.append(leaf.name.upper())
-                    elif isinstance(leaf, exp.JSONExtract) and isinstance(leaf.this, exp.Column):
+                    elif isinstance(leaf, (exp.JSONExtract, exp.Bracket)) and isinstance(leaf.this, exp.Column):
                         changed |= self.retype_field(sql_key, leaf, hint)
             return any([self.retype_column(sql_key, c, "DOUBLE") for c in dict.fromkeys(names)]) or changed
         if re.search(r"argument types '[-+]\((?:TIMESTAMP[^,]*, (?:INTEGER|BIGINT|TINYINT|SMALLINT)|(?:INTEGER|BIGINT)[^,]*, TIMESTAMP)", message):
@@ -2528,6 +2539,9 @@ class Fitter:
         CASE and arithmetic, not through a function that makes new text (SPLIT_PART, REGEXP_SUBSTR)."""
         if isinstance(node, (exp.Column, exp.JSONExtract)):
             return [node]
+        if isinstance(node, exp.Bracket) and isinstance(node.this, exp.Column) and len(node.expressions) == 1 \
+                and isinstance(node.expressions[0], exp.Literal) and node.expressions[0].is_string:
+            return [node]  # minutes['business']
         if isinstance(node, (exp.Paren, exp.Cast, exp.TryCast, exp.Neg)):
             return Fitter._cast_reads(node.this)
         if isinstance(node, (exp.Coalesce, exp.Nullif, exp.Binary)) and not isinstance(node, (exp.DPipe, exp.Predicate, exp.Connector)):
@@ -2562,7 +2576,7 @@ class Fitter:
             if not cast.to.is_type("float", "double", "decimal", "int", "bigint"):
                 continue
             for leaf in self._cast_reads(cast.this):
-                if isinstance(leaf, exp.JSONExtract) and isinstance(leaf.this, exp.Column):
+                if isinstance(leaf, (exp.JSONExtract, exp.Bracket)) and isinstance(leaf.this, exp.Column):
                     changed |= self.retype_field(sql_key, leaf, "DOUBLE", times=True)
                 elif isinstance(leaf, exp.Column):
                     for table in self.sources_of(sql_key):
@@ -2578,8 +2592,11 @@ class Fitter:
 
     def retype_field(self, uid: str, access: exp.JSONExtract, hint: str, times: bool = False) -> bool:
         """`col:field::int` on an object column whose field was generated as text (`times`: or as a time, for its name)."""
-        keys = [str(k.this) for k in access.expression.expressions if isinstance(k, exp.JSONPathKey)] \
-            if isinstance(access.expression, exp.JSONPath) else []
+        if isinstance(access, exp.Bracket):
+            keys = [access.expressions[0].name]
+        else:
+            keys = [str(k.this) for k in access.expression.expressions if isinstance(k, exp.JSONPathKey)] \
+                if isinstance(access.expression, exp.JSONPath) else []
         if not keys:
             return False
         col, changed = access.this.name.upper(), False
