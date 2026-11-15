@@ -157,7 +157,8 @@ _REPLACE = tuple(getattr(exp, name) for name in ("Replace",) if hasattr(exp, nam
 _REGEX_TESTS = tuple(getattr(exp, name) for name in ("RegexpLike", "RegexpILike", "RegexpExtract", "RegexpInstr", "RegexpCount")
                      if hasattr(exp, name))
 _ARRAY_READERS = tuple(getattr(exp, name) for name in (
-    "ArrayToString", "ArraySize", "ArrayContains", "ArrayOverlaps", "ArrayDistinct", "ArraySlice", "ArrayPosition", "ArrayConcat")
+    "ArrayToString", "ArraySize", "ArrayContains", "ArrayOverlaps", "ArrayDistinct", "ArraySlice", "ArrayPosition", "ArrayConcat",
+    "SortArray", "ArraySort", "ArrayCompact", "ArrayReverse", "ArrayMin", "ArrayMax", "ArrayFirst", "ArrayLast")
     if hasattr(exp, name))
 
 
@@ -661,6 +662,9 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     use.texts.add(found[1])
                 continue
             known = use.paths.setdefault(found[1], {})
+            listed = cast.parent if cast is not None and cast.to.is_type("variant") else reader
+            if isinstance(listed, _ARRAY_READERS) and listed.this in (cast, top):
+                flattened = True  # array_sort(doc['credits']::variant), array_size(doc:tags): a list
             if flattened:
                 known.setdefault(text + "[]", None)
                 continue
@@ -1297,6 +1301,27 @@ def part_templates(shapes: dict[str, dict[int, set[str]]], casts: dict[str, dict
     return [*out, free]
 
 
+def flattened_objects(paths: dict[str, str | None]) -> dict[str, str | None]:
+    """`flatten(input => doc:query)` beside `doc:query:success`: what is flattened is an object, not a list (a
+    place cannot be both), and its "elements" are the values of its keys. What the SQL reads in an element
+    (`value:data:resultType`) is read in the keys that hold objects (`query.body.data.resultType`)."""
+    out = dict(paths)
+    for path in sorted(paths):
+        at = path.find("[]")
+        while at != -1:
+            base, rest = path[:at], path[at + 2:]
+            keys = {other[len(base) + 1:].split(".")[0].split("[")[0] for other in paths
+                    if base and other.startswith(base + ".") and other != path}
+            if keys:
+                out.pop(path, None)
+                holders = [k for k in sorted(keys) if any(o.startswith(f"{base}.{k}.") or o.startswith(f"{base}.{k}[") for o in paths)]
+                for k in holders if rest else []:
+                    out.setdefault(f"{base}.{k}{rest}", paths[path])
+                break
+            at = path.find("[]", at + 2)
+    return out
+
+
 def like_shape(pattern: str) -> str:
     """A template whose values match the LIKE pattern: `%.pool%.near` -> `{hex}.pool{hex}.near`."""
     return pattern.replace("\\", "").replace("%", "{hex}").replace("_", "x")
@@ -1672,6 +1697,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 # other separators the SQL splits on come after: 123/456.json
                 out[col] = {"gen": "template", "template": sep.join(shape) + "".join(f"{other}x" for other, _ in others)}
             elif col in use.paths:
+                use.paths[col] = flattened_objects(use.paths[col])
                 out[col] = {"gen": "object", "fields": {
                     path: field_gen(path, h, use.path_literals.get(col, {}).get(path), use.path_patterns.get(col, {}).get(path))
                     for path, h in sorted(use.paths[col].items())

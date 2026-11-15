@@ -767,3 +767,13 @@ def test_a_column_joined_to_a_seed_that_nobody_asks_null_of_holds_only_the_seeds
     }
     values = build_spec(manifest, "A")[0]["tables"]["RAW.S.PRICES"]["columns"]["TOKEN_ID"]["values"]
     assert set(values) == {"22132", "87854"}
+
+
+def test_a_flattened_place_that_also_has_named_keys_is_an_object():
+    from fauxflake.init import flattened_objects
+
+    paths = {"q.body.data.result[]": None, "q.body.data.result[].value[]": "DOUBLE", "q.message": "TEXT", "q.success": "BOOLEAN",
+             "q[]": None, "q[].data.resultType": "TEXT", "q[].status": "TEXT", "tags[]": None, "tags[].name": "TEXT"}
+    assert flattened_objects(paths) == {
+        "q.body.data.result[]": None, "q.body.data.result[].value[]": "DOUBLE", "q.message": "TEXT", "q.success": "BOOLEAN",
+        "q.body.data.resultType": "TEXT", "q.body.status": "TEXT", "tags[]": None, "tags[].name": "TEXT"}
