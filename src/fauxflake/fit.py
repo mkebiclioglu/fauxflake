@@ -750,7 +750,17 @@ class Fitter:
             elif numeric and kind == "fk":
                 parent = self.tables.get(str(gen.get("ref", "")).upper(), {}).get("columns") or {}
                 key = next((c for c, d in parent.items() if d.get("gen") == "hash_id"), None)
-                if key is None or _text_ids(parent[key]):
+                if key is not None and _text_ids(parent[key]):
+                    # the key it refers to is text the SQL takes apart or names (`1.2.3`), and this column is read as
+                    # a number: it does not hold that key. A number of its own
+                    columns[name] = guess(name, hint) if guess(name, hint).get("gen") == "dist" else \
+                        {"gen": "dist", "type": "BIGINT" if hint == "BIGINT" else "DOUBLE", "p": [0, 1], "v": [1, 1000]}
+                    self.retyped.add(table)
+                    self.learned.append(f"{table}.{name}: read as a number, but {gen['ref']}.{key} which it was taken to refer to "
+                                        "holds text; generated as a number of its own.")
+                    changed = True
+                    continue
+                if key is None:
                     continue
                 parent[key] = {**parent[key], "gen": "sequence"}  # the reference follows its parent's key
                 self.retyped.add(str(gen["ref"]).upper())

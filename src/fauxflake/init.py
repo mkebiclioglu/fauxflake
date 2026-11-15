@@ -1774,7 +1774,15 @@ def analyse(manifest: dict, database: str) -> Analysis:
                      f"{', '.join(keyless[:12])}{' ...' if len(keyless) > 12 else ''}.")
     # a column named like another table's key is almost always a reference to it
     guessed: list[str] = []
-    key_owner = {c: t for t, spec in tables.items() for c, d in spec["columns"].items() if d["gen"] in ("sequence", "hash_id")}
+    keyed: dict[str, list[str]] = {}
+    for t, spec in tables.items():
+        for c, d in spec["columns"].items():
+            if d["gen"] in ("sequence", "hash_id"):
+                keyed.setdefault(c, []).append(t)
+    # (a name that is the key of one table only, and reads like an id: `ID` is the key of many tables, and a table
+    # with one row per `NAME`, `MONTH` or `VERSION` is not what every other NAME, MONTH or VERSION refers to)
+    key_owner = {c: owners[0] for c, owners in keyed.items()
+                 if len(owners) == 1 and re.search(r"[A-Z0-9](_ID|_KEY|_UUID|_GUID|_SK|_PK|_SFID|ID)$", c)}
     for name, spec in tables.items():
         for col, d in spec["columns"].items():
             owner = key_owner.get(col)
