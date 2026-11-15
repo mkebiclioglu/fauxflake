@@ -769,8 +769,8 @@ def test_a_query_string_read_key_by_key_holds_every_key_with_values_of_the_shape
                                                     where regexp_substr(sec.version, '^[0-9]{1,2}[.][0-9]{1,2}[.][0-9]{1,2}$') is not null"""}},
     }
     column = build_spec(manifest, "A")[0]["tables"]["RAW.D.LOG_ENTRIES"]["columns"]["CS_URI_QUERY"]
-    assert column["gen"] == "template" and column["templates"][0] == "x=1&auc={n}&b=0.0.0&id={n}"
-    assert all(t.startswith("x=1&auc={n}&b=") and t.endswith("&id={n}") for t in column["templates"])
+    assert column["gen"] == "template" and column["templates"][0] == "x=1&auc={n}&b=0.0.0&id={hex}"
+    assert all(t.startswith("x=1&auc={n}&b=") and t.endswith("&id={hex}") for t in column["templates"])
 
 
 def test_a_column_joined_to_a_seed_that_nobody_asks_null_of_holds_only_the_seeds_values(tmp_path):
