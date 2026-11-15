@@ -2208,10 +2208,11 @@ class Fitter:
             changed = True
         if ranged and self.fewer_groups(sql_key, tree):
             changed = True
-        if ranged and not changed and getattr(self, "project", None) is not None:
+        if not changed and getattr(self, "project", None) is not None:
             # nothing left to narrow: the model keeps a row a day for each row it reads, for as long as the history
-            # runs. A tenth of the rows, then (down to a handful a day), and only in a real build: a trial pass runs
-            # on a few hundred rows whatever the volumes say.
+            # runs, or is simply too wide for this machine at these volumes (forty tables joined, six hundred columns
+            # grouped). A tenth of the rows, then (down to a handful a day), and only in a real build: a trial pass
+            # runs on a few hundred rows whatever the volumes say.
             model = self.nodes.get(sql_key, {}).get("name", sql_key)
             for table in self.sources_of(sql_key):
                 volume = self.tables[table].setdefault("volume", {})
