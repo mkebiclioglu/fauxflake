@@ -417,6 +417,9 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 if isinstance(node, exp.ParseJSON) and isinstance(inner, (exp.Cast, exp.TryCast)) \
                         and inner.to.is_type("float", "double", "decimal", "int", "bigint"):
                     return base  # parse_json(point[0]::float): a number read back as a VARIANT, not text holding JSON
+                if isinstance(node, exp.ParseJSON) and isinstance(base, tuple) and base[2] and base[2][-1] == "[]" \
+                        and isinstance(inner, exp.Column) and inner.name.upper() == "VALUE":
+                    return base  # parse_json(zone.value) on what a FLATTEN gave: already the document's own value
                 if isinstance(base, tuple) and base[2] and base[2][-1] != mark and "{}" not in base[2]:
                     return base[0], base[1], base[2] + (mark,)
                 return base
