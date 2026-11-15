@@ -535,6 +535,8 @@ class Fitter:
                     or isinstance(reader, (exp.StrToTime, exp.TsOrDsToTimestamp)) \
                     or (isinstance(reader, exp.Anonymous) and "to_timestamp" in reader.name.lower())
                 operands = [o for o in node.flatten()] if isinstance(node, exp.DPipe) else list(node.expressions)
+                operands = [o.this if isinstance(o, (exp.Cast, exp.TryCast)) and isinstance(o.this, exp.Column) else o
+                            for o in operands]  # `logdate::date || ' ' || logtime`
                 columns = [o for o in operands if isinstance(o, exp.Column)]
                 spaced = any(isinstance(o, exp.Literal) and o.is_string and o.name in (" ", "T") for o in operands)
                 if timed and spaced and len(columns) == 2 and len(operands) == 3:

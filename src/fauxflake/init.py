@@ -1285,7 +1285,7 @@ def regex_examples(pattern: str, count: int = 4, ignore_case: bool = False, whol
             return classes[av][i % len(classes[av])]
         raise ValueError(op)
 
-    def sample(items, i: int) -> str:  # noqa: ANN001
+    def sample(items, i: int, before: str = "") -> str:  # noqa: ANN001
         out = []
         for op, av in items:
             if op is c.LITERAL:
@@ -1293,7 +1293,8 @@ def regex_examples(pattern: str, count: int = 4, ignore_case: bool = False, whol
             elif op is c.NOT_LITERAL:
                 out.append("x" if av != ord("x") else "y")
             elif op is c.ANY:
-                out.append("abcd"[i % 4])
+                # after digits, a dot: `[0-9]+.[0-9]+` is a version or a decimal written with an unescaped `.`
+                out.append("." if ("".join(out) or before)[-1:].isdigit() else "abcd"[i % 4])
             elif op is c.IN:
                 if av and av[0][0] is c.NEGATE:
                     out.append(next(ch for ch in "a1-_ x/Z" if not re.fullmatch("[" + "".join(
@@ -1303,11 +1304,12 @@ def regex_examples(pattern: str, count: int = 4, ignore_case: bool = False, whol
             elif op in (c.MAX_REPEAT, c.MIN_REPEAT, getattr(c, "POSSESSIVE_REPEAT", None)):
                 low, high, inner = av
                 times = min(max(low, 1 if high else 0) + (i % 2 if high > max(low, 1) else 0), 6)
-                out += [sample(inner, i + k) for k in range(times)]
+                for k in range(times):
+                    out.append(sample(inner, i + k, (before + "".join(out))[-1:] if times == 1 and low == high else ""))
             elif op is c.SUBPATTERN:
-                out.append(sample(av[3], i))
+                out.append(sample(av[3], i, (before + "".join(out))[-1:]))
             elif op is c.BRANCH:
-                out.append(sample(av[1][i % len(av[1])], i))
+                out.append(sample(av[1][i % len(av[1])], i, (before + "".join(out))[-1:]))
             elif op in (c.AT, c.ASSERT, c.ASSERT_NOT):
                 continue
             else:
