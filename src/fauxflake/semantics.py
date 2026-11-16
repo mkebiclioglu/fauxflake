@@ -214,6 +214,10 @@ MACROS = [
     f"create or replace macro {_NS}_sf_object_keys(o) as to_json(list_sort(json_keys(o::json)))",
     f"create or replace macro {_NS}_sf_hash_agg(x) as bit_xor(hash(x))",
     # FLATTEN(..., RECURSIVE => TRUE) walks every level.
+    # what FLATTEN is given, when it is a list or an object; a string or a number held in a VARIANT gives no rows,
+    # as in Snowflake, instead of an error
+    f"""create or replace macro {_NS}_sf_flattenable(x) as
+          case when json_type(to_json(x)) in ('ARRAY', 'OBJECT') then to_json(x) end""",
     f"""create or replace macro {_NS}_sf_flatten_recursive(input) as table
           select hash(to_json(input))::ubigint as SEQ,
                  case when fullkey like '%]' then null else "key" end as KEY,
@@ -659,7 +663,9 @@ def _fix(node: exp.Expression) -> exp.Expression:
     if isinstance(node, (exp.ArrayFilter, exp.Transform, exp.Reduce)):
         node.set("this", _fn("_sf_list", node.this))  # lambdas walk a list; the array itself is JSON
     if isinstance(node, exp.ParseJSON) and not isinstance(node.this, (exp.Literal, exp.Null)):
-        text = exp.cast(node.this, "varchar")
+        # (as text the way a cast gives it: a VARIANT that holds a string gives the string, not its JSON spelling
+        # with quotes, so PARSE_JSON of `"[1, 2]"` held in a VARIANT is the list)
+        text = _fn("_sf_text", node.this)
         node.set("this", exp.Nullif(this=text, expression=exp.Literal.string("")))  # PARSE_JSON('') is NULL
     if isinstance(node, exp.Bracket) and len(node.expressions) == 1 and isinstance(node.expressions[0], exp.Literal):
         # v['a']['b'][0] is the path v:a.b[0]. Written as a path, every step stays a VARIANT access
@@ -1372,9 +1378,12 @@ def parenthesize_arrows(transformed: exp.Expression) -> exp.Expression:
 
 def keep_outer_rows(transformed: exp.Expression, flags: list[bool], recursive: list[bool] = ()) -> exp.Expression:
     """FLATTEN(..., OUTER => TRUE) keeps rows that have nothing to expand: a LEFT lateral join."""
+    calls = [n for n in transformed.find_all(exp.Anonymous) if n.name.upper() == "_FS_FLATTEN"]
+    for call in calls:
+        if call.expressions and not (isinstance(call.expressions[0], exp.Anonymous) and call.expressions[0].name.lower().endswith("_sf_flattenable")):
+            call.set("expressions", [_fn("_sf_flattenable", call.expressions[0]), *call.expressions[1:]])
     if not any(flags) and not any(recursive):
         return transformed
-    calls = [n for n in transformed.find_all(exp.Anonymous) if n.name.upper() == "_FS_FLATTEN"]
     for call, deep in zip(calls, recursive):
         if deep:
             call.set("this", _NS + "_sf_flatten_recursive")

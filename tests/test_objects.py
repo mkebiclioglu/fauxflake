@@ -706,3 +706,21 @@ def test_a_case_that_gives_a_variant_in_one_branch_and_text_in_another(run):
     rows = run("""select id, (case when audit_value = 'Emergency Support' then audit_value else 'Priority Support - FRT' end)::string,
                          iff(id = 1, audit_value, 'none')::string from audits order by id""")
     assert rows == [(1, "Emergency Support", "Emergency Support"), (2, "Priority Support - FRT", "none")]
+
+
+def test_parse_json_of_a_variant_that_holds_json_as_a_string(run):
+    run("create or replace table zones (j varchar)")
+    run(r"""insert into zones select '[{"title":"x","countries":"[\\"IL\\",\\"US\\"]"},{"title":"y","countries":["DE"]}]'""")
+    rows = run("""with g as (select z.value['title']::varchar as t, z.value['countries']::variant as c
+                             from zones, lateral flatten(input => parse_json(j), outer => true) z)
+                  select t, x.value::varchar from g inner join lateral flatten(input => parse_json(c), outer => true) x order by 1, 2""")
+    assert rows == [("x", "IL"), ("x", "US"), ("y", "DE")]
+
+
+def test_flatten_of_a_variant_that_is_not_a_list_gives_no_rows(run):
+    run("create or replace table docs (id int, v variant)")
+    run("""insert into docs select 1, parse_json('{"areas":[{"n":1},{"n":2}]}') union all select 2, parse_json('{"areas":"none"}')
+           union all select 3, parse_json('{"areas":7}')""")
+    assert run("select id, a.value['n']::int from docs, lateral flatten(input => v['areas']) a order by 1, 2") == [(1, 1), (1, 2)]
+    assert run("select id, a.value['n']::int from docs, lateral flatten(input => v['areas'], outer => true) a order by 1, 2") == [
+        (1, 1), (1, 2), (2, None), (3, None)]

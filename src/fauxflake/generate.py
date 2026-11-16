@@ -429,7 +429,8 @@ class TableSQL:
                         # another generator's value inside the text: an id a model parses back out of it
                         parts.append(f"({self._expr(f'{col}:{chunk}', d['parts'][int(chunk[4:])])})::varchar")
                     elif chunk == "n":
-                        parts.append(f"({self.base} + 1)::varchar" if self.base in ("g", "(g - 1)") else f"({self.base})::varchar")
+                        # (inside a document the row has no number of its own: a small one, so that `12.4.0` reads as numbers)
+                        parts.append(f"({self.base} + 1)::varchar" if self.base in ("g", "(g - 1)") else f"(({self.base}) % 1000)::varchar")
                     elif chunk == "hex":
                         parts.append(f"substr(md5(concat({lit(self.salt(col) + ':')}, {self.base})), 1, 12)")
                     elif chunk:
