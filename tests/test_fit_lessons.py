@@ -693,3 +693,15 @@ def test_a_piece_of_a_document_value_read_as_a_number_shapes_that_value():
     assert tables["RAW.Y.RELEASES"]["columns"]["JSONTEXT"]["fields"]["[].version"]["template"] == "{n}.{n}.{n}"
     f.split_number("m", "MAJOR_VERSION")  # fewer pieces: nothing is taken back
     assert tables["RAW.Y.RELEASES"]["columns"]["JSONTEXT"]["fields"]["[].version"]["template"] == "{n}.{n}.{n}"
+
+
+def test_pieces_read_as_numbers_through_a_cleaned_alias_keep_the_shapes_the_text_has():
+    tree = parse("""select regexp_replace(nullif(p.version, ''), '[^0-9.]+') as cleaned_version, iff(p.version ilike '%-pre', true, false) as pre,
+                           split_part(cleaned_version, '.', 1)::number as major_version, split_part(cleaned_version, '.', 2)::number as minor_version
+                    from pings p""")
+    tables = {"RAW.V.PINGS": {"columns": {"VERSION": {"gen": "template", "templates": ["{hex}-pre", "version_{hex}"]}}}}
+    f = fitter(trees={"m": tree}, tables=tables)
+    f.sources_of, f.origins, f._ancestors = (lambda uid: ["RAW.V.PINGS"]), (lambda uid, name, depth=0, strict=False: [name]), (lambda uid: set())
+    assert f.split_numbers("m")
+    assert tables["RAW.V.PINGS"]["columns"]["VERSION"] == {"gen": "template", "templates": ["{n}.{n}", "{n}.{n}-pre"]}
+    assert not f.split_numbers("m")

@@ -731,12 +731,44 @@ class Fitter:
             delimiter, part = piece.args.get("delimiter"), piece.args.get("part_index")
             if isinstance(delimiter, exp.Literal) and isinstance(part, exp.Literal) and part.is_int and 0 < int(part.name) <= 8:
                 column = piece.this.name.upper()
+                # regexp_replace(nullif(p.version, ''), '[^0-9.]+') as cleaned_version, taken apart further down: the
+                # column behind the name, when the same query gives it one
+                for alias in tree.find_all(exp.Alias):
+                    inner = alias.this
+                    while isinstance(inner, (exp.RegexpReplace, exp.Nullif, exp.Trim, exp.Cast, exp.TryCast, exp.Paren, exp.Lower, exp.Upper)):
+                        inner = inner.this
+                    if alias.alias.upper() == column and isinstance(inner, exp.Column) and inner.name.upper() != column:
+                        column = inner.name.upper()
+                        break
                 shapes[column] = (delimiter.name, max(int(part.name), shapes.get(column, ("", 0))[1]))
         changed = False
         for column, (delimiter, count) in shapes.items():
             fresh = {"gen": "template", "template": delimiter.join(["{n}"] * max(count, 2))}
             for table in self.sources_of(uid):
                 columns = self.tables[table].get("columns") or {}
+                if column not in columns:  # (read under another name upstream)
+                    renamed = [n for n in self.origins(uid, column, strict=True) if n in columns]
+                    if not renamed:
+                        continue
+                    column_here = renamed[0]
+                else:
+                    column_here = column
+                held = columns[column_here]
+                if held.get("templates") and held.get("gen") == "template":
+                    # `version ilike '%-pre'` elsewhere: the shapes it already has, with numbers where made-up text was
+                    shaped = [str(t).replace("{hex}", fresh["template"]) if "{n}" not in str(t) else str(t) for t in held["templates"]
+                              if "{hex}" in str(t) or "{n}" in str(t)]
+                    shaped = list(dict.fromkeys(t for t in shaped if not re.fullmatch(r"[a-z0-9_]+_" + re.escape(fresh["template"]), t)))
+                    wanted = {"gen": "template", "templates": [fresh["template"], *[t for t in shaped if t != fresh["template"]]]}
+                    if held != wanted:
+                        columns[column_here] = wanted
+                        self.retyped.add(table)
+                        self.learned.append(f"{table}.{column_here}: its pieces are read as numbers; generated as {wanted['templates']!r}.")
+                        changed = True
+                    continue
+                column = column_here
+                if held.get("gen") == "template" and held.get("templates"):
+                    continue
                 if column in columns and columns[column] != fresh and columns[column].get("template") != fresh["template"] \
                         and columns[column].get("gen") in (*_FREE, "sequence", "dist", "hash_id"):
                     if columns[column].get("gen") in ("sequence", "hash_id"):
