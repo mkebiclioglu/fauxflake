@@ -742,7 +742,8 @@ class Fitter:
                 return out
         return fmt
 
-    def retype_column(self, uid: str, name: str, hint: str, fmt: str | None = None, direct: bool = False) -> bool:
+    def retype_column(self, uid: str, name: str, hint: str, fmt: str | None = None, direct: bool = False,
+                      made_up: bool = False) -> bool:
         """The model converts column `name` to `hint`: make the sources it reads generate that. `direct`: the name is a
         source column's own (it was read off a generated value), not one to follow back through the models."""
         changed = False
@@ -760,6 +761,9 @@ class Fitter:
             if gen is None:
                 continue
             kind = gen.get("gen")
+            if direct and made_up and not (kind == "template" and not gen.get("format")
+                                           and (gen.get("template") == f"{name.lower()}_{{hex}}" or gen.get("templates"))):
+                continue  # the value that failed is made-up text (`version_3fa2...`): this column makes something else by now
             numeric = hint in ("BIGINT", "DOUBLE")
             fresh = None
             kept_text = self.__dict__.setdefault("kept_text", set())  # columns a comparison showed to be text
@@ -1083,6 +1087,9 @@ class Fitter:
                                 changed = True
                 if not gen or gen.get("gen") not in _FREE or gen.get("type") or gen.get("format"):
                     continue
+                if re.fullmatch(r".+_[0-9a-f]{12}", token) and gen.get("gen") == "template" and not gen.get("templates") \
+                        and gen.get("template") != f"{name.lower()}_{{hex}}":
+                    continue  # (made-up text failed; this column has been given a shape since and makes none)
                 if fmt:  # parsed with an explicit format: text in that format
                     fresh = {"gen": "time_offset", "format": fmt, "p": [0, 0.5, 1], "seconds": [0, 86400, 604800]}
                 elif hint == "TIMESTAMP" and len(tokens) > 1 and position > 0:
@@ -2508,7 +2515,8 @@ class Fitter:
                     self.array_values(sql_key)
                     return True
                 for token in m.group("value").split():  # generated text starts with its column's name
-                    if "_" in token and self.retype_column(sql_key, token.rsplit("_", 1)[0].upper(), hint, fmt, direct=True):
+                    if "_" in token and self.retype_column(sql_key, token.rsplit("_", 1)[0].upper(), hint, fmt, direct=True,
+                                                           made_up=bool(re.fullmatch(r".+_[0-9a-f]{12}", token))):
                         if hint in ("DATE", "TIMESTAMP", "BOOLEAN") and not fmt:
                             self.cast_alike(sql_key, hint)
                         if hint in ("BIGINT", "DOUBLE") and self.tree(sql_key) is not None:
