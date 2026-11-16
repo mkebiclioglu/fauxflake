@@ -313,3 +313,20 @@ def test_one_row_without_a_parent():
         Warehouse(emu, spec, 1.0)
         rows = emu.cursor().execute("select count(*), count_if(PARENT_ID is null) from RAW.N.SUBS").fetchone()
     assert rows[0] > 20 and rows[1] == 1
+
+
+def test_numbers_in_templates_inside_and_outside_documents():
+    from fauxflake.spec import Spec
+
+    spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "history": 3, "tables": {"RAW.Y.R": {
+        "volume": {"rows_per_day": 5, "weekly": [1] * 7}, "lateness": {"p": [0, 1], "seconds": [0, 1]},
+        "columns": {"RC_ID": {"gen": "template", "template": "rc_id_{hex}"},
+                    "POB": {"gen": "template", "template": "rc_pob_id_{n}", "follows": "RC_ID"},
+                    "DOC": {"gen": "object", "fields": {"[].version": {"gen": "template", "template": "{n}.{n}.{n}"}}}}}}}, ".")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 3))
+        cur = emu.cursor()
+        follows = cur.execute("select count(*), count_if(POB = 'rc_pob_id_' || RC_ID) from RAW.Y.R").fetchone()
+        versions = [r[0] for r in cur.execute("select unnest(from_json(DOC, '[\"JSON\"]')) ->> 'version' from RAW.Y.R").fetchall()]
+    assert follows[0] == follows[1] > 5
+    assert versions and all(len(v.split(".")) == 3 and all(p.isdigit() and int(p) < 1000 for p in v.split(".")) for v in versions)
