@@ -3172,6 +3172,7 @@ class Fitter:
             expected = self.spec.setdefault("dbt", {}).setdefault("expected_failures", [])
             accepted = 0
             again: set[str] = set()  # models to build in the next round, with everything downstream
+            behind_sources: set[str] = set()  # and what reads a source one of whose tests failed
             for r in failed:
                 node = nodes.get(r["unique_id"])
                 if node is None:
@@ -3183,6 +3184,11 @@ class Fitter:
                         (nodes[d] for d in node["depends_on"]["nodes"] if d in nodes), None)
                     if tested:
                         again.add(tested["name"])
+                    for dep in node["depends_on"]["nodes"]:
+                        # a test on a source: everything that reads the source was skipped
+                        src = manifest.get("sources", {}).get(dep)
+                        if src:
+                            behind_sources.add(f"source:{src['source_name']}.{src['name']}+")
                     # a failing test either teaches the spec something, or states a fact about production
                     # data that invented data does not share: that one goes on the list of expected failures
                     if r["status"] == "error":  # the test's own SQL failed: the same lessons as for a model
@@ -3286,7 +3292,8 @@ class Fitter:
                 if owner in nodes and any(m in self.retyped for m in members):
                     again.add(nodes[owner]["name"])
             others = len(self.learned) - before - len(self.retyped)  # lessons about something else than a source's values
-            if not again or len(again) + len(changed) > 300 or (others > 0 and not changed and not again):
+            changed = sorted({*changed, *behind_sources})
+            if not (again or behind_sources) or len(again) + len(changed) > 300 or (others > 0 and not changed and not again):
                 selected = []
             else:
                 selected = ["--select", *[f"{name}+" for name in sorted(again)], *sorted(changed)]
