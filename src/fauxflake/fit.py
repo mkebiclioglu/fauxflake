@@ -929,6 +929,7 @@ class Fitter:
                 continue
             columns[name] = fresh
             self.retyped.add(table)
+            self.__dict__.setdefault("_taught", set()).add((table, name))  # (a failed build said so: a later reading leaves it)
             self.learned.append(f"{table}.{name}: used as {fresh.get('format') or hint}, retyped.")
             changed = True
         # relations that start out empty (read before they are built, or stand-ins): the declared type
@@ -3374,8 +3375,8 @@ class Fitter:
                                    and gen.get("gen") in ("fk", "pool") and "type" not in gen else {})}
                     if told_now == held:
                         continue  # (what the name suggested is what the SQL says as well)
-                    if (table, col) in gave and gave[(table, col)] != held:
-                        continue  # a failed build has corrected what an earlier reading put here: the build knows better
+                    if ((table, col) in gave and gave[(table, col)] != held) or (table, col) in self.__dict__.get("_taught", ()):
+                        continue  # a failed build has corrected what was here: the build knows better
                     mine[col] = gave[(table, col)] = told_now
                     changed += 1
                     self.retyped.add(table)
