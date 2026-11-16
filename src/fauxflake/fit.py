@@ -684,8 +684,8 @@ class Fitter:
                     for holder in (self.tables[table].get("columns") or {}).values():
                         fields = holder.get("fields") if holder.get("gen") == "object" else None
                         for path, field in list((fields or {}).items()):
-                            if re.sub(r"~\w+|\[\]", "", path).split(".")[-1].lower() == key and field.get("gen") == "template" \
-                                    and not field.get("templates") and longer(field):
+                            if re.sub(r"~\w+|\[\]", "", path).split(".")[-1].lower() == key and field.get("gen") in ("template", "dist") \
+                                    and not field.get("templates") and longer(field):  # (also a number an earlier lesson made of it)
                                 fields[path] = {"gen": "template", "template": template}
                                 self.retyped.add(table)
                                 self.learned.append(f"{table}: field {path}: {name} is a piece of it read as a number; generated as {template!r}.")
@@ -892,9 +892,16 @@ class Fitter:
                 else:
                     fresh = {**gen, "type": "VARCHAR"}
             elif hint == "ARRAY":
-                if kind == "array" or (kind == "object" and any(str(path).startswith("[]") for path in gen.get("fields") or {})):
-                    continue  # (a document whose places start with `[]` is a list already, with what its elements hold)
-                fresh = {"gen": "array"}
+                if kind == "array":
+                    continue
+                if kind == "object" and any(str(path).startswith("[]") for path in gen.get("fields") or {}):
+                    # a document whose places start with `[]` is a list already, with what its elements hold; held as
+                    # text it is not one the model can flatten as it is, so it is held as a VARIANT
+                    if not gen.get("type"):
+                        continue
+                    fresh = {k: v for k, v in gen.items() if k != "type"}
+                else:
+                    fresh = {"gen": "array"}
             elif hint == "DAY":  # `col + 1`: only a DATE takes a number of days
                 if str(gen.get("type", "")).upper() == "DATE" or gen.get("format") or gen.get("epoch"):
                     continue
