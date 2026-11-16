@@ -78,6 +78,7 @@ class SourceUse:
         self.path_optional: dict[str, set[str]] = {}  # variant column -> paths a CASE / IFF tests for being there
         self.nullable: set[str] = set()  # columns a WHERE keeps only when they are NULL
         self.null_tests: set[str] = set()  # columns the SQL asks `is null` / `is not null` of, anywhere
+        self.single_null: set[str] = set()  # `= (select x from t where parent_id is null)`: one row has no parent
         self.future: set[str] = set()  # time columns compared with the present from above (`expire_at >= current_date`)
         self.embeds: dict[str, list[tuple[str, str, tuple[str, str]]]] = {}  # text column -> (before, after, the column whose value sits between them)
         self.star = False
@@ -661,7 +662,13 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 test = held.parent
                 if isinstance(test, exp.Is) and isinstance(test.expression, exp.Null) and test.this is held:
                     use.null_tests.add(found[1])
-                if isinstance(test, exp.Is) and isinstance(test.expression, exp.Null) and test.this is held \
+                scalar = select.parent if isinstance(select.parent, exp.Subquery) and isinstance(
+                    select.parent.parent, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.Add, exp.Sub, exp.Mul, exp.Div)) else None
+                if isinstance(test, exp.Is) and isinstance(test.expression, exp.Null) and test.this is held and scalar is not None \
+                        and not isinstance(test.parent, exp.Not) and not select.args.get("group") \
+                        and not any(isinstance(p.unalias(), exp.AggFunc) for p in select.expressions):
+                    use.single_null.add(found[1])  # used as one value: more than one such row is an error in Snowflake too
+                elif isinstance(test, exp.Is) and isinstance(test.expression, exp.Null) and test.this is held \
                         and not isinstance(test.parent, exp.Not) and test.find_ancestor(exp.Where) is not None \
                         and test.find_ancestor(exp.Or, exp.If, exp.Case) is None:
                     use.nullable.add(found[1])  # `where converted_at is null`: some rows have none
@@ -1806,7 +1813,10 @@ def analyse(manifest: dict, database: str) -> Analysis:
             within_bounds(out[col], {min(window), max(window)} if ranged else use.bounds.get(col), exact=ranged)
             if col in use.future and out[col].get("gen") == "time_offset" and not out[col].get("format") and not out[col].get("epoch"):
                 out[col].update(p=[0, 0.3, 1], seconds=[-30 * 86400, 30 * 86400, 400 * 86400])  # from last month to next year
-            if col in use.nullable and out[col].get("gen") not in ("sequence", "hash_id", "loaded_at", "event_time", "lifecycle") \
+            if col in use.single_null and out[col].get("gen") not in ("sequence", "hash_id", "loaded_at", "lifecycle"):
+                out[col].pop("null_rate", None)
+                out[col]["null_once"] = True
+            elif col in use.nullable and out[col].get("gen") not in ("sequence", "hash_id", "loaded_at", "event_time", "lifecycle") \
                     and not out[col].get("null_rate"):
                 out[col]["null_rate"] = 0.3
         for col, habit in catalog.habits(name, out).items():

@@ -300,3 +300,16 @@ def test_a_log_loaded_part_way_through_a_day_has_no_row_missing_in_the_middle():
         breaks = cur.execute("select count(*) from (select PREV_HASH, lag(HASH) over (order by HEIGHT) as prior from RAW.T.BLOCKS) "
                              "where prior <> PREV_HASH").fetchone()[0]
     assert count == high - low + 1 > 600 and breaks == 0
+
+
+def test_one_row_without_a_parent():
+    from fauxflake.spec import Spec
+
+    spec = Spec.from_raw({"seed": 3, "start": "2025-01-01", "history": 3, "tables": {"RAW.N.SUBS": {
+        "volume": {"rows_per_day": 50, "weekly": [1] * 7}, "lateness": {"p": [0, 1], "seconds": [0, 1]},
+        "columns": {"ID": {"gen": "sequence"}, "PARENT_ID": {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000], "null_once": True}}}}}, ".")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 2))
+        Warehouse(emu, spec, 1.0)
+        rows = emu.cursor().execute("select count(*), count_if(PARENT_ID is null) from RAW.N.SUBS").fetchone()
+    assert rows[0] > 20 and rows[1] == 1

@@ -505,6 +505,9 @@ class TableSQL:
             rate = self.during(repr(self.sc.null_rate), rate)
         if rate != "0.0":
             expr = f"case when {self.u(col + ':null')} < {rate} then NULL else {expr} end"
+        if d.get("null_once") and self.base == "g":
+            # one row has none: the root of a tree (`where parent_id is null`, asked for as a single value)
+            expr = f"case when g = 0 then NULL else {expr} end"
         if d.get("type"):
             expr = f"({expr})::{d['type']}"
         return expr
