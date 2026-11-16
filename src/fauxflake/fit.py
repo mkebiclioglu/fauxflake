@@ -911,6 +911,8 @@ class Fitter:
                     continue
                 if gen.get("format") and not re.search(r"%[YymdjbB]", str(gen["format"])):
                     continue  # a time of day (`%H:%M:%S`), read next to its date: it stays one
+                if gen.get("format") and not re.search(r"%[dj]", str(gen["format"])) and not fmt:
+                    continue  # a year and a month (`%Y%m`) the models complete with a day before casting: it stays that
                 fresh = {"gen": "time_offset", **({"type": "DATE"} if hint == "DATE" else {}), "p": [0, 0.5, 1], "seconds": [0, 86400, 604800]}
             else:
                 fresh = guess(name, hint)
