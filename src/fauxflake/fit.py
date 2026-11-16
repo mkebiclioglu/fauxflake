@@ -3176,7 +3176,11 @@ class Fitter:
                         except Exception:  # noqa: BLE001, S110
                             pass
             results_path.unlink(missing_ok=True)
-            project.invoke(["build", *selected], silent=True)
+            os.environ["FAUXFLAKE_TESTS_DO_NOT_BLOCK"] = "1"  # (every failing test in one round; see DbtProject.invoke)
+            try:
+                project.invoke(["build", *selected], silent=True)
+            finally:
+                os.environ.pop("FAUXFLAKE_TESTS_DO_NOT_BLOCK", None)
             if not results_path.exists():
                 self.log(f"  dbt build did not run: {project.last_error[:600] or 'no results were written'}")
                 return {"error": project.last_error or "dbt build wrote no results"}

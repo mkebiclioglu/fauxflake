@@ -157,7 +157,25 @@ class DbtProject:
             "--target-path", str(self.target_path),
         ]
         _tolerate_exposures()
-        result = dbtRunner().invoke(cmd)
+        restore = None
+        if os.environ.get("FAUXFLAKE_TESTS_DO_NOT_BLOCK") and args and args[0] == "build":
+            # while a spec is being fitted: a failing test does not keep dbt from building what comes after it, so
+            # one round shows every test that fails instead of the first of each chain
+            from dbt.task.build import BuildTask
+
+            marked = BuildTask._mark_dependent_errors
+
+            def mark(task, node_id, result, cause):  # noqa: ANN001, ANN202
+                if not str(node_id).startswith(("test.", "unit_test.")):
+                    marked(task, node_id, result, cause)
+
+            BuildTask._mark_dependent_errors = mark
+            restore = lambda: setattr(BuildTask, "_mark_dependent_errors", marked)  # noqa: E731
+        try:
+            result = dbtRunner().invoke(cmd)
+        finally:
+            if restore:
+                restore()
         _close_connections()
         self.last_error = str(result.exception) if result.exception else ""
         return bool(result.success)
