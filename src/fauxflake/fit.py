@@ -582,9 +582,39 @@ class Fitter:
         """Columns the model casts to `kind` hold numbers up to `top`."""
         tree = self.tree(uid)
         target = exp.DataType.build(kind, dialect="snowflake")
-        names = [c.name.upper() for cast in (tree.find_all(exp.Cast, exp.TryCast) if tree is not None else [])
-                 if cast.to == target for c in cast.this.find_all(exp.Column)]
+        def cast_here(t) -> list[str]:  # noqa: ANN001
+            out = []
+            for cast in (t.find_all(exp.Cast, exp.TryCast) if t is not None else []):
+                if cast.to == target:
+                    out += [c.name.upper() for c in cast.this.find_all(exp.Column)]
+                    # zone.value['factor']::number(6, 3): the key read out of the document
+                    out += [b.expressions[0].name.upper() for b in cast.this.find_all(exp.Bracket)
+                            if b.expressions and isinstance(b.expressions[0], exp.Literal) and b.expressions[0].is_string]
+                    out += [str(k.this).upper() for j in cast.this.find_all(exp.JSONExtract) if isinstance(j.expression, exp.JSONPath)
+                            for k in j.expression.expressions[-1:] if isinstance(k, exp.JSONPathKey)]
+            return out
+
+        names = cast_here(tree)
+        if not names:  # the cast sits in a view upstream, and fails when this model reads it
+            for dep in sorted(self._ancestors(uid)):
+                if dep.startswith(("model.", "snapshot.")) and dep in self.sql_of:
+                    names += cast_here(self.tree(dep))
         changed = False
+        flat = lambda text: re.sub(r"[^a-z0-9]", "", text.lower())  # noqa: E731
+        wanted = {flat(n) for c in names for n in [c, *self.origins(uid, c)]}
+        for table in self.sources_of(uid):
+            # the same for a number inside a document (`zone.value['factor']::number(6, 3)`, or `locationFactor` read
+            # upstream and cast here as `location_factor`)
+            for col, holder in (self.tables[table].get("columns") or {}).items():
+                for path, field in ((holder.get("fields") or {}).items() if holder.get("gen") == "object" else ()):
+                    last = re.sub(r"~\w+|\[\]", "", path).split(".")[-1]
+                    if field.get("gen") == "dist" and flat(last) in wanted and max(field.get("v") or [0]) > top:
+                        points = len(field.get("p") or [0, 1])
+                        field["v"] = [round(top * i / max(points - 1, 1), 4) for i in range(points)]
+                        field.setdefault("p", [0, 1])
+                        self.retyped.add(table)
+                        self.learned.append(f"{table}.{col}: field {path} cast to {kind}, bounded at {top}.")
+                        changed = True
         for name in dict.fromkeys(n for c in names for n in [c, *self.origins(uid, c)]):
             for table in self.sources_of(uid):
                 gen = (self.tables[table].get("columns") or {}).get(name)
@@ -2433,6 +2463,16 @@ class Fitter:
                         not re.fullmatch(r"\d{4}-\d\d-\d\d", m.group("value")):
                     # period || '01' read as a date: the column holds a year and a month
                     if self.retype_column(sql_key, named.group(1).upper(), "DATE", "%Y%m"):
+                        tree = self.tree(sql_key)
+                        for node in (tree.find_all(exp.DPipe, exp.Concat) if tree is not None else []):
+                            # and every other period the model completes the same way, in the same lesson
+                            parts = list(node.flatten()) if isinstance(node, exp.DPipe) else list(node.expressions)
+                            if len(parts) == 2 and isinstance(parts[1], exp.Literal) and parts[1].name == "01":
+                                inner = parts[0]
+                                while isinstance(inner, (exp.Cast, exp.TryCast, exp.Paren)):
+                                    inner = inner.this
+                                if isinstance(inner, exp.Column) and inner.name.upper() != named.group(1).upper():
+                                    self.retype_column(sql_key, inner.name.upper(), "DATE", "%Y%m")
                         return True
                 if hint == "TIMESTAMP" and re.fullmatch(r"\d{4}-\d\d-\d\d \d{4}-\d\d-\d\d[ T][\d:.]+", m.group("value")):
                     return any([self.retype_column(sql_key, c, "TIMESTAMP", "%H:%M:%S") for c in self.columns_used(sql_key, "time_of_day")])
