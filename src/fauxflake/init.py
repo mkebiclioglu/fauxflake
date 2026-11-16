@@ -235,7 +235,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                links: list[set[tuple[str, str]]] | None = None,
                joins: list[tuple[tuple[str, str], tuple[str, str]]] | None = None,
                dates: list[tuple[str, date]] | None = None,
-               lookups: collections.Counter | None = None) -> dict[str, tuple[str, str]]:
+               lookups: collections.Counter | None = None,
+               coalesced: list[set[tuple[str, str]]] | None = None) -> dict[str, tuple[str, str]]:
     """Record source columns used by one model. Returns {output column: (source, source column)}
     for outputs that are a plain (possibly cast or renamed) source column."""
     try:
@@ -551,6 +552,15 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 return (*renames[owner][name], ())
             return None
 
+        if coalesced is not None:
+            # coalesce(employees, zoominfo_employees, cognism_employees): one value, whichever column has it
+            for node in select.find_all(exp.Coalesce):
+                if node.find_ancestor(exp.Select) is not select:
+                    continue
+                hits = [resolve(a) for a in [node.this, *node.expressions] if isinstance(a, exp.Column)]
+                group = {h for h in hits if h}
+                if len(group) > 1:
+                    coalesced.append(group)
         for node in select.find_all(exp.JSONExtract, exp.Bracket, exp.Column):
             if isinstance(node.parent, (exp.JSONExtract, exp.Bracket)) and node.parent.this is node:
                 continue  # part of a longer path: that one is recorded
@@ -1556,6 +1566,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
     outputs: dict[str, dict[str, tuple[str, str]]] = {}
     by_relation: dict[str, dict[str, tuple[str, str]]] = {}
     links: list[set[tuple[str, str]]] = []
+    coalesced: list[set[tuple[str, str]]] = []
     joins: list[tuple[tuple[str, str], tuple[str, str]]] = []
     dates: list[tuple[str, date]] = []
     lookups: collections.Counter = collections.Counter()
@@ -1568,7 +1579,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
         for parent in node["depends_on"]["nodes"]:
             scan(parent)
         if node.get("compiled_code"):
-            outputs[uid] = scan_model(node["compiled_code"], uses, by_relation, links, joins, dates, lookups)
+            outputs[uid] = scan_model(node["compiled_code"], uses, by_relation, links, joins, dates, lookups, coalesced)
         if node["resource_type"] == "snapshot" and "*" in outputs[uid] and outputs[uid]["*"][0] in uses:
             # `select * from source` with `unique_key='id', updated_at='modified'` in the snapshot's config: dbt reads
             # those columns of the source, though the snapshot's SQL does not name them
@@ -1588,7 +1599,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
     # once more, now that every model's outputs are known: a model that reads another by a written-out name
     # (no ref(), so dbt orders nothing) may have been read before the one it reads
     outputs.clear()
-    links.clear(), joins.clear(), dates.clear(), lookups.clear()
+    links.clear(), joins.clear(), dates.clear(), lookups.clear(), coalesced.clear()
     for uid in manifest["nodes"]:
         scan(uid)
     # a test the project wrote out as a query joins what must match (a tracking plan with the events that
@@ -1601,6 +1612,21 @@ def analyse(manifest: dict, database: str) -> Analysis:
             except Exception:  # noqa: BLE001 - a test that does not parse teaches nothing
                 pass
 
+    # the columns of one COALESCE hold one kind of value: where one is known to be a number, a date or a boolean
+    # and nothing is known of another, it is that too (the count from one vendor, then from the next)
+    for _ in range(2):
+        for group in coalesced:
+            members = [(uses[m[0]], m[1]) for m in group if len(m) == 2 and m[0] in uses]
+            if any(c in u.texts for u, c in members):
+                continue
+            hint = next((u.columns.get(c) for u, c in members if u.columns.get(c)
+                         and (hint_is_number(u.columns[c]) or u.columns[c].upper().startswith(("DATE", "TIMESTAMP", "BOOL")))), None)
+            for u, c in members:
+                if hint and not u.columns.get(c):
+                    u.columns[c] = hint
+            if any(c in u.numbers for u, c in members):
+                for u, c in members:
+                    u.numbers.add(c)
     # what is known about one column of a union holds for the columns aligned with it
     for _ in range(3):
         for group in links:

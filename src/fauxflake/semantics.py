@@ -883,7 +883,9 @@ def _fix(node: exp.Expression) -> exp.Expression:
         if isinstance(inner, exp.Anonymous) and inner.expressions:
             name, arg = inner.name.lower(), inner.expressions[0]
             if name == "ratio_to_report":
-                return _fn("_sf_div", arg.copy(), _over(node, exp.Sum(this=arg.copy())))
+                # (NULL when the group's total is zero, as Snowflake documents: not the error a plain `/` gives)
+                total = _over(node, exp.Sum(this=arg.copy()))
+                return _fn("_sf_div", arg.copy(), exp.Nullif(this=total, expression=exp.Literal.number(0)))
             if name == "conditional_true_event":
                 flag = exp.Case(ifs=[exp.If(this=arg.copy(), true=exp.Literal.number(1))], default=exp.Literal.number(0))
                 return _over(node, exp.Sum(this=flag))

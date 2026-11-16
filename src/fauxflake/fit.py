@@ -2599,7 +2599,12 @@ class Fitter:
                         names.append(leaf.name.upper())
                     elif isinstance(leaf, (exp.JSONExtract, exp.Bracket)) and isinstance(leaf.this, exp.Column):
                         changed |= self.retype_field(sql_key, leaf, hint)
-            return any([self.retype_column(sql_key, c, "DOUBLE") for c in dict.fromkeys(names)]) or changed
+            if any([self.retype_column(sql_key, c, "DOUBLE") for c in dict.fromkeys(names)]) or changed:
+                return True
+            # nullif(coalesce(payload, rebuilt)['is_dedicated'], -1)::boolean: no cast names the place; the made-up
+            # text that failed does (it starts with the name of what made it)
+            made = re.search(r'Failed to cast value to numerical: "([a-z][\w.\-]*_[0-9a-f]{12})"', message)
+            return bool(made) and self.retype(made.group(1), "BIGINT", only=set(self.sources_of(sql_key)))
         if re.search(r"argument types '[-+]\((?:TIMESTAMP[^,]*, (?:INTEGER|BIGINT|TINYINT|SMALLINT)|(?:INTEGER|BIGINT)[^,]*, TIMESTAMP)", message):
             # `term_date + 1`: Snowflake adds days to a DATE and refuses a TIMESTAMP, so the column is a DATE
             tree = self.tree(sql_key)

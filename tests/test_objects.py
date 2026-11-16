@@ -724,3 +724,10 @@ def test_flatten_of_a_variant_that_is_not_a_list_gives_no_rows(run):
     assert run("select id, a.value['n']::int from docs, lateral flatten(input => v['areas']) a order by 1, 2") == [(1, 1), (1, 2)]
     assert run("select id, a.value['n']::int from docs, lateral flatten(input => v['areas'], outer => true) a order by 1, 2") == [
         (1, 1), (1, 2), (2, None), (3, None)]
+
+
+def test_ratio_to_report_is_null_when_the_total_is_zero(run):
+    run("create or replace table sizes (day int, gb float)")
+    run("insert into sizes values (1, 0), (1, 0), (2, 1), (2, 3)")
+    assert run("select day, gb, ratio_to_report(gb) over (partition by day) from sizes order by day, gb") == [
+        (1, 0.0, None), (1, 0.0, None), (2, 1.0, 0.25), (2, 3.0, 0.75)]

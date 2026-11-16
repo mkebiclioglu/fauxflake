@@ -793,3 +793,17 @@ def test_a_snapshots_config_names_columns_of_the_source_it_selects_whole():
     }
     columns = build_spec(manifest, "A")[0]["tables"]["RAW.N.LINES"]["columns"]
     assert "UNIQUE_KEY" in columns and columns["DATE_LAST_MODIFIED_GMT"]["gen"] in ("time_offset", "updated_at", "event_time")
+
+
+def test_the_columns_of_one_coalesce_share_what_is_known_of_one():
+    from fauxflake.init import build_spec
+
+    manifest = {
+        "sources": {"source.p.s.l": {"database": "RAW", "schema": "S", "name": "leads", "identifier": "leads", "columns": {}}},
+        "nodes": {"model.p.m": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.M", "compiled_code": """
+            select id, employees::number as n, coalesce(employees, zoominfo_employees, cognism_employees) as employee_count,
+                   coalesce(name, nickname) as called from raw.s.leads"""}},
+    }
+    columns = build_spec(manifest, "A")[0]["tables"]["RAW.S.LEADS"]["columns"]
+    assert columns["COGNISM_EMPLOYEES"]["gen"] == columns["ZOOMINFO_EMPLOYEES"]["gen"] == "dist"
+    assert columns["NICKNAME"]["gen"] == "template"
