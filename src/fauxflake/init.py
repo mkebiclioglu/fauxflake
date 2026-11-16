@@ -563,7 +563,24 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 top = top.parent
             reader = top.parent
             cast = reader if isinstance(reader, (exp.Cast, exp.TryCast)) else None
+            if isinstance(reader, exp.RegexpReplace) and reader.this is top and isinstance(reader.parent, (exp.Cast, exp.TryCast)) \
+                    and reader.parent.to.is_type("float", "double", "decimal", "int", "bigint") \
+                    and (reader.args.get("replacement") is None or reader.args["replacement"].name == ""):
+                cast = reader.parent  # regexp_replace(salary, '[a-zA-Z]', '')::decimal(10, 2): a number, once the letters are gone
             hint = _parsed_as(top) or (cast.to.sql(dialect="duckdb") if cast else None)
+            if not hint or hint.upper() in ("TEXT", "VARCHAR", "STRING"):
+                # (case when d:hired = '' then null else d:hired::varchar end)::date: what the CASE gives is cast on
+                held = cast if cast is not None else top
+                branch = held.parent
+                case = branch.parent if isinstance(branch, exp.If) and held in (branch.args.get("true"), branch.args.get("false")) \
+                    and isinstance(branch.parent, exp.Case) else branch if isinstance(branch, exp.Case) and branch.args.get("default") is held \
+                    else branch if isinstance(branch, exp.If) and held in (branch.args.get("true"), branch.args.get("false")) else None
+                over = case.parent if case is not None else None
+                while isinstance(over, exp.Paren):
+                    over = over.parent
+                if isinstance(over, (exp.Cast, exp.TryCast)) and over.to.is_type(
+                        "date", "timestamp", "timestampntz", "timestampltz", "timestamptz", "float", "double", "decimal", "int", "bigint"):
+                    hint = over.to.sql(dialect="duckdb")
             outer = cast.parent if cast is not None else reader
             flattened = isinstance(outer, (exp.Explode, exp.ArraySize)) or (
                 isinstance(outer, exp.Kwarg) and isinstance(outer.parent, exp.Explode))
@@ -1377,6 +1394,8 @@ def field_gen(path: str, hint: str | None, literals: set[str] | None = None, pat
         # `like '%.pool%.near'` keeps some rows, and the values compared by name are there too
         return {"gen": "template", "templates": [*sorted(like_shape(p) for p in patterns), *sorted(literals or ()),
                                                   f"{name.lower()}_{{hex}}"]}
+    if literals and (hint or "").upper().startswith(("DATE", "TIMESTAMP")) and all(not re.search(r"[1-9]", v) for v in literals):
+        return guess(name, hint)  # compared with '' and '0000-00-00' before it is cast to a date: a date, those stand for none
     if literals and not hint_is_number(hint):
         named = sorted(literals)
         share = round(0.8 / len(named), 4)
@@ -1543,6 +1562,17 @@ def analyse(manifest: dict, database: str) -> Analysis:
             scan(parent)
         if node.get("compiled_code"):
             outputs[uid] = scan_model(node["compiled_code"], uses, by_relation, links, joins, dates, lookups)
+        if node["resource_type"] == "snapshot" and "*" in outputs[uid] and outputs[uid]["*"][0] in uses:
+            # `select * from source` with `unique_key='id', updated_at='modified'` in the snapshot's config: dbt reads
+            # those columns of the source, though the snapshot's SQL does not name them
+            config, source = node.get("config") or {}, uses[outputs[uid]["*"][0]]
+            listed = config.get("check_cols") if isinstance(config.get("check_cols"), list) else []
+            keys = config.get("unique_key") if isinstance(config.get("unique_key"), list) else [config.get("unique_key")]
+            for name in [*keys, *listed]:
+                if isinstance(name, str) and re.fullmatch(r"\w+", name):
+                    source.add(name)
+            if isinstance(config.get("updated_at"), str) and re.fullmatch(r"\w+", config["updated_at"]):
+                source.add(config["updated_at"], "TIMESTAMP")
         if node.get("relation_name"):
             by_relation[node["relation_name"].replace('"', "").upper()] = outputs[uid]
 
@@ -1698,7 +1728,8 @@ def analyse(manifest: dict, database: str) -> Analysis:
             elif (name, col) in accepted:
                 values = accepted[(name, col)]
                 out[col] = {"gen": "categorical", "values": {v: round(1 / len(values), 4) for v in values}}
-            elif 0 < len(use.literals.get(col, ())) <= 30 and not hint_is_number(hint):
+            elif 0 < len(use.literals.get(col, ())) <= 30 and not hint_is_number(hint) \
+                    and not (col in use.json_text or use.paths.get(col)):  # (a document compared with '[{}]' is still a document)
                 # `where status = 'open'` should select something: use the values the SQL names
                 named = sorted(use.literals[col] | set(sorted(use.examples.get(col, ()))[:12]))
                 share = round(0.8 / len(named), 4)

@@ -779,3 +779,17 @@ def test_a_flattened_place_that_also_has_named_keys_is_an_object():
         "q.body.data.resultType": "TEXT", "q.body.status": "TEXT", "tags[]": None, "tags[].name": "TEXT"}
     mixed = {"[].factor": "DOUBLE", "[].factor[]": None, "[].factor[].name": "TEXT", "[].name": "TEXT"}
     assert flattened_objects(mixed) == {"[].factor": "DOUBLE", "[].name": "TEXT"}
+
+
+def test_a_snapshots_config_names_columns_of_the_source_it_selects_whole():
+    from fauxflake.init import build_spec
+
+    manifest = {
+        "sources": {"source.p.n.lines": {"database": "RAW", "schema": "N", "name": "lines", "identifier": "lines", "columns": {}}},
+        "nodes": {"snapshot.p.lines_snapshot": {
+            "resource_type": "snapshot", "depends_on": {"nodes": []}, "relation_name": "A.SNAPSHOTS.LINES_SNAPSHOT",
+            "config": {"strategy": "timestamp", "unique_key": "unique_key", "updated_at": "date_last_modified_gmt"},
+            "compiled_code": "select * from raw.n.lines"}},
+    }
+    columns = build_spec(manifest, "A")[0]["tables"]["RAW.N.LINES"]["columns"]
+    assert "UNIQUE_KEY" in columns and columns["DATE_LAST_MODIFIED_GMT"]["gen"] in ("time_offset", "updated_at", "event_time")
