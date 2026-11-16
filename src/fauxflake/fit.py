@@ -661,19 +661,41 @@ class Fitter:
                         delimiter, part = arg.args.get("delimiter"), arg.args.get("part_index")
                         if not (isinstance(delimiter, exp.Literal) and isinstance(part, exp.Literal) and part.is_int):
                             break
-                        template = delimiter.name.join([*["x"] * (int(part.name) - 1), template, "x"])
+                        # (every piece a number, and one more after the one read: `12.4.0`; a later lesson that reads a
+                        # piece further on makes it longer, never back into text)
+                        template = delimiter.name.join([*["{n}"] * (int(part.name) - 1), template, "{n}"])
                     arg = arg.this
                 if not isinstance(arg, exp.Column) or template == "{n}":
                     continue
                 scope = alias.find_ancestor(exp.Select)
                 produced = scope is not None and scope.find(exp.Lateral, exp.TableFromRows, exp.Unnest) is not None \
                     and arg.name.upper() in ("VALUE", "SEQ", "INDEX", "KEY", "PATH", "THIS")
+                longer = lambda held: template.count("{n}") > str(held.get("template") or "").count("{n}")  # noqa: E731
+                # the text is a value inside a document, named in the same query: `row['version']::varchar as full_version`
+                key = None
+                for other in tree.find_all(exp.Alias):
+                    inner = other.this
+                    while isinstance(inner, (exp.Cast, exp.TryCast, exp.Paren)):
+                        inner = inner.this
+                    if other.alias.upper() == arg.name.upper() and isinstance(inner, exp.Bracket) and inner.expressions \
+                            and isinstance(inner.expressions[0], exp.Literal) and inner.expressions[0].is_string:
+                        key = inner.expressions[0].name.lower()
+                for table in (self.sources_of(uid) if key else []):
+                    for holder in (self.tables[table].get("columns") or {}).values():
+                        fields = holder.get("fields") if holder.get("gen") == "object" else None
+                        for path, field in list((fields or {}).items()):
+                            if re.sub(r"~\w+|\[\]", "", path).split(".")[-1].lower() == key and field.get("gen") == "template" \
+                                    and not field.get("templates") and longer(field):
+                                fields[path] = {"gen": "template", "template": template}
+                                self.retyped.add(table)
+                                self.learned.append(f"{table}: field {path}: {name} is a piece of it read as a number; generated as {template!r}.")
+                                changed = True
                 for table in ([] if produced else self.sources_of(uid)):  # `value` of a table function is no source column
                     columns = self.tables[table].get("columns") or {}
                     column = arg.name.upper()
                     held = columns.get(column) or {}
-                    if held.get("gen") in ("hash_id", "sequence", "fk") or "{n}" in str(held.get("template") or ""):
-                        continue  # a key, or text that already has a shape with numbers in it: another table's column failed
+                    if held.get("gen") in ("hash_id", "sequence", "fk") or ("{n}" in str(held.get("template") or "") and not longer(held)):
+                        continue  # a key, or text that already has this many numbers in it: another table's column failed
                     if column in columns and columns[column] != {"gen": "template", "template": template}:
                         columns[column] = {"gen": "template", "template": template}
                         self.retyped.add(table)
@@ -870,8 +892,8 @@ class Fitter:
                 else:
                     fresh = {**gen, "type": "VARCHAR"}
             elif hint == "ARRAY":
-                if kind == "array":
-                    continue
+                if kind == "array" or (kind == "object" and any(str(path).startswith("[]") for path in gen.get("fields") or {})):
+                    continue  # (a document whose places start with `[]` is a list already, with what its elements hold)
                 fresh = {"gen": "array"}
             elif hint == "DAY":  # `col + 1`: only a DATE takes a number of days
                 if str(gen.get("type", "")).upper() == "DATE" or gen.get("format") or gen.get("epoch"):

@@ -680,3 +680,16 @@ def test_a_time_by_name_that_the_model_casts_to_a_number_is_a_number():
     columns = tables["RAW.E.STATS"]["columns"]
     assert columns["WAIT_TIME"]["gen"] == "dist" and columns["PAYLOAD"]["fields"]["fields.fabrication_time"]["gen"] == "dist"
     assert columns["PAYLOAD"]["fields"]["time"] == time
+
+
+def test_a_piece_of_a_document_value_read_as_a_number_shapes_that_value():
+    tree = parse("""select row['version']::varchar as full_version, split_part(full_version, '.', 1) as major_version,
+                           split_part(full_version, '.', 2) as minor_version from releases""")
+    tables = {"RAW.Y.RELEASES": {"columns": {"JSONTEXT": {"gen": "object", "fields": {
+        "[].version": {"gen": "template", "template": "version_{hex}"}}}}}}
+    f = fitter(trees={"m": tree}, tables=tables)
+    f.sources_of, f._ancestors = (lambda uid: ["RAW.Y.RELEASES"]), (lambda uid: set())
+    assert f.split_number("m", "MINOR_VERSION")
+    assert tables["RAW.Y.RELEASES"]["columns"]["JSONTEXT"]["fields"]["[].version"]["template"] == "{n}.{n}.{n}"
+    f.split_number("m", "MAJOR_VERSION")  # fewer pieces: nothing is taken back
+    assert tables["RAW.Y.RELEASES"]["columns"]["JSONTEXT"]["fields"]["[].version"]["template"] == "{n}.{n}.{n}"
