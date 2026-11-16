@@ -1736,9 +1736,10 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 values = accepted[(name, col)]
                 out[col] = {"gen": "categorical", "values": {v: round(1 / len(values), 4) for v in values}}
             elif 0 < len(use.literals.get(col, ())) <= 30 and not hint_is_number(hint) \
-                    and not (hint or "").upper().startswith("BOOL") \
+                    and not (hint or "").upper().startswith(("BOOL", "DATE", "TIMESTAMP")) \
                     and not (col in use.json_text or use.paths.get(col)):
-                # (a document compared with '[{}]' is still a document; `isdeleted::boolean` compared with 'true' is a boolean)
+                # (a document compared with '[{}]' is still a document; `isdeleted::boolean` compared with 'true' is a
+                # boolean; `closedate::date` compared with '2020-02-01' is a date)
                 # `where status = 'open'` should select something: use the values the SQL names
                 named = sorted(use.literals[col] | set(sorted(use.examples.get(col, ()))[:12]))
                 share = round(0.8 / len(named), 4)
