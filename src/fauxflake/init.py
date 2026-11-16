@@ -176,6 +176,13 @@ def _is_condition(col: exp.Column) -> bool:
     return False
 
 
+def _stands_for_null(test: exp.Expression) -> bool:
+    """`iff(amount = 'true null', null, amount)`, `nullif`-style: the value compared with is a marker that is turned
+    back into NULL, not a value rows should be generated with."""
+    branch = test.parent
+    return isinstance(branch, exp.If) and branch.this is test and isinstance(branch.args.get("true"), exp.Null)
+
+
 _WRAPPERS = (exp.Cast, exp.TryCast, exp.Paren, exp.Lower, exp.Upper, exp.Trim)
 _SAME_VALUE = (exp.Lower, exp.Upper, exp.Trim, exp.Initcap, exp.Nullif, exp.Lag, exp.Lead, exp.FirstValue, exp.LastValue, exp.Max,
                exp.Min, exp.AnyValue, exp.IgnoreNulls, exp.RespectNulls, exp.Window) + tuple(
@@ -699,7 +706,7 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                             except ValueError:
                                 pass
                 if isinstance(test, (exp.EQ, exp.In)) and held in (test.this, test.args.get("expression")) \
-                        and not isinstance(test.parent, exp.Not):
+                        and not isinstance(test.parent, exp.Not) and not _stands_for_null(test):
                     values = test.expressions if isinstance(test, exp.In) else [test.expression if test.this is held else test.this]
                     named = {v for v in map(named_value, values) if v is not None and not re.fullmatch(r"[\d\s:.\-/T+Z]*", v)}
                     if named:
@@ -932,7 +939,7 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                                 and not isinstance(parent.parent, exp.Not) and re.search(r"[A-Za-z0-9]", other.name):
                             use.patterns.setdefault(hit[1], set()).add(other.name)  # name LIKE 'tap-%'
                         # `label != '(not set)'` names a value to leave out: not one to generate rows with
-                        if isinstance(parent, (exp.EQ, exp.In)) and not isinstance(parent.parent, exp.Not):
+                        if isinstance(parent, (exp.EQ, exp.In)) and not isinstance(parent.parent, exp.Not) and not _stands_for_null(parent):
                             compared = parent.expressions if isinstance(parent, exp.In) else [other]
                             use.literals.setdefault(hit[1], set()).update(
                                 v.name for v in compared if isinstance(v, exp.Literal) and v.is_string and len(v.name) <= 60)
