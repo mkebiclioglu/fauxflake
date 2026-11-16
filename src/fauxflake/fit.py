@@ -671,6 +671,9 @@ class Fitter:
                 for table in ([] if produced else self.sources_of(uid)):  # `value` of a table function is no source column
                     columns = self.tables[table].get("columns") or {}
                     column = arg.name.upper()
+                    held = columns.get(column) or {}
+                    if held.get("gen") in ("hash_id", "sequence", "fk") or "{n}" in str(held.get("template") or ""):
+                        continue  # a key, or text that already has a shape with numbers in it: another table's column failed
                     if column in columns and columns[column] != {"gen": "template", "template": template}:
                         columns[column] = {"gen": "template", "template": template}
                         self.retyped.add(table)
@@ -712,7 +715,8 @@ class Fitter:
             fresh = {"gen": "template", "template": delimiter.join(["{n}"] * max(count, 2))}
             for table in self.sources_of(uid):
                 columns = self.tables[table].get("columns") or {}
-                if column in columns and columns[column] != fresh and columns[column].get("gen") in (*_FREE, "sequence", "dist", "hash_id"):
+                if column in columns and columns[column] != fresh and columns[column].get("template") != fresh["template"] \
+                        and columns[column].get("gen") in (*_FREE, "sequence", "dist", "hash_id"):
                     if columns[column].get("gen") in ("sequence", "hash_id"):
                         self._unkey(table)  # `version` took for a key: nothing can reference 1.2.3
                     columns[column] = dict(fresh)
