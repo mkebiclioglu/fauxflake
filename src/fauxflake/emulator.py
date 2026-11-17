@@ -792,6 +792,23 @@ def _patch_fakesnow() -> None:
     if "as DATETIME_PRECISION" not in info.SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW:
         info.SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW = info.SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW.replace(
             "null::VARCHAR as DATA_TYPE_ALIAS", "null::VARCHAR as DATA_TYPE_ALIAS" + more)
+    # INFORMATION_SCHEMA.TABLES lists views too, and comments are read from where `COMMENT ON` leaves them (DuckDB's
+    # catalog: they go when the relation is replaced, as in Snowflake, and stay in a kept warehouse)
+    listed = info.SQL_CREATE_INFORMATION_SCHEMA_TABLES_VIEW.template
+    if "duckdb_views" not in listed:
+        start, end = listed.index("from duckdb_tables tables"), listed.index("where tables.database_name")
+        listed = listed[:start] + (
+            "from (select database_name, schema_name, table_name, estimated_size, comment, 'BASE TABLE' as kind from duckdb_tables\n"
+            "      union all select database_name, schema_name, view_name, null, comment, 'VIEW' from duckdb_views where not internal) tables\n"
+        ) + listed[end:]
+        listed = listed.replace("'BASE TABLE' AS \"TABLE_TYPE\"", "tables.kind AS \"TABLE_TYPE\"") \
+            .replace("_fs_tables_ext.comment AS \"COMMENT\"", "tables.comment AS \"COMMENT\"") \
+            .replace("and tables.schema_name != '_fs_information_schema'",
+                     "and tables.schema_name != '_fs_information_schema' and tables.table_name not like '\\_\\_FX\\_%' escape '\\'")
+        info.SQL_CREATE_INFORMATION_SCHEMA_TABLES_VIEW = Template(listed)
+    views_view = info.SQL_CREATE_INFORMATION_SCHEMA_VIEWS_VIEW.template
+    if "null::VARCHAR as COMMENT" in views_view:
+        info.SQL_CREATE_INFORMATION_SCHEMA_VIEWS_VIEW = Template(views_view.replace("null::VARCHAR as COMMENT", "comment as COMMENT"))
     tables_view = info.SQL_CREATE_INFORMATION_SCHEMA_TABLES_VIEW.template
     if '"ERROR_LOGGING"' not in tables_view:
         info.SQL_CREATE_INFORMATION_SCHEMA_TABLES_VIEW = Template(tables_view.replace(

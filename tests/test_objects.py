@@ -751,3 +751,24 @@ def test_stream_marks_the_two_halves_of_an_update(run):
     run("update accounts set plan = 'x' where id = 1")
     run("insert into accounts values (10, 'free')")
     assert run('select id, metadata$action, metadata$isupdate from account_adds') == [(10, "INSERT", False)]
+
+
+def test_comments_are_kept_where_information_schema_reads_them(run):
+    """What dbt's persist_docs sends, and what `dbt docs generate` reads back."""
+    run("create or replace table docs as select 1 as id, 'a' as name")
+    run("create or replace view docs_v as select * from docs")
+    run("comment on table ANALYTICS.CI.docs IS $$A table, it's documented$$")
+    run('alter table ANALYTICS.CI.docs alter "ID" COMMENT $$the key\'s "doc"$$, "NAME" COMMENT $$second$$')
+    run("comment on view docs_v is 'a ''view'''")
+    run("comment if exists on table no_such_table is 'x'")
+    with pytest.raises(Exception, match="does not exist"):
+        run("comment on table no_such_table is 'x'")
+    listed = "select table_name, table_type, comment from information_schema.tables where table_name like 'DOCS%' order by 1"
+    assert run(listed) == [("DOCS", "BASE TABLE", "A table, it's documented"), ("DOCS_V", "VIEW", "a 'view'")]
+    assert run("select column_name, comment from information_schema.columns where table_name = 'DOCS' order by 1") == [
+        ("ID", 'the key\'s "doc"'), ("NAME", "second")]
+    assert run("select comment from information_schema.views where table_name = 'DOCS_V'") == [("a 'view'",)]
+    run("alter table docs set comment = 'again'")
+    assert run(listed)[0][2] == "again"
+    run("create or replace table docs as select 1 as id")  # a replaced table starts without its comment
+    assert run(listed)[0][2] is None

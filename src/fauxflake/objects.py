@@ -959,6 +959,102 @@ _SIMPLE[:0] = [
 ]
 
 
+# ---------------------------------------------------------------- comments (dbt's persist_docs)
+
+def _string_literal(text: str, start: int = 0) -> tuple[str, int] | None:
+    """The Snowflake string that starts at `start` ('...' with '' or \\' inside, or $$...$$) and where it ends."""
+    text_from = text[start:]
+    lead = len(text_from) - len(text_from.lstrip())
+    i = start + lead
+    if text.startswith("$$", i):
+        end = text.find("$$", i + 2)
+        return (text[i + 2:end], end + 2) if end >= 0 else None
+    if not text.startswith("'", i):
+        return None
+    out, j = [], i + 1
+    while j < len(text):
+        ch = text[j]
+        if ch == "\\" and j + 1 < len(text):
+            out.append(text[j + 1])
+            j += 2
+        elif ch == "'" and text.startswith("''", j):
+            out.append("'")
+            j += 2
+        elif ch == "'":
+            return "".join(out), j + 1
+        else:
+            out.append(ch)
+            j += 1
+    return None
+
+
+def _write_comment(cursor, fq: tuple[str, str, str], column: str | None, text: str | None) -> bool:  # noqa: ANN001
+    """Keep a comment where information_schema and DESCRIBE read it. False when there is no such relation."""
+    duck = cursor._duck_conn
+    kinds = duck.execute("select 'table' from duckdb_tables() where database_name = ? and schema_name = ? and table_name = ? union all "
+                         "select 'view' from duckdb_views() where database_name = ? and schema_name = ? and view_name = ?",
+                         [*fq, *fq]).fetchall()
+    if not kinds:
+        return False
+    value = "null" if text is None else "'" + text.replace("'", "''") + "'"
+    if column is not None:
+        held = [r[0] for r in duck.execute("select column_name from duckdb_columns() where database_name = ? and schema_name = ? and "
+                                           "table_name = ? and upper(column_name) = upper(?)", [*fq, column]).fetchall()]
+        name = column if column in held else (held[0] if held else None)
+        if name is None:
+            raise error(f"SQL compilation error:\nColumn '{column}' does not exist or not authorized.", 904, "42000")
+        duck.execute(f"comment on column {_sql_name(fq)}.\"{name}\" is {value}")
+        return True
+    duck.execute(f"comment on {kinds[0][0]} {_sql_name(fq)} is {value}")
+    return True
+
+
+def _comment_on(cursor, original, state: State, m):  # noqa: ANN001, ANN202
+    literal = _string_literal(m.group("rest"))
+    if m.group("kind").lower() == "column":
+        parts = re.findall(r'"[^"]*"|[^.]+', m.group("name").strip())
+        fq, column = qualified(cursor, ".".join(parts[:-1])), _unquote(parts[-1])
+    else:
+        fq, column = qualified(cursor, m.group("name")), None
+    if literal is not None and not _write_comment(cursor, fq, column, literal[0]) and not m.group("exists"):
+        raise error(f"SQL compilation error:\nTable '{'.'.join(fq)}' does not exist or not authorized.", 2003, "42S02")
+    return _status(cursor, original, "Statement executed successfully.")
+
+
+def _column_comments(cursor, original, state: State, m):  # noqa: ANN001, ANN202
+    """ALTER TABLE t ALTER "A" COMMENT $$...$$, "B" COMMENT $$...$$ (also MODIFY, COLUMN, and in parentheses)."""
+    fq, rest = qualified(cursor, m.group("name")), m.group("rest").strip()
+    if rest.startswith("(") and rest.rstrip().rstrip(";").endswith(")"):
+        rest = rest.rstrip().rstrip(";")[1:-1]
+    at = 0
+    while True:
+        one = re.compile(r"(?is)\s*,?\s*(?:(?:alter|modify)\s+)?(?:column\s+)?(" + _NAME + r")\s+comment\s*").match(rest, at)
+        literal = _string_literal(rest, one.end()) if one else None
+        if literal is None:
+            break
+        _write_comment(cursor, fq, _unquote(one.group(1)), literal[0])
+        at = literal[1]
+    return _status(cursor, original, "Statement executed successfully.")
+
+
+def _set_comment(cursor, original, state: State, m):  # noqa: ANN001, ANN202
+    literal = _string_literal(m.group("rest")) if m.group("verb").lower() == "set" else ("", 0)
+    if literal is not None:
+        _write_comment(cursor, qualified(cursor, m.group("name")), None, literal[0] or None)
+    return _status(cursor, original, "Statement executed successfully.")
+
+
+_RELATION = r"(?:table|view|materialized\s+view|dynamic\s+table|external\s+table)"
+_SIMPLE[:0] = [
+    (re.compile(_LEAD + r"comment\s+(?P<exists>if\s+exists\s+)?on\s+(?P<kind>" + _RELATION + r"|column)\s+(?P<name>" + _NAME + r")\s+is\s+(?P<rest>.*)$"),
+     "comment_on"),
+    (re.compile(_LEAD + r"alter\s+" + _RELATION + r"\s+(?:if\s+exists\s+)?(?P<name>" + _NAME + r")\s+(?:alter|modify)\s+"
+                        r"(?P<rest>\(?\s*(?:column\s+)?" + _NAME + r"\s+comment\s.*)$"), "column_comments"),
+    (re.compile(_LEAD + r"alter\s+" + _RELATION + r"\s+(?:if\s+exists\s+)?(?P<name>" + _NAME + r")\s+(?P<verb>set|unset)\s+comment\b\s*=?\s*(?P<rest>.*)$"),
+     "set_comment"),
+]
+
+
 _TRAILING_COMMENT = re.compile(r"(?s)(?:\s*;)?\s*/\*(?:(?!\*/).)*\*/\s*;?\s*$")
 _LAST_QUERY = re.compile(r"(?i)\blast_query_id\(\s*(?:-1)?\s*\)")
 
@@ -1001,7 +1097,7 @@ def intercept(cursor, command: str, original):  # noqa: ANN001, ANN201
     """Handle a statement about one of the objects above. Returns None for everything else."""
     head = re.match(_LEAD + r"(\w+)", command)
     command = _TRAILING_COMMENT.sub("", command)  # dbt appends its query comment after the statement
-    if not head or head.group(1).lower() not in ("create", "alter", "drop", "show", "call", "execute", "declare", "begin", "use", "with", "copy"):
+    if not head or head.group(1).lower() not in ("create", "alter", "drop", "show", "call", "execute", "declare", "begin", "use", "with", "copy", "comment"):
         return None
     state = state_of(cursor._conn)
     with state.lock:
