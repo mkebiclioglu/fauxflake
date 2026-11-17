@@ -1488,6 +1488,10 @@ def _share_join_values(tables: dict[str, dict], joins: list, notes: list[str], l
             for d in named:
                 for v, w in d["values"].items():
                     values.setdefault(v, w)
+            for m in free:  # and the values another side is asked for by name, beside shapes it matches
+                for t in (gen[m].get("templates") or ()) if gen[m]["gen"] == "template" else ():
+                    if "{" not in t:
+                        values.setdefault(t, 0.16)
             for m in free:
                 put(m, {"gen": "categorical", "values": dict(values)})
         elif any(gen[m]["gen"] == "template" and any("{" not in t for t in gen[m].get("templates") or ()) for m in free):
@@ -1763,7 +1767,7 @@ def part_templates(shapes: dict[str, dict[int, set[str]]], casts: dict[str, dict
     return [*out, free]
 
 
-def flattened_objects(paths: dict[str, str | None]) -> dict[str, str | None]:
+def flattened_objects(paths: dict[str, str | None], moved: dict[str, list[str]] | None = None) -> dict[str, str | None]:
     """`flatten(input => doc:query)` beside `doc:query:success`: what is flattened is an object, not a list (a
     place cannot be both), and its "elements" are the values of its keys. What the SQL reads in an element
     (`value:data:resultType`) is read in the keys that hold objects (`query.body.data.resultType`)."""
@@ -1777,8 +1781,12 @@ def flattened_objects(paths: dict[str, str | None]) -> dict[str, str | None]:
             if keys:
                 out.pop(path, None)
                 holders = [k for k in sorted(keys) if any(o.startswith(f"{base}.{k}.") or o.startswith(f"{base}.{k}[") for o in paths)]
+                # (no key is read any deeper by name: what is read in the values is in each of them)
+                holders = holders or sorted(keys)
                 for k in holders if rest else []:
                     out.setdefault(f"{base}.{k}{rest}", paths[path])
+                    if moved is not None:
+                        moved.setdefault(path, []).append(f"{base}.{k}{rest}")
                 break
             at = path.find("[]", at + 2)
     # a place the SQL casts to a number, a date or a boolean and also takes apart (a `factor` that is a number in
@@ -2301,7 +2309,12 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 # other separators the SQL splits on come after: 123/456.json
                 out[col] = {"gen": "template", "template": sep.join(shape) + "".join(f"{other}x" for other, _ in others)}
             elif col in use.paths:
-                use.paths[col] = flattened_objects(use.paths[col])
+                moved: dict[str, list[str]] = {}
+                use.paths[col] = flattened_objects(use.paths[col], moved)
+                for asked in (use.path_literals.get(col), use.path_patterns.get(col)):
+                    for path, places in moved.items() if asked else ():  # what is asked of a value is asked in each key
+                        for place in places if path in asked else ():
+                            asked.setdefault(place, asked[path])
                 out[col] = {"gen": "object", "fields": {
                     path: field_gen(path, h, use.path_literals.get(col, {}).get(path), use.path_patterns.get(col, {}).get(path))
                     for path, h in sorted(use.paths[col].items())

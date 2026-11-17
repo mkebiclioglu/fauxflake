@@ -1203,3 +1203,31 @@ def test_joined_columns_keep_the_values_asked_for_by_name_beside_a_pattern():
     columns = {t: d["columns"] for t, d in build_spec(manifest, "A")[0]["tables"].items()}
     for held in (columns["RAW.S.OLD"]["CATEGORY"], columns["RAW.S.NEW"]["KIND"]):
         assert held["gen"] == "template" and "cli elt" in held["templates"], held
+
+
+def test_what_is_read_in_the_values_of_a_flattened_object_is_in_each_of_its_keys():
+    from fauxflake.init import flattened_objects
+
+    moved = {}
+    paths = flattened_objects({"actions[]": None, "actions[].Transfer": None, "actions[].FunctionCall": None,
+                               "actions[][]": None, "actions[][].method_name": "TEXT"}, moved)
+    assert paths == {"actions[]": None, "actions[].Transfer": None, "actions[].FunctionCall": None,
+                     "actions[].Transfer.method_name": "TEXT", "actions[].FunctionCall.method_name": "TEXT"}
+    assert moved["actions[][].method_name"] == ["actions[].FunctionCall.method_name", "actions[].Transfer.method_name"]
+
+
+def test_columns_joined_to_a_category_bring_the_values_they_are_asked_for_by_name():
+    from fauxflake.init import build_spec
+
+    def source(name, cols):
+        return {"database": "RAW", "schema": "S", "name": name, "identifier": name,
+                "columns": {c: {"data_type": t} for c, t in cols.items()}}
+
+    manifest = {
+        "sources": {"source.p.s.rates": source("rates", {"usage": "VARCHAR", "service": "VARCHAR"})},
+        "nodes": {"model.p.m": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.M", "compiled_code": """
+            select a.usage from raw.s.rates a join raw.s.rates b on a.usage = b.service
+            where b.service in ('STORAGE', 'COMPUTE') and (a.usage = 'compute' or a.usage like '%adj%')"""}},
+    }
+    columns = build_spec(manifest, "A")[0]["tables"]["RAW.S.RATES"]["columns"]
+    assert "compute" in columns["USAGE"]["values"] and "STORAGE" in columns["USAGE"]["values"], columns
