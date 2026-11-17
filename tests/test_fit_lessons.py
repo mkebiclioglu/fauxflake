@@ -748,3 +748,20 @@ def test_pivoted_values_add_up_over_rounds():
     tables["RAW.T.STAGES"]["columns"]["STAGE"] = {"gen": "categorical", "values": {"screen": 1.0}}
     assert f.pivot_values("m", message.replace("SCREEN", "OFFER"))
     assert set(tables["RAW.T.STAGES"]["columns"]["STAGE"]["values"]) == {"screen", "offer"}
+
+
+def test_numbers_are_followed_back_through_the_models_before():
+    """One made-up value fails as a number; every source column the models use as numbers is learned with it."""
+    stage = parse("select id, amount__c as amount, probability, stage_name as stage, closed_on, owner_id, "
+                  "coalesce(arr__c, 0) as arr, discount__c as discount from RAW.CRM.OPPS")
+    mart = parse("select stage, sum(amount) as amount, sum(amount * probability) as weighted, max(arr) as arr, "
+                 "sum(iff(stage = 'won', discount, 0)) as won_discount, datediff(day, closed_on, current_date) as age, "
+                 "count(distinct owner_id) as owners from stg group by 1, closed_on")
+    template = lambda name: {"gen": "template", "template": f"{name.lower()}_{{hex}}"}  # noqa: E731
+    columns = {name: template(name) for name in ("ID", "AMOUNT__C", "PROBABILITY", "STAGE_NAME", "CLOSED_ON", "OWNER_ID", "ARR__C", "DISCOUNT__C")}
+    f = fitter(trees={"model.p.mart": mart, "model.p.stg": stage}, tables={"RAW.CRM.OPPS": {"columns": columns}})
+    f._ancestors = lambda uid: {"model.p.stg"}
+    f.sources_of = lambda uid: ["RAW.CRM.OPPS"]
+    assert f.numbers_upstream("model.p.mart")
+    numbers = {name for name, gen in columns.items() if gen.get("gen") != "template"}
+    assert numbers == {"AMOUNT__C", "PROBABILITY", "ARR__C", "DISCOUNT__C"}  # not the stage, the date or the ids
