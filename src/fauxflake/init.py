@@ -198,6 +198,11 @@ def _parsed_as(node: exp.Expression) -> str | None:
     only_dates = semantics._DATES_ONLY.get(type(direct.parent))
     if only_dates and any(direct.parent.args.get(key) is direct for key in only_dates[1:]):
         return "TIMESTAMP"  # year(billed), date_trunc('month', billed): Snowflake compiles these on dates and times only
+    if isinstance(direct.parent, exp.Sub) and direct.parent.this is direct:
+        # due_on - current_date: only a date has a date taken away from it (a number of days could stand on the right)
+        other = direct.parent.expression.unnest()
+        if isinstance(other, exp.CurrentDate) or (isinstance(other, (exp.Cast, exp.TryCast)) and other.to.is_type("date")):
+            return "DATE"
     top, as_number = node, False
     while isinstance(top.parent, (exp.Cast, exp.TryCast, exp.Paren)):
         if not isinstance(top.parent, exp.Paren) and not top.parent.to.is_type(*exp.DataType.TEXT_TYPES):

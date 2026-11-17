@@ -54,3 +54,18 @@ def test_fit_updates_a_spec_without_losing_edits(tmp_path):
     after = yaml.safe_load(spec_path.read_text())["tables"]["RAW.APP.EVENTS"]
     assert after["columns"]["REGION_CODE"]["v"] == [40, 60, 70] and after["volume"]["rows_per_day"] == 123
     assert "RAW.APP.EVENTS.REGION_CODE" in out.output
+
+
+def test_init_types_columns_by_what_snowflake_compiles(tmp_path):
+    """YEAR(text) and `where number` do not compile in Snowflake, and do not here: the columns a project hands to
+    date-part functions, conditions and date arithmetic are generated as dates and booleans."""
+    project = Path(__file__).parent / "projects" / "strict_types"
+    spec_path = tmp_path / "fauxflake.yml"
+    out = CliRunner().invoke(main, ["init", "--project-dir", str(project), "--spec", str(spec_path)])
+    assert out.exit_code == 0, out.output
+    assert "4/4 models" in out.output, out.output
+    columns = yaml.safe_load(spec_path.read_text())["tables"]["RAW.APP.ACCOUNTS"]["columns"]
+    for name in ("SIGNED_UP", "BILLED_ON", "RENEWAL", "SEEN", "SHIPPED", "CLOSED", "OPENED", "FIRST_TOUCH", "LAST_TOUCH", "DUE_ON"):
+        assert columns[name]["gen"] in ("time_offset", "event_time", "updated_at"), (name, columns[name])
+    for name in ("IS_TRIAL", "CHURNED", "FLAGGED"):
+        assert str(columns[name].get("type", "")).upper() == "BOOLEAN" or set(columns[name].get("values", [])) <= {True, False}, (name, columns[name])

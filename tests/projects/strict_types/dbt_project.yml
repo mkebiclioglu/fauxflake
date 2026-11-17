@@ -1,0 +1,7 @@
+name: strict_types
+version: "1.0"
+profile: strict_types
+model-paths: [models]
+models:
+  strict_types:
+    +materialized: table
