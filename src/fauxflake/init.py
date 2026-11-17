@@ -2422,8 +2422,8 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 use.paths[col] = flattened_objects(use.paths[col], moved)
                 for asked in (use.path_literals.get(col), use.path_patterns.get(col)):
                     for path, places in moved.items() if asked else ():  # what is asked of a value is asked in each key
-                        for place in places if path in asked else ():
-                            asked.setdefault(place, asked[path])
+                        for moved_to in places if path in asked else ():
+                            asked.setdefault(moved_to, asked[path])
                 out[col] = {"gen": "object", "fields": {
                     path: field_gen(path, h, use.path_literals.get(col, {}).get(path), use.path_patterns.get(col, {}).get(path))
                     for path, h in sorted(use.paths[col].items())

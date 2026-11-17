@@ -1260,3 +1260,21 @@ def test_an_id_the_models_measure_is_that_long_wherever_it_is_matched():
     }
     columns = {t: d["columns"] for t, d in build_spec(manifest, "A")[0]["tables"].items()}
     assert columns["RAW.S.SERVERS"]["ID"].get("length") == 26 and columns["RAW.S.PINGS"]["SERVER_ID"].get("length") == 26, columns
+
+
+def test_the_reading_still_says_where_a_column_comes_from_when_a_flattened_object_was_moved():
+    from fauxflake.init import analyse
+
+    manifest = {
+        "sources": {"source.p.s.shards": {"database": "RAW", "schema": "S", "name": "shards", "identifier": "shards",
+                                          "columns": {"value": {"data_type": "VARIANT"}, "id": {"data_type": "NUMBER"}}}},
+        "nodes": {"model.p.m": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.M", "name": "m", "compiled_code": """
+            with a as (select s.id, f.value as action, s.value:actions[0]:Transfer as t, s.value:actions[0]:FunctionCall as c
+                       from raw.s.shards s, lateral flatten(input => s.value:actions) f),
+                 b as (select a.id, g.key as name, g.value:method_name::string as method_name from a, lateral flatten(input => a.action) g)
+            select * from b where method_name = 'stake'"""}},
+    }
+    analysis = analyse(manifest, "A")
+    fields = analysis.spec["tables"]["RAW.S.SHARDS"]["columns"]["VALUE"]["fields"]
+    assert "stake" in str(fields.get("actions[].FunctionCall.method_name")), fields
+    assert analysis.place("model.p.m", "ID") == ("RAW.S.SHARDS", "ID", "")
