@@ -104,6 +104,8 @@ CONTEXT = {"CURRENT_ACCOUNT": "FAUXFLAKE", "CURRENT_ACCOUNT_NAME": "FAUXFLAKE", 
            "CURRENT_REGION": "LOCAL", "CURRENT_WAREHOUSE": "LOCAL"}
 _PATHS = "\0paths"  # in a model's outputs: {column: (source, source column, path inside its document)}
 _ANY = "\0any:"  # in a model's outputs: _ANY + column -> the source columns a COALESCE takes the value from, in order
+_KEYED = "\0key:"  # in a model's outputs: _KEYED + column -> the parts of a surrogate key of several columns, in order
+_EXPR = "\0sql:"  # in a model's outputs: _EXPR + column -> (table, the value written in that source table's own columns)
 _HASHED = "\0md5:"  # in a model's outputs: _HASHED + column -> the source columns a surrogate key is the hash of
 
 
@@ -340,6 +342,7 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
     lineage: dict[str, dict[str, tuple[str, str]]] = {}  # CTE name -> its outputs
     last: dict[str, tuple[str, str]] = {}
     positional: dict[int, list] = {}  # select -> source column behind each projection, by position
+    chosen_among: dict[int, list] = {}  # select -> the source columns a projection chooses among (a COALESCE), by position
     cte_positions: dict[str, list] = {}
     outputs_of: dict[int, dict] = {}
     for scope in traverse_scope(tree):
@@ -942,6 +945,9 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     use.columns[hit[1]] = _parsed_as(col)
                 elif cast and _parsed_as(col) == "EPOCH":
                     use.columns[hit[1]] = "EPOCH"  # cast to a number only to be read as a point in time
+                elif cast and cast.to.is_type(*exp.DataType.TEXT_TYPES) and _parsed_as(col) in ("TIMESTAMP", "DATE") \
+                        and (use.columns.get(hit[1]) or "").upper() in ("", "VARCHAR", "TEXT", "STRING"):
+                    use.columns[hit[1]] = _parsed_as(col)  # try_to_timestamp(cast(issued as varchar)): a point in time
                 if _epoch_scale(col):
                     use.scales[(hit[1], "")] = _epoch_scale(col)
                 if isinstance(parent, (exp.Sum, exp.Avg, exp.Add, exp.Sub, exp.Mul, exp.Div)):
@@ -960,6 +966,11 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                             joins.append((hit, there))
                         if not there and a_calendar_day(other):
                             use.whole_days.add(hit[1])
+                        if not there and isinstance(other, exp.SplitPart) and getattr(other.args.get("delimiter"), "name", "") == "@" \
+                                and getattr(other.args.get("part_index"), "name", "") == "2":
+                            # `on a.domain = split_part(l.email, '@', 2)`: the domain the generated addresses are at
+                            use.literals.setdefault(hit[1], set()).add(MAILBOX[1:])
+                            use.texts.add(hit[1])
                 if named_numbers(parent, col):
                     use.equals.setdefault(hit[1], set()).update(named_numbers(parent, col))
                 if isinstance(parent, exp.Coalesce) and parent.this is col and hit[1].endswith("ID"):
@@ -1121,9 +1132,86 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
             alias = written(e)
             return hashed(alias, depth + 1) if alias is not None else upstream(_HASHED, e)
 
+        def inline(e, depth: int = 0):  # noqa: ANN001, ANN202
+            """`try_to_decimal(split_part(version, '.', 3)) as version_patch`: the value written in the columns of the
+            one source table it is computed from, row by row (None when rows are put together to make it)."""
+            if depth > 4 or e.find(exp.Window, exp.AggFunc, exp.Subquery, exp.Select, exp.Star) is not None:
+                return None
+            columns = list(e.find_all(exp.Column))
+            if not 0 < len(columns) <= 6 or sum(1 for _ in e.walk()) > 80:
+                return None
+            table, swap = None, {}
+            for col in columns:
+                key = (col.table.upper(), col.name.upper())
+                if key in swap:
+                    continue
+                hit, alias = resolve(col), written(col)
+                if alias is not None:  # (an alias written earlier in the select stands before a column of that name)
+                    got = inline(alias, depth + 1)
+                elif hit:
+                    got = (hit[0], exp.column(hit[1], quoted=True))
+                else:
+                    got = upstream(_EXPR, col)
+                    got = (got[0], sqlglot.parse_one(got[1], read="snowflake")) if got else None
+                if not got or (table and got[0] != table):
+                    return None
+                table, swap[key] = got[0], got[1]
+            if isinstance(e, exp.Column):
+                return table, swap[(e.table.upper(), e.name.upper())]
+            return table, e.transform(lambda n: exp.Paren(this=swap[(n.table.upper(), n.name.upper())].copy())
+                                      if isinstance(n, exp.Column) else n)
+
+        def keyed(e, depth: int = 0):  # noqa: ANN001, ANN202
+            """`md5(server_id || '-' || activity_date) as daily_server_id`: the source column behind each part of a
+            surrogate key of several columns (None for a part that is computed, a day cut out of a time among them)."""
+            while isinstance(e, (exp.Cast, exp.TryCast, exp.Paren)):
+                e = e.this
+            if isinstance(e, (exp.MD5, exp.SHA, exp.SHA2)):
+                pieces, todo = [], [e.this]
+                while todo:
+                    piece = todo.pop()
+                    while isinstance(piece, exp.Paren) or (isinstance(piece, (exp.Cast, exp.TryCast))
+                                                           and piece.to.is_type(*exp.DataType.TEXT_TYPES)):
+                        piece = piece.this
+                    if isinstance(piece, exp.DPipe):
+                        todo += [piece.expression, piece.this]
+                    elif isinstance(piece, exp.Concat):
+                        todo += reversed(piece.expressions)
+                    elif isinstance(piece, exp.Coalesce) and all(isinstance(x, exp.Literal) for x in piece.expressions):
+                        todo.append(piece.this)
+                    elif not isinstance(piece, exp.Literal):
+                        pieces.append(piece)
+                parts = []
+                for piece in pieces:
+                    for _ in range(4):  # (an alias written earlier in the select, as long as it is a plain value)
+                        if isinstance(piece, exp.Column) and written(piece) is not None:
+                            piece = written(piece)
+                            while isinstance(piece, exp.Paren) or (isinstance(piece, (exp.Cast, exp.TryCast))
+                                                                   and piece.to.is_type(*exp.DataType.TEXT_TYPES)):
+                                piece = piece.this
+                    hit = resolve(piece) if isinstance(piece, exp.Column) and not isinstance(piece.this, exp.Star) else None
+                    parts.append(tuple(hit[:2]) if hit else None)
+                return tuple(parts) if len(parts) >= 2 and any(parts) else None
+            if not isinstance(e, exp.Column) or isinstance(e.this, exp.Star) or depth >= 4:
+                return None
+            alias = written(e)
+            return keyed(alias, depth + 1) if alias is not None else upstream(_KEYED, e)
+
+        if joins is not None:
+            # `on s.daily_server_id = a.daily_server_id`, each the hash of a server and a day: the join matches when
+            # the two tables hold the same servers, so the columns behind the same part share values
+            for test in select.find_all(exp.EQ):
+                if not (isinstance(test.this, exp.Column) and isinstance(test.expression, exp.Column)) \
+                        or test.find_ancestor(exp.Select) is not select or resolve(test.this) or resolve(test.expression):
+                    continue
+                one, two = keyed(test.this), keyed(test.expression)
+                if one and two and len(one) == len(two):
+                    joins.extend((a, b) for a, b in zip(one, two) if a and b and a != b and a[0] != b[0])
+
         outputs: dict[str, tuple[str, str]] = {}
         stars = [p for p in select.expressions if isinstance(p, exp.Star) or (isinstance(p, exp.Column) and isinstance(p.this, exp.Star))]
         positional[id(select)] = by_position = []
+        chosen_among[id(select)] = by_choice = []
         for proj in select.expressions:
             inner = proj.unalias()
             while isinstance(inner, (exp.Cast, exp.TryCast, exp.Paren)):
@@ -1136,12 +1224,25 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 outputs[proj.alias_or_name.upper()] = hit
             elif not isinstance(proj, exp.Star):
                 key, among = hashed(proj.unalias()), None
+                if not key and keyed(proj.unalias()):
+                    outputs[_KEYED + proj.alias_or_name.upper()] = keyed(proj.unalias())
+                if not key:
+                    try:
+                        told = inline(proj.unalias())
+                    except Exception:  # noqa: BLE001
+                        told = None
+                    if told:
+                        outputs[_EXPR + proj.alias_or_name.upper()] = (told[0], told[1].sql(dialect="snowflake"))
                 if key:
                     outputs[_HASHED + proj.alias_or_name.upper()] = key
                 else:
                     among = behind(proj.unalias())
                 if among:
                     outputs[_ANY + proj.alias_or_name.upper()] = among
+                if among:
+                    while len(by_choice) < len(by_position) - 1:
+                        by_choice.append(())
+                    by_choice.append(tuple(spot for spot in among if len(spot) == 2))
         paths_out: dict[str, tuple[str, str, tuple[str, ...]]] = {}
         if stars and len(plain) == 1 and plain[0] in path_maps:
             paths_out.update(path_maps[plain[0]])  # `select *` (next to a FLATTEN or not) keeps what is known
@@ -1212,8 +1313,10 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 # In the real warehouse the two have one order; position says nothing about these
                 continue
             rows = [positional.get(id(b), []) for b in parts]
-            for aligned in zip(*rows):
+            for i, aligned in enumerate(zip(*rows)):
                 group = {hit for hit in aligned if hit}
+                # (`coalesce(serverversion, server_version)` in one branch: either column is lined up with the others)
+                group |= {spot for b in parts for spot in (chosen_among.get(id(b)) or [])[i:i + 1] for spot in spot}
                 if len(group) > 1:
                     links.append(group)
     return last
@@ -1389,6 +1492,48 @@ _RARELY_TRUE = re.compile(r"(?<![A-Z])(DELETED|ISDELETED|ARCHIVED|REMOVED|HIDDEN
 _USUALLY_TRUE = re.compile(r"(?<![A-Z])(ACTIVE|ENABLED|VALID|CURRENT|VERIFIED|CONFIRMED|PUBLISHED|VISIBLE|LATEST)(?![A-Z])")
 
 
+# a domain no project filters out: `example.com`, `test.com` and the company's own are what `not like` drops
+MAILBOX = "@fauxmail.net"
+_EMAIL = re.compile(r"^(?!HAS|IS_|ISDEFAULT|SUPPRESS|RECEIVE|SEND|ALLOW|ENABLE|OPT|DO_?NOT|NO_)"
+                    r".*E_?MAIL(_?ADDRESS)?(_\d+)?(_FOR_TEMPLA\w*)?(__C)?$")
+
+
+def holds_email(column: str) -> bool:
+    """`EMAIL`, `CONTACTEMAIL`, `CUST_EMAIL__C`: an address; `HASOPTEDOUTOFEMAIL`, `EMAILS_SENT`: not one."""
+    return bool(_EMAIL.match(column.upper()))
+
+
+def address_emails(tables: dict) -> list[tuple[str, str]]:
+    """Every text in a column named as an email is an address (`x@y.zz`): models keep the rows whose email is
+    valid, whatever generator the column ended up with. Columns that share values (a pool, the key the pool
+    points at) all get the same ending, so the joins between them still match. Returns what changed."""
+    pools = set()
+    for table in tables.values():
+        for col, gen in (table.get("columns") or {}).items():
+            if not holds_email(col):
+                continue
+            if gen.get("gen") == "pool" and not gen.get("numeric"):
+                pools.add(str(gen["pool"]))
+            elif gen.get("gen") == "template" and not gen.get("templates") and str(gen.get("template", "")).endswith("_{n}"):
+                pools.add(str(gen["template"])[: -len("_{n}")])
+    changed = []
+    for name, table in tables.items():
+        for col, gen in (table.get("columns") or {}).items():
+            before = dict(gen)
+            if gen.get("gen") == "pool" and not gen.get("numeric") and str(gen.get("pool")) in pools:
+                gen["suffix"] = MAILBOX
+            elif gen.get("gen") == "template" and gen.get("templates"):
+                if holds_email(col):
+                    gen["templates"] = [t + MAILBOX if t == f"{col.lower()}_{{hex}}" else t for t in gen["templates"]]
+            elif gen.get("gen") == "template":
+                shape = re.fullmatch(r"(\w+)_\{(n|hex)\}", str(gen.get("template", "")))
+                if shape and ((shape[2] == "n" and shape[1] in pools) or holds_email(col)):
+                    gen["template"] = shape[0] + MAILBOX
+            if gen != before:
+                changed.append((name, col))
+    return changed
+
+
 def guess(column: str, hint: str | None) -> dict:
     """A generator for a column we know only by name and (maybe) a cast."""
     c, h = column.upper(), (hint or "").upper()
@@ -1421,14 +1566,14 @@ def guess(column: str, hint: str | None) -> dict:
         return {"gen": "time_offset", "type": "DATE", **WEEK}
     if h.startswith("TIMESTAMP") or c.endswith(("_AT", "_TS", "_TIME", "_TIMESTAMP")) or c in ("SYSTEMMODSTAMP", "TIMESTAMP", "DATETIME"):
         return {"gen": "time_offset", **({"type": "TIMESTAMPTZ"} if h == "TIMESTAMPTZ" else {}), **WEEK}
+    if holds_email(c) and (not h or h in ("VARCHAR", "TEXT", "STRING")):
+        return {"gen": "template", "template": "user_{hex}" + MAILBOX}
     if h in ("VARCHAR", "TEXT"):
         return {"gen": "template", "template": f"{column.lower()}_{{hex}}"}
     if h in ("BIGINT", "INTEGER", "INT", "SMALLINT") or h.endswith(",0)") or c.endswith(("_ID", "_COUNT", "_QTY", "_QUANTITY")) or c == "ID":
         return {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000]}
     if re.search(r"(AMOUNT|PRICE|TOTAL|COST|REVENUE|VALUE|BALANCE|RATE|SCORE)", c):
         return {"gen": "dist", "type": "DECIMAL(18,2)", **AMOUNT}
-    if "EMAIL" in c:
-        return {"gen": "template", "template": "user_{hex}@example.com"}
     return {"gen": "template", "template": f"{column.lower()}_{{hex}}"}
 
 
@@ -1883,6 +2028,25 @@ def analyse(manifest: dict, database: str) -> Analysis:
             return found[0], found[1], path_text(found[2])
         return None
 
+    def worked_out(node_id: str, column: str):  # noqa: ANN202
+        """A model's column written in the columns of the source table it is computed from: (table, expression)."""
+        hit = locate(node_id, column)
+        if hit:
+            return hit[0], exp.column(hit[1], quoted=True)
+        told = outputs.get(node_id, {}).get(_EXPR + column.upper())
+        return (told[0], sqlglot.parse_one(told[1], read="snowflake")) if told else None
+
+    def decided_by(node_id: str, column: str) -> tuple[str, str, str] | None:
+        """The one source column a computed time comes from: the first choice of a COALESCE
+        (`coalesce(actual_release_date, planned)`), or the only column in its arithmetic (`dateadd(month, -1, planned)`)."""
+        among = outputs.get(node_id, {}).get(_ANY + column.upper())
+        if among and len(among[0]) == 2:
+            return among[0][0], among[0][1], ""
+        told = worked_out(node_id, column)
+        names = {c.name.upper() for c in told[1].find_all(exp.Column)} if told else set()
+        return (told[0], names.pop(), "") if len(names) == 1 else None
+
+    gated: list[tuple[tuple[str, str], str]] = []  # (a column, the rule about the row that holds wherever it is not null)
     keys: dict[str, str] = {}
     ordered: list[tuple[tuple[str, str, str], tuple[str, str, str]]] = []  # (the later, the earlier) of two times a test compares
     together: list[tuple[str, list[str]]] = []  # (table, columns a test says are unique together)
@@ -1913,9 +2077,20 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 said = None
             if isinstance(said, (exp.GT, exp.GTE, exp.LT, exp.LTE)) and isinstance(said.this, exp.Column) and isinstance(said.expression, exp.Column):
                 later, earlier = (said.this, said.expression) if isinstance(said, (exp.GT, exp.GTE)) else (said.expression, said.this)
-                ends = [place(node["attached_node"], c.name) for c in (later, earlier)]
+                ends = [place(node["attached_node"], c.name) or decided_by(node["attached_node"], c.name) for c in (later, earlier)]
                 if all(ends) and ends[0][0] == ends[1][0] and ends[0] != ends[1]:
                     ordered.append((ends[0], ends[1]))
+            kw = meta["kwargs"].get("arguments") or meta["kwargs"]
+            only = re.fullmatch(r"\s*(\w+)\s+is\s+not\s+null\s*", str(kw.get("where") or (node.get("config") or {}).get("where") or ""), re.I)
+            gate = locate(node["attached_node"], only[1]) if only and said is not None else None
+            if gate:
+                # `expression: "version_patch = '0'"` with `where: "rc1_date is not null"`: a rule about each row, kept
+                # by leaving the tested column empty in the rows the rule does not hold for
+                parts = {c.name.upper(): worked_out(node["attached_node"], c.name) for c in said.find_all(exp.Column)}
+                if parts and all(parts.values()) and {part[0] for part in parts.values()} == {gate[0]}:
+                    rule = said.transform(lambda n: exp.Paren(this=parts[n.name.upper()][1].copy()) if isinstance(n, exp.Column) else n)
+                    rule = rule.transform(lambda n: exp.Var(this=f"__col_{n.name.upper()}__") if isinstance(n, exp.Column) else n)
+                    gated.append((gate, re.sub(r"__col_(\w+?)__", r"{{\1}}", rule.sql(dialect="duckdb"))))
             continue
         here = locate(node["attached_node"], column) if column else None
         if not here and column and meta["name"] == "relationships":
@@ -1933,6 +2108,14 @@ def analyse(manifest: dict, database: str) -> Analysis:
                         fks.setdefault(spot, theirs[0])
                     else:
                         begins.append((spot, theirs[0]))
+        if not here and column and meta["name"] == "relationships":
+            # `project_id` read out of a document (`fields:project.id`) is tested against the projects: the ids
+            # inside the documents are ids the parent holds
+            kw = meta["kwargs"].get("arguments") or meta["kwargs"]
+            others = [n for n in node["depends_on"]["nodes"] if n != node["attached_node"]]
+            inside, there = place(node["attached_node"], column), locate(others[0], str(kw.get("field", ""))) if others else None
+            if inside and inside[2] and there and there[0] != inside[0]:
+                joins.append((inside, (there[0], there[1], "")))
         if not here:
             continue
         if meta["name"] == "unique":
@@ -2289,6 +2472,9 @@ def analyse(manifest: dict, database: str) -> Analysis:
             top = max(before["seconds"])
             if min(after["seconds"]) <= top:
                 after.update(p=[0, 0.5, 1], seconds=[top + 86400, top + 30 * 86400, top + 365 * 86400])
+        elif after and before and after.get("gen") == before.get("gen") == "time_offset" and before.get("unique") \
+                and after.get("unique") and before.get("plus_days") and not after.get("plus_days"):
+            after["plus_days"] = before.pop("plus_days")  # the two ends of a period: the test says which one closes it
     # `where server_id = '93myk...'` on a column that refers to another table's key: that table has a row with that id
     for name, table in tables.items():
         for col, gen in table["columns"].items():
@@ -2318,6 +2504,8 @@ def analyse(manifest: dict, database: str) -> Analysis:
         elif not (head == "{0}" and held.get("parts") == [shared]):
             continue
         tables[child]["columns"][col] = dict(shared)
+    if begins:
+        _share_union_values(tables, links)  # (what is lined up with such a column in a UNION holds the same list)
     # a foreign key needs its parent to have a key
     for (child, col), (parent, pcol) in fks.items():
         if child in tables and parent in tables and tables[parent]["columns"].get(pcol, {}).get("gen") not in ("sequence", "hash_id") \
@@ -2397,6 +2585,17 @@ def analyse(manifest: dict, database: str) -> Analysis:
                      f"warehouse: the build runs as that role (`dbt: {{role: {role}}}`).")
     for table in tables.values():
         follow_categories(table["columns"])
+    address_emails(tables)
+    for table in tables.values():
+        created_comes_first(table["columns"])
+        for gen in table["columns"].values():
+            if gen.get("gen") == "object" and gen.get("fields"):
+                created_comes_first(gen["fields"])
+    for (name, col), rule in gated:
+        columns = tables.get(name, {}).get("columns") or {}
+        if col in columns and columns[col].get("gen") not in _KEYS and rule_binds(rule, col, columns):
+            columns[col]["null_unless"] = rule
+            notes.append(f"{name}.{col}: a test states a rule about the rows that have one; it is empty in the other rows (`null_unless`).")
     least = rows_asked(manifest)
     if least:
         notes.append(f"the project lists tables by their size (`row_count >= {least}` in INFORMATION_SCHEMA.TABLES): every "
@@ -2416,6 +2615,54 @@ HEADER = """# Written by `fauxflake init` from the dbt project. Keys, relationsh
 # from your tests; columns and types from how models use each source. Volumes, lateness and
 # distributions are placeholders: run `fauxflake profile` to measure them, or edit by hand.
 """
+
+
+_BEGUN = re.compile(r"(date)?(created|opened|started)(at|on|date|time)?$")
+_ENDED = re.compile(r"(date|last)?(updated|modified|resolved|resolution|closed|completed|merged|finished|ended|deleted)(at|on|date|time)?$")
+
+
+def created_comes_first(columns: dict) -> None:
+    """`created` and `updated` side by side (columns of a table, or fields of one object in a document): a thing is
+    changed, resolved or closed after it is made. The later time starts where the range of the earlier one stops,
+    so `datediff(day, created, closed)` is never below zero."""
+    by_place: dict[str, dict[str, list[str]]] = {}
+    for name, gen in columns.items():
+        if gen.get("gen") != "time_offset" or gen.get("unique") or not gen.get("seconds"):
+            continue
+        head, _, leaf = name.rpartition(".")
+        leaf = re.sub(r"[^a-z]", "", leaf.lower())
+        role = "begun" if _BEGUN.fullmatch(leaf) else "ended" if _ENDED.fullmatch(leaf) else None
+        if role:
+            by_place.setdefault(head, {}).setdefault(role, []).append(name)
+    for found in by_place.values():
+        if len(found.get("begun", ())) != 1:
+            continue
+        top = max(columns[found["begun"][0]]["seconds"])
+        for name in found.get("ended", ()):
+            if min(columns[name]["seconds"]) <= top:
+                columns[name].update(p=[0, 0.5, 1], seconds=[top + 60, top + 3 * 86400, top + 30 * 86400])
+
+
+def rule_binds(rule: str, col: str, columns: dict) -> bool:
+    """Whether a rule about a row (`{{VERSION}}` standing for a column) is one the generator can work out: it names
+    columns the table has, not the one it gates, and DuckDB takes it with values of their kinds."""
+    names = set(re.findall(r"\{\{(\w+)\}\}", rule))
+    if not names or col in names or not names <= set(columns) or any(columns[n].get("null_unless") for n in names):
+        return False
+
+    def kind(gen: dict) -> str:
+        if gen.get("type"):
+            return str(gen["type"])
+        return "TIMESTAMP" if gen.get("gen") in ("event_time", "time_offset", "loaded_at", "updated_at") else \
+            "BIGINT" if gen.get("gen") in ("sequence", "dist") or gen.get("numeric") else "VARCHAR"
+
+    try:
+        import duckdb
+
+        duckdb.connect().execute("select " + re.sub(r"\{\{(\w+)\}\}", lambda m: f"cast(NULL as {kind(columns[m[1]])})", rule))
+    except Exception:  # noqa: BLE001
+        return False
+    return True
 
 
 def follow_categories(columns: dict) -> None:

@@ -1025,3 +1025,111 @@ def test_a_text_whose_shapes_begin_with_a_category_follows_it():
             "select count(*), sum(case when starts_with(command, category) then 1 else 0 end), count(distinct category) "
             "from RAW.P.EVENTS").fetchone()
     assert total > 1000 and begin == total and kinds == 4
+
+
+def test_a_column_named_as_an_email_holds_addresses():
+    from fauxflake.init import MAILBOX, address_emails, guess, holds_email
+
+    assert holds_email("CONTACTEMAIL") and holds_email("CUST_EMAIL__C") and holds_email("context_traits_email")
+    assert not holds_email("HASOPTEDOUTOFEMAIL") and not holds_email("INACTIVE_SERVER_EMAILS_SENT")
+    assert guess("TRIAL_EMAIL", "VARCHAR")["template"].endswith(MAILBOX)
+    assert guess("HASOPTEDOUTOFEMAIL", None)["template"] == "hasoptedoutofemail_{hex}"
+    tables = {
+        "A": {"columns": {"EMAIL": {"gen": "template", "template": "email_{n}"},
+                          "NAME": {"gen": "template", "template": "name_{hex}"}}},
+        "B": {"columns": {"CONTACT": {"gen": "pool", "pool": "email", "size": 200},
+                          "OWNER_EMAIL": {"gen": "template", "templates": ["a@b.cc", "owner_email_{hex}"]},
+                          "N": {"gen": "pool", "pool": "n", "size": 5, "numeric": True}}},
+    }
+    assert sorted(address_emails(tables)) == [("A", "EMAIL"), ("B", "CONTACT"), ("B", "OWNER_EMAIL")]
+    assert tables["A"]["columns"]["EMAIL"]["template"] == "email_{n}" + MAILBOX
+    assert tables["B"]["columns"]["CONTACT"]["suffix"] == MAILBOX
+    assert tables["B"]["columns"]["OWNER_EMAIL"]["templates"] == ["a@b.cc", "owner_email_{hex}" + MAILBOX]
+    assert tables["A"]["columns"]["NAME"] == {"gen": "template", "template": "name_{hex}"}
+    assert address_emails(tables) == []
+
+
+def test_a_text_cast_handed_to_a_timestamp_parser_says_the_column_is_a_time():
+    sources = {"RAW.T.LICENSE": SourceUse()}
+    scan_model("""
+        with source as (select * from raw.t.license)
+        select try_to_timestamp_ntz(cast(_start as varchar)) as starts_at, cast(name as varchar) as name from source""", sources)
+    assert sources["RAW.T.LICENSE"].columns["_START"] == "TIMESTAMP"
+    assert sources["RAW.T.LICENSE"].columns["NAME"].upper() in ("VARCHAR", "TEXT")
+
+
+def test_a_join_on_surrogate_keys_of_several_columns_links_what_they_are_made_of():
+    key = "md5(cast(coalesce(cast(server_id as text), '_null_') || '-' || coalesce(cast(server_date as text), '_null_') as text))"
+    uses, outputs, joins, *_ = _scan({
+        "a.b.servers": f"select user_id as server_id, cast(timestamp as date) as server_date, {key} as daily_server_id "
+                       "from raw.t.server",
+        "a.b.activity": f"select user_id as server_id, cast(timestamp as date) as server_date, {key} as daily_server_id, "
+                        "mau from raw.t.activity",
+        "a.b.joined": "select s.server_id, a.mau from a.b.servers s left join a.b.activity a "
+                      "on s.daily_server_id = a.daily_server_id",
+    }, ["RAW.T.SERVER", "RAW.T.ACTIVITY"])
+    assert joins == [(("RAW.T.SERVER", "USER_ID"), ("RAW.T.ACTIVITY", "USER_ID"))]  # the servers, not the days
+
+
+def test_a_column_joined_to_the_domain_of_an_email_holds_the_domain_addresses_are_at():
+    from fauxflake.init import MAILBOX
+
+    uses, *_ = _scan({"a.b.link": "select l.id, a.id from raw.t.lead l left join raw.t.account a "
+                                  "on a.domain = split_part(l.email, '@', 2) where a.id is not null"},
+                     ["RAW.T.LEAD", "RAW.T.ACCOUNT"])
+    assert uses["RAW.T.ACCOUNT"].literals["DOMAIN"] == {MAILBOX[1:]}
+
+
+def test_a_rule_a_test_states_about_the_rows_that_have_a_value_is_kept_by_leaving_the_others_empty():
+    from fauxflake.init import build_spec
+
+    manifest = {
+        "sources": {"source.p.s.releases": {
+            "database": "RAW", "schema": "S", "name": "releases", "identifier": "releases",
+            "columns": {c: {"data_type": t} for c, t in {"version": "VARCHAR", "release_date": "DATE",
+                                                         "actual_release_date": "DATE", "rc1_date": "DATE"}.items()}}},
+        "nodes": {
+            "model.p.stg": {"resource_type": "model", "depends_on": {"nodes": ["source.p.s.releases"]}, "relation_name": "A.B.STG",
+                            "compiled_code": """
+                select version, try_to_decimal(split_part(version, '.', 3)) as version_patch,
+                       release_date::date as planned_release_date,
+                       dateadd(month, -1, planned_release_date) as release_start_date,
+                       coalesce(actual_release_date::date, planned_release_date) as actual_release_date,
+                       rc1_date::date as rc1_date
+                from raw.s.releases"""},
+            "test.p.rc1": {"resource_type": "test", "attached_node": "model.p.stg", "depends_on": {"nodes": ["model.p.stg"]},
+                           "config": {"where": "rc1_date is not null"},
+                           "test_metadata": {"name": "expression_is_true", "namespace": "dbt_utils",
+                                             "kwargs": {"expression": "version_patch = '0'"}}},
+            "test.p.start": {"resource_type": "test", "attached_node": "model.p.stg", "depends_on": {"nodes": ["model.p.stg"]},
+                             "test_metadata": {"name": "expression_is_true", "namespace": "dbt_utils",
+                                               "kwargs": {"expression": "release_start_date < actual_release_date"}}},
+        },
+    }
+    spec, notes = build_spec(manifest, "A")
+    columns = spec["tables"]["RAW.S.RELEASES"]["columns"]
+    assert "{{VERSION}}" in columns["RC1_DATE"]["null_unless"] and "null_unless" not in columns["VERSION"]
+    # the start is worked out from the planned date, the release is the actual date when there is one: it comes later
+    assert min(columns["ACTUAL_RELEASE_DATE"]["seconds"]) > max(columns["RELEASE_DATE"]["seconds"])
+
+
+def test_created_comes_before_updated_also_inside_a_document():
+    from fauxflake.init import created_comes_first
+
+    week = {"gen": "time_offset", "p": [0, 0.5, 1], "seconds": [0, 86400, 604800]}
+    fields = {"created": dict(week), "updated": dict(week), "resolutiondate": dict(week), "status.name": {"gen": "template", "template": "x"},
+              "parent.created": dict(week), "duedate": dict(week)}
+    created_comes_first(fields)
+    assert min(fields["updated"]["seconds"]) > 604800 and min(fields["resolutiondate"]["seconds"]) > 604800
+    assert fields["created"] == week and fields["parent.created"] == week and fields["duedate"] == week
+
+
+def test_a_coalesce_in_one_branch_of_a_union_is_lined_up_with_the_other_branch():
+    uses = {name: SourceUse() for name in ("RAW.A.SCORE", "RAW.B.SCORE")}
+    links: list = []
+    scan_model("""
+        with a as (select id, server_version as version_full from raw.a.score),
+             b as (select id, coalesce(serverversion, server_version) as version_full from raw.b.score)
+        select id, version_full from a union select id, version_full from b""", uses, {}, links, [], [])
+    assert {(m[0], m[1]) for group in links for m in group if any(x[1] == "SERVER_VERSION" for x in group)} == {
+        ("RAW.A.SCORE", "SERVER_VERSION"), ("RAW.B.SCORE", "SERVERVERSION"), ("RAW.B.SCORE", "SERVER_VERSION")}

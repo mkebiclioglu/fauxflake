@@ -35,7 +35,7 @@ import yaml
 from sqlglot import exp
 
 from . import emulator
-from .init import follow_categories, guess, periods_have_length, unique_together, within_bounds
+from .init import address_emails, follow_categories, guess, periods_have_length, unique_together, within_bounds
 from .spec import quoted
 
 Log = Callable[[str], None]
@@ -1209,6 +1209,9 @@ class Fitter:
                     self.retyped.add(table)
                     self.learned.append(f"{table}.{col}: its shapes begin with values of {gen['begins_with']}; each row's text "
                                         "begins with the row's own.")
+        for table, col in address_emails(self.tables):
+            self.retyped.add(table)
+            self.learned.append(f"{table}.{col}: holds emails; every value is an address.")
 
     def _holds_text(self, gen: dict) -> bool:
         number = lambda v: isinstance(v, (int, float)) or re.fullmatch(r"-?\d+(\.\d+)?", str(v)) is not None  # noqa: E731
@@ -4072,7 +4075,11 @@ class Fitter:
                 columns[col] = {"gen": "dist", "type": gen.get("type", "BIGINT"), "p": [0, 1], "v": [1, 1000], "unique": True}
             else:
                 fresh = {"gen": "template", "template": f"{col.lower()}_{{hex}}"}  # one value per row
-                if gen == fresh:
+                held = [v for v in (gen.get("values") or ()) if isinstance(v, str)] if gen["gen"] in ("categorical", "row_of") else []
+                if held:
+                    # the values it shares with a seed or another table (what a join meets on): each once, in the first rows
+                    fresh["named"] = list(dict.fromkeys(held))[:500]
+                if gen == fresh or (gen.get("gen") == "template" and gen.get("named")):
                     return False
                 columns[col] = fresh
             self.learned.append(f"{table}.{col}: a `unique` test failed, now generated without repeats.")

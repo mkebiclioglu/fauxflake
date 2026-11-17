@@ -195,6 +195,11 @@ class TableSQL:
             return f"(case {index} {arms} else {self._key_expr(table, d, index)} end)"
         return self._key_expr(table, d, index)
 
+    @staticmethod
+    def ending(d: dict) -> str:
+        """What every value of a pool ends with (`email_7@fauxmail.net`), as one more argument of its concat."""
+        return f", {lit(str(d['suffix']))}" if d.get("suffix") else ""
+
     def _key_expr(self, table: Table, d: dict, index: str) -> str:
         if d.get("template") and d["gen"] == "hash_id":
             # an id with a shape (`{n}.{n}.{n}`): the row's number written across the `{n}`s, the last ones a digit
@@ -427,11 +432,11 @@ class TableSQL:
         elif gen == "pool" and col in self.grain() and self.base == "g":
             sizes = self.grain()
             n = f"((_n // {math.prod(list(sizes.values())[:list(sizes).index(col)])}) % {sizes[col]})::bigint"
-            expr = f"({n} + 1)" if d.get("numeric") else f"concat({lit(str(d['pool']) + '_')}, {n})"
+            expr = f"({n} + 1)" if d.get("numeric") else f"concat({lit(str(d['pool']) + '_')}, {n}{self.ending(d)})"
         elif gen == "pool":
             # one of `size` values shared by every column that names the same pool: joins between them match
             n = f"floor({self.u(col)} * {int(d.get('size', 200))})::bigint"
-            expr = f"({n} + 1)" if d.get("numeric") else f"concat({lit(str(d['pool']) + '_')}, {n})"
+            expr = f"({n} + 1)" if d.get("numeric") else f"concat({lit(str(d['pool']) + '_')}, {n}{self.ending(d)})"
         elif gen == "dist":
             # (in a log, a number filtered by ranges grows with time: a range is a stretch of consecutive rows)
             expr = piecewise(self.log_fraction() if self.in_order() and len(d["p"]) > 2 and "." not in col else self.u(col), d["p"], d["v"])
@@ -481,6 +486,10 @@ class TableSQL:
                 expr = f"case ({self._expr(str(d['begins_with']), lead)})::varchar {arms} else {one_of(shapes)} end"
             else:
                 expr = one_of(shapes)
+            if d.get("named") and self.base == "g" and "." not in col:
+                # values another table or a seed holds, in a column no two rows share: the first rows have them
+                arms = " ".join(f"when {i} then {lit(str(v))}" for i, v in enumerate(d["named"]))
+                expr = f"(case g {arms} else {expr} end)"
         elif gen == "time_offset":
             expr = f"_ev + {ms(piecewise(self.u(col), d['p'], d['seconds']))}"
             if self.in_order() and min(d["seconds"]) >= 0 and max(d["seconds"]) <= 7 * 86400:
@@ -548,6 +557,10 @@ class TableSQL:
             rate = self.during(repr(self.sc.null_rate), rate)
         if rate != "0.0":
             expr = f"case when {self.u(col + ':null')} < {rate} then NULL else {expr} end"
+        if d.get("null_unless") and self.base == "g" and "." not in col:
+            # a rule about the row holds wherever the column has a value: no value in the rows it does not hold for
+            rule = re.sub(r"\{\{(\w+)\}\}", lambda m: f"({self.expr(m[1], self.t.columns[m[1]])})", str(d["null_unless"]))
+            expr = f"case when ({rule}) then {expr} end"
         if d.get("null_once") and self.base == "g":
             # one row has none: the root of a tree (`where parent_id is null`, asked for as a single value)
             expr = f"case when g = 0 then NULL else {expr} end"
