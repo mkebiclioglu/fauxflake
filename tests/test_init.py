@@ -923,3 +923,13 @@ def test_values_that_contain_something_also_begin_the_way_that_is_asked():
 
     assert like_shapes({"http%", "%utm_content=partner%"}) == ["http{hex}", "http{hex}utmxcontent=partner{hex}"]
     assert like_shapes({"%a%", "%.com"}) == ["{hex}.com", "{hex}a{hex}"]
+
+
+def test_a_time_matched_with_a_calendar_day_is_a_whole_day():
+    from fauxflake.init import scan_model, SourceUse
+
+    uses = {"RAW.P.PINGS": SourceUse()}
+    scan_model("with pings as (select ping_date::timestamp as ping_date, sent_at from RAW.P.PINGS), "
+               "days as (select date_day from A.B.DIM_DATE) "
+               "select * from pings inner join days on ping_date = date_day", uses, None, [], [])
+    assert uses["RAW.P.PINGS"].whole_days == {"PING_DATE"}

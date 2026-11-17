@@ -60,6 +60,7 @@ class SourceUse:
         self.text_bounds: dict[str, set[int]] = {}  # text column -> numbers written as text it is ranged by (`between '4000' and '4999'`)
         # column -> texts and LIKE patterns asked of the columns it is lined up with in a UNION
         self.united: dict[str, dict[str, set[str]]] = {"literals": {}, "patterns": {}}
+        self.whole_days: set[str] = set()  # time columns matched with a calendar's day (`on ping_date = date_day`)
         self.equals: dict[str, set[int]] = {}  # column -> whole numbers the SQL asks for by name (`project_id = 278964`, `in (1, 2)`)
         self.scales: dict[tuple[str, str], int] = {}  # (column, path in its document) -> digits of an epoch number below the second
         self.splits: dict[str, dict] = {}  # text column -> {"seps": {"/": {0: "BIGINT"}}, "digits": False} from split()[i]::type
@@ -101,6 +102,16 @@ _DATE_LITERAL = re.compile(r"(\d{4})-(\d{2})-(\d{2})(?:[ T]00:00:00(?:\.0+)?)?")
 CONTEXT = {"CURRENT_ACCOUNT": "FAUXFLAKE", "CURRENT_ACCOUNT_NAME": "FAUXFLAKE", "CURRENT_ORGANIZATION_NAME": "FAUXFLAKE",
            "CURRENT_REGION": "LOCAL", "CURRENT_WAREHOUSE": "LOCAL"}
 _PATHS = "\0paths"  # in a model's outputs: {column: (source, source column, path inside its document)}
+
+
+_CALENDAR_DAY = re.compile(r"DATE_DAY|DATE_ACTUAL|CALENDAR_DATE|CALENDAR_DAY|DAY_DATE|DATE|DAY")
+
+
+def a_calendar_day(node: exp.Expression | None) -> bool:
+    """`dim_date.date_day`, `date_spine.date_actual`: a calendar's column of days, by its name."""
+    while isinstance(node, (exp.Paren, exp.Cast, exp.TryCast)):
+        node = node.this
+    return isinstance(node, exp.Column) and bool(_CALENDAR_DAY.fullmatch(node.name.upper()))
 
 
 def named_numbers(test: exp.Expression | None, held: exp.Expression) -> set[int]:
@@ -656,6 +667,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 if isinstance(side.parent, exp.EQ):
                     other = side.parent.expression if side.parent.this is side else side.parent.this
                     there = resolve_path(other) if not isinstance(other, exp.Literal) else None
+                    if there is None and not found[2] and a_calendar_day(other):
+                        sources[found[0]].whole_days.add(found[1])  # matched with a calendar: a day, not a moment in it
                     if isinstance(there, tuple) and there[0] in sources and not there[2]:
                         sources[found[0]].embeds.setdefault(found[1], []).append((found[2][1], found[2][2], (there[0], there[1])))
                 continue
@@ -931,6 +944,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                         there = resolve(other) if isinstance(other, exp.Column) else None
                         if there and there[0] != hit[0]:
                             joins.append((hit, there))
+                        if not there and a_calendar_day(other):
+                            use.whole_days.add(hit[1])
                 if named_numbers(parent, col):
                     use.equals.setdefault(hit[1], set()).update(named_numbers(parent, col))
                 if isinstance(parent, (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ, exp.Between)):
@@ -2125,6 +2140,12 @@ def analyse(manifest: dict, database: str) -> Analysis:
             return column
         return (column.get("fields") or {}).get(spot[2]) if column.get("gen") == "object" else None
 
+    for name, use in uses.items():
+        for c in sorted(use.whole_days):
+            held = (tables.get(name, {}).get("columns") or {}).get(c) or {}
+            if held.get("gen") in ("event_time", "time_offset") and not held.get("trunc") and not held.get("format") \
+                    and not held.get("epoch") and str(held.get("type", "")).upper() != "DATE":
+                held["trunc"] = "day"  # `on ping_date = date_day`: a time of day would never meet the calendar's day
     for name, use in uses.items():
         # a table matched on an entity and its period together (`on q.warehouse_id = m.entity_id and q.hour = m.start_time`)
         # holds one row per period for each of a few entities, as a meter or a daily balance does: generated so, and
