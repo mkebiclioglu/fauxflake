@@ -505,13 +505,39 @@ def _create_stream(cursor, original, state: State, m: re.Match):  # noqa: ANN001
     initial = bool(re.search(r"(?i)\bshow_initial_rows\s*=\s*true", options))
     base = _sql_name((fq[0], fq[1], f"__FX_STREAM_{fq[2]}"))
     duck = cursor._duck_conn
-    duck.execute(f"create or replace table {base} as select * from {source}" + (" where false" if initial else ""))
-    meta = "false as \"METADATA$ISUPDATE\", md5(cast(t as varchar)) as \"METADATA$ROW_ID\""
-    view = f"select t.*, 'INSERT' as \"METADATA$ACTION\", {meta} from (select * from {source} except all select * from {base}) t"
-    if not append_only:
-        view += f" union all select t.*, 'DELETE' as \"METADATA$ACTION\", {meta} from (select * from {base} except all select * from {source}) t"
+    src = qualified(cursor, m.group("source"))
+    is_table = bool(duck.execute("select 1 from duckdb_tables() where database_name = ? and schema_name = ? and table_name = ?",
+                                 list(src)).fetchall())
+    if is_table:
+        # The rows that changed are found by comparing the table with a copy taken at the stream's offset. A row
+        # DuckDB updated in place keeps its row id: where the row with one id reads differently now, the old
+        # version and the new one are the two halves of an UPDATE (METADATA$ISUPDATE, one METADATA$ROW_ID).
+        snapshot = (f'create or replace table {base} as select s.rowid as "__FX_RID", md5(cast(s as varchar)) as "__FX_KEY", s.* '
+                    f"from {source} s")
+        old = f'select * exclude ("__FX_RID", "__FX_KEY") from {base}'
+        pairs = (f'(select b."__FX_KEY" as old_k, md5(cast(s as varchar)) as new_k, md5(b."__FX_RID"::varchar) as rid from {base} b '
+                 f'join {source} s on s.rowid = b."__FX_RID" where b."__FX_KEY" <> md5(cast(s as varchar)))')
+
+        def side(action: str, rows: str, key: str) -> str:
+            return (f"select t.*, '{action}' as \"METADATA$ACTION\", u.rid is not null as \"METADATA$ISUPDATE\", "
+                    f"coalesce(u.rid, md5(cast(t as varchar))) as \"METADATA$ROW_ID\" from ({rows}) t "
+                    f"left join (select {key} as k, min(rid) as rid from {pairs} group by 1) u on u.k = md5(cast(t as varchar))")
+
+        view = side("INSERT", f"select * from {source} except all {old}", "new_k") if not append_only else (
+            f"select t.*, 'INSERT' as \"METADATA$ACTION\", false as \"METADATA$ISUPDATE\", md5(cast(t as varchar)) as "
+            f"\"METADATA$ROW_ID\" from (select s.* from {source} s where s.rowid not in (select \"__FX_RID\" from {base})) t")
+        # (an append-only stream shows the rows added since its offset, not the ones changed)
+        if not append_only:
+            view += " union all " + side("DELETE", f"{old} except all select * from {source}", "old_k")
+    else:
+        snapshot = f"create or replace table {base} as select * from {source}"
+        meta = "false as \"METADATA$ISUPDATE\", md5(cast(t as varchar)) as \"METADATA$ROW_ID\""
+        view = f"select t.*, 'INSERT' as \"METADATA$ACTION\", {meta} from (select * from {source} except all select * from {base}) t"
+        if not append_only:
+            view += f" union all select t.*, 'DELETE' as \"METADATA$ACTION\", {meta} from (select * from {base} except all select * from {source}) t"
+    duck.execute(snapshot + (" where false" if initial else ""))
     duck.execute(f"create or replace view {_sql_name(fq)} as {view}")
-    state.streams[fq] = {"source": source, "base": base, "mode": "APPEND_ONLY" if append_only else "DEFAULT"}
+    state.streams[fq] = {"source": source, "base": base, "mode": "APPEND_ONLY" if append_only else "DEFAULT", "snapshot": snapshot}
     return _status(cursor, original, f"Stream {fq[2]} successfully created.")
 
 
@@ -522,7 +548,7 @@ def consume_streams(cursor, command: str) -> None:  # noqa: ANN001
         return
     for fq, stream in state.streams.items():
         if re.search(r'(?i)(?<![\w$])"?' + re.escape(fq[2]) + r'"?(?![\w$])', command):
-            cursor._duck_conn.execute(f"create or replace table {stream['base']} as select * from {stream['source']}")
+            cursor._duck_conn.execute(stream.get("snapshot") or f"create or replace table {stream['base']} as select * from {stream['source']}")
 
 
 # ---------------------------------------------------------------- COPY INTO from cloud storage

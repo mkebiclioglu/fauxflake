@@ -243,7 +243,7 @@ production weekly and opens a pull request with what moved.
 | **Python models** | Snowpark sends its SQL here, so a Python model runs like a SQL one (`pip install "fauxflake[snowpark]"`); models that only use `session.sql`, `session.table` and pandas need no extra |
 | **Functions** | SQL functions and SQL table functions become macros; Python functions run as written; JavaScript functions run in an embedded engine |
 | **Procedures** | Snowflake Scripting (variables, `IF`, `CASE`, loops, cursors, `RESULTSET`, `EXECUTE IMMEDIATE`, exception handlers), JavaScript with the `snowflake` API, Python with a session; `CALL`, anonymous blocks and anonymous procedures |
-| **Streams** | show the rows inserted and deleted since they were last consumed; a DML statement that reads one consumes it |
+| **Streams** | show the rows inserted, deleted and updated (`METADATA$ISUPDATE`, one `METADATA$ROW_ID` for both halves) since they were last consumed; a DML statement that reads one consumes it |
 | **Tasks** | stored with their schedule and predecessors; `EXECUTE TASK` runs one and its resumed children; `simulate` runs the scheduled ones at every step |
 | **Masking and row access policies** | applied wherever the table is read, for the current role (`USE ROLE`, or `dbt: {role: ...}` in the spec) |
 | **Loading** | `COPY INTO` from S3, GCS, Azure or HTTPS with `PATTERN` and `FILES`; internal stages and file formats; external table definitions; pipes and alerts, stored and run on demand |
@@ -325,7 +325,6 @@ from at-least-once loaders and out-of-order updates appear without being scripte
 - **The session time zone is UTC**, and a `TIMESTAMP_TZ` does not remember its original offset.
 - **Where Snowflake leaves an order undefined** (`LISTAGG` without `ORDER BY`, ties in a
   window) the two engines pick differently.
-- **A stream reports an update as a delete and an insert** with `METADATA$ISUPDATE` false.
 - **Time travel reads current data.** `AT` and `BEFORE` are accepted; there is no history.
 - **A transaction that writes to two databases commits at that point** and continues in
   autocommit, with a message. Within one database it behaves as Snowflake's does.

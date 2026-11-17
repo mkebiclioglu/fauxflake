@@ -731,3 +731,23 @@ def test_ratio_to_report_is_null_when_the_total_is_zero(run):
     run("insert into sizes values (1, 0), (1, 0), (2, 1), (2, 3)")
     assert run("select day, gb, ratio_to_report(gb) over (partition by day) from sizes order by day, gb") == [
         (1, 0.0, None), (1, 0.0, None), (2, 1.0, 0.25), (2, 3.0, 0.75)]
+
+
+def test_stream_marks_the_two_halves_of_an_update(run):
+    run("create or replace table accounts as select column1 id, column2 plan from values (1, 'free'), (2, 'free'), (3, 'pro'), (4, 'pro')")
+    run("create or replace stream account_changes on table accounts")
+    run("update accounts set plan = 'pro' where id = 2")
+    run("""merge into accounts using (select 3 id, 'team' plan union all select 9, 'free') s on accounts.id = s.id
+           when matched then update set plan = s.plan when not matched then insert (id, plan) values (s.id, s.plan)""")
+    run("delete from accounts where id = 4")
+    run("update accounts set plan = 'free' where id = 1")  # to what it already was: no change to report
+    rows = run('select id, plan, metadata$action, metadata$isupdate, metadata$row_id from account_changes order by id, metadata$action')
+    assert [r[:4] for r in rows] == [
+        (2, "free", "DELETE", True), (2, "pro", "INSERT", True), (3, "pro", "DELETE", True), (3, "team", "INSERT", True),
+        (4, "pro", "DELETE", False), (9, "free", "INSERT", False)]
+    assert rows[0][4] == rows[1][4] and rows[2][4] == rows[3][4] and len({r[4] for r in rows}) == 4  # one row id per changed row
+    # an append-only stream shows what was added, not what was changed
+    run("create or replace stream account_adds on table accounts append_only = true")
+    run("update accounts set plan = 'x' where id = 1")
+    run("insert into accounts values (10, 'free')")
+    assert run('select id, metadata$action, metadata$isupdate from account_adds') == [(10, "INSERT", False)]
