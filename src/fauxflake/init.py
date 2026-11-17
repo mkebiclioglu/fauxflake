@@ -80,6 +80,10 @@ class SourceUse:
         # list is empty (or the column null) wherever the rule, written in the table's own columns, does not hold
         self.implied: list[tuple[str, str, str]] = []
         self.readings: set[tuple[str, str]] = set()
+        # (the thing, the start, the end): rows looked up by a thing and a moment inside their period (`on a.namespace_id =
+        # h.namespace_id and a.created_at >= h.valid_from and a.created_at < coalesce(h.valid_to, '2099-01-01')`):
+        # the history of each thing, whose periods never overlap
+        self.histories: set[tuple[str, str, str]] = set()
         self.lengths: dict[str, int] = {}  # text column -> how long the models take its values to be (`length(server_id) <> 26`: invalid)
         # ((column, path), (column, path)): rows kept as the latest of each of the first, then looked up by the
         # second (`partition by dns` ... `on x.installation_id = l.installation_id`): the first belongs to one of the second
@@ -905,6 +909,29 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                         continue  # (a calendar that is itself a generated table: `join dates d on d.date between start and end`)
                     if len(owners) == 1 and probes and not owners & probes and "" not in owners:
                         role.setdefault(next(iter(owners)), []).append(bound)
+            if keyed and on is not None:
+                looked = (join.this.alias_or_name or "").upper()
+                of_looked = lambda e: [resolve_path(c) for c in e.find_all(exp.Column) if c.table.upper() == looked]  # noqa: E731
+                things = [spot for e in on.find_all(exp.EQ) if isinstance(e.this, exp.Column) and isinstance(e.expression, exp.Column)
+                          and e.this.table != e.expression.table for spot in of_looked(e)]
+                starts, ends = [], []
+                for test in on.find_all(exp.GT, exp.GTE, exp.LT, exp.LTE, exp.Between):
+                    if isinstance(test, exp.Between):
+                        if not of_looked(test.this):
+                            starts += of_looked(test.args["low"])
+                            ends += of_looked(test.args["high"])
+                        continue
+                    above = isinstance(test, (exp.GT, exp.GTE))
+                    if of_looked(test.expression) and not of_looked(test.this):
+                        (starts if above else ends).extend(of_looked(test.expression))  # `a.at >= h.valid_from`
+                    elif of_looked(test.this) and not of_looked(test.expression):
+                        (ends if above else starts).extend(of_looked(test.this))  # `h.valid_from <= a.at`
+                columns_of = lambda spots: {spot[:2] for spot in spots if isinstance(spot, tuple) and not spot[2] and spot[0] in sources}  # noqa: E731
+                thing, start, end = columns_of(things), columns_of(starts), columns_of(ends)
+                if len(thing) == len(start) == len(end) == 1 and len({t for t, _ in thing | start | end}) == 1 \
+                        and len({c for _, c in thing | start | end}) == 3:
+                    table = next(iter(thing))[0]
+                    sources[table].histories.add((next(iter(thing))[1], next(iter(start))[1], next(iter(end))[1]))
             for owner in set(lower) & set(upper):
                 for role, bounds in (("start", lower[owner]), ("end", upper[owner])):
                     for column in (c for bound in bounds for c in bound.find_all(exp.Column)):
@@ -2664,6 +2691,29 @@ def analyse(manifest: dict, database: str) -> Analysis:
             held[column] = {"gen": "row_of", "group": seed, "values": [row[i] for row in rows]}
         joined.append(f"{table} ({', '.join(columns)}): joined together to the seed {seed}, generated as the rows it lists.")
     _share_join_values(tables, joins, joined, lookups)
+    for name, use in uses.items():
+        columns = tables.get(name, {}).get("columns") or {}
+        for thing, start, end in sorted(use.histories):
+            if (thing, end, start) in use.histories and re.search(r"(^|_)(TO|END|UNTIL|ENDED|CLOSED)(_|$)", start):
+                continue  # (read both ways round by two joins: the one that starts at the start)
+            # rows looked up by a thing and a moment between two of their times: the history of the thing, in periods
+            # that never overlap (a moment in two of them would bring every row that looks it up twice). One period
+            # for each thing here, most of them still open
+            held, since, until = columns.get(thing) or {}, columns.get(start) or {}, columns.get(end) or {}
+            if since.get("gen") not in ("time_offset", "event_time", "updated_at", "loaded_at") or until.get("gen") != "time_offset" \
+                    or until.get("unique") or since.get("unique"):
+                continue
+            if held.get("gen") == "fk" and not held.get("per_parent") and not held.get("first"):
+                held["per_parent"] = 1
+            elif held.get("gen") == "dist" and not held.get("unique") and str(held.get("type", "BIGINT")).upper() in ("BIGINT", "INTEGER", "INT"):
+                held["unique"] = True
+            elif held.get("gen") not in _KEYS and not held.get("unique") and held.get("per_parent") != 1:
+                continue
+            until["null_rate"] = max(float(until.get("null_rate") or 0), 0.8)
+            if since.get("gen") == "time_offset":
+                ordered.append(((name, end, ""), (name, start, "")))
+            notes.append(f"{name}: models look rows up by {thing} and a moment between {start} and {end}; generated as one period "
+                         f"for each {thing.lower()}, most of them still open.")
     as_long_as(tables, uses, [*joins, *((a, b) for group in links for a in sorted(group, key=str)[:1] for b in sorted(group, key=str)[1:])], notes)
     _share_union_values(tables, links)
     if joined:

@@ -3466,7 +3466,8 @@ class Fitter:
                                 outcome.pop(r["unique_id"], None)
                                 self.learned.append(f"test {node['name']}: names a column its model does not write; listed as an expected failure.")
                     if r["status"] == "fail" and not self.learn_from_test(node, analysis) \
-                            and not self.learn_from_singular(node, analysis, self._compiled(project, node)) and node["name"] not in expected:
+                            and not self.learn_from_singular(node, analysis, self._compiled(project, node)) \
+                            and not self.learn_from_twice(node, analysis) and node["name"] not in expected:
                         expected.append(node["name"])
                         accepted += 1
                         outcome.pop(r["unique_id"], None)
@@ -3640,6 +3641,108 @@ class Fitter:
                                         f"{' ...' if len(named) > 4 else ''}; some rows hold those now.")
                     changed = True
         self.dirty |= changed
+        return changed
+
+    def behind_relation(self, ctes: list, relation: exp.Expression, column: str, depth: int = 0) -> tuple[str, str] | None:
+        """The model (its id) and column behind a column of something a query reads: a relation a model built, or a
+        CTE that passes the column on from one (`dim_project as (select * from prod.common.dim_project)`)."""
+        if not isinstance(relation, exp.Table) or depth > 6:
+            return None
+        if relation.db:
+            fq = ".".join(part.upper() for part in (relation.catalog, relation.db, relation.name) if part)
+            uid = self.by_rel.get(fq) or self.relation_owner.get(fq)
+            return (uid, column.upper()) if uid else None
+        cte = next((c for c in ctes if c.alias.upper() == relation.name.upper()), None)
+        select = cte.this.unnest() if cte is not None else None
+        if not isinstance(select, exp.Select) or select.args.get("from_") is None:
+            return None
+        read = {t.alias_or_name.upper(): t for t in [select.args["from_"].this, *(j.this for j in select.args.get("joins") or [])]}
+        written = next((p.unalias() for p in select.expressions if p.alias_or_name.upper() == column.upper() and not isinstance(p, exp.Star)), None)
+        while isinstance(written, (exp.Cast, exp.TryCast, exp.Paren)):
+            written = written.this
+        earlier = ctes[: ctes.index(cte)]
+        if isinstance(written, exp.Column):
+            source = read.get(written.table.upper()) if written.table else (next(iter(read.values())) if len(read) == 1 else None)
+            return self.behind_relation(earlier, source, written.name, depth + 1) if source is not None else None
+        if written is None and len(read) == 1 and any(isinstance(p, exp.Star) or (isinstance(p, exp.Column) and isinstance(p.this, exp.Star))
+                                                      for p in select.expressions):
+            return self.behind_relation(earlier, next(iter(read.values())), column, depth + 1)
+        return None
+
+    def learn_from_twice(self, node: dict, analysis) -> bool:  # noqa: ANN001
+        """A `unique` test fails on a column whose source holds every value once: the model itself brings a row
+        twice, or a model it reads does. The warehouse the build left says where (`why.Twice`): a join that pairs a
+        row with several on the other side. In the real data the other side has one row for what it is matched on
+        (one set of settings for a project, one current plan for a namespace); the column behind it is generated
+        without repeats."""
+        meta = node.get("test_metadata") or {}
+        tested = node.get("attached_node") or next(iter(reversed(node.get("depends_on", {}).get("nodes") or [])), None)
+        column = node.get("column_name") or (meta.get("kwargs") or {}).get("column_name")
+        tried = self.__dict__.setdefault("_twice_tried", set())
+        if meta.get("name") != "unique" or not tested or not column or not re.fullmatch(r"\w+", str(column)) or node["name"] in tried:
+            return False
+        tried.add(node["name"])
+        return self.comes_twice(tested, str(column), analysis, node["name"])
+
+    def comes_twice(self, uid: str, column: str, analysis, test: str, depth: int = 0) -> bool:  # noqa: ANN001
+        """Where the values of a model's column come to repeat, followed up through the models it reads; True when
+        the spec was taught something about it (now, or for another test that led to the same place)."""
+        from . import why
+
+        seen = self.__dict__.setdefault("_twice_seen", {})
+        if (uid, column.upper()) in seen:
+            return seen[uid, column.upper()]
+        seen[uid, column.upper()] = False
+        model = self.nodes.get(uid)
+        if not model or uid not in self.sql_of or depth > 4 or len(seen) > 400:
+            return False
+        try:
+            conn = self.emu._fs.connect(database=model["database"], schema=model["schema"])
+        except Exception:  # noqa: BLE001
+            return False
+        try:
+            walk = why.Twice(conn.cursor(), self.sql_of[uid], column)
+            finding = walk.find()
+        except Exception:  # noqa: BLE001 - a query the walk cannot take apart teaches nothing
+            return False
+        finally:
+            conn.close()
+        ctes = list(walk.ctes)
+        if finding.scope != "the final select":  # inside a CTE: what it reads are the CTEs before it
+            at = next((i for i, c in enumerate(ctes) if finding.scope.split(",")[0].upper() == c.alias.upper()), len(ctes))
+            ctes = ctes[:at]
+        changed = False
+        if finding.kind == "join" and isinstance(finding.node, exp.Join) and finding.node.args.get("on") is not None:
+            join = finding.node
+            alias = (join.this.alias_or_name or "").upper()
+            asked: list[tuple[str, str]] = []
+            # what the other side is matched on by equality (a bound of a period, or a flag, is not what names its row)
+            for cond in join.args["on"].find_all(exp.EQ):
+                for mine, theirs in ((cond.this, cond.expression), (cond.expression, cond.this)):
+                    if isinstance(mine, exp.Column) and mine.table.upper() == alias and isinstance(theirs, exp.Column) and theirs.table.upper() != alias:
+                        behind = self.behind_relation(ctes, join.this, mine.name)
+                        if behind:
+                            asked.append(behind)
+            asked = list(dict.fromkeys(asked))
+            if len(asked) > 1 and len({other for other, _ in asked}) == 1:
+                # matched on several columns: together they name one row of the other side
+                asked, changed = [], self.together(asked[0][0], [name for _, name in asked], analysis, test)
+            for other, name in asked:
+                before = len(self.learned)
+                # the other side is a model that repeats what it is matched on: where that comes from, first
+                if self.comes_twice(other, name, analysis, test, depth + 1):
+                    changed = True
+                elif self.learn_from_test({"name": test, "attached_node": other, "column_name": name, "depends_on": {"nodes": [other]},
+                                           "test_metadata": {"name": "unique", "kwargs": {}}}, analysis):
+                    changed = True
+                    self.learned[before:] = [f"{line} (test {test}: {model['name']} met several rows of "
+                                             f"{self.nodes[other]['name'] if other in self.nodes else other} for one {name.lower()})"
+                                             for line in self.learned[before:]]
+        elif finding.kind == "input" and finding.node is not None:
+            behind = self.behind_relation(ctes, finding.node, column)
+            if behind and behind[0] != uid:
+                changed = self.comes_twice(behind[0], behind[1], analysis, test, depth + 1)
+        seen[uid, column.upper()] = changed
         return changed
 
     def learn_from_empties(self, nodes: dict, limit: int = 200) -> int:
