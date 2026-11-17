@@ -579,7 +579,7 @@ class TableSQL:
                 # (a few of them, from a place in the list that differs from row to row: each value is in some lists)
                 known = "[" + ", ".join(lit(v) for v in [*d["values"], *d["values"]]) + "]"
                 at = f"floor({self.u(col + ':from')} * {len(d['values'])})::bigint"
-                expr = f"to_json(list_slice({known}, 1 + {at}, {at} + {n}))::JSON"
+                expr = f"to_json(list_slice({known}, 1 + {at}, {at} + least({n}, {len(d['values'])})))::JSON"  # (no value twice)
             else:
                 expr = f"to_json(list_transform(range({n}), lambda i: concat({lit(col.lower() + '_')}, i)))::JSON"
         elif gen == "event_time":

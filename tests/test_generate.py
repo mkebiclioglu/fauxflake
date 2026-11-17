@@ -546,3 +546,18 @@ def test_references_spare_the_rows_a_flag_of_the_parent_marks(tmp_path):
         assert 0.1 < marked / rows < 0.2
         assert cur.execute("""select count(*), count_if(a."ID" is null), count_if(a."DELETED") from "RAW"."T"."REVIEWS" r
                               left join "RAW"."T"."ACCOUNTS" a on a."ID" = r."ACCOUNT_ID" """).fetchone()[1:] == (0, 0)
+
+
+def test_a_list_of_known_values_holds_each_at_most_once(tmp_path):
+    from datetime import datetime
+
+    from fauxflake.emulator import serve
+    from fauxflake.generate import Warehouse
+    from fauxflake.spec import Spec
+
+    spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "tables": {"RAW.T.TRACKS": {"volume": {"rows_per_day": 400}, "columns": {
+        "ID": {"gen": "sequence"}, "SKUS": {"gen": "array", "values": ["professional", "enterprise"]}}}}}, tmp_path / "x.yml")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 3))
+        rows = emu.cursor().execute("""select distinct "SKUS"::varchar from "RAW"."T"."TRACKS" """).fetchall()
+        assert {r[0] for r in rows} == {"[]", '["professional"]', '["enterprise"]', '["professional","enterprise"]', '["enterprise","professional"]'}
