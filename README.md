@@ -308,8 +308,8 @@ distributions with measurements from production, reading aggregates only.
 | key | meaning |
 | --- | --- |
 | `start`, `history` | the first day of the generated history and how many days it holds when a run begins (60 unless the dates your SQL compares with need more). In a history of several years, `recent` (days) and `older` (a share) keep the last year at full volume and thin the days before it, so a long history costs what a short one does. `least_rows` is set when the project picks tables by size (`row_count >= 100` in `INFORMATION_SCHEMA.TABLES`): every table holds at least that many rows at any scale |
-| `tables` | one entry per source table: `volume`, `lateness`, `duplicate_rate`, `mode: upsert`, and a generator per column |
-| column generators | `sequence`, `hash_id`, `fk`, `categorical`, `dist`, `template`, `pool`, `time_offset`, `event_time`, `updated_at`, `loaded_at`, `lifecycle`, `object`, `array`, `ip`, `constant`; any column takes `null_rate` and `type` |
+| `tables` | one entry per source table: `volume`, `lateness`, `duplicate_rate`, `mode: upsert`, and a generator per column. `until_day` / `from_day` give a table rows only while it was in use (a system another took over from); `grain` lists the columns a table of readings has one row a day (or an hour) for |
+| column generators | `sequence`, `hash_id`, `fk`, `categorical`, `dist`, `template`, `pool`, `time_offset`, `event_time`, `updated_at`, `loaded_at`, `lifecycle`, `object`, `array`, `ip`, `constant`; any column takes `null_rate` and `type`. `null_unless` leaves a column empty in the rows where a rule about the row does not hold (`{{COLUMN}}` stands for another column); `of: 20` on a key makes it name twenty things in turn, for readings taken day after day; a `pool` takes a `suffix` |
 | `existing` | relations the project reads before it builds them; they start each run empty. `keeps` lists columns a snapshot table still has from an earlier version of its model |
 | `udfs` | stand-ins, in DuckDB SQL, for functions that exist only in your account |
 | `locations` | cloud storage prefixes that `COPY INTO` should read from a local directory instead |
