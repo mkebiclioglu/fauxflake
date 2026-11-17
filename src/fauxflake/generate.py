@@ -674,6 +674,14 @@ class TableSQL:
         # one row a day for each combination of the listed values: the rows of a day take them in turn, and
         # a day has no more rows than there are combinations
         grain = f" and _n < {math.prod(self.grain().values()) * (24 if self.grain_hour() else 1)}" if self.grain() else ""
+        things = next((c for c in self.grain() if t.columns.get(c, {}).get("of")), None)
+        if things and t.raw.get("gaps"):
+            # readings miss a day now and then (a server that was down, a report that never arrived): the thing has
+            # no row that day, which is what the models that fill the days in between are written for
+            sizes = self.grain()
+            turn = f"((_n // {math.prod(list(sizes.values())[:list(sizes).index(things)])}) % {sizes[things]})"
+            grain += (f" and hash(concat({lit(f'{self.spec.seed}:{t.name}:gap:')}, day::varchar, ':', {turn})) % 1000 "
+                      f">= {int(float(t.raw['gaps']) * 1000)}")
         if with_new_column:
             since = f"timestamp '{self.sc.start} 00:00:00'"
             cols += f',\n  case when _loaded >= {since} then \'v2\' end as "{self.sc.new_column}"'

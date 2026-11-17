@@ -407,14 +407,15 @@ def test_a_table_of_readings_holds_a_row_a_day_for_each_of_a_few_things(tmp_path
     from fauxflake.generate import Warehouse
     from fauxflake.spec import Spec
 
-    spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "tables": {
+    raw = {"seed": 1, "start": "2025-01-01", "tables": {
         "RAW.T.SERVER": {"volume": {"rows_per_day": 2}, "grain": ["TIMESTAMP", "USER_ID"], "columns": {
             "USER_ID": {"gen": "hash_id", "of": 5, "named": ["93myk"]},
             "INSTALLATION": {"gen": "template", "template": "installation_{hex}", "follows": "USER_ID", "named": ["u85ky", "qe3n8"]},
             "TIMESTAMP": {"gen": "event_time"}, "RECEIVED_AT": {"gen": "loaded_at"}}},
         "RAW.T.EVENT": {"volume": {"rows_per_day": 300}, "columns": {
             "ID": {"gen": "sequence"}, "SERVER": {"gen": "fk", "ref": "RAW.T.SERVER", "skew": 1.5},
-            "TIMESTAMP": {"gen": "event_time"}}}}}, tmp_path / "x.yml")
+            "TIMESTAMP": {"gen": "event_time"}}}}}
+    spec = Spec.from_raw(raw, tmp_path / "x.yml")
     with serve() as emu:
         Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 11))
         cur = emu.cursor()
@@ -434,6 +435,15 @@ def test_a_table_of_readings_holds_a_row_a_day_for_each_of_a_few_things(tmp_path
         assert cur.execute("""select count(*) from "RAW"."T"."EVENT" e left join "RAW"."T"."SERVER" s
                               on s."USER_ID" = e."SERVER" and s."TIMESTAMP"::date = e."TIMESTAMP"::date
                               where e."TIMESTAMP" < '2025-01-10' and s."USER_ID" is null""").fetchone()[0] == 0
+
+    # a reading in five never arrives (`gaps`): every server is still there, with days missing
+    raw["tables"]["RAW.T.SERVER"]["gaps"] = 0.2
+    spec = Spec.from_raw(raw, tmp_path / "y.yml")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 31))
+        things, rows = emu.cursor().execute("""select count(distinct "USER_ID"), count(*) from "RAW"."T"."SERVER"
+                                               where "TIMESTAMP" < '2025-01-30'""").fetchone()
+        assert things == 5 and 5 * 29 * 0.6 < rows < 5 * 29 * 0.95
 
 
 def test_a_table_another_took_over_from_has_rows_only_while_it_was_in_use():

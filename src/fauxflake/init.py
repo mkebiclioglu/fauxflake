@@ -2671,6 +2671,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
                     and not when.get("format") and not when.get("epoch") and not when.get("unique") and not tables[name].get("grain"):
                 held["of"] = 20
                 tables[name]["grain"] = [moment, thing]
+                tables[name]["gaps"] = 0.05  # (a reading in twenty never arrives: days the models have to fill in)
                 for other, gen in columns.items():
                     # what a reading says about the thing in words (its installation, its address) is the same in
                     # every reading of it; what it counts changes from day to day
@@ -2722,6 +2723,11 @@ def analyse(manifest: dict, database: str) -> Analysis:
         elif after and before and after.get("gen") == before.get("gen") == "time_offset" and before.get("unique") \
                 and after.get("unique") and before.get("plus_days") and not after.get("plus_days"):
             after["plus_days"] = before.pop("plus_days")  # the two ends of a period: the test says which one closes it
+        elif after and before and after.get("gen") == before.get("gen") == "time_offset" and after.get("unique") and after.get("every_days") \
+                and not before.get("unique") and not before.get("format") and not before.get("epoch"):
+            # releases follow one another every so often, and each has a date that comes before its release (the
+            # first candidate is cut two weeks ahead): on the release's own schedule, some days earlier
+            before.update(unique=True, every_days=after["every_days"], plus_days=int(after.get("plus_days") or 0) - 14)
     # `where server_id = '93myk...'` on a column that refers to another table's key: that table has a row with that id
     for name, table in tables.items():
         for col, gen in table["columns"].items():
