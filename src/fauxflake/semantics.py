@@ -2193,6 +2193,7 @@ def coerce_union_literals(transformed: exp.Expression, conn) -> exp.Expression: 
     return transformed
 
 
+CLOCK_LITERALS: dict[str, str] = {}  # the literals the simulated clock put into a statement, and what stood there
 LOOSE_TABLES: set[str] = set()  # DATABASE.SCHEMA.TABLE of generated tables: their column names are not case-exact
 MIXED_CASE: set[str] | None = None  # names of relations holding a column with lower-case letters; None: not looked up yet
 
@@ -2733,6 +2734,8 @@ def name_expressions(tree: exp.Expression, command: str) -> exp.Expression:
             e.replace(e.unnest().copy())  # (id) is named ID
         elif unnamed(e):
             name = command[tokens[a].start:tokens[b].end + 1].upper()
+            for literal in sorted(CLOCK_LITERALS, key=len, reverse=True):  # (...::TIMESTAMP_NTZ before ...::TIMESTAMP)
+                name = name.replace(literal, CLOCK_LITERALS[literal])
             if len(name) <= 250:
                 e.replace(exp.alias_(e.copy(), exp.to_identifier(name, quoted=True)))
     return tree

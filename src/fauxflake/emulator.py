@@ -202,11 +202,20 @@ _QUOTED_TEXT = re.compile(r"""('(?:[^'\\]|''|\\.)*'|"(?:[^"]|"")*"|\$\$.*?\$\$)"
 
 def _freeze_clock(sql: str) -> str:
     def sub(m: re.Match[str]) -> str:
-        if m.group(0).lower().startswith("current_date"):
-            return f"'{FROZEN_NOW:%Y-%m-%d}'::date"
-        if re.match(r"(?i)(current_time|localtime)\b", m.group(0)):
-            return f"'{FROZEN_NOW:%H:%M:%S}'::time"
-        return f"'{FROZEN_NOW:%Y-%m-%d %H:%M:%S}'::timestamp"
+        written = m.group(0)
+        name = re.match(r"\w+", written).group(0).lower()
+        # (the same value for every clock function, spelled apart: a column left unnamed is called by what the
+        # query wrote, `CURRENT_TIMESTAMP()` or `SYSDATE()`, and `semantics.name_expressions` reads that back)
+        gap = "" if written.rstrip().endswith(")") else " "
+        if name == "current_date":
+            literal = f"'{FROZEN_NOW:%Y-%m-%d}'::{gap}date"
+        elif name in ("current_time", "localtime"):
+            literal = f"'{FROZEN_NOW:%H:%M:%S}'::{gap}{'time' if name == 'current_time' else 'time(9)'}"
+        else:
+            kind = {"current_timestamp": "timestamp", "sysdate": "timestamp_ntz", "getdate": "datetime"}.get(name, "timestamp_ntz(9)")
+            literal = f"'{FROZEN_NOW:%Y-%m-%d %H:%M:%S}'::{gap}{kind}"
+        semantics.CLOCK_LITERALS[literal.upper()] = re.sub(r"\s+", "", written).upper()
+        return literal
 
     if "'" not in sql and '"' not in sql and "$$" not in sql:
         return _CLOCK.sub(sub, sql)
