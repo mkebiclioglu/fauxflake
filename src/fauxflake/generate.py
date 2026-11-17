@@ -48,6 +48,14 @@ def begins_with(shapes: list[str], values: list[str]) -> dict[str, list[str]]:
     return out
 
 
+ORGS = 24  # how many organisations the generated addresses are at (`{org}`): org1 ... org24
+
+
+def org_of(text: str) -> str:
+    """SQL for the organisation the text `text` (SQL as well) belongs to."""
+    return f"concat('org', 1 + (hash({text}) % {ORGS})::bigint)"
+
+
 def lit(v) -> str:
     if v is None:
         return "NULL"
@@ -190,9 +198,18 @@ class TableSQL:
         return self._key_expr(table, d, index)
 
     @staticmethod
-    def ending(d: dict) -> str:
-        """What every value of a pool ends with (`email_7@fauxmail.net`), as one more argument of its concat."""
-        return f", {lit(str(d['suffix']))}" if d.get("suffix") else ""
+    def ending(d: dict, head: str = "''") -> str:
+        """What every value of a pool ends with (`email_7@org3.fauxmail.net`), as more arguments of its concat.
+        `{org}` in it is one of a few organisations, always the same one for the same text before it (`head`)."""
+        if not d.get("suffix"):
+            return ""
+        return "".join(f", {org_of(head)}" if piece == "{org}" else f", {lit(piece)}"
+                       for piece in re.split(r"(\{org\})", str(d["suffix"])) if piece)
+
+    def pooled(self, d: dict, n: str) -> str:
+        """The n-th text of a pool: `plan_7`, or `email_7@org3.fauxmail.net` when the pool has an ending."""
+        head = f"concat({lit(str(d['pool']) + '_')}, {n})"
+        return f"concat({lit(str(d['pool']) + '_')}, {n}{self.ending(d, head)})"
 
     def _key_expr(self, table: Table, d: dict, index: str) -> str:
         if d.get("template") and d["gen"] == "hash_id":
@@ -438,11 +455,11 @@ class TableSQL:
         elif gen == "pool" and col in self.grain() and self.base == "g":
             sizes = self.grain()
             n = f"((_n // {math.prod(list(sizes.values())[:list(sizes).index(col)])}) % {sizes[col]})::bigint"
-            expr = f"({n} + 1)" if d.get("numeric") else f"concat({lit(str(d['pool']) + '_')}, {n}{self.ending(d)})"
+            expr = f"({n} + 1)" if d.get("numeric") else self.pooled(d, n)
         elif gen == "pool":
             # one of `size` values shared by every column that names the same pool: joins between them match
             n = f"floor({self.u(col)} * {int(d.get('size', 200))})::bigint"
-            expr = f"({n} + 1)" if d.get("numeric") else f"concat({lit(str(d['pool']) + '_')}, {n}{self.ending(d)})"
+            expr = f"({n} + 1)" if d.get("numeric") else self.pooled(d, n)
         elif gen == "dist":
             # (in a log, a number filtered by ranges grows with time: a range is a stretch of consecutive rows)
             expr = piecewise(self.log_fraction() if self.in_order() and len(d["p"]) > 2 and "." not in col else self.u(col), d["p"], d["v"])
@@ -462,7 +479,7 @@ class TableSQL:
                 parts = []
                 for i, part in enumerate(d.get("parts") or []):
                     template = template.replace("{" + str(i) + "}", f"\0part{i}\0")
-                for chunk in template.replace("{n}", "\0n\0").replace("{hex}", "\0hex\0").split("\0"):
+                for chunk in template.replace("{n}", "\0n\0").replace("{hex}", "\0hex\0").replace("{org}", "\0org\0").split("\0"):
                     if chunk.startswith("part") and chunk[4:].isdigit() and int(chunk[4:]) < len(d.get("parts") or []):
                         # another generator's value inside the text: an id a model parses back out of it
                         parts.append(f"({self._expr(f'{col}:{chunk}', d['parts'][int(chunk[4:])])})::varchar")
@@ -472,6 +489,9 @@ class TableSQL:
                                      f"(hash({self.base}) % 1000)::varchar" if template.count("{n}") > 1 else f"({self.base})::varchar")
                     elif chunk == "hex":
                         parts.append(f"substr(md5(concat({lit(self.salt(col) + ':')}, {self.base})), 1, 12)")
+                    elif chunk == "org":
+                        # the organisation an address is at: the same one wherever the same name is written
+                        parts.append(org_of(f"concat({', '.join(parts)})" if parts else "''"))
                     elif chunk:
                         parts.append(lit(chunk))
                 return f"concat({', '.join(parts)})"

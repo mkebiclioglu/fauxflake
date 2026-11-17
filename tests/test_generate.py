@@ -379,7 +379,8 @@ def test_a_column_is_empty_where_the_rule_about_its_rows_does_not_hold_and_email
     spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "tables": {"RAW.T.RELEASES": {
         "volume": {"rows_per_day": 200}, "columns": {
             "VERSION": {"gen": "hash_id", "template": "{n}.{n}.{n}"},
-            "CONTACT": {"gen": "pool", "pool": "email", "size": 20, "suffix": "@fauxmail.net"},
+            "CONTACT": {"gen": "pool", "pool": "email", "size": 20, "suffix": "@{org}.fauxmail.net"},
+            "OWNER": {"gen": "template", "template": "user_{hex}@{org}.fauxmail.net"},
             "RC1_DATE": {"gen": "time_offset", "type": "DATE", "p": [0, 1], "seconds": [0, 86400],
                          "null_unless": "SPLIT_PART(({{VERSION}}), '.', 3) = '0'"}}}}}, tmp_path / "x.yml")
     with serve() as emu:
@@ -389,8 +390,14 @@ def test_a_column_is_empty_where_the_rule_about_its_rows_does_not_hold_and_email
             """select count(*), count("RC1_DATE"), count_if("RC1_DATE" is not null and split_part("VERSION", '.', 3) <> '0')
                from "RAW"."T"."RELEASES" """).fetchone()
         assert 0 < cut < rows and wrong == 0
-        assert cur.execute("""select count(*), count_if("CONTACT" like 'email\\__%@fauxmail.net' escape '\\')
+        assert cur.execute("""select count(*), count_if("CONTACT" like 'email\\__%@org%.fauxmail.net' escape '\\')
                               from "RAW"."T"."RELEASES" """).fetchone() == (rows, rows)
+        # an address is at one organisation wherever it is written, and the addresses are spread over several
+        names, hosts, pairs = cur.execute("""select count(distinct split_part("CONTACT", '@', 1)), count(distinct split_part("CONTACT", '@', 2)),
+                                             count(distinct "CONTACT") from "RAW"."T"."RELEASES" """).fetchone()
+        assert names == pairs and hosts > 3
+        assert cur.execute("""select count(distinct split_part("OWNER", '@', 2)) > 3, count_if("OWNER" not like 'user\\_%@org%.fauxmail.net' escape '\\')
+                              from "RAW"."T"."RELEASES" """).fetchone() == (True, 0)
 
 
 def test_a_table_of_readings_holds_a_row_a_day_for_each_of_a_few_things(tmp_path):

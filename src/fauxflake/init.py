@@ -974,7 +974,7 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                         if not there and isinstance(other, exp.SplitPart) and getattr(other.args.get("delimiter"), "name", "") == "@" \
                                 and getattr(other.args.get("part_index"), "name", "") == "2":
                             # `on a.domain = split_part(l.email, '@', 2)`: the domain the generated addresses are at
-                            use.literals.setdefault(hit[1], set()).add(MAILBOX[1:])
+                            use.literals.setdefault(hit[1], set()).update(mail_hosts())
                             use.texts.add(hit[1])
                 if named_numbers(parent, col):
                     use.equals.setdefault(hit[1], set()).update(named_numbers(parent, col))
@@ -1582,9 +1582,15 @@ _USUALLY_TRUE = re.compile(r"(?<![A-Z])(ACTIVE|ENABLED|VALID|CURRENT|VERIFIED|CO
 
 
 # a domain no project filters out: `example.com`, `test.com` and the company's own are what `not like` drops
-MAILBOX = "@fauxmail.net"
+MAILBOX = "@{org}.fauxmail.net"  # (`{org}`: one of a few organisations, so that domains can be counted and compared)
 _EMAIL = re.compile(r"^(?!HAS|IS_|ISDEFAULT|SUPPRESS|RECEIVE|SEND|ALLOW|ENABLE|OPT|DO_?NOT|NO_)"
                     r".*E_?MAIL(_?ADDRESS)?(_\d+)?(_FOR_TEMPLA\w*)?(__C)?$")
+
+
+def mail_hosts() -> list[str]:
+    """The domains the generated addresses are at."""
+    from .generate import ORGS
+    return [MAILBOX[1:].replace("{org}", f"org{i}") for i in range(1, ORGS + 1)]
 
 
 def holds_email(column: str) -> bool:
