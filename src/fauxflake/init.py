@@ -331,6 +331,7 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
     lineage: dict[str, dict[str, tuple[str, str]]] = {}  # CTE name -> its outputs
     last: dict[str, tuple[str, str]] = {}
     positional: dict[int, list] = {}  # select -> source column behind each projection, by position
+    chosen_among: dict[int, list] = {}  # select -> the source columns a projection chooses among (a COALESCE), by position
     cte_positions: dict[str, list] = {}
     outputs_of: dict[int, dict] = {}
     for scope in traverse_scope(tree):
@@ -1199,6 +1200,7 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
         outputs: dict[str, tuple[str, str]] = {}
         stars = [p for p in select.expressions if isinstance(p, exp.Star) or (isinstance(p, exp.Column) and isinstance(p.this, exp.Star))]
         positional[id(select)] = by_position = []
+        chosen_among[id(select)] = by_choice = []
         for proj in select.expressions:
             inner = proj.unalias()
             while isinstance(inner, (exp.Cast, exp.TryCast, exp.Paren)):
@@ -1226,6 +1228,10 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     among = behind(proj.unalias())
                 if among:
                     outputs[_ANY + proj.alias_or_name.upper()] = among
+                if among:
+                    while len(by_choice) < len(by_position) - 1:
+                        by_choice.append(())
+                    by_choice.append(tuple(spot for spot in among if len(spot) == 2))
         paths_out: dict[str, tuple[str, str, tuple[str, ...]]] = {}
         if stars and len(plain) == 1 and plain[0] in path_maps:
             paths_out.update(path_maps[plain[0]])  # `select *` (next to a FLATTEN or not) keeps what is known
@@ -1296,8 +1302,10 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 # In the real warehouse the two have one order; position says nothing about these
                 continue
             rows = [positional.get(id(b), []) for b in parts]
-            for aligned in zip(*rows):
+            for i, aligned in enumerate(zip(*rows)):
                 group = {hit for hit in aligned if hit}
+                # (`coalesce(serverversion, server_version)` in one branch: either column is lined up with the others)
+                group |= {spot for b in parts for spot in (chosen_among.get(id(b)) or [])[i:i + 1] for spot in spot}
                 if len(group) > 1:
                     links.append(group)
     return last
@@ -2485,6 +2493,8 @@ def analyse(manifest: dict, database: str) -> Analysis:
         elif not (head == "{0}" and held.get("parts") == [shared]):
             continue
         tables[child]["columns"][col] = dict(shared)
+    if begins:
+        _share_union_values(tables, links)  # (what is lined up with such a column in a UNION holds the same list)
     # a foreign key needs its parent to have a key
     for (child, col), (parent, pcol) in fks.items():
         if child in tables and parent in tables and tables[parent]["columns"].get(pcol, {}).get("gen") not in ("sequence", "hash_id") \

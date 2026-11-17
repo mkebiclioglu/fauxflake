@@ -1109,3 +1109,14 @@ def test_created_comes_before_updated_also_inside_a_document():
     created_comes_first(fields)
     assert min(fields["updated"]["seconds"]) > 604800 and min(fields["resolutiondate"]["seconds"]) > 604800
     assert fields["created"] == week and fields["parent.created"] == week and fields["duedate"] == week
+
+
+def test_a_coalesce_in_one_branch_of_a_union_is_lined_up_with_the_other_branch():
+    uses = {name: SourceUse() for name in ("RAW.A.SCORE", "RAW.B.SCORE")}
+    links: list = []
+    scan_model("""
+        with a as (select id, server_version as version_full from raw.a.score),
+             b as (select id, coalesce(serverversion, server_version) as version_full from raw.b.score)
+        select id, version_full from a union select id, version_full from b""", uses, {}, links, [], [])
+    assert {(m[0], m[1]) for group in links for m in group if any(x[1] == "SERVER_VERSION" for x in group)} == {
+        ("RAW.A.SCORE", "SERVER_VERSION"), ("RAW.B.SCORE", "SERVERVERSION"), ("RAW.B.SCORE", "SERVER_VERSION")}
