@@ -26,6 +26,14 @@ MACROS = [
     # argument is only marked here; when DuckDB refuses the statement, `text_as_written` converts the marked
     # arguments that turn out to be text.
     f"create or replace macro {_NS}_sf_reads(x, kind) as x",
+    # CONVERT_TIMEZONE(zone, t) with two arguments: the time of day in that zone. A timestamp without a zone (or a
+    # date, or text) is the session's time, which is UTC here. (DuckDB's `t AT TIME ZONE zone` on such a timestamp
+    # goes the other way: it takes t as that zone's time.)
+    f"""create or replace macro {_NS}_sf_convert_tz
+          (z, x timestamptz) as timezone(z, x),
+          (z, x timestamp) as timezone(z, timezone('UTC', x)),
+          (z, x date) as timezone(z, timezone('UTC', x::timestamp)),
+          (z, x varchar) as timezone(z, regexp_replace(x, '^"(.*)"$', '\\1')::timestamptz)""",
     f"""create or replace macro {_NS}_sf_formattable
           (x time) as (date '1970-01-01' + x),
           (x date) as x::timestamp,
@@ -98,7 +106,7 @@ MACROS = [
           when typeof(x) in ('TIMESTAMP', 'TIMESTAMP_NS', 'TIMESTAMP_MS', 'TIMESTAMP_S')
             then strftime(try_cast(x::varchar as timestamp), '%Y-%m-%d %H:%M:%S.%g')
           when typeof(x) = 'TIMESTAMP WITH TIME ZONE'
-            then strftime(timezone('UTC', try_cast(x::varchar as timestamptz)), '%Y-%m-%d %H:%M:%S.%g') || ' +0000'
+            then strftime(timezone('UTC', try_cast(x::varchar as timestamptz)), '%Y-%m-%d %H:%M:%S.%g') || ' Z'
           else x::varchar end""",
     # Text of a division: NUMBER / NUMBER prints every decimal of its scale ('1.500000').
     f"""create or replace macro {_NS}_sf_fixed(v, s) as
@@ -860,6 +868,8 @@ def _fix(node: exp.Expression) -> exp.Expression:
         return _fn("_sf_div", node.this, node.expression)
     if isinstance(node, exp.AddMonths):
         return _fn("_sf_add_months", node.this, node.expression)
+    if isinstance(node, exp.ConvertTimezone) and node.args.get("source_tz") is None and node.args.get("timestamp") is not None:
+        return _fn("_sf_convert_tz", node.args["target_tz"], node.args["timestamp"])
     if isinstance(node, (exp.TimestampTrunc, exp.DateTrunc)):
         return _fn("_sf_date_trunc", exp.Literal.string(node.unit.name.lower()), node.this)
     if isinstance(node, _HASHES) and not (isinstance(node.this, exp.Literal) and node.this.is_string):
