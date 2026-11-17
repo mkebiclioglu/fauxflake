@@ -511,13 +511,17 @@ def test_ids_of_a_given_length_still_match_what_refers_to_them(tmp_path):
     from fauxflake.spec import Spec
 
     spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "tables": {
-        "RAW.T.SERVERS": {"volume": {"rows_per_day": 50}, "columns": {"ID": {"gen": "hash_id", "length": 26}}},
+        "RAW.T.SERVERS": {"volume": {"rows_per_day": 50}, "columns": {"ID": {"gen": "hash_id", "length": 26, "named": ["93myk"]}}},
         "RAW.T.PINGS": {"volume": {"rows_per_day": 300}, "columns": {
             "N": {"gen": "sequence"}, "SERVER_ID": {"gen": "fk", "ref": "RAW.T.SERVERS", "length": 26}}}}}, tmp_path / "x.yml")
     with serve() as emu:
         Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 3))
         cur = emu.cursor()
-        assert cur.execute("""select count(*) = count(distinct "ID"), min(length("ID")), max(length("ID")) from "RAW"."T"."SERVERS" """).fetchone() == (True, 26, 26)
+        assert cur.execute("""select count(*) = count(distinct "ID"), min(length("ID")), max(length("ID")) from "RAW"."T"."SERVERS"
+                              where "ID" <> '93myk' """).fetchone() == (True, 26, 26)
+        # the id the models ask for by name is still there, and referred to
+        assert cur.execute("""select count(*) from "RAW"."T"."SERVERS" where "ID" = '93myk' """).fetchone()[0] == 1
+        assert cur.execute("""select count(*) from "RAW"."T"."PINGS" where "SERVER_ID" = '93myk' """).fetchone()[0] >= 1
         assert cur.execute("""select count(*), count(s."ID") from "RAW"."T"."PINGS" p left join "RAW"."T"."SERVERS" s
                               on s."ID" = p."SERVER_ID" where length(p."SERVER_ID") = 26""").fetchone()[1] > 100
 

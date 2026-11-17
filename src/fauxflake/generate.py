@@ -614,7 +614,11 @@ class TableSQL:
             # an id of a given length (`length(server_id) = 26`): the value rewritten, the same way wherever it is
             # written, so what matched still matches and what differed still differs
             text = f"({expr})::varchar"
-            expr = f"substr(md5({text}) || md5({text} || '+'), 1, {int(d['length'])})"
+            # (the values the models ask for by name stay as they are named, here and in what refers to them)
+            parent = self.spec.tables.get(str(d.get("ref") or "").upper()) if gen == "fk" else None
+            named = [str(v) for v in (d.get("named") or (parent.key[1].get("named") if parent is not None else None) or [])]
+            rewritten = f"substr(md5({text}) || md5({text} || '+'), 1, {int(d['length'])})"
+            expr = f"(case when {text} in ({', '.join(lit(v) for v in named)}) then {text} else {rewritten} end)" if named else rewritten
         rate = repr(float(d.get("null_rate") or 0.0))
         if self.sc and self.sc.null_rate is not None and gen in ("fk", "categorical", "dist", "pool", "template", "time_offset", "object", "array"):
             rate = self.during(repr(self.sc.null_rate), rate)
