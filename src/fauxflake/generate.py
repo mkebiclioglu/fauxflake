@@ -415,6 +415,11 @@ class TableSQL:
         elif gen == "dist":
             # (in a log, a number filtered by ranges grows with time: a range is a stretch of consecutive rows)
             expr = piecewise(self.log_fraction() if self.in_order() and len(d["p"]) > 2 and "." not in col else self.u(col), d["p"], d["v"])
+            if d.get("exactly") and not d.get("unique"):
+                # numbers the SQL asks for by name (`where calendar_id = 2`): four rows in ten hold one of them
+                known = "[" + ", ".join(str(int(v)) for v in d["exactly"]) + "]"
+                pick = f"list_extract({known}, 1 + floor({self.u(col + ':which')} * {len(d['exactly'])})::bigint)"
+                expr = f"(case when {self.u(col + ':exactly')} < 0.4 then {pick} else {expr} end)"
             if d.get("unique") and self.base == "g":
                 expr = "(g + 1)"  # a `unique` test covers it: one value per row
             if "round" in d:
@@ -453,6 +458,8 @@ class TableSQL:
                             f"to_days((g * {int(d['every_days'])} + {int(d.get('plus_days', 0))})::integer))")
             if d.get("epoch"):  # the moment as seconds since 1970, the way APIs often send it
                 expr = f"epoch({expr})::bigint"
+                if d.get("scale"):  # read with to_timestamp(x, 3): milliseconds (6: micro-, 9: nanoseconds)
+                    expr = f"({expr} * {10 ** int(d['scale'])} + floor({self.u(col + ':sub')} * {10 ** int(d['scale'])})::bigint)"
             if d.get("format"):  # a text column holding dates in this format
                 # nanoseconds are written as microseconds and three zeros: DuckDB's strftime pads %n with NUL bytes
                 expr = f"strftime({expr}, {lit(d['format'].replace('%n', '%f000'))})"
@@ -621,7 +628,7 @@ class Warehouse:
         for t in self.spec.tables.values():
             if only is not None and t.name not in only:
                 continue
-            cal = t.calendar(self.spec.start, until.date(), self.spec.seed, self.scale, self.scenario)
+            cal = t.calendar(self.spec.start, until.date(), self.spec.seed, self.scale, self.scenario, self.spec.thin)
             self.cur.execute(f"create or replace temp table cal_{t.ident} (day date, cum bigint, n bigint)")
             self.cur.executemany(f"insert into cal_{t.ident} values (?, ?, ?)", cal)
             cals[t.name] = cal

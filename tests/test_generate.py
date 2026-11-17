@@ -330,3 +330,25 @@ def test_numbers_in_templates_inside_and_outside_documents():
         versions = [r[0] for r in cur.execute("select unnest(from_json(DOC, '[\"JSON\"]')) ->> 'version' from RAW.Y.R").fetchall()]
     assert follows[0] == follows[1] > 5
     assert versions and all(len(v.split(".")) == 3 and all(p.isdigit() and int(p) < 1000 for p in v.split(".")) for v in versions)
+
+
+def test_named_numbers_and_scaled_epochs_are_generated(tmp_path):
+    from datetime import datetime
+
+    from fauxflake.emulator import serve
+    from fauxflake.generate import Warehouse
+    from fauxflake.spec import Spec
+
+    spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "tables": {"RAW.T.LINES": {
+        "volume": {"rows_per_day": 200}, "columns": {
+            "ID": {"gen": "sequence"},
+            "FORM_ID": {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000], "exactly": [334447, 426148]},
+            "SENT_AT": {"gen": "time_offset", "epoch": True, "scale": 6, "p": [0, 1], "seconds": [0, 3600]}}}}}, tmp_path / "x.yml")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 3))
+        cur = emu.cursor()
+        got = dict(cur.execute('select "FORM_ID", count(*) from "RAW"."T"."LINES" where "FORM_ID" > 1000 group by 1').fetchall())
+        assert set(got) == {334447, 426148} and min(got.values()) > 30
+        low, high = cur.execute('select min(to_timestamp("SENT_AT" / 1000000)), max(to_timestamp("SENT_AT" / 1000000)) '
+                                'from "RAW"."T"."LINES"').fetchone()
+        assert low.year == 2025 and high.year == 2025

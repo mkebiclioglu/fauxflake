@@ -57,6 +57,8 @@ class SourceUse:
         self.texts: set[str] = set()  # columns compared with string literals
         self.ips: set[str] = set()  # text columns handed to PARSE_IP
         self.bounds: dict[str, set[float]] = {}  # column -> numbers the SQL compares it with
+        self.equals: dict[str, set[int]] = {}  # column -> whole numbers the SQL asks for by name (`project_id = 278964`, `in (1, 2)`)
+        self.scales: dict[tuple[str, str], int] = {}  # (column, path in its document) -> digits of an epoch number below the second
         self.splits: dict[str, dict] = {}  # text column -> {"seps": {"/": {0: "BIGINT"}}, "digits": False} from split()[i]::type
         self.numbers: set[str] = set()  # columns that are summed, averaged or used in arithmetic
         self.literals: dict[str, set[str]] = {}  # column -> string values the SQL compares it with
@@ -96,6 +98,19 @@ _DATE_LITERAL = re.compile(r"(\d{4})-(\d{2})-(\d{2})(?:[ T]00:00:00(?:\.0+)?)?")
 CONTEXT = {"CURRENT_ACCOUNT": "FAUXFLAKE", "CURRENT_ACCOUNT_NAME": "FAUXFLAKE", "CURRENT_ORGANIZATION_NAME": "FAUXFLAKE",
            "CURRENT_REGION": "LOCAL", "CURRENT_WAREHOUSE": "LOCAL"}
 _PATHS = "\0paths"  # in a model's outputs: {column: (source, source column, path inside its document)}
+
+
+def named_numbers(test: exp.Expression | None, held: exp.Expression) -> set[int]:
+    """The whole numbers a column is asked for by name: `project_id = 278964`, `form_id in (334447, 426148)`."""
+    if isinstance(test, exp.EQ) and held in (test.this, test.expression):
+        values = [test.expression if test.this is held else test.this]
+    elif isinstance(test, exp.In) and test.this is held:
+        values = test.expressions
+    else:
+        return set()
+    if isinstance(test.parent, exp.Not):
+        return set()
+    return {int(v.name) for v in values if isinstance(v, exp.Literal) and not v.is_string and re.fullmatch(r"\d{1,18}", v.name)}
 
 
 def named_value(node: exp.Expression | None) -> str | None:
@@ -187,6 +202,27 @@ _WRAPPERS = (exp.Cast, exp.TryCast, exp.Paren, exp.Lower, exp.Upper, exp.Trim)
 _SAME_VALUE = (exp.Lower, exp.Upper, exp.Trim, exp.Initcap, exp.Nullif, exp.Lag, exp.Lead, exp.FirstValue, exp.LastValue, exp.Max,
                exp.Min, exp.AnyValue, exp.IgnoreNulls, exp.RespectNulls, exp.Window) + tuple(
     getattr(exp, name) for name in ("Replace",) if hasattr(exp, name))
+
+
+def _epoch_scale(node: exp.Expression) -> int | None:
+    """3, 6 or 9 when the number is read as `to_timestamp(x::int, 6)`: milli-, micro- or nanoseconds since 1970."""
+    top = node
+    while isinstance(top.parent, (exp.Cast, exp.TryCast, exp.Paren)):
+        top = top.parent
+    reader = top.parent
+    if not isinstance(reader, exp.Func):
+        return None
+    if (reader.expressions[0] if isinstance(reader, exp.Anonymous) and reader.expressions else reader.args.get("this")) is not top:
+        return None
+    named = reader.name.upper() if isinstance(reader, exp.Anonymous) else reader.sql_name().upper()
+    if not re.fullmatch(r"(TRY_)?TO_TIMESTAMP(_NTZ|_LTZ|_TZ)?|UNIX_TO_TIME", named):
+        return None
+    rest = reader.expressions[1:] if isinstance(reader, exp.Anonymous) else \
+        [reader.args.get(k) for k in ("scale", "format", "expression") if reader.args.get(k) is not None]
+    for arg in rest:
+        if isinstance(arg, exp.Literal) and not arg.is_string and arg.name in ("3", "6", "9"):
+            return int(arg.name)
+    return None
 
 
 def _parsed_as(node: exp.Expression) -> str | None:
@@ -646,6 +682,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     sources[found[0]].paths.setdefault(found[1], {}).setdefault(path_text(inside), None)
                 continue
             use, text = sources[found[0]], path_text(found[2])
+            if _epoch_scale(top):
+                use.scales[(found[1], text)] = _epoch_scale(top)
             if joins is not None and "{}" not in found[2]:
                 # a.x = b.y, where either side may sit inside a document: the two must share values
                 side = cast if cast is not None else top
@@ -705,6 +743,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                                 use.bounds.setdefault(found[1], set()).add(-float(number.name) if negative else float(number.name))
                             except ValueError:
                                 pass
+                if named_numbers(test, held):
+                    use.equals.setdefault(found[1], set()).update(named_numbers(test, held))
                 if isinstance(test, (exp.EQ, exp.In)) and held in (test.this, test.args.get("expression")) \
                         and not isinstance(test.parent, exp.Not) and not _stands_for_null(test):
                     values = test.expressions if isinstance(test, exp.In) else [test.expression if test.this is held else test.this]
@@ -863,6 +903,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     use.columns[hit[1]] = _parsed_as(col)
                 elif cast and _parsed_as(col) == "EPOCH":
                     use.columns[hit[1]] = "EPOCH"  # cast to a number only to be read as a point in time
+                if _epoch_scale(col):
+                    use.scales[(hit[1], "")] = _epoch_scale(col)
                 if isinstance(parent, (exp.Sum, exp.Avg, exp.Add, exp.Sub, exp.Mul, exp.Div)):
                     use.numbers.add(hit[1])
                 if joins is not None:
@@ -877,6 +919,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                         there = resolve(other) if isinstance(other, exp.Column) else None
                         if there and there[0] != hit[0]:
                             joins.append((hit, there))
+                if named_numbers(parent, col):
+                    use.equals.setdefault(hit[1], set()).update(named_numbers(parent, col))
                 if isinstance(parent, (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ, exp.Between)):
                     # `where block_number between 9820000 and 10000000`: the numbers that should select something
                     sides = [parent.args.get("low"), parent.args.get("high")] if isinstance(parent, exp.Between) else \
@@ -952,6 +996,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     outer = parent.parent
                     hint = outer.to.sql(dialect="duckdb") if isinstance(outer, (exp.Cast, exp.TryCast)) else None
                     hint = _parsed_as(parent) or hint
+                    if keys and _epoch_scale(parent):
+                        use.scales[(hit[1], ".".join(keys))] = _epoch_scale(parent)
                     if keys:
                         known = use.paths.setdefault(hit[1], {})
                         previous = known.get(".".join(keys))
@@ -1407,8 +1453,23 @@ def history_window(dates: list[tuple[str, date]], default: date = date(2025, 1, 
         end = max(end, inside[-1] + timedelta(days=31))
     if after and after[-1] >= end - timedelta(days=7):
         end = after[-1] + timedelta(days=45)
-    span = min((end - start).days, 1500)  # four years at most: beyond that the volume is the cost
+    span = (end - start).days
+    if span > LONGEST:
+        # more than the longest history: the recent end stays (what is asked of the last years is asked most)
+        start, span = end - timedelta(days=LONGEST), LONGEST
     return start, (span if (start, span) != (default, days) else None)
+
+
+LONGEST = 4000  # days: eleven years of history at most
+RECENT, FULL = 365, 1500  # a long history holds what FULL days would; the last RECENT days at a row a day or more
+
+
+def thinned(history: int | None) -> float | None:
+    """The share of the daily volume that days before the last year hold, in a history longer than four
+    years: as many rows in all as four years would have, so that a build costs what it did."""
+    if not history or history <= FULL:
+        return None
+    return round((FULL - RECENT) / (history - RECENT), 4)
 
 
 def field_gen(path: str, hint: str | None, literals: set[str] | None = None, patterns: set[str] | None = None) -> dict:
@@ -1847,6 +1908,12 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 window = None  # another model reads the table itself and asks for something outside it
             ranged = bool(window and len(window) >= 2)
             within_bounds(out[col], {min(window), max(window)} if ranged else use.bounds.get(col), exact=ranged)
+            if use.equals.get(col) and out[col].get("gen") == "dist" and not out[col].get("unique") and not ranged:
+                # `where fiscal_calendar_id = 2`, `form_id in (334447, 426148)`: four rows in ten hold one of the numbers asked for
+                # (not a zero in a number the SQL calculates with: it may be divided by)
+                asked = sorted(n for n in use.equals[col] if n or col not in use.numbers)[:30]
+                if asked:
+                    out[col]["exactly"] = asked
             if col in use.future and out[col].get("gen") == "time_offset" and not out[col].get("format") and not out[col].get("epoch"):
                 out[col].update(p=[0, 0.3, 1], seconds=[-30 * 86400, 30 * 86400, 400 * 86400])  # from last month to next year
             if col in use.single_null and out[col].get("gen") not in ("sequence", "hash_id", "loaded_at", "lifecycle"):
@@ -1855,6 +1922,10 @@ def analyse(manifest: dict, database: str) -> Analysis:
             elif col in use.nullable and out[col].get("gen") not in ("sequence", "hash_id", "loaded_at", "event_time", "lifecycle") \
                     and not out[col].get("null_rate"):
                 out[col]["null_rate"] = 0.3
+        for (col, path), digits in use.scales.items():
+            held = out.get(col) if not path else ((out.get(col) or {}).get("fields") or {}).get(path)
+            if held and held.get("epoch"):
+                held["scale"] = digits  # to_timestamp(x, 6): microseconds since 1970
         for col, habit in catalog.habits(name, out).items():
             if out[col].get("gen") in ("event_time", "time_offset", "updated_at") and not out[col].get("format"):
                 out[col] = {**habit, **({"type": out[col]["type"]} if out[col].get("type") else {})}
@@ -2042,7 +2113,8 @@ def analyse(manifest: dict, database: str) -> Analysis:
     for name, table in tables.items():
         for col, gen in table["columns"].items():
             kind = gen.get("gen")
-            asked = sorted(uses[name].literals.get(col, ())) if kind in ("fk", "sequence", "hash_id") and name in uses else []
+            asked = sorted({*uses[name].literals.get(col, ()), *map(str, uses[name].equals.get(col, ()))}) \
+                if kind in ("fk", "sequence", "hash_id") and name in uses else []
             parent = (table if kind != "fk" else tables.get(str(gen.get("ref", "")).upper())) if asked else None
             key = next((g for g in parent["columns"].values() if g.get("gen") in ("sequence", "hash_id")), None) if parent else None
             if key is None:
@@ -2077,15 +2149,18 @@ def analyse(manifest: dict, database: str) -> Analysis:
     # a history longer than the usual sixty days holds the same number of rows, spread thinner: the dates the SQL
     # asks for are there, and a build costs what it did
     start, history = history_window(dates)
+    older = None
     if history and history > 60:
+        if any(float(table["volume"]["rows_per_day"]) * 60 / history < 1000 for table in tables.values()):
+            older = thinned(history)  # (a table with rows to spare is thinned too: one rule for the whole history)
         for table in tables.values():
-            table["volume"]["rows_per_day"] = max(1000, int(float(table["volume"]["rows_per_day"]) * 60 / history))
+            table["volume"]["rows_per_day"] = max(1000, int(float(table["volume"]["rows_per_day"]) * 60 / min(history, FULL)))
     # a shared pool as large as the table: two tables of a few thousand rows joined on a column drawn from
     # 200 values pair every row with dozens of others, and three such joins in a row fill the disk. Drawn from
     # about as many values as there are rows, each row finds a partner or two, as with real ids. (The smaller
     # table's values are the first of the larger one's, so they still meet.)
     for table in tables.values():
-        rows = int(float(table["volume"]["rows_per_day"]) * 0.001 * (history or 60))  # at the default scale
+        rows = int(float(table["volume"]["rows_per_day"]) * 0.001 * (min(history, FULL) if older else history or 60))  # at the default scale
 
         def widen(gens: dict) -> None:
             for d in gens.values():
@@ -2111,6 +2186,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
         notes.append(f"the SQL compares with dates between {min(d for _, d in dates)} and {max(d for _, d in dates)}: "
                      f"the generated history starts {start}" + (f" and spans {history} days." if history else "."))
     analysis = Analysis({"seed": 42, "start": start.isoformat(), **({"history": history} if history else {}),
+                         **({"recent": RECENT, "older": older} if older else {}),
                          "dbt": settings, "tables": tables}, notes, locate, place)
     analysis.bounds = {(name, col): numbers for name, use in uses.items() for col, numbers in use.bounds.items()}
     return analysis

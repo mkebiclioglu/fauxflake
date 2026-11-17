@@ -830,3 +830,33 @@ def test_memory_is_bounded_below_duckdb_default():
     with emulator.engine() as emu:
         bounded = emu.duck.execute("select current_setting('memory_limit')").fetchone()[0]
     assert bounded != default
+
+
+def test_a_long_history_keeps_its_recent_end_and_thins_the_rest():
+    from fauxflake.init import LONGEST, history_window, thinned
+    from fauxflake.spec import Spec
+
+    # one old upper limit no longer leaves out what is asked of the last years
+    start, span = history_window([("before", date(2018, 1, 15)), ("after", date(2024, 6, 21)), ("after", date(2026, 11, 1))])
+    assert start <= date(2017, 12, 1) and start + timedelta(days=span) > date(2026, 11, 1)
+    start, span = history_window([("before", date(2015, 1, 15)), ("after", date(2034, 6, 21))])
+    assert span == LONGEST and start + timedelta(days=span) > date(2034, 6, 21)
+    assert thinned(1500) is None and 0 < thinned(3300) < 0.5
+    spec = Spec.from_raw({"seed": 1, "start": "2018-01-01", "history": 3300, "recent": 365, "older": thinned(3300), "tables": {
+        "RAW.T.EVENTS": {"volume": {"rows_per_day": 1000}, "columns": {"ID": {"gen": "sequence"}}}}}, "x.yml")
+    cal = spec.tables["RAW.T.EVENTS"].calendar(spec.start, spec.start + timedelta(days=3300), 1, 0.001, None, spec.thin)
+    cut = spec.thin[0]
+    assert all(n >= 1 for day, _, n in cal if day >= cut)  # a row a day in the last year
+    assert 1300 < sum(n for _, _, n in cal) < 1700  # as many rows as four years would hold
+    assert sum(n for day, _, n in cal if day < date(2018, 3, 1)) >= 10  # and the first weeks are not empty
+
+
+def test_numbers_asked_for_by_name_are_generated():
+    from fauxflake.init import scan_model, SourceUse
+
+    uses = {"RAW.T.LINES": SourceUse()}
+    scan_model("select to_timestamp(sent_at::int, 6) as sent, v['at']::int as at_raw, to_timestamp(v['at']::int, 3) as at "
+               "from RAW.T.LINES where calendar_id = 2 and form_id in (334447, 426148) and not other_id = 7", uses)
+    use = uses["RAW.T.LINES"]
+    assert use.equals == {"CALENDAR_ID": {2}, "FORM_ID": {334447, 426148}}
+    assert use.scales[("SENT_AT", "")] == 6 and use.scales[("V", "at")] == 3
