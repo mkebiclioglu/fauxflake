@@ -105,6 +105,7 @@ CONTEXT = {"CURRENT_ACCOUNT": "FAUXFLAKE", "CURRENT_ACCOUNT_NAME": "FAUXFLAKE", 
 _PATHS = "\0paths"  # in a model's outputs: {column: (source, source column, path inside its document)}
 _ANY = "\0any:"  # in a model's outputs: _ANY + column -> the source columns a COALESCE takes the value from, in order
 _KEYED = "\0key:"  # in a model's outputs: _KEYED + column -> the parts of a surrogate key of several columns, in order
+_EXPR = "\0sql:"  # in a model's outputs: _EXPR + column -> (table, the value written in that source table's own columns)
 _HASHED = "\0md5:"  # in a model's outputs: _HASHED + column -> the source columns a surrogate key is the hash of
 
 
@@ -1119,6 +1120,35 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
             alias = written(e)
             return hashed(alias, depth + 1) if alias is not None else upstream(_HASHED, e)
 
+        def inline(e, depth: int = 0):  # noqa: ANN001, ANN202
+            """`try_to_decimal(split_part(version, '.', 3)) as version_patch`: the value written in the columns of the
+            one source table it is computed from, row by row (None when rows are put together to make it)."""
+            if depth > 4 or e.find(exp.Window, exp.AggFunc, exp.Subquery, exp.Select, exp.Star) is not None:
+                return None
+            columns = list(e.find_all(exp.Column))
+            if not 0 < len(columns) <= 6 or sum(1 for _ in e.walk()) > 80:
+                return None
+            table, swap = None, {}
+            for col in columns:
+                key = (col.table.upper(), col.name.upper())
+                if key in swap:
+                    continue
+                hit, alias = resolve(col), written(col)
+                if alias is not None:  # (an alias written earlier in the select stands before a column of that name)
+                    got = inline(alias, depth + 1)
+                elif hit:
+                    got = (hit[0], exp.column(hit[1], quoted=True))
+                else:
+                    got = upstream(_EXPR, col)
+                    got = (got[0], sqlglot.parse_one(got[1], read="snowflake")) if got else None
+                if not got or (table and got[0] != table):
+                    return None
+                table, swap[key] = got[0], got[1]
+            if isinstance(e, exp.Column):
+                return table, swap[(e.table.upper(), e.name.upper())]
+            return table, e.transform(lambda n: exp.Paren(this=swap[(n.table.upper(), n.name.upper())].copy())
+                                      if isinstance(n, exp.Column) else n)
+
         def keyed(e, depth: int = 0):  # noqa: ANN001, ANN202
             """`md5(server_id || '-' || activity_date) as daily_server_id`: the source column behind each part of a
             surrogate key of several columns (None for a part that is computed, a day cut out of a time among them)."""
@@ -1183,6 +1213,13 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 key, among = hashed(proj.unalias()), None
                 if not key and keyed(proj.unalias()):
                     outputs[_KEYED + proj.alias_or_name.upper()] = keyed(proj.unalias())
+                if not key:
+                    try:
+                        told = inline(proj.unalias())
+                    except Exception:  # noqa: BLE001
+                        told = None
+                    if told:
+                        outputs[_EXPR + proj.alias_or_name.upper()] = (told[0], told[1].sql(dialect="snowflake"))
                 if key:
                     outputs[_HASHED + proj.alias_or_name.upper()] = key
                 else:
@@ -1972,6 +2009,25 @@ def analyse(manifest: dict, database: str) -> Analysis:
             return found[0], found[1], path_text(found[2])
         return None
 
+    def worked_out(node_id: str, column: str):  # noqa: ANN202
+        """A model's column written in the columns of the source table it is computed from: (table, expression)."""
+        hit = locate(node_id, column)
+        if hit:
+            return hit[0], exp.column(hit[1], quoted=True)
+        told = outputs.get(node_id, {}).get(_EXPR + column.upper())
+        return (told[0], sqlglot.parse_one(told[1], read="snowflake")) if told else None
+
+    def decided_by(node_id: str, column: str) -> tuple[str, str, str] | None:
+        """The one source column a computed time comes from: the first choice of a COALESCE
+        (`coalesce(actual_release_date, planned)`), or the only column in its arithmetic (`dateadd(month, -1, planned)`)."""
+        among = outputs.get(node_id, {}).get(_ANY + column.upper())
+        if among and len(among[0]) == 2:
+            return among[0][0], among[0][1], ""
+        told = worked_out(node_id, column)
+        names = {c.name.upper() for c in told[1].find_all(exp.Column)} if told else set()
+        return (told[0], names.pop(), "") if len(names) == 1 else None
+
+    gated: list[tuple[tuple[str, str], str]] = []  # (a column, the rule about the row that holds wherever it is not null)
     keys: dict[str, str] = {}
     ordered: list[tuple[tuple[str, str, str], tuple[str, str, str]]] = []  # (the later, the earlier) of two times a test compares
     together: list[tuple[str, list[str]]] = []  # (table, columns a test says are unique together)
@@ -2002,9 +2058,20 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 said = None
             if isinstance(said, (exp.GT, exp.GTE, exp.LT, exp.LTE)) and isinstance(said.this, exp.Column) and isinstance(said.expression, exp.Column):
                 later, earlier = (said.this, said.expression) if isinstance(said, (exp.GT, exp.GTE)) else (said.expression, said.this)
-                ends = [place(node["attached_node"], c.name) for c in (later, earlier)]
+                ends = [place(node["attached_node"], c.name) or decided_by(node["attached_node"], c.name) for c in (later, earlier)]
                 if all(ends) and ends[0][0] == ends[1][0] and ends[0] != ends[1]:
                     ordered.append((ends[0], ends[1]))
+            kw = meta["kwargs"].get("arguments") or meta["kwargs"]
+            only = re.fullmatch(r"\s*(\w+)\s+is\s+not\s+null\s*", str(kw.get("where") or (node.get("config") or {}).get("where") or ""), re.I)
+            gate = locate(node["attached_node"], only[1]) if only and said is not None else None
+            if gate:
+                # `expression: "version_patch = '0'"` with `where: "rc1_date is not null"`: a rule about each row, kept
+                # by leaving the tested column empty in the rows the rule does not hold for
+                parts = {c.name.upper(): worked_out(node["attached_node"], c.name) for c in said.find_all(exp.Column)}
+                if parts and all(parts.values()) and {part[0] for part in parts.values()} == {gate[0]}:
+                    rule = said.transform(lambda n: exp.Paren(this=parts[n.name.upper()][1].copy()) if isinstance(n, exp.Column) else n)
+                    rule = rule.transform(lambda n: exp.Var(this=f"__col_{n.name.upper()}__") if isinstance(n, exp.Column) else n)
+                    gated.append((gate, re.sub(r"__col_(\w+?)__", r"{{\1}}", rule.sql(dialect="duckdb"))))
             continue
         here = locate(node["attached_node"], column) if column else None
         if not here and column and meta["name"] == "relationships":
@@ -2378,6 +2445,9 @@ def analyse(manifest: dict, database: str) -> Analysis:
             top = max(before["seconds"])
             if min(after["seconds"]) <= top:
                 after.update(p=[0, 0.5, 1], seconds=[top + 86400, top + 30 * 86400, top + 365 * 86400])
+        elif after and before and after.get("gen") == before.get("gen") == "time_offset" and before.get("unique") \
+                and after.get("unique") and before.get("plus_days") and not after.get("plus_days"):
+            after["plus_days"] = before.pop("plus_days")  # the two ends of a period: the test says which one closes it
     # `where server_id = '93myk...'` on a column that refers to another table's key: that table has a row with that id
     for name, table in tables.items():
         for col, gen in table["columns"].items():
@@ -2487,6 +2557,11 @@ def analyse(manifest: dict, database: str) -> Analysis:
     for table in tables.values():
         follow_categories(table["columns"])
     address_emails(tables)
+    for (name, col), rule in gated:
+        columns = tables.get(name, {}).get("columns") or {}
+        if col in columns and columns[col].get("gen") not in _KEYS and rule_binds(rule, col, columns):
+            columns[col]["null_unless"] = rule
+            notes.append(f"{name}.{col}: a test states a rule about the rows that have one; it is empty in the other rows (`null_unless`).")
     least = rows_asked(manifest)
     if least:
         notes.append(f"the project lists tables by their size (`row_count >= {least}` in INFORMATION_SCHEMA.TABLES): every "
@@ -2506,6 +2581,28 @@ HEADER = """# Written by `fauxflake init` from the dbt project. Keys, relationsh
 # from your tests; columns and types from how models use each source. Volumes, lateness and
 # distributions are placeholders: run `fauxflake profile` to measure them, or edit by hand.
 """
+
+
+def rule_binds(rule: str, col: str, columns: dict) -> bool:
+    """Whether a rule about a row (`{{VERSION}}` standing for a column) is one the generator can work out: it names
+    columns the table has, not the one it gates, and DuckDB takes it with values of their kinds."""
+    names = set(re.findall(r"\{\{(\w+)\}\}", rule))
+    if not names or col in names or not names <= set(columns) or any(columns[n].get("null_unless") for n in names):
+        return False
+
+    def kind(gen: dict) -> str:
+        if gen.get("type"):
+            return str(gen["type"])
+        return "TIMESTAMP" if gen.get("gen") in ("event_time", "time_offset", "loaded_at", "updated_at") else \
+            "BIGINT" if gen.get("gen") in ("sequence", "dist") or gen.get("numeric") else "VARCHAR"
+
+    try:
+        import duckdb
+
+        duckdb.connect().execute("select " + re.sub(r"\{\{(\w+)\}\}", lambda m: f"cast(NULL as {kind(columns[m[1]])})", rule))
+    except Exception:  # noqa: BLE001
+        return False
+    return True
 
 
 def follow_categories(columns: dict) -> None:

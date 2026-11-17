@@ -1065,3 +1065,36 @@ def test_a_column_joined_to_the_domain_of_an_email_holds_the_domain_addresses_ar
                                   "on a.domain = split_part(l.email, '@', 2) where a.id is not null"},
                      ["RAW.T.LEAD", "RAW.T.ACCOUNT"])
     assert uses["RAW.T.ACCOUNT"].literals["DOMAIN"] == {MAILBOX[1:]}
+
+
+def test_a_rule_a_test_states_about_the_rows_that_have_a_value_is_kept_by_leaving_the_others_empty():
+    from fauxflake.init import build_spec
+
+    manifest = {
+        "sources": {"source.p.s.releases": {
+            "database": "RAW", "schema": "S", "name": "releases", "identifier": "releases",
+            "columns": {c: {"data_type": t} for c, t in {"version": "VARCHAR", "release_date": "DATE",
+                                                         "actual_release_date": "DATE", "rc1_date": "DATE"}.items()}}},
+        "nodes": {
+            "model.p.stg": {"resource_type": "model", "depends_on": {"nodes": ["source.p.s.releases"]}, "relation_name": "A.B.STG",
+                            "compiled_code": """
+                select version, try_to_decimal(split_part(version, '.', 3)) as version_patch,
+                       release_date::date as planned_release_date,
+                       dateadd(month, -1, planned_release_date) as release_start_date,
+                       coalesce(actual_release_date::date, planned_release_date) as actual_release_date,
+                       rc1_date::date as rc1_date
+                from raw.s.releases"""},
+            "test.p.rc1": {"resource_type": "test", "attached_node": "model.p.stg", "depends_on": {"nodes": ["model.p.stg"]},
+                           "config": {"where": "rc1_date is not null"},
+                           "test_metadata": {"name": "expression_is_true", "namespace": "dbt_utils",
+                                             "kwargs": {"expression": "version_patch = '0'"}}},
+            "test.p.start": {"resource_type": "test", "attached_node": "model.p.stg", "depends_on": {"nodes": ["model.p.stg"]},
+                             "test_metadata": {"name": "expression_is_true", "namespace": "dbt_utils",
+                                               "kwargs": {"expression": "release_start_date < actual_release_date"}}},
+        },
+    }
+    spec, notes = build_spec(manifest, "A")
+    columns = spec["tables"]["RAW.S.RELEASES"]["columns"]
+    assert "{{VERSION}}" in columns["RC1_DATE"]["null_unless"] and "null_unless" not in columns["VERSION"]
+    # the start is worked out from the planned date, the release is the actual date when there is one: it comes later
+    assert min(columns["ACTUAL_RELEASE_DATE"]["seconds"]) > max(columns["RELEASE_DATE"]["seconds"])

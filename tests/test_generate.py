@@ -367,3 +367,27 @@ def test_a_text_no_two_rows_share_starts_with_the_values_it_was_given():
             "select count(*), count(distinct INSTALLATION), count(*) filter (where INSTALLATION in ('u85ky7x', 'qe3n8xc')) "
             "from RAW.T.SERVERS").fetchone()
     assert total == distinct and named == 2
+
+
+def test_a_column_is_empty_where_the_rule_about_its_rows_does_not_hold_and_emails_share_a_pool(tmp_path):
+    from datetime import datetime
+
+    from fauxflake.emulator import serve
+    from fauxflake.generate import Warehouse
+    from fauxflake.spec import Spec
+
+    spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "tables": {"RAW.T.RELEASES": {
+        "volume": {"rows_per_day": 200}, "columns": {
+            "VERSION": {"gen": "hash_id", "template": "{n}.{n}.{n}"},
+            "CONTACT": {"gen": "pool", "pool": "email", "size": 20, "suffix": "@fauxmail.net"},
+            "RC1_DATE": {"gen": "time_offset", "type": "DATE", "p": [0, 1], "seconds": [0, 86400],
+                         "null_unless": "SPLIT_PART(({{VERSION}}), '.', 3) = '0'"}}}}}, tmp_path / "x.yml")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 3))
+        cur = emu.cursor()
+        rows, cut, wrong = cur.execute(
+            """select count(*), count("RC1_DATE"), count_if("RC1_DATE" is not null and split_part("VERSION", '.', 3) <> '0')
+               from "RAW"."T"."RELEASES" """).fetchone()
+        assert 0 < cut < rows and wrong == 0
+        assert cur.execute("""select count(*), count_if("CONTACT" like 'email\\__%@fauxmail.net' escape '\\')
+                              from "RAW"."T"."RELEASES" """).fetchone() == (rows, rows)
