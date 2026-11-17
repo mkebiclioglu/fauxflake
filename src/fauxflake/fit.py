@@ -3470,8 +3470,10 @@ class Fitter:
                     continue
                 if "Compilation Error" in message and self.empty_lookup(node["unique_id"], message):
                     continue
-                if ("RecursionError" in message or "MB of SQL text" in message) and self.few_values(node["unique_id"]):
-                    continue  # a pivot with one column per row: too long a statement to even read
+                if ("RecursionError" in message or "MB of SQL text" in message) and (
+                        self.few_values(node["unique_id"])
+                        or any([self.few_values(a) for a in sorted(self._ancestors(node["unique_id"]))])):
+                    continue  # a pivot with one column per row (here, or in a model this one lists the columns of)
                 compiled = self._compiled(project, node)
                 if compiled and node.get("relation_name") and _fq(node["relation_name"]).count(".") == 2:
                     uid, fq = node["unique_id"], _fq(node["relation_name"])

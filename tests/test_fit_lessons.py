@@ -839,3 +839,15 @@ def test_a_unique_reference_stays_a_reference():
             "test_metadata": {"name": "unique", "kwargs": {"column_name": "charge_id"}}}
     assert f.learn_from_test(test, Reading)
     assert tables["RAW.Z.ITEMS"]["columns"]["CHARGEID"] == {"gen": "fk", "ref": "RAW.Z.CHARGES", "skew": 1.5, "per_parent": 1}
+
+
+def test_a_pivot_upstream_is_found_through_the_models_a_node_reads():
+    columns = {"FEATURE_NAME": {"gen": "template", "template": "feature_name_{hex}"}}
+    nodes = {"m.spine": {"name": "spine", "raw_code": "select * from {{ ref('wide') }}", "depends_on": {"nodes": ["m.wide"]}},
+             "m.wide": {"name": "wide", "depends_on": {"nodes": []}, "raw_code":
+                        "{% set values = dbt_utils.get_column_values(ref('events'), 'feature_name') %} select 1"}}
+    f = fitter(nodes=nodes, tables={"RAW.P.EVENTS": {"columns": columns}})
+    f.sources_of, f.origins = lambda uid: ["RAW.P.EVENTS"], lambda uid, name: [name]
+    assert not f.few_values("m.spine")  # nothing pivoted in the model whose statement grew too long
+    assert f._ancestors("m.spine") == {"m.wide"} and f.few_values("m.wide")
+    assert columns["FEATURE_NAME"]["gen"] == "categorical" and len(columns["FEATURE_NAME"]["values"]) == 6
