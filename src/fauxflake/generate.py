@@ -481,6 +481,10 @@ class TableSQL:
                 expr = f"case ({self._expr(str(d['begins_with']), lead)})::varchar {arms} else {one_of(shapes)} end"
             else:
                 expr = one_of(shapes)
+            if d.get("named") and self.base == "g" and "." not in col:
+                # values another table or a seed holds, in a column no two rows share: the first rows have them
+                arms = " ".join(f"when {i} then {lit(str(v))}" for i, v in enumerate(d["named"]))
+                expr = f"(case g {arms} else {expr} end)"
         elif gen == "time_offset":
             expr = f"_ev + {ms(piecewise(self.u(col), d['p'], d['seconds']))}"
             if self.in_order() and min(d["seconds"]) >= 0 and max(d["seconds"]) <= 7 * 86400:

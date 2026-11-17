@@ -851,3 +851,16 @@ def test_a_pivot_upstream_is_found_through_the_models_a_node_reads():
     assert not f.few_values("m.spine")  # nothing pivoted in the model whose statement grew too long
     assert f._ancestors("m.spine") == {"m.wide"} and f.few_values("m.wide")
     assert columns["FEATURE_NAME"]["gen"] == "categorical" and len(columns["FEATURE_NAME"]["values"]) == 6
+
+
+def test_a_unique_column_keeps_the_values_it_shares_with_a_seed():
+    values = {"gen": "categorical", "values": {"u85ky7x": 0.5, "qe3n8xc": 0.5}}
+    tables = {"RAW.T.SERVER": {"columns": {"ID": {"gen": "hash_id"}, "INSTALLATION_ID": values}}}
+    f = fitter(tables=tables)
+    test = {"name": "unique_server_installation_id", "attached_node": "model.p.server", "column_name": "installation_id",
+            "test_metadata": {"name": "unique", "kwargs": {}}, "depends_on": {"nodes": ["model.p.server"]}}
+    places = _Places({("model.p.server", "INSTALLATION_ID"): ("RAW.T.SERVER", "INSTALLATION_ID", "")})
+    assert f.learn_from_test(test, places)
+    assert tables["RAW.T.SERVER"]["columns"]["INSTALLATION_ID"] == {
+        "gen": "template", "template": "installation_id_{hex}", "named": ["u85ky7x", "qe3n8xc"]}
+    assert not f.learn_from_test(test, places)

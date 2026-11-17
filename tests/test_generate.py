@@ -352,3 +352,18 @@ def test_named_numbers_and_scaled_epochs_are_generated(tmp_path):
         low, high = cur.execute('select min(to_timestamp("SENT_AT" / 1000000)), max(to_timestamp("SENT_AT" / 1000000)) '
                                 'from "RAW"."T"."LINES"').fetchone()
         assert low.year == 2025 and high.year == 2025
+
+
+def test_a_text_no_two_rows_share_starts_with_the_values_it_was_given():
+    from fauxflake.spec import Spec
+
+    spec = Spec.from_raw({"seed": 42, "start": "2025-01-01", "tables": {"RAW.T.SERVERS": {
+        "volume": {"rows_per_day": 500, "weekly": [1] * 7}, "lateness": {"p": [0, 1], "seconds": [0, 1]},
+        "columns": {"ID": {"gen": "sequence"},
+                    "INSTALLATION": {"gen": "template", "template": "installation_{hex}", "named": ["u85ky7x", "qe3n8xc"]}}}}}, ".")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 3))
+        total, distinct, named = emu.cursor().execute(
+            "select count(*), count(distinct INSTALLATION), count(*) filter (where INSTALLATION in ('u85ky7x', 'qe3n8xc')) "
+            "from RAW.T.SERVERS").fetchone()
+    assert total == distinct and named == 2
