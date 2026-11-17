@@ -22,8 +22,9 @@ _SCALE_T = r"coalesce(try_cast(nullif(regexp_extract(t, ',(\d+)\)', 1), '') as i
 MACROS = [
     # Snowflake's date-part functions take dates and times and nothing else: YEAR(text_column) does not compile
     # there. The argument is passed through this check, which binds only for a date or time (`microsecond`
-    # has no other overloads) and costs nothing when it does: the condition is constant and folds away.
-    f"create or replace macro {_NS}_sf_strict(x, fn) as if(true, x, if(microsecond(x) is null, x, x))",
+    # has no other overloads) and costs nothing when it does: the condition is constant and folds away. (The
+    # argument is written twice and no more: nested calls multiply what DuckDB has to bind.)
+    f"create or replace macro {_NS}_sf_strict(x, fn) as if(false and microsecond(x) is null, null, x)",
     # The opposite case: ADD_MONTHS(text_column, 1) compiles in Snowflake, which reads the text as a date. The
     # argument is only marked here; when DuckDB refuses the statement, `text_as_written` converts the marked
     # arguments that turn out to be text.
