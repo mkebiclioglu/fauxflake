@@ -368,6 +368,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 elif node.name.upper() in passthrough:
                     direct[alias.upper()] = passthrough[node.name.upper()]
                     added[alias.upper()] = computed.get(node.name.upper(), set())
+                    explicit[alias.upper()] = {k: v for k, v in lineage.get(node.name.upper(), {}).items()
+                                               if k not in ("*", _PATHS) and not k.startswith("\0")}
                 elif models and _table_id(node) in models and "*" in models[_table_id(node)]:
                     # a model that is `select * from source`: reading it is reading the source
                     through, computed_there = models[_table_id(node)]["*"]
@@ -388,6 +390,9 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 if name in passthrough:
                     direct[alias_name] = passthrough[name]
                     added[alias_name] = computed.get(name, set())
+                    # (`o.id as sfid, o.*` in the CTE: its sfid is the source's id, whatever alias the CTE is read by)
+                    explicit[alias_name] = {k: v for k, v in lineage.get(name, {}).items()
+                                            if k not in ("*", _PATHS) and not k.startswith("\0")}
                 elif name in lineage:
                     renames[alias_name] = lineage[name]
                 elif id(getattr(node, "expression", None)) in outputs_of:
@@ -956,6 +961,10 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                         there = resolve(other) if isinstance(other, exp.Column) else None
                         if there and there[0] != hit[0]:
                             joins.append((hit, there))
+                        elif there and there[1] != hit[1] and col.table and other.table and col.table.upper() != other.table.upper():
+                            # `on a.sfid = b.renewed_by_opportunity_id__c`, both read from the opportunities: one row
+                            # names another row of its own table
+                            joins.append((hit, there))
                         if not there and a_calendar_day(other):
                             use.whole_days.add(hit[1])
                         if not there and isinstance(other, exp.SplitPart) and getattr(other.args.get("delimiter"), "name", "") == "@" \
@@ -1368,10 +1377,13 @@ def _share_join_values(tables: dict[str, dict], joins: list, notes: list[str], l
         return (fields, m[2]) if fields is not None and m[2] in fields else None
 
     group_of: dict[tuple[str, str, str], set] = {}
+    own = set()  # pairs of columns of one table that a model matches with each other (`on a.id = b.parent_id`)
     for a, b in joins:
         a, b = place(a), place(b)
         if holder(a) is None or holder(b) is None:
             continue
+        if a[0] == b[0] and not a[2] and not b[2]:
+            own.add((a, b))
         merged = group_of.get(a, {a}) | group_of.get(b, {b})
         for m in merged:
             group_of[m] = merged
@@ -1394,14 +1406,16 @@ def _share_join_values(tables: dict[str, dict], joins: list, notes: list[str], l
                 if gen[m]["gen"] != gen[parent]["gen"]:
                     gen[m]["gen"] = gen[parent]["gen"]
             for m in members:
-                if gen[m]["gen"] not in _FREE or (m[0] == parent[0] and not m[2]):
+                if gen[m]["gen"] not in _FREE or (m[0] == parent[0] and not m[2] and (m, parent) not in own and (parent, m) not in own):
                     continue
                 if m[2]:  # inside a document: one of the parent's first rows, which every day's load has
                     put(m, {"gen": "fk", "ref": parent[0], "first": 50})
                 elif m[0] != parent[0]:
                     put(m, {"gen": "fk", "ref": parent[0], "skew": 1.5})
                 else:
-                    continue
+                    # a row that names another row of its own table (the opportunity that renewed it, a parent):
+                    # half the rows name none, as the first of a chain does
+                    put(m, {"gen": "fk", "ref": parent[0], "skew": 1.5, "null_rate": float(gen[m].get("null_rate") or 0.5)})
                 notes.append(f"{name(m)}: joined to {parent[0]}.{parent[1]} in a model, generated as a reference to it.")
             continue
         free = [m for m in members if gen[m]["gen"] in _FREE]

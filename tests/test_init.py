@@ -1128,3 +1128,28 @@ def test_rows_kept_as_the_latest_of_each_thing_each_day_are_readings():
         from raw.t.server
         qualify row_number() over (partition by server_id, server_date order by timestamp desc) = 1"""}, ["RAW.T.SERVER"])
     assert uses["RAW.T.SERVER"].readings == {("USER_ID", "TIMESTAMP")}
+
+
+def test_a_row_that_names_another_row_of_its_own_table_refers_to_it():
+    from fauxflake.init import build_spec
+
+    manifest = {
+        "sources": {"source.p.s.opportunity": {
+            "database": "RAW", "schema": "S", "name": "opportunity", "identifier": "opportunity",
+            "columns": {c: {"data_type": t} for c, t in {"id": "VARCHAR", "renewed_by_opportunity_id__c": "NUMBER",
+                                                         "amount": "NUMBER"}.items()}}},
+        "nodes": {
+            "model.p.m": {"resource_type": "model", "depends_on": {"nodes": ["source.p.s.opportunity"]}, "relation_name": "A.B.M",
+                          "compiled_code": """
+                with opportunity as (select distinct o.id as sfid, o.* from raw.s.opportunity o)
+                select a.sfid, sum(b.amount) as renewed
+                from opportunity a left join opportunity b on a.sfid = b.renewed_by_opportunity_id__c
+                group by 1"""},
+            "test.p.u": {"resource_type": "test", "attached_node": "model.p.m", "depends_on": {"nodes": ["model.p.m"]},
+                         "column_name": "sfid", "test_metadata": {"name": "unique", "kwargs": {"column_name": "sfid"}}},
+        },
+    }
+    spec, _notes = build_spec(manifest, "A")
+    columns = spec["tables"]["RAW.S.OPPORTUNITY"]["columns"]
+    assert columns["ID"]["gen"] in ("hash_id", "sequence")
+    assert columns["RENEWED_BY_OPPORTUNITY_ID__C"]["gen"] == "fk" and columns["RENEWED_BY_OPPORTUNITY_ID__C"]["ref"] == "RAW.S.OPPORTUNITY"
