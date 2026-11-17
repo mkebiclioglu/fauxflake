@@ -53,6 +53,7 @@ class SourceUse:
         self.columns: dict[str, str | None] = {}  # column -> type hint from a cast
         self.paths: dict[str, dict[str, str | None]] = {}  # variant column -> {"a.b": type hint}
         self.arrays: set[str] = set()  # variant columns that are flattened or indexed
+        self.array_values: dict[str, set[str]] = {}  # list column -> the values the SQL asks whether it contains
         self.formats: dict[str, str] = {}  # text column -> strftime format it is parsed with
         self.json_text: set[str] = set()  # text columns holding JSON (passed to PARSE_JSON)
         self.texts: set[str] = set()  # columns compared with string literals
@@ -1113,6 +1114,14 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 elif isinstance(parent, exp.Bracket) or col.find_ancestor(exp.Explode, exp.Lateral, exp.Unnest) is not None \
                         or (isinstance(parent, _ARRAY_READERS) and parent.this is col):
                     use.arrays.add(hit[1])  # array_to_string(tags, ','), array_size(tags): a list
+                    if isinstance(parent, (exp.ArrayContains, exp.ArrayOverlaps)) and not isinstance(parent.parent, exp.Not):
+                        # array_contains('database::approved'::variant, labels): the list holds that, in some rows
+                        asked = parent.expression
+                        while isinstance(asked, (exp.Cast, exp.TryCast, exp.Paren)):
+                            asked = asked.this
+                        for one in (asked.expressions if isinstance(asked, (exp.Array, exp.Tuple)) else [asked]):
+                            if isinstance(one, exp.Literal) and one.is_string and 0 < len(one.name) <= 80:
+                                use.array_values.setdefault(hit[1], set()).add(one.name)
                 elif isinstance(parent, (exp.StrToTime, exp.StrToDate, exp.TsOrDsToDate)) and parent.this is col \
                         and isinstance(parent.args.get("format"), exp.Literal):
                     use.formats[hit[1]] = parent.args["format"].name  # a text column holding dates
@@ -2560,6 +2569,8 @@ def analyse(manifest: dict, database: str) -> Analysis:
                     out[col]["type"] = "VARCHAR"
             elif col in use.arrays:
                 out[col] = {"gen": "array"}
+                if use.array_values.get(col):  # (what it is asked to contain, beside values of its own)
+                    out[col]["values"] = [*sorted(use.array_values[col])[:40], f"{col.lower()}_1", f"{col.lower()}_2"]
             elif col in use.formats:
                 out[col] = {"gen": "time_offset", "format": use.formats[col], **WEEK}
             elif col == loaded:

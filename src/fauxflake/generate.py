@@ -576,8 +576,10 @@ class TableSQL:
                                   for name, kind in d["fields"].items())
                 expr = f"to_json(list_transform(range(1 + {n}), lambda i: json_object({pairs})))::JSON"
             elif d.get("values"):  # elements drawn from a known list
-                known = "[" + ", ".join(lit(v) for v in d["values"]) + "]"
-                expr = f"to_json(list_slice({known}, 1, {n}))::JSON"
+                # (a few of them, from a place in the list that differs from row to row: each value is in some lists)
+                known = "[" + ", ".join(lit(v) for v in [*d["values"], *d["values"]]) + "]"
+                at = f"floor({self.u(col + ':from')} * {len(d['values'])})::bigint"
+                expr = f"to_json(list_slice({known}, 1 + {at}, {at} + {n}))::JSON"
             else:
                 expr = f"to_json(list_transform(range({n}), lambda i: concat({lit(col.lower() + '_')}, i)))::JSON"
         elif gen == "event_time":

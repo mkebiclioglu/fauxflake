@@ -1341,3 +1341,11 @@ def test_tests_that_state_the_shape_of_an_id_and_the_order_of_two_times_are_read
     assert columns["RAW.S.ORDERS"]["ID"] == {"gen": "hash_id", "length": 32}
     assert columns["RAW.S.LINES"]["ORDER_ID"]["gen"] == "fk" and columns["RAW.S.LINES"]["ORDER_ID"]["length"] == 32
     assert min(columns["RAW.S.ORDERS"]["VALID_TO"]["seconds"]) > max(columns["RAW.S.ORDERS"]["VALID_FROM"].get("seconds", [0]))
+
+
+def test_a_list_holds_what_the_models_ask_whether_it_contains():
+    sources = {"RAW.S.MRS": SourceUse()}
+    scan_model("""select id from raw.s.mrs where array_contains('database::approved'::variant, labels)
+                  and contains(title, 'All') and not array_contains('wip'::variant, labels)""", sources)
+    assert sources["RAW.S.MRS"].array_values == {"LABELS": {"database::approved"}} and "LABELS" in sources["RAW.S.MRS"].arrays
+    assert sources["RAW.S.MRS"].patterns == {"TITLE": {"%All%"}}
