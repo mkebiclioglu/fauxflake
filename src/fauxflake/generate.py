@@ -162,14 +162,7 @@ class TableSQL:
     def grain(self) -> dict[str, int]:
         """The columns of the table's `grain` that take their values in turn (listed values, or a pool's), with how
         many each has: unique together with the period (the day, or the hour when the time column is cut to hours)."""
-        out = {}
-        for c in self.t.raw.get("grain") or []:
-            d = self.t.columns.get(c, {})
-            if d.get("gen") == "categorical" and d.get("values"):
-                out[c] = len(d["values"])
-            elif d.get("gen") == "pool":
-                out[c] = int(d.get("size", 200))
-        return out
+        return self.t.grain_sizes()
 
     def grain_time(self) -> tuple[str, str] | None:
         """The time column of the grain and its period (hour or day): the rows of a day fill its periods in turn."""
@@ -364,6 +357,11 @@ class TableSQL:
         if gen == "hash_id" and d.get("domain") and "." in col:
             # an id inside a document: one per element, in a range of its own that `link` values point into
             expr = f"md5(concat({lit(f'{self.spec.seed}:{d['domain']}:')}, {self.base}))"
+        elif gen in ("sequence", "hash_id") and d.get("of") and col in self.grain() and self.base == "g" and "." not in col:
+            # a table of readings: the same few things report period after period, each in its turn
+            sizes = self.grain()
+            stride = math.prod(list(sizes.values())[:list(sizes).index(col)])
+            expr = self.key_expr(self.t, f"((_n // {stride}) % {sizes[col]})::bigint")
         elif gen in ("sequence", "hash_id"):
             expr = self.key_expr(self.t, "g")
         elif gen == "link":
@@ -406,7 +404,9 @@ class TableSQL:
             parent = self.spec.tables[d["ref"].upper()]
             skew = float(d.get("skew", 1.0))
             idx = f"floor(pow({self.u(col)}, {skew!r}) * greatest(_pc_{col}, 1))::bigint"
-            if d.get("first"):  # inside a document: one of the parent's first rows
+            if parent.key[1].get("of"):  # readings of a few things: one of them
+                idx = f"floor({self.u(col)} * {int(parent.key[1]['of'])})::bigint"
+            elif d.get("first"):  # inside a document: one of the parent's first rows
                 idx = f"floor({self.u(col)} * {int(d['first'])})::bigint"
             elif d.get("per_parent") and self.base == "g":
                 # at most so many rows for one parent (`having count(*) > 2` is a test): rows share parents in turn

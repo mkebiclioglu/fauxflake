@@ -1120,3 +1120,11 @@ def test_a_coalesce_in_one_branch_of_a_union_is_lined_up_with_the_other_branch()
         select id, version_full from a union select id, version_full from b""", uses, {}, links, [], [])
     assert {(m[0], m[1]) for group in links for m in group if any(x[1] == "SERVER_VERSION" for x in group)} == {
         ("RAW.A.SCORE", "SERVER_VERSION"), ("RAW.B.SCORE", "SERVERVERSION"), ("RAW.B.SCORE", "SERVER_VERSION")}
+
+
+def test_rows_kept_as_the_latest_of_each_thing_each_day_are_readings():
+    uses, *_ = _scan({"a.b.latest": """
+        select user_id as server_id, cast(timestamp as date) as server_date, version
+        from raw.t.server
+        qualify row_number() over (partition by server_id, server_date order by timestamp desc) = 1"""}, ["RAW.T.SERVER"])
+    assert uses["RAW.T.SERVER"].readings == {("USER_ID", "TIMESTAMP")}

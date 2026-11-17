@@ -391,3 +391,33 @@ def test_a_column_is_empty_where_the_rule_about_its_rows_does_not_hold_and_email
         assert 0 < cut < rows and wrong == 0
         assert cur.execute("""select count(*), count_if("CONTACT" like 'email\\__%@fauxmail.net' escape '\\')
                               from "RAW"."T"."RELEASES" """).fetchone() == (rows, rows)
+
+
+def test_a_table_of_readings_holds_a_row_a_day_for_each_of_a_few_things(tmp_path):
+    from datetime import datetime
+
+    from fauxflake.emulator import serve
+    from fauxflake.generate import Warehouse
+    from fauxflake.spec import Spec
+
+    spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "tables": {
+        "RAW.T.SERVER": {"volume": {"rows_per_day": 2}, "grain": ["TIMESTAMP", "USER_ID"], "columns": {
+            "USER_ID": {"gen": "hash_id", "of": 5, "named": ["93myk"]},
+            "TIMESTAMP": {"gen": "event_time"}, "RECEIVED_AT": {"gen": "loaded_at"}}},
+        "RAW.T.EVENT": {"volume": {"rows_per_day": 300}, "columns": {
+            "ID": {"gen": "sequence"}, "SERVER": {"gen": "fk", "ref": "RAW.T.SERVER", "skew": 1.5},
+            "TIMESTAMP": {"gen": "event_time"}}}}}, tmp_path / "x.yml")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 11))
+        cur = emu.cursor()
+        # every server reports every day, however few rows a day the scale leaves the table
+        assert cur.execute("""select count(distinct "USER_ID"), count(distinct "TIMESTAMP"::date), count(*),
+                                     count(distinct concat("USER_ID", "TIMESTAMP"::date)), count_if("USER_ID" = '93myk')
+                              from "RAW"."T"."SERVER" where "TIMESTAMP" < '2025-01-10'""").fetchone() == (5, 9, 45, 45, 9)
+        # and an event of a server on a day finds that server's reading of the day
+        assert cur.execute("""select count(*), count(s."USER_ID") from "RAW"."T"."EVENT" e left join "RAW"."T"."SERVER" s
+                              on s."USER_ID" = e."SERVER" and s."TIMESTAMP"::date = e."TIMESTAMP"::date
+                              where e."TIMESTAMP" < '2025-01-10'""").fetchone()[0] > 1000
+        assert cur.execute("""select count(*) from "RAW"."T"."EVENT" e left join "RAW"."T"."SERVER" s
+                              on s."USER_ID" = e."SERVER" and s."TIMESTAMP"::date = e."TIMESTAMP"::date
+                              where e."TIMESTAMP" < '2025-01-10' and s."USER_ID" is null""").fetchone()[0] == 0

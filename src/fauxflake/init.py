@@ -72,6 +72,9 @@ class SourceUse:
         self.periods: dict[str, str] = {}
         self.path_prefix: dict[str, dict[str, str]] = {}  # variant column -> path -> text stripped off before the rest is parsed
         self.truncs: dict[str, str] = {}  # time column -> the unit a model cuts it to before matching on it (`date_trunc('hour', at)`)
+        # (the thing, the time): rows kept as the latest of each thing each day (`qualify row_number() over
+        # (partition by server_id, cast(timestamp as date) order by timestamp desc) = 1`): readings, taken day after day
+        self.readings: set[tuple[str, str]] = set()
         self.series: set[frozenset[str]] = set()  # columns a join matches on together (`on a.id = b.id and a.hour = b.hour`)
         self.read_bounds: dict[str, set[float]] = {}  # number column -> what the models that read the table itself compare it with
         self.windows: dict[str, set[float]] = {}  # number column -> the range the model that reads the table itself keeps (`between a and b`)
@@ -1196,6 +1199,34 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 one, two = keyed(test.this), keyed(test.expression)
                 if one and two and len(one) == len(two):
                     joins.extend((a, b) for a, b in zip(one, two) if a and b and a != b and a[0] != b[0])
+
+        kept = select.args.get("qualify")
+        for test in (kept.find_all(exp.EQ) if kept is not None else []):
+            window, one = (test.this, test.expression) if isinstance(test.this, exp.Window) else (test.expression, test.this)
+            if not (isinstance(window, exp.Window) and isinstance(window.this, exp.RowNumber) and isinstance(one, exp.Literal)
+                    and one.name == "1" and len(window.args.get("partition_by") or []) == 2):
+                continue
+            thing = moment = None
+            for part in window.args["partition_by"]:
+                daily = False
+                for _ in range(6):
+                    if isinstance(part, exp.Column) and written(part) is not None:
+                        part = written(part)
+                    elif isinstance(part, (exp.TsOrDsToDate, exp.Date)) or (
+                            isinstance(part, (exp.Cast, exp.TryCast)) and part.to.is_type(exp.DataType.Type.DATE)) or (
+                            isinstance(part, (exp.DateTrunc, exp.TimestampTrunc)) and str(part.args.get("unit") or "").upper().strip("'") == "DAY"):
+                        part, daily = part.this, True
+                    elif isinstance(part, (exp.Cast, exp.TryCast, exp.Paren)):
+                        part = part.this
+                    else:
+                        break
+                hit = resolve(part) if isinstance(part, exp.Column) and not isinstance(part.this, exp.Star) else None
+                if hit and daily:
+                    moment = hit
+                elif hit:
+                    thing = hit
+            if thing and moment and thing[0] == moment[0] and thing[0] in sources and thing[1] != moment[1]:
+                sources[thing[0]].readings.add((thing[1], moment[1]))
 
         outputs: dict[str, tuple[str, str]] = {}
         stars = [p for p in select.expressions if isinstance(p, exp.Star) or (isinstance(p, exp.Column) and isinstance(p.this, exp.Star))]
@@ -2422,6 +2453,18 @@ def analyse(manifest: dict, database: str) -> Analysis:
         # holds one row per period for each of a few entities, as a meter or a daily balance does: generated so, and
         # whatever is joined to the entity draws from the same few
         columns = tables.get(name, {}).get("columns") or {}
+        for thing, moment in sorted(use.readings):
+            # the latest row of each server each day is what the models keep: the table holds readings, the same few
+            # things reporting day after day. A key that gives every row a thing of its own would leave each with
+            # one day of history; it names a few, each in its turn, and what refers to it refers to those
+            held, when = columns.get(thing) or {}, columns.get(moment) or {}
+            if held.get("gen") in _KEYS and not held.get("template") and when.get("gen") in ("event_time", "time_offset") \
+                    and not when.get("format") and not when.get("epoch") and not when.get("unique") and not tables[name].get("grain"):
+                held["of"] = 20
+                tables[name]["grain"] = [moment, thing]
+                notes.append(f"{name}: models keep the latest row of each {thing.lower()} each day; generated as readings, "
+                             f"one row a day for each of 20 {thing.lower()}s (`of` on the key).")
+                break
         for together_here in sorted(use.series, key=sorted):
             for c in together_here:  # cut to the hour by the models that match on it: on the hour here
                 if columns.get(c, {}).get("gen") in ("event_time", "time_offset") and not columns[c].get("trunc") and use.truncs.get(c) \

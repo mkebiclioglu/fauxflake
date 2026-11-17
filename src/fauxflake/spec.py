@@ -44,6 +44,32 @@ class Table:
                 return col, d
         raise ValueError(f"{self.name}: needs one column with gen: sequence or gen: hash_id")
 
+    def grain_sizes(self) -> dict[str, int]:
+        """The columns of the table's `grain` that take their values in turn, with how many each has: listed values,
+        a pool's, or the things a table of readings is about (`of: 20` on its key: twenty servers, one row each a day)."""
+        out = {}
+        for c in self.raw.get("grain") or []:
+            d = self.columns.get(c, {})
+            if d.get("gen") == "categorical" and d.get("values"):
+                out[c] = len(d["values"])
+            elif d.get("gen") == "pool":
+                out[c] = int(d.get("size", 200))
+            elif d.get("gen") in ("sequence", "hash_id") and d.get("of"):
+                out[c] = int(d["of"])
+        return out
+
+    def grain_rows(self) -> int:
+        """Rows a day of a table that holds one row a period for each combination of its grain (0 when it has none)."""
+        sizes = self.grain_sizes()
+        if not sizes:
+            return 0
+        hourly = any(self.columns.get(c, {}).get("gen") in ("event_time", "time_offset") and self.columns[c].get("trunc") == "hour"
+                     for c in self.raw.get("grain") or [])
+        rows = 24 if hourly else 1
+        for size in sizes.values():
+            rows *= size
+        return rows
+
     @property
     def lifecycle(self) -> dict | None:
         col = self.role("lifecycle")
@@ -77,6 +103,7 @@ class Table:
         noise = float(vol.get("noise", 0.0))
         anchor = _date(vol.get("as_of", start))
         out, cum, day, carry = [], 0, start, 0.0
+        full = self.grain_rows()  # one row a period for each combination, whatever the scale: no day leaves one out
         window = start + timedelta(days=max(1, least[1]) - 1) if least else None
         last = max(end, window) if window else end
         while day <= last:
@@ -91,7 +118,7 @@ class Table:
                 carry -= int(carry)
             else:
                 n = max(1, round(level * max(0.0, 1 + noise * rng.gauss(0, 1))))
-            out.append((day, 0, n))
+            out.append((day, 0, max(n, full)))
             day += timedelta(days=1)
         if least:
             days = max(1, least[1])
