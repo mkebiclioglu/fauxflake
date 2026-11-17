@@ -8,6 +8,7 @@ involved actually hold.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 
 import sqlglot
@@ -61,6 +62,8 @@ class Why:
         return "with " + ("recursive " if self.recursive else "") + ", ".join(c.sql(dialect="snowflake") for c in ctes) + " "
 
     def rows(self, sql: str) -> list[tuple]:
+        if getattr(self, "deadline", None) is not None and time.monotonic() > self.deadline:
+            raise TimeoutError("the walk ran out of the time it was given")
         self.cur.execute(sql)
         return self.cur.fetchall()
 

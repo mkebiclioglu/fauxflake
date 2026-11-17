@@ -3770,13 +3770,27 @@ class Fitter:
             conn = self.emu._fs.connect(database=model["database"], schema=model["schema"])
         except Exception:  # noqa: BLE001
             return False
+        # a few minutes for one walk, and no more than a share of an hour for all of them in one fitting: on a model of
+        # a thousand lines every count is a query of its own
+        spent = self.__dict__.setdefault("_twice_spent", 0.0)
+        if spent > 1500:
+            conn.close()
+            return False
+        started, limit = time.monotonic(), os.environ.get("FAUXFLAKE_STATEMENT_TIMEOUT")
+        os.environ["FAUXFLAKE_STATEMENT_TIMEOUT"] = "45"
         try:
             walk = why.Twice(conn.cursor(), self.sql_of[uid], column)
+            walk.deadline = started + 150
             finding = walk.find()
         except Exception:  # noqa: BLE001 - a query the walk cannot take apart teaches nothing
             return False
         finally:
             conn.close()
+            self._twice_spent = spent + time.monotonic() - started
+            if limit is None:
+                os.environ.pop("FAUXFLAKE_STATEMENT_TIMEOUT", None)
+            else:
+                os.environ["FAUXFLAKE_STATEMENT_TIMEOUT"] = limit
         ctes = list(walk.ctes)
         if finding.scope != "the final select":  # inside a CTE: what it reads are the CTEs before it
             at = next((i for i, c in enumerate(ctes) if finding.scope.split(",")[0].upper() == c.alias.upper()), len(ctes))
