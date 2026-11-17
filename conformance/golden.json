@@ -1327,6 +1327,38 @@
    ]
   ]
  },
+ "distinct_order_by_column_under_a_function": {
+  "error": "002024 (42601): SQL compilation error:"
+ },
+ "distinct_order_by_unselected_column": {
+  "error": "002024 (42601): SQL compilation error:"
+ },
+ "distinct_order_by_what_is_selected": {
+  "rows": [
+   [
+    "a",
+    "2",
+    "A"
+   ],
+   [
+    "b",
+    "1",
+    "B"
+   ]
+  ]
+ },
+ "distinct_star_order_by": {
+  "rows": [
+   [
+    "b",
+    "1"
+   ],
+   [
+    "a",
+    "2"
+   ]
+  ]
+ },
  "div0": {
   "rows": [
    [
@@ -2675,6 +2707,15 @@
     "Table FX_NO_DUPES successfully created."
    ]
   ]
+ },
+ "not_enough_arguments_coalesce": {
+  "error": "000938 (22023): SQL compilation error: error line 1 at position 7"
+ },
+ "not_enough_arguments_nvl": {
+  "error": "000938 (22023): SQL compilation error: error line 1 at position 7"
+ },
+ "not_enough_arguments_nvl2": {
+  "error": "000938 (22023): SQL compilation error: error line 1 at position 7"
  },
  "null_aggregates": {
   "rows": [

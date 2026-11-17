@@ -409,3 +409,10 @@
 - {id: quoted_lower_name_in_group_by, sql: "select count(*) from (select 1 as id, 'a' as name) group by \"name\""}
 - {id: quoted_names_spelled_exactly, sql: "with c as (select 1 as \"k\", 'a' as name, 2 as \"lowerCol\"), d as (select \"k\" as k2, c.\"k\", \"lowerCol\" as lc, name as \"n\" from c) select k2, \"k\", lc, d.\"n\" from d where \"n\" = 'a' order by \"n\", K2"}
 - {id: quoted_keys_of_a_variant, sql: "select object_construct('userId', 7):\"userId\", parse_json('{\"a\": 1}'):\"a\", v.\"value\" from (select 1 id, 2 as \"value\") v"}
+- {id: not_enough_arguments_coalesce, sql: "select coalesce(1)"}
+- {id: not_enough_arguments_nvl, sql: "select nvl(1)"}
+- {id: not_enough_arguments_nvl2, sql: "select nvl2(1, 2)"}
+- {id: distinct_order_by_unselected_column, sql: "select distinct name from (select 'a' name, 1 amount) t order by t.amount"}
+- {id: distinct_order_by_column_under_a_function, sql: "select distinct upper(name) from (select 'a' name, 1 amount) t order by amount"}
+- {id: distinct_order_by_what_is_selected, sql: "select distinct t.name as n, amount as a, upper(name) from (select column1 name, column2 amount from values ('b', 1), ('a', 2), ('a', 2)) t order by name, n, a desc nulls last, 1, upper(name), name || 'x'"}
+- {id: distinct_star_order_by, sql: "select distinct * from (select column1 name, column2 amount from values ('b', 1), ('a', 2), ('a', 2)) t order by amount"}

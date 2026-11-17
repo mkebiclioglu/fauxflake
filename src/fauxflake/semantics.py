@@ -1303,8 +1303,38 @@ def _format_chosen_at_run_time(node: exp.Expression) -> exp.Expression | None:
     return exp.Case(ifs=ifs) if ifs else None
 
 
+def _refuse_what_does_not_compile(node: exp.Expression) -> None:
+    """Mistakes DuckDB lets through and Snowflake stops at compile time, seen in the statement as written."""
+    from snowflake.connector.errors import ProgrammingError
+
+    if (isinstance(node, exp.Coalesce) and not node.expressions) or (isinstance(node, exp.Nvl2) and node.args.get("false") is None):
+        shown = node.sql(dialect="snowflake")
+        wanted, got = (3, 2) if isinstance(node, exp.Nvl2) else (2, 1)
+        raise ProgrammingError(msg=f"SQL compilation error:\nnot enough arguments for function [{shown}], expected {wanted}, got {got}",
+                               errno=938, sqlstate="22023")
+    if isinstance(node, exp.Select) and node.args.get("distinct") is not None and node.args.get("order") is not None \
+            and not node.args["distinct"].args.get("on"):
+        # SELECT DISTINCT name ... ORDER BY amount: which amount, of the rows folded into one name?
+        shown = [e.unalias() for e in node.expressions]
+        if any(isinstance(e, exp.Star) or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star)) for e in shown):
+            return
+        names = {e.alias_or_name.upper() for e in node.expressions if e.alias_or_name} | {
+            c.name.upper() for e in shown for c in e.find_all(exp.Column)}  # (the columns that go into what is selected)
+        written = {e.sql(dialect="snowflake").upper() for e in shown}
+        for term in node.args["order"].expressions:
+            value = term.this
+            if value.sql(dialect="snowflake").upper() in written or isinstance(value, exp.Literal):
+                continue
+            for column in value.find_all(exp.Column):
+                if column.name.upper() not in names and column.find_ancestor(exp.Subquery, exp.Window) is None:
+                    raise ProgrammingError(msg=f"SQL compilation error:\n[{column.sql(dialect='snowflake')}] is not a valid order by "
+                                               f"expression\n(with SELECT DISTINCT, ORDER BY takes what is selected)",
+                                           errno=2024, sqlstate="42601")
+
+
 def rewrite(node: exp.Expression) -> exp.Expression:
     """Apply the fixes bottom-up, so nested cases (a ratio of averages) all get rewritten."""
+    _refuse_what_does_not_compile(node)
     if isinstance(node, (exp.TsOrDsToDate, exp.StrToTime, exp.StrToDate, exp.TsOrDsToTimestamp)):
         chosen = _format_chosen_at_run_time(node)
         if chosen is not None:
