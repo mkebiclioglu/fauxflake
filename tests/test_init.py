@@ -1349,3 +1349,55 @@ def test_a_list_holds_what_the_models_ask_whether_it_contains():
                   and contains(title, 'All') and not array_contains('wip'::variant, labels)""", sources)
     assert sources["RAW.S.MRS"].array_values == {"LABELS": {"database::approved"}} and "LABELS" in sources["RAW.S.MRS"].arrays
     assert sources["RAW.S.MRS"].patterns == {"TITLE": {"%All%"}}
+
+
+def test_no_helper_of_the_reading_shares_its_name_with_a_variable():
+    """`scan_model` and `analyse` define helpers inside themselves; a variable of the same name replaces the helper
+    for everything after it, and the reading goes on with whatever that variable holds."""
+    import ast
+    from pathlib import Path
+
+    import fauxflake.init as init
+
+    tree = ast.parse(Path(init.__file__).read_text())
+    for fn in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name in ("scan_model", "analyse")):
+        helpers, assigned = set(), set()
+
+        class Names(ast.NodeVisitor):
+            depth = 0
+
+            def visit_FunctionDef(self, node):  # noqa: N802
+                if self.depth == 1:
+                    helpers.add(node.name)
+                    return
+                self.depth += 1
+                self.generic_visit(node)
+                self.depth -= 1
+
+            def visit_Lambda(self, node):  # noqa: N802
+                return
+
+            def visit_Name(self, node):  # noqa: N802
+                if isinstance(node.ctx, ast.Store):
+                    assigned.add(node.id)
+
+        Names().visit(fn)
+        assert not helpers & assigned, (fn.name, sorted(helpers & assigned))
+
+
+def test_what_is_read_no_further_back_than_a_mark_lies_within_that_of_the_top_of_the_range_loaded():
+    from fauxflake.init import build_spec
+
+    manifest = {
+        "sources": {"source.p.s.shards": {"database": "RAW", "schema": "S", "name": "shards", "identifier": "shards",
+                                          "columns": {"block": {"data_type": "NUMBER"}, "v": {"data_type": "VARCHAR"}}}},
+        "nodes": {
+            "model.p.load": {"resource_type": "model", "name": "load", "depends_on": {"nodes": []}, "relation_name": "A.B.LOAD",
+                             "compiled_code": "select block, v from raw.s.shards where block between 9820000 and 10000000"},
+            "model.p.map": {"resource_type": "model", "name": "map", "depends_on": {"nodes": ["model.p.load"]}, "relation_name": "A.B.MAP",
+                            "compiled_code": "select * from a.b.load where block >= (select max(block) from a.b.done) - 20000"},
+            "model.p.late": {"resource_type": "model", "name": "late", "depends_on": {"nodes": ["model.p.load"]}, "relation_name": "A.B.LATE",
+                             "compiled_code": "select * from a.b.load where block >= 75000000"}},
+    }
+    held = build_spec(manifest, "A")[0]["tables"]["RAW.S.SHARDS"]["columns"]["BLOCK"]
+    assert held["v"] == [9980000, 10000000] and held["p"] == [0, 1], held

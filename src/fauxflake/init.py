@@ -86,6 +86,10 @@ class SourceUse:
         # the history of each thing, whose periods never overlap
         self.histories: set[tuple[str, str, str]] = set()
         self.lengths: dict[str, int] = {}  # text column -> how long the models take its values to be (`length(server_id) <> 26`: invalid)
+        # number column -> how far behind the newest value the models still read (`block >= (select max(block) from
+        # what was loaded) - 20000`): what a run takes in lies within that of the newest
+        self.lookbacks: dict[str, float] = {}
+        self.kept_ranges: dict[str, tuple[float, float]] = {}  # number column -> a range some model keeps (`between a and b`)
         # ((column, path), (column, path)): rows kept as the latest of each of the first, then looked up by the
         # second (`partition by dns` ... `on x.installation_id = l.installation_id`): the first belongs to one of the second
         self.one_per: set[tuple[tuple[str, str], tuple[str, str]]] = set()
@@ -398,8 +402,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     renames[alias.upper()] = lineage[node.name.upper()]
             else:  # a CTE or subquery scope
                 # `from base_receipts r`: known by the CTE's name, used by its alias
-                written = scope.selected_sources.get(alias, (None, None))[0]
-                name, alias_name = (written.name.upper() if isinstance(written, exp.Table) else alias.upper()), alias.upper()
+                read_as = scope.selected_sources.get(alias, (None, None))[0]
+                name, alias_name = (read_as.name.upper() if isinstance(read_as, exp.Table) else alias.upper()), alias.upper()
                 if name not in passthrough and name not in lineage:
                     name = alias_name
                 if name in passthrough:
@@ -888,10 +892,10 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                         sources[source].series.add(frozenset(columns))
             on = join.args.get("on")
             lower, upper = {}, {}  # table that bounds from below / above -> the bounding expressions
-            keyed = on is not None and any(
+            on_a_key = on is not None and any(
                 isinstance(e.this, exp.Column) and isinstance(e.expression, exp.Column) and e.this.table != e.expression.table
                 for e in on.find_all(exp.EQ))  # `on a.id = b.id and a.day between b.valid_from and b.valid_to`: periods of one id
-            for test in (on.find_all(exp.GT, exp.GTE, exp.LT, exp.LTE, exp.Between) if on is not None and not keyed else []):
+            for test in (on.find_all(exp.GT, exp.GTE, exp.LT, exp.LTE, exp.Between) if on is not None and not on_a_key else []):
                 if isinstance(test, exp.Between):
                     pairs = [(test.args.get("low"), lower), (test.args.get("high"), upper)]
                     probe = test.this
@@ -910,7 +914,7 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                         continue  # (a calendar that is itself a generated table: `join dates d on d.date between start and end`)
                     if len(owners) == 1 and probes and not owners & probes and "" not in owners:
                         role.setdefault(next(iter(owners)), []).append(bound)
-            if keyed and on is not None:
+            if on_a_key and on is not None:
                 looked = (join.this.alias_or_name or "").upper()
                 of_looked = lambda e: [resolve_path(c) for c in e.find_all(exp.Column) if c.table.upper() == looked]  # noqa: E731
                 things = [spot for e in on.find_all(exp.EQ) if isinstance(e.this, exp.Column) and isinstance(e.expression, exp.Column)
@@ -1034,6 +1038,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     use.bounds.setdefault(hit[1], set()).update(read)
                     if hit[0] in read_here:
                         use.read_bounds.setdefault(hit[1], set()).update(read)
+                    if isinstance(parent, exp.Between) and len(read) == 2 and not isinstance(parent.parent, exp.Not):
+                        use.kept_ranges.setdefault(hit[1], (min(read), max(read)))  # (the first range any model keeps)
                     if isinstance(parent, exp.Between) and len(read) == 2 and hit[0] in read_here and not isinstance(parent.parent, exp.Not):
                         # the model that reads the table itself takes only this range: nothing outside it gets any further
                         use.windows.setdefault(hit[1], set()).update(read)
@@ -1302,6 +1308,21 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 for got in behind(inner) or ():
                     if len(got) == 2 and got[0] in sources:
                         sources[got[0]].lengths.setdefault(got[1], int(number.name))
+
+        # `where block >= (select max(block) from loaded) - 20000`: a run reads what is within 20000 of the newest
+        for test in select.find_all(exp.GTE, exp.GT):
+            mark_less = test.expression  # (the newest value, less how far back is read)
+            if not (isinstance(test.this, exp.Column) and isinstance(mark_less, exp.Sub) and isinstance(mark_less.expression, exp.Literal)
+                    and not mark_less.expression.is_string and isinstance(mark_less.this.unnest(), (exp.Subquery, exp.Select))
+                    and mark_less.this.find(exp.Max) is not None):
+                continue
+            got = resolve(test.this)
+            try:
+                reach = float(mark_less.expression.name)
+            except ValueError:
+                continue
+            if got and got[0] in sources and reach > 0:
+                sources[got[0]].lookbacks[got[1]] = min(reach, sources[got[0]].lookbacks.get(got[1], reach))
 
         latest_of = None
         kept = select.args.get("qualify")
@@ -2590,6 +2611,17 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 window = None  # another model reads the table itself and asks for something outside it
             ranged = bool(window and len(window) >= 2)
             within_bounds(out[col], {min(window), max(window)} if ranged else use.bounds.get(col), exact=ranged)
+            reach = use.lookbacks.get(col)
+            if reach and out[col].get("gen") == "dist" and len(out[col].get("v") or ()) >= 2 and isinstance(out[col]["v"][0], (int, float)):
+                # the models that keep a mark of the newest value read no further back than this: the values lie
+                # within that of the top of the range the reader keeps
+                # (the range a loader keeps, where there is one: thresholds beyond it are never reached by what it loads)
+                kept = (min(window), max(window)) if ranged else use.kept_ranges.get(col)
+                top = kept[1] if kept else max(use.bounds.get(col) or out[col]["v"])
+                low = max(kept[0] if kept else min(out[col]["v"]), top - reach)
+                if low < top:
+                    whole = str(out[col].get("type", "")).upper() == "BIGINT"
+                    out[col].update(p=[0, 1], v=[int(low), int(top)] if whole else [low, top])
             if len(use.text_bounds.get(col, ())) >= 2 and out[col] == {"gen": "template", "template": f"{col.lower()}_{{hex}}"}:
                 # `account_number between '4000' and '4999'`: numbers kept as text, most of them in the range asked for
                 low, high = min(use.text_bounds[col]), max(use.text_bounds[col])
