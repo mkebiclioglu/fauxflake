@@ -10,7 +10,10 @@ from fauxflake.emulator import serve
 @pytest.fixture(scope="module")
 def conn():
     with serve() as emu:
-        yield snowflake.connector.connect(**emu.connect_kwargs(database="CONFORMANCE", schema="PUBLIC"))
+        emu.ensure_database("ANALYTICS", "CI")  # the cases that create something name the schema the recording account has
+        connection = snowflake.connector.connect(**emu.connect_kwargs(database="CONFORMANCE", schema="PUBLIC"))
+        yield connection
+        connection.close()
 
 
 def _params():

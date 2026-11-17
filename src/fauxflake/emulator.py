@@ -346,6 +346,47 @@ def _record_semi_types(cursor) -> None:  # noqa: ANN001
         pass
 
 
+def _no_duplicate_columns(cursor, create: exp.Create, params=None) -> None:  # noqa: ANN001
+    """`create table t as select a.id, b.id from a join b ...`: Snowflake refuses two columns of one name. DuckDB
+    calls the second one `id_1` and carries on, so the model would build here and fail in production. When the
+    new relation has such a column, ask what the query itself names its columns, and refuse as Snowflake does."""
+    query, target = create.expression, create.this
+    kind = str(create.args.get("kind") or "").upper()
+    if not isinstance(query, exp.Query) or kind not in ("TABLE", "VIEW") or isinstance(target, exp.Schema):
+        return  # (a column list after the name gives the names)
+    if isinstance(target, exp.Table) and (target.name.upper() == "MERGE_CANDIDATES" or target.name.upper().startswith("__FX_")):
+        return  # the emulator's own working table for a MERGE
+    duck = cursor._duck_conn
+    try:
+        name = target.sql(dialect="duckdb")
+        made = [r[0] for r in duck.execute(f"describe {name}").fetchall()]
+        held = {m.upper() for m in made}
+        if not any(re.fullmatch(r"(.+)_\d+", m) and re.fullmatch(r"(.+)_\d+", m).group(1).upper() in held for m in made):
+            return
+        text = "describe " + query.sql(dialect="duckdb")
+        asked = [r[0] for r in (duck.execute(text, params) if params else duck.execute(text)).fetchall()]
+    except duckdb.Error:
+        return
+    twice = next((n for i, n in enumerate(asked) if n in asked[:i]), None)
+    if twice is None:
+        # `with j as (select a.id, b.id ...) select * from j`: the two names met inside, and DuckDB renamed one there
+        for inner in query.find_all(exp.Select):
+            names = [e.alias_or_name for e in inner.expressions]
+            if any(isinstance(e, exp.Star) or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star)) or not e.alias_or_name
+                   for e in inner.expressions):
+                continue
+            twice = next((n for i, n in enumerate(names) if n in names[:i] and f"{n}_1".upper() in held), None)
+            if twice is not None:
+                break
+    if twice is None:
+        return
+    with contextlib.suppress(duckdb.Error):
+        duck.execute(f"drop {kind.lower()} if exists {name}")
+    from snowflake.connector.errors import ProgrammingError
+
+    raise ProgrammingError(msg=f"SQL compilation error:\nduplicate column name '{twice}'", errno=2025, sqlstate="42S21")
+
+
 def stand_in(duck, name: str, statement: str) -> None:  # noqa: ANN001
     """Create a stand-in with `statement` and keep it out of SHOW OBJECTS / TABLES / VIEWS."""
     duck.execute(statement)
@@ -841,6 +882,7 @@ def _patch_fakesnow() -> None:
                     _built(self, replaced[0])
                 if isinstance(tree, exp.Create):
                     _record_semi_types(self)
+                    _no_duplicate_columns(self, tree, params)
             except Exception as e:
                 if replaced and replaced[1]:
                     with contextlib.suppress(Exception):

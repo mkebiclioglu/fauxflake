@@ -1386,6 +1386,29 @@
    ]
   ]
  },
+ "duplicate_names_from_star_in_ctas": {
+  "error": "002025 (42S21): SQL compilation error:"
+ },
+ "duplicate_names_in_a_query": {
+  "rows": [
+   [
+    "1",
+    "1"
+   ]
+  ]
+ },
+ "duplicate_names_in_ctas": {
+  "error": "002025 (42S21): SQL compilation error:"
+ },
+ "duplicate_names_in_view": {
+  "error": "002025 (42S21): SQL compilation error:"
+ },
+ "duplicate_names_star_plus_column_in_ctas": {
+  "error": "002025 (42S21): SQL compilation error:"
+ },
+ "duplicate_names_through_cte_in_ctas": {
+  "error": "002025 (42S21): SQL compilation error:"
+ },
  "dynamic_pivot": {
   "rows": [
    [
@@ -2639,6 +2662,20 @@
    ]
   ]
  },
+ "no_duplicate_names_in_ctas": {
+  "rows": [
+   [
+    "Table FX_NO_DUPES successfully created."
+   ]
+  ]
+ },
+ "no_duplicate_names_with_using": {
+  "rows": [
+   [
+    "Table FX_NO_DUPES successfully created."
+   ]
+  ]
+ },
  "null_aggregates": {
   "rows": [
    [
@@ -3172,6 +3209,13 @@
     "1",
     "2",
     "3"
+   ]
+  ]
+ },
+ "quoted_names_differ_by_case_in_ctas": {
+  "rows": [
+   [
+    "Table FX_NO_DUPES successfully created."
    ]
   ]
  },
