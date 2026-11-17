@@ -79,6 +79,10 @@ class SourceUse:
         # list is empty (or the column null) wherever the rule, written in the table's own columns, does not hold
         self.implied: list[tuple[str, str, str]] = []
         self.readings: set[tuple[str, str]] = set()
+        self.lengths: dict[str, int] = {}  # text column -> how long the models take its values to be (`length(server_id) <> 26`: invalid)
+        # ((column, path), (column, path)): rows kept as the latest of each of the first, then looked up by the
+        # second (`partition by dns` ... `on x.installation_id = l.installation_id`): the first belongs to one of the second
+        self.one_per: set[tuple[tuple[str, str], tuple[str, str]]] = set()
         self.series: set[frozenset[str]] = set()  # columns a join matches on together (`on a.id = b.id and a.hour = b.hour`)
         self.read_bounds: dict[str, set[float]] = {}  # number column -> what the models that read the table itself compare it with
         self.windows: dict[str, set[float]] = {}  # number column -> the range the model that reads the table itself keeps (`between a and b`)
@@ -112,6 +116,7 @@ CONTEXT = {"CURRENT_ACCOUNT": "FAUXFLAKE", "CURRENT_ACCOUNT_NAME": "FAUXFLAKE", 
 _PATHS = "\0paths"  # in a model's outputs: {column: (source, source column, path inside its document)}
 _ANY = "\0any:"  # in a model's outputs: _ANY + column -> the source columns a COALESCE takes the value from, in order
 _KEYED = "\0key:"  # in a model's outputs: _KEYED + column -> the parts of a surrogate key of several columns, in order
+_LATEST = "\0latest"  # in a CTE's outputs: the one place its rows are the latest of (`qualify row_number() over (partition by x) = 1`)
 _EXPR = "\0sql:"  # in a model's outputs: _EXPR + column -> (table, the value written in that source table's own columns)
 _HASHED = "\0md5:"  # in a model's outputs: _HASHED + column -> the source columns a surrogate key is the hash of
 
@@ -1213,9 +1218,57 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 if one and two and len(one) == len(two):
                     joins.extend((a, b) for a, b in zip(one, two) if a and b and a != b and a[0] != b[0])
 
+        def place(e):  # noqa: ANN001, ANN202
+            """(table, column, path in its document or "") for a value that is one source column or one place in one."""
+            for _ in range(6):
+                if isinstance(e, exp.Column) and written(e) is not None:
+                    e = written(e)
+                elif isinstance(e, (exp.Cast, exp.TryCast, exp.Paren)):
+                    e = e.this
+                else:
+                    break
+            hit = resolve(e) if isinstance(e, exp.Column) and not isinstance(e.this, exp.Star) else None
+            if hit:
+                return hit[0], hit[1], ""
+            try:
+                placed = resolve_path(e)
+            except Exception:  # noqa: BLE001
+                placed = None
+            if isinstance(placed, tuple) and len(placed) == 3 and placed[0] in sources and placed[2] \
+                    and not any(k in path_text(placed[2]) for k in ("{}", "~", "[]")):
+                return placed[0], placed[1], path_text(placed[2])
+            return None
+
+        # `on l.installation_id = s.installation_id`, s the latest row of each hostname: were a hostname's rows of
+        # several installations the join would find one of them only, and an installation with several hostnames
+        # comes out once for each. The models take each hostname to be of one installation
+        for test in select.find_all(exp.EQ):
+            for side in (test.this, test.expression):
+                latest = renames.get(side.table.upper(), {}).get(_LATEST) if isinstance(side, exp.Column) and side.table else None
+                by = place(side) if latest else None
+                if by and by[0] == latest[0] and by != latest and by[0] in sources and (by[1] == latest[1] or not (by[2] or latest[2])):
+                    sources[by[0]].one_per.add(((latest[1], latest[2]), (by[1], by[2])))
+
+        # `where length(server_id) <> 26` (the invalid ones), `length(id) = 26`: how long an id is
+        for test in select.find_all(exp.EQ, exp.NEQ):
+            for measured, number in ((test.this, test.expression), (test.expression, test.this)):
+                if not (isinstance(measured, exp.Length) and isinstance(number, exp.Literal) and not number.is_string
+                        and number.name.isdigit() and 8 <= int(number.name) <= 64):
+                    continue
+                inner = measured.this
+                while isinstance(inner, (exp.Trim, exp.Cast, exp.TryCast, exp.Paren, exp.Lower, exp.Upper)):
+                    inner = inner.this
+                for got in behind(inner) or ():
+                    if len(got) == 2 and got[0] in sources:
+                        sources[got[0]].lengths.setdefault(got[1], int(number.name))
+
+        latest_of = None
         kept = select.args.get("qualify")
         for test in (kept.find_all(exp.EQ) if kept is not None else []):
             window, one = (test.this, test.expression) if isinstance(test.this, exp.Window) else (test.expression, test.this)
+            if isinstance(window, exp.Window) and isinstance(window.this, exp.RowNumber) and isinstance(one, exp.Literal) \
+                    and one.name == "1" and len(window.args.get("partition_by") or []) == 1:
+                latest_of = place(window.args["partition_by"][0])
             if not (isinstance(window, exp.Window) and isinstance(window.this, exp.RowNumber) and isinstance(one, exp.Literal)
                     and one.name == "1" and len(window.args.get("partition_by") or []) == 2):
                 continue
@@ -1363,6 +1416,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
             inner_name = next(iter(selected)).upper()
             if inner_name in cte_positions:  # `select * from cte` keeps the CTE's column order
                 by_position[:] = cte_positions[inner_name]
+        if latest_of:
+            outputs[_LATEST] = latest_of
         outputs_of[id(select)] = outputs
         if name:
             lineage[name] = outputs
@@ -1536,6 +1591,59 @@ def _share_join_values(tables: dict[str, dict], joins: list, notes: list[str], l
 def pool_name(m) -> str:  # noqa: ANN001
     """What the made-up values of a (table, column, path) are called."""
     return (m[2].replace("[]", "").split(".")[-1] or m[1]).lower()
+
+
+def as_long_as(tables: dict[str, dict], uses: dict, pairs: list, notes: list[str]) -> None:
+    """`length(server_id) <> 26` marks the invalid ids: an id is 26 characters, in that column and in every
+    column a join or a UNION lines up with it (`length`: the made-up value, rewritten at that length). Left alone
+    where any of them holds values known by name: those are as long as they are."""
+    group_of: dict[tuple[str, str], set] = {}
+    for a, b in pairs:
+        if len(a) != 2 or len(b) != 2 or any(m[0] not in tables or m[1] not in tables[m[0]].get("columns", {}) for m in (a, b)):
+            continue
+        merged = group_of.get(a, {a}) | group_of.get(b, {b})
+        for m in merged:
+            group_of[m] = merged
+    done: set[int] = set()
+    for name, use in uses.items():
+        for col, size in sorted(getattr(use, "lengths", {}).items()):
+            if name not in tables or col not in tables[name].get("columns", {}):
+                continue
+            group = group_of.get((name, col), {(name, col)})
+            if id(group) in done:
+                continue
+            done.add(id(group))
+            held = [tables[t]["columns"][c] for t, c in sorted(group)]
+            made_up = lambda d: (d.get("gen") in ("hash_id", "fk", "pool") and not d.get("numeric") and not d.get("template")) or (  # noqa: E731
+                d.get("gen") == "template" and not d.get("templates") and re.fullmatch(r"\w+_\{(n|hex)\}", str(d.get("template", ""))))
+            if not all(made_up(d) and not d.get("suffix") and not d.get("format") for d in held):
+                continue
+            for d in held:
+                d["length"] = size
+            # and whatever else is generated from the same values: references to a key, keys of one domain, a pool
+            for _ in range(3):
+                first = {t: next((d for d in table.get("columns", {}).values() if d.get("gen") in ("hash_id", "sequence")), None)
+                         for t, table in tables.items()}
+                for table in tables.values():  # (a reference of that length is to a key of that length)
+                    for d in table.get("columns", {}).values():
+                        if d.get("gen") == "fk" and d.get("length") and first.get(d.get("ref")) and first[d["ref"]].get("gen") == "hash_id":
+                            first[d["ref"]].setdefault("length", d["length"])
+                keys = {t: d for t, d in first.items() if d and d.get("length")}
+                domains = {d["domain"]: d["length"] for d in keys.values() if d.get("domain")}
+                pools = {d["pool"]: d["length"] for table in tables.values() for d in table.get("columns", {}).values()
+                         if d.get("gen") == "pool" and d.get("length")}
+                for table in tables.values():
+                    for d in table.get("columns", {}).values():
+                        if d.get("length"):
+                            continue
+                        if d.get("gen") == "fk" and d.get("ref") in keys:
+                            d["length"] = keys[d["ref"]]["length"]
+                        elif d.get("gen") == "hash_id" and d.get("domain") in domains:
+                            d["length"] = domains[d["domain"]]
+                        elif d.get("gen") == "pool" and d.get("pool") in pools:
+                            d["length"] = pools[d["pool"]]
+            notes.append(f"{name}.{col}: models take its values to be {size} characters long; generated so, as are the "
+                         f"{len(held) - 1} column(s) matched with it (`length`).")
 
 
 def _share_union_values(tables: dict[str, dict], links: list) -> None:
@@ -2520,6 +2628,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
             held[column] = {"gen": "row_of", "group": seed, "values": [row[i] for row in rows]}
         joined.append(f"{table} ({', '.join(columns)}): joined together to the seed {seed}, generated as the rows it lists.")
     _share_join_values(tables, joins, joined, lookups)
+    as_long_as(tables, uses, [*joins, *((a, b) for group in links for a in sorted(group, key=str)[:1] for b in sorted(group, key=str)[1:])], notes)
     _share_union_values(tables, links)
     if joined:
         notes.append(f"{len(joined)} group(s) of columns are joined in models and generated to match, for example: {' '.join(joined[:3])}")
@@ -2540,6 +2649,18 @@ def analyse(manifest: dict, database: str) -> Analysis:
         # holds one row per period for each of a few entities, as a meter or a daily balance does: generated so, and
         # whatever is joined to the entity draws from the same few
         columns = tables.get(name, {}).get("columns") or {}
+        for (one, one_path), (by, by_path) in sorted(use.one_per):
+            # a hostname is of one installation: written from the installation's value, the same in each of its rows
+            if one_path or by_path:
+                fields = (columns.get(one) or {}).get("fields") or {}
+                held, known = fields.get(one_path) or {}, by_path in fields and one == by
+            else:
+                held, known = columns.get(one) or {}, by in columns
+            made_up = f"{(one_path or one).split('.')[-1].lower()}_{{hex}}"
+            if known and held.get("gen") == "template" and held.get("template") == made_up and not held.get("follows") and not held.get("unique"):
+                held["follows"] = by_path or by
+                notes.append(f"{name}.{one}{'.' + one_path if one_path else ''}: models keep the latest row of each and look it up by "
+                             f"{by_path or by}; each belongs to one {(by_path or by).lower()} (`follows`).")
         for thing, moment in sorted(use.readings):
             # the latest row of each server each day is what the models keep: the table holds readings, the same few
             # things reporting day after day. A key that gives every row a thing of its own would leave each with

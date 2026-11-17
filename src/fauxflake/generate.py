@@ -295,6 +295,14 @@ class TableSQL:
                     return self._expr(f"{col}.{value[2]['of']}", fields[value[2]["of"]])
                 finally:
                     self.base = "g"
+            if value[2].get("follows") in fields and value[2]["follows"] != value[1] and self.base == "g":
+                # a field that belongs to another of the same document: one hostname for one installation
+                other = value[2]["follows"]
+                self.base = f"({self.expr(f'{col}.{other}', {k: v for k, v in fields[other].items() if k != 'follows'})})"
+                try:
+                    return self._expr(f"{col}.{value[1]}", value[2])
+                finally:
+                    self.base = "g"
             if key_expr and value[1] != keyed_by and self.base == "g":
                 self.base = key_expr
                 try:
@@ -579,6 +587,11 @@ class TableSQL:
                 f"(day::timestamp + to_hours(((_n // {math.prod(self.grain().values())}) % 24)::integer))"
         if d.get("trunc") and gen in ("event_time", "time_offset", "updated_at") and not d.get("format") and not d.get("epoch"):
             expr = f"date_trunc({lit(str(d['trunc']))}, {expr})"  # reported per hour (or day): on the boundary
+        if d.get("length") and "." not in col:
+            # an id of a given length (`length(server_id) = 26`): the value rewritten, the same way wherever it is
+            # written, so what matched still matches and what differed still differs
+            text = f"({expr})::varchar"
+            expr = f"substr(md5({text}) || md5({text} || '+'), 1, {int(d['length'])})"
         rate = repr(float(d.get("null_rate") or 0.0))
         if self.sc and self.sc.null_rate is not None and gen in ("fk", "categorical", "dist", "pool", "template", "time_offset", "object", "array"):
             rate = self.during(repr(self.sc.null_rate), rate)

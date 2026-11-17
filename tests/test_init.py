@@ -1231,3 +1231,32 @@ def test_columns_joined_to_a_category_bring_the_values_they_are_asked_for_by_nam
     }
     columns = build_spec(manifest, "A")[0]["tables"]["RAW.S.RATES"]["columns"]
     assert "compute" in columns["USAGE"]["values"] and "STORAGE" in columns["USAGE"]["values"], columns
+
+
+def test_the_latest_row_of_each_hostname_looked_up_by_installation_makes_a_hostname_of_one_installation():
+    sources = {"RAW.S.SUBS": SourceUse(), "RAW.S.SERVERS": SourceUse()}
+    scan_model("""
+        with latest as (
+            select s.meta:"inst"::varchar as installation_id, s.meta:"dns"::varchar as hostname
+            from raw.s.subs s
+            qualify row_number() over (partition by s.meta:"dns"::varchar order by s.created desc) = 1)
+        select v.id, l.hostname from raw.s.servers v left join latest l on v.installation_id = l.installation_id""",
+               sources, joins=[])
+    assert sources["RAW.S.SUBS"].one_per == {(("META", "dns"), ("META", "inst"))}
+
+
+def test_an_id_the_models_measure_is_that_long_wherever_it_is_matched():
+    from fauxflake.init import build_spec
+
+    def source(name, cols):
+        return {"database": "RAW", "schema": "S", "name": name, "identifier": name,
+                "columns": {c: {"data_type": t} for c, t in cols.items()}}
+
+    manifest = {
+        "sources": {"source.p.s.servers": source("servers", {"id": "VARCHAR", "name": "VARCHAR"}),
+                    "source.p.s.pings": source("pings", {"server_id": "VARCHAR", "at": "TIMESTAMP"})},
+        "nodes": {"model.p.m": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.M", "compiled_code": """
+            select s.id, p.at from raw.s.servers s join raw.s.pings p on p.server_id = s.id where length(p.server_id) = 26"""}},
+    }
+    columns = {t: d["columns"] for t, d in build_spec(manifest, "A")[0]["tables"].items()}
+    assert columns["RAW.S.SERVERS"]["ID"].get("length") == 26 and columns["RAW.S.PINGS"]["SERVER_ID"].get("length") == 26, columns

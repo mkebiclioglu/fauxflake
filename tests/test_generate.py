@@ -472,3 +472,41 @@ def test_a_list_is_empty_where_the_rule_about_its_rows_does_not_hold(tmp_path):
             """select count(*), count_if("NAME" = 'Calls' and json_array_length("SKUS") > 0), count_if(json_array_length("SKUS") = 0),
                       count_if("NAME" <> 'Calls' and json_array_length("SKUS") > 0) from "RAW"."T"."CALLS" """).fetchone()
         assert known > 0 and unknown > 0 and lost == 0 and known + unknown == rows
+
+
+def test_a_field_that_follows_another_of_its_document_is_the_same_wherever_that_one_is(tmp_path):
+    from datetime import datetime
+
+    from fauxflake.emulator import serve
+    from fauxflake.generate import Warehouse
+    from fauxflake.spec import Spec
+
+    spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "tables": {"RAW.T.SUBS": {
+        "volume": {"rows_per_day": 300}, "columns": {
+            "ID": {"gen": "sequence"},
+            "META": {"gen": "object", "fields": {
+                "inst": {"gen": "categorical", "values": {"a": 0.25, "b": 0.25, "c": 0.25, "d": 0.25}},
+                "dns": {"gen": "template", "template": "dns_{hex}", "follows": "inst"}}}}}}}, tmp_path / "x.yml")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 3))
+        assert emu.cursor().execute("""select count(distinct "META"->>'inst'), count(distinct "META"->>'dns'),
+            count(distinct ("META"->>'inst') || ("META"->>'dns')) from "RAW"."T"."SUBS" """).fetchone() == (4, 4, 4)
+
+
+def test_ids_of_a_given_length_still_match_what_refers_to_them(tmp_path):
+    from datetime import datetime
+
+    from fauxflake.emulator import serve
+    from fauxflake.generate import Warehouse
+    from fauxflake.spec import Spec
+
+    spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "tables": {
+        "RAW.T.SERVERS": {"volume": {"rows_per_day": 50}, "columns": {"ID": {"gen": "hash_id", "length": 26}}},
+        "RAW.T.PINGS": {"volume": {"rows_per_day": 300}, "columns": {
+            "N": {"gen": "sequence"}, "SERVER_ID": {"gen": "fk", "ref": "RAW.T.SERVERS", "length": 26}}}}}, tmp_path / "x.yml")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 3))
+        cur = emu.cursor()
+        assert cur.execute("""select count(*) = count(distinct "ID"), min(length("ID")), max(length("ID")) from "RAW"."T"."SERVERS" """).fetchone() == (True, 26, 26)
+        assert cur.execute("""select count(*), count(s."ID") from "RAW"."T"."PINGS" p left join "RAW"."T"."SERVERS" s
+                              on s."ID" = p."SERVER_ID" where length(p."SERVER_ID") = 26""").fetchone()[1] > 100
