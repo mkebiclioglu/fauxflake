@@ -455,12 +455,22 @@ class TableSQL:
             elif d.get("per_parent") and self.base == "g":
                 # at most so many rows for one parent (`having count(*) > 2` is a test): rows share parents in turn
                 idx = f"((g // {max(int(d['per_parent']), 1)}) % greatest(_pe_{col}, 1))::bigint"
+            flag = parent.columns.get(str(d.get("spares") or ""))
+            if flag and flag.get("every") and int(flag["every"]) > 1:
+                # the rows a flag of the parent marks (deleted ones) are never referred to: the row before, instead
+                every = int(flag["every"])
+                idx = f"(select case when (i % {every}) = {every - 1} then i - 1 else i end from (select {idx} as i))"
             expr = self.key_expr(parent, idx)
         elif gen == "categorical" and col in self.grain() and self.base == "g":
             sizes = self.grain()
             stride = math.prod(list(sizes.values())[:list(sizes).index(col)])
             known = "[" + ", ".join(lit(v) for v in d["values"]) + "]"
             expr = f"list_extract({known}, 1 + ((_n // {stride}) % {sizes[col]})::bigint)"
+        elif gen == "categorical" and d.get("every") and self.base == "g" and "." not in col:
+            # a flag that marks one row in so many, always the same ones (the deleted accounts): what refers to the
+            # table can leave those rows alone (`spares`)
+            marked = f"((g % {int(d['every'])}) = {int(d['every']) - 1})"
+            expr = marked if d.get("marks", True) else f"(not {marked})"
         elif gen == "categorical":
             total = sum(d["values"].values())
             x, arms, acc = self.u(col), [], 0.0

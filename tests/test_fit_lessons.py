@@ -938,3 +938,27 @@ def test_a_key_that_repeats_because_a_join_meets_several_rows_makes_the_other_si
     # another test that leads to the same place is taken as taught too
     other = {**test, "name": "unique_dim_project_id", "attached_node": "model.p.dim_project", "column_name": "id"}
     assert f.learn_from_twice(other, places)
+
+
+def test_a_failing_relationship_makes_a_reference_or_spares_the_rows_the_parent_model_leaves_out():
+    tables = {"RAW.T.ACCOUNTS": {"columns": {"ID": {"gen": "hash_id"},
+                                             "ISDELETED": {"gen": "categorical", "type": "BOOLEAN", "values": {True: 0.15, False: 0.85}}}},
+              "RAW.T.REVIEWS": {"columns": {"ID": {"gen": "sequence"}, "ACCOUNT": {"gen": "template", "template": "account_{hex}"}}}}
+    sql = {"model.p.accounts": "with s as (select id as account_id, isdeleted as is_deleted from raw.t.accounts) "
+                               "select * from s where account_id is not null and is_deleted = false"}
+    nodes = {"model.p.accounts": {"name": "accounts", "depends_on": {"nodes": []}}}
+    f = fitter(tables=tables, sql_of=sql, nodes=nodes)
+    places = _Places({("model.p.reviews", "ACCOUNT_ID"): ("RAW.T.REVIEWS", "ACCOUNT", ""),
+                      ("model.p.accounts", "ACCOUNT_ID"): ("RAW.T.ACCOUNTS", "ID", ""),
+                      ("model.p.accounts", "IS_DELETED"): ("RAW.T.ACCOUNTS", "ISDELETED", "")})
+    test = {"name": "relationships_reviews_account", "attached_node": "model.p.reviews", "column_name": "account_id",
+            "test_metadata": {"name": "relationships", "kwargs": {"to": "ref('accounts')", "field": "account_id"}},
+            "depends_on": {"nodes": ["model.p.accounts", "model.p.reviews"]}}
+    # first the column becomes a reference to what the other model is built from
+    assert f.learn_from_test(test, places)
+    assert tables["RAW.T.REVIEWS"]["columns"]["ACCOUNT"] == {"gen": "fk", "ref": "RAW.T.ACCOUNTS", "skew": 1.5}
+    # it still fails: the model leaves deleted accounts out, and nothing refers to those from now on
+    assert f.learn_from_test(test, places)
+    assert tables["RAW.T.REVIEWS"]["columns"]["ACCOUNT"]["spares"] == "ISDELETED"
+    assert tables["RAW.T.ACCOUNTS"]["columns"]["ISDELETED"]["every"] == 7 and tables["RAW.T.ACCOUNTS"]["columns"]["ISDELETED"]["marks"] is True
+    assert not f.learn_from_test(test, places)

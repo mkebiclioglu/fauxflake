@@ -3669,6 +3669,76 @@ class Fitter:
             return self.behind_relation(earlier, next(iter(read.values())), column, depth + 1)
         return None
 
+    def learn_from_relationship(self, node: dict, analysis, table: str, col: str, kwargs: dict) -> bool:  # noqa: ANN001
+        """A `relationships` test fails: rows name something the other model does not hold. Either the column is not
+        generated as a reference to what that model is built from, or it is, and the model leaves some of its rows
+        out by a flag (`where is_deleted = false`): then nothing refers to the rows the flag marks, as nothing
+        refers to a deleted account."""
+        gen = self.tables[table]["columns"][col]
+        parents = [n for n in (node.get("depends_on") or {}).get("nodes") or [] if n != node.get("attached_node")]
+        field = str(kwargs.get("field") or "")
+        if len(parents) != 1 or not re.fullmatch(r"\w+", field):
+            return False
+        there = analysis.place(parents[0], field)
+        if not there or there[2] or there[0] not in self.tables or there[1] not in self.tables[there[0]].get("columns", {}):
+            return False
+        parent, pcol = there[0], there[1]
+        held = self.tables[parent]["columns"]
+        key = next((c for c, d in held.items() if d.get("gen") in ("sequence", "hash_id")), None)
+        if gen.get("gen") != "fk" or str(gen.get("ref", "")).upper() != parent:
+            if pcol != key or gen.get("gen") in ("sequence", "hash_id") or (parent == table and pcol == col):
+                return False
+            # (a row that names itself as its parent has none above it: half of them are roots)
+            fresh = {"gen": "fk", "ref": parent, "skew": 1.5, **({"null_rate": gen["null_rate"]} if gen.get("null_rate") else {}),
+                     **({"null_rate": 0.5} if parent == table and not gen.get("null_rate") else {})}
+            self.tables[table]["columns"][col] = fresh
+            self.learned.append(f"{table}.{col}: a `relationships` test failed; generated as a reference to {parent}.")
+            self.retyped.add(table)
+            self.dirty = True
+            return True
+        if gen.get("spares") or pcol != key or held[key].get("of") or self.tables[parent].get("grain"):
+            return False
+        # the reference is right: which of its rows does the other model leave out?
+        from .why import _conjuncts
+
+        chain, uid = [], parents[0]
+        for _ in range(4):
+            if uid not in self.sql_of:
+                break
+            chain.append(uid)
+            above = [d for d in (self.nodes.get(uid, {}).get("depends_on") or {}).get("nodes") or [] if d.startswith("model.")]
+            if len(above) != 1:
+                break
+            uid = above[0]
+        for uid in chain:
+            try:
+                tree = self.tree(uid)
+            except Exception:  # noqa: BLE001
+                continue
+            for where in tree.find_all(exp.Where) if tree is not None else []:
+                for cond in _conjuncts(where.this):
+                    flag, dropped = None, None  # the flag, and the value of the rows left out
+                    if isinstance(cond, (exp.EQ, exp.Is)) and isinstance(cond.this, exp.Column) and isinstance(cond.expression, exp.Boolean):
+                        flag, dropped = cond.this, not cond.expression.this
+                    elif isinstance(cond, exp.Not) and isinstance(cond.this, exp.Column):
+                        flag, dropped = cond.this, True
+                    elif isinstance(cond, exp.NEQ) and isinstance(cond.this, exp.Column) and isinstance(cond.expression, exp.Boolean):
+                        flag, dropped = cond.this, bool(cond.expression.this)
+                    spot = analysis.place(uid, flag.name) if flag is not None else None
+                    marked = held.get(spot[1]) if spot and spot[0] == parent and not spot[2] else None
+                    if not marked or marked.get("gen") != "categorical" or str(marked.get("type", "")).upper() != "BOOLEAN":
+                        continue
+                    if not marked.get("every"):
+                        marked.update(every=7, marks=bool(dropped))  # one row in seven, the same ones every time
+                        self.retyped.add(parent)
+                    gen["spares"] = spot[1]
+                    self.retyped.add(table)
+                    self.dirty = True
+                    self.learned.append(f"{table}.{col}: a `relationships` test failed; {self.nodes[uid]['name']} leaves out the rows of "
+                                        f"{parent} that {spot[1]} marks, and nothing refers to those now (`spares`).")
+                    return True
+        return False
+
     def learn_from_twice(self, node: dict, analysis) -> bool:  # noqa: ANN001
         """A `unique` test fails on a column whose source holds every value once: the model itself brings a row
         twice, or a model it reads does. The warehouse the build left says where (`why.Twice`): a join that pairs a
@@ -4196,6 +4266,8 @@ class Fitter:
             self.retyped.add(table)
             return True
         gen = columns[col]
+        if name in ("relationships", "relationships_where"):
+            return self.learn_from_relationship(node, analysis, table, col, kwargs)
         if name == "unique":
             if gen["gen"] in ("sequence", "hash_id"):
                 return False
