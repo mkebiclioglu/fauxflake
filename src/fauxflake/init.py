@@ -2089,6 +2089,14 @@ def analyse(manifest: dict, database: str) -> Analysis:
                         fks.setdefault(spot, theirs[0])
                     else:
                         begins.append((spot, theirs[0]))
+        if not here and column and meta["name"] == "relationships":
+            # `project_id` read out of a document (`fields:project.id`) is tested against the projects: the ids
+            # inside the documents are ids the parent holds
+            kw = meta["kwargs"].get("arguments") or meta["kwargs"]
+            others = [n for n in node["depends_on"]["nodes"] if n != node["attached_node"]]
+            inside, there = place(node["attached_node"], column), locate(others[0], str(kw.get("field", ""))) if others else None
+            if inside and inside[2] and there and there[0] != inside[0]:
+                joins.append((inside, (there[0], there[1], "")))
         if not here:
             continue
         if meta["name"] == "unique":
@@ -2557,6 +2565,11 @@ def analyse(manifest: dict, database: str) -> Analysis:
     for table in tables.values():
         follow_categories(table["columns"])
     address_emails(tables)
+    for table in tables.values():
+        created_comes_first(table["columns"])
+        for gen in table["columns"].values():
+            if gen.get("gen") == "object" and gen.get("fields"):
+                created_comes_first(gen["fields"])
     for (name, col), rule in gated:
         columns = tables.get(name, {}).get("columns") or {}
         if col in columns and columns[col].get("gen") not in _KEYS and rule_binds(rule, col, columns):
@@ -2581,6 +2594,32 @@ HEADER = """# Written by `fauxflake init` from the dbt project. Keys, relationsh
 # from your tests; columns and types from how models use each source. Volumes, lateness and
 # distributions are placeholders: run `fauxflake profile` to measure them, or edit by hand.
 """
+
+
+_BEGUN = re.compile(r"(date)?(created|opened|started)(at|on|date|time)?$")
+_ENDED = re.compile(r"(date|last)?(updated|modified|resolved|resolution|closed|completed|merged|finished|ended|deleted)(at|on|date|time)?$")
+
+
+def created_comes_first(columns: dict) -> None:
+    """`created` and `updated` side by side (columns of a table, or fields of one object in a document): a thing is
+    changed, resolved or closed after it is made. The later time starts where the range of the earlier one stops,
+    so `datediff(day, created, closed)` is never below zero."""
+    by_place: dict[str, dict[str, list[str]]] = {}
+    for name, gen in columns.items():
+        if gen.get("gen") != "time_offset" or gen.get("unique") or not gen.get("seconds"):
+            continue
+        head, _, leaf = name.rpartition(".")
+        leaf = re.sub(r"[^a-z]", "", leaf.lower())
+        role = "begun" if _BEGUN.fullmatch(leaf) else "ended" if _ENDED.fullmatch(leaf) else None
+        if role:
+            by_place.setdefault(head, {}).setdefault(role, []).append(name)
+    for found in by_place.values():
+        if len(found.get("begun", ())) != 1:
+            continue
+        top = max(columns[found["begun"][0]]["seconds"])
+        for name in found.get("ended", ()):
+            if min(columns[name]["seconds"]) <= top:
+                columns[name].update(p=[0, 0.5, 1], seconds=[top + 60, top + 3 * 86400, top + 30 * 86400])
 
 
 def rule_binds(rule: str, col: str, columns: dict) -> bool:

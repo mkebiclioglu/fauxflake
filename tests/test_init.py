@@ -1098,3 +1098,14 @@ def test_a_rule_a_test_states_about_the_rows_that_have_a_value_is_kept_by_leavin
     assert "{{VERSION}}" in columns["RC1_DATE"]["null_unless"] and "null_unless" not in columns["VERSION"]
     # the start is worked out from the planned date, the release is the actual date when there is one: it comes later
     assert min(columns["ACTUAL_RELEASE_DATE"]["seconds"]) > max(columns["RELEASE_DATE"]["seconds"])
+
+
+def test_created_comes_before_updated_also_inside_a_document():
+    from fauxflake.init import created_comes_first
+
+    week = {"gen": "time_offset", "p": [0, 0.5, 1], "seconds": [0, 86400, 604800]}
+    fields = {"created": dict(week), "updated": dict(week), "resolutiondate": dict(week), "status.name": {"gen": "template", "template": "x"},
+              "parent.created": dict(week), "duedate": dict(week)}
+    created_comes_first(fields)
+    assert min(fields["updated"]["seconds"]) > 604800 and min(fields["resolutiondate"]["seconds"]) > 604800
+    assert fields["created"] == week and fields["parent.created"] == week and fields["duedate"] == week
