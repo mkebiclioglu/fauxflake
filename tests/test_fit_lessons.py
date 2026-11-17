@@ -581,6 +581,10 @@ def test_a_row_a_day_model_that_still_does_not_finish_gets_a_tenth_of_the_rows()
     assert tables["RAW.P.EVENTS"]["volume"]["rows_per_day"] == 100 and columns["USER_ID"]["v"] == [1, 50]
     assert f.runaway("m", "Out of Memory Error") and tables["RAW.P.EVENTS"]["volume"]["rows_per_day"] == 20  # down to a handful a day
     assert not f.runaway("m", "Out of Memory Error")
+    tables["RAW.P.EVENTS"]["volume"]["rows_per_day"] = 1000
+    f.n_round = 3  # in a build round the failure reaches more than one lesson: the rows are cut once
+    assert f.runaway("m", "Out of Memory Error") and not f.runaway("m", "Out of Memory Error")
+    assert tables["RAW.P.EVENTS"]["volume"]["rows_per_day"] == 100
 
 
 def test_a_test_that_returns_rows_not_naming_the_row_before_makes_the_table_a_log():
@@ -825,3 +829,34 @@ def test_an_empty_filter_on_made_up_text_gets_the_values_it_names():
     assert f.learn_from_empty("m", Finding("final", "where", "LOWER(status) IN ('pass', 'warn') AND id = '7'"))
     assert tables["RAW.S.RUNS"]["columns"]["STATUS"] == {"gen": "template", "templates": ["pass", "warn", "status_{hex}"]}
     assert tables["RAW.S.RUNS"]["columns"]["ID"] == {"gen": "sequence"}
+
+
+def test_flags_are_followed_back_through_the_models_before():
+    """One made-up value fails as a boolean; every source column the models cast to one is learned with it."""
+    stage = parse("select server_id, enable_testing as testing, enable_gitlab, coalesce(enable_sso, 'false') as sso, version, "
+                  "max(plugins_on) as plugins from RAW.MM.CONFIG group by 1, 2, 3, 4, 5")
+    mart = parse("select server_id, testing::boolean as testing, cast(enable_gitlab as boolean) as gitlab, sso::boolean as sso, "
+                 "plugins::boolean as plugins, version from stg")
+    template = lambda name: {"gen": "template", "template": f"{name.lower()}_{{hex}}"}  # noqa: E731
+    columns = {name: template(name) for name in ("SERVER_ID", "ENABLE_TESTING", "ENABLE_GITLAB", "ENABLE_SSO", "VERSION", "PLUGINS_ON")}
+    f = fitter(trees={"model.p.mart": mart, "model.p.stg": stage}, tables={"RAW.MM.CONFIG": {"columns": columns}})
+    f._ancestors = lambda uid: {"model.p.stg"}
+    f.sources_of = lambda uid: ["RAW.MM.CONFIG"]
+    assert f.flags_upstream("model.p.mart")
+    flags = {name for name, gen in columns.items() if gen.get("type") == "BOOLEAN"}
+    assert flags == {"ENABLE_TESTING", "ENABLE_GITLAB", "ENABLE_SSO", "PLUGINS_ON"}  # not the id or the version
+
+
+def test_a_unique_reference_stays_a_reference():
+    class Reading:
+        @staticmethod
+        def place(node, column):
+            return ("RAW.Z.ITEMS", "CHARGEID", "")
+
+    tables = {"RAW.Z.CHARGES": {"columns": {"ID": {"gen": "sequence"}}},
+              "RAW.Z.ITEMS": {"columns": {"ID": {"gen": "sequence"}, "CHARGEID": {"gen": "fk", "ref": "RAW.Z.CHARGES", "skew": 1.5}}}}
+    f = fitter(tables=tables)
+    test = {"name": "unique_items_charge_id", "attached_node": "model.p.items", "column_name": "charge_id",
+            "test_metadata": {"name": "unique", "kwargs": {"column_name": "charge_id"}}}
+    assert f.learn_from_test(test, Reading)
+    assert tables["RAW.Z.ITEMS"]["columns"]["CHARGEID"] == {"gen": "fk", "ref": "RAW.Z.CHARGES", "skew": 1.5, "per_parent": 1}

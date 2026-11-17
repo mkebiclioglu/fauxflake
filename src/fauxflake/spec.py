@@ -63,9 +63,11 @@ class Table:
         return math.ceil(seconds / DAY) + 1
 
     def calendar(self, start: date, end: date, seed: int, scale: float, scenario=None,
-                 thin: tuple[date, float] | None = None) -> list[tuple[date, int, int]]:
+                 thin: tuple[date, float] | None = None, least: tuple[int, int] | None = None) -> list[tuple[date, int, int]]:
         """(day, cumulative rows before day, rows on day) for every event day in [start, end].
-        `thin`: days before that date hold that share of the volume (the far end of a long history)."""
+        `thin`: days before that date hold that share of the volume (the far end of a long history).
+        `least`: (rows, days) - the table holds at least that many rows once that many days have passed,
+        whatever the scale; what is missing is spread evenly over those days."""
         vol = self.raw.get("volume", {})
         base = float(vol.get("rows_per_day", 1000))
         if self.raw.get("scale", True):
@@ -75,7 +77,9 @@ class Table:
         noise = float(vol.get("noise", 0.0))
         anchor = _date(vol.get("as_of", start))
         out, cum, day, carry = [], 0, start, 0.0
-        while day <= end:
+        window = start + timedelta(days=max(1, least[1]) - 1) if least else None
+        last = max(end, window) if window else end
+        while day <= last:
             rng = random.Random(f"{seed}:{self.name}:{day.isoformat()}")
             level = base * (1 + growth) ** ((day - anchor).days / 365.0) * weekly[day.weekday()]
             if thin and day < thin[0]:
@@ -87,12 +91,22 @@ class Table:
                 carry -= int(carry)
             else:
                 n = max(1, round(level * max(0.0, 1 + noise * rng.gauss(0, 1))))
+            out.append((day, 0, n))
+            day += timedelta(days=1)
+        if least:
+            days = max(1, least[1])
+            short = least[0] - sum(n for _, _, n in out[:days])
+            if short > 0:
+                out[:days] = [(d, 0, n + (i + 1) * short // days - i * short // days) for i, (d, _, n) in enumerate(out[:days])]
+        done, cum = [], 0
+        for day, _, n in out:
+            if day > end:
+                break
             if scenario and scenario.start <= day <= scenario.end:
                 n = round(n * scenario.volume_factor)
-            out.append((day, cum, n))
+            done.append((day, cum, n))
             cum += n
-            day += timedelta(days=1)
-        return out
+        return done
 
 
 def quoted(name: str) -> str:
@@ -112,6 +126,11 @@ class Spec:
     history: int | None = None  # days of history present at the start, when the project's own date filters need more than the default
     recent: int | None = None  # the last days of that history that hold the full volume ...
     older: float | None = None  # ... and the share of it the days before them hold (a long history costs what a short one does)
+    least_rows: int | None = None  # every table holds at least this many rows when a run begins, whatever the scale
+
+    @property
+    def least(self) -> tuple[int, int] | None:
+        return (self.least_rows, self.history or 60) if self.least_rows else None
 
     @property
     def thin(self) -> tuple[date, float] | None:
@@ -146,7 +165,8 @@ class Spec:
                    existing={k.upper(): dict(v or {}) for k, v in (raw.get("existing") or {}).items()},
                    history=int(raw["history"]) if raw.get("history") else None,
                    recent=int(raw["recent"]) if raw.get("recent") else None,
-                   older=float(raw["older"]) if raw.get("older") else None)
+                   older=float(raw["older"]) if raw.get("older") else None,
+                   least_rows=int(raw["least_rows"]) if raw.get("least_rows") else None)
         spec.validate()
         spec.loose_names()
         for var, value in (spec.dbt.get("env") or {}).items():

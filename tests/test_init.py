@@ -946,3 +946,29 @@ def test_a_time_matched_with_a_calendar_day_is_a_whole_day():
                "days as (select date_day from A.B.DIM_DATE) "
                "select * from pings inner join days on ping_date = date_day", uses, None, [], [])
     assert uses["RAW.P.PINGS"].whole_days == {"PING_DATE"}
+
+
+def test_the_id_a_column_falls_back_to_is_recorded():
+    from fauxflake.init import scan_model, SourceUse
+
+    uses = {"RAW.G.NAMESPACES": SourceUse()}
+    scan_model("select id, coalesce(plan_id, 34) as plan_id, coalesce(seats, 0) as seats from RAW.G.NAMESPACES", uses)
+    assert uses["RAW.G.NAMESPACES"].fallbacks == {"PLAN_ID": {34}}
+
+
+def test_a_table_listed_by_its_row_count_holds_that_many_rows():
+    from datetime import date
+
+    from fauxflake.init import rows_asked
+    from fauxflake.spec import Table
+
+    manifest = {"macros": {"macro.p.events": {"macro_sql": "{% macro events(pattern, min_rows=100) %} select table_name from "
+                                                           "raw.information_schema.tables where row_count >= {{min_rows}} {% endmacro %}"}},
+                "nodes": {}}
+    assert rows_asked(manifest) == 100
+    assert rows_asked({"macros": {}, "nodes": {"m": {"raw_code": "select 1 where row_count > 5"}}}) is None
+    table = Table(name="A.B.C", raw={"volume": {"rows_per_day": 20}}, columns={})
+    whole = table.calendar(date(2023, 2, 1), date(2024, 12, 15), 42, 0.001, None, None, (100, 683))
+    assert sum(n for _, _, n in whole) == 100
+    part = table.calendar(date(2023, 2, 1), date(2023, 6, 1), 42, 0.001, None, None, (100, 683))
+    assert part == whole[:len(part)]  # the same days hold the same rows however far the clock has moved

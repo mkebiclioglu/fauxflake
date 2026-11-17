@@ -61,6 +61,7 @@ class SourceUse:
         # column -> texts and LIKE patterns asked of the columns it is lined up with in a UNION
         self.united: dict[str, dict[str, set[str]]] = {"literals": {}, "patterns": {}}
         self.whole_days: set[str] = set()  # time columns matched with a calendar's day (`on ping_date = date_day`)
+        self.fallbacks: dict[str, set[int]] = {}  # column -> the id it is given when it has none (`coalesce(plan_id, 34)`)
         self.equals: dict[str, set[int]] = {}  # column -> whole numbers the SQL asks for by name (`project_id = 278964`, `in (1, 2)`)
         self.scales: dict[tuple[str, str], int] = {}  # (column, path in its document) -> digits of an epoch number below the second
         self.splits: dict[str, dict] = {}  # text column -> {"seps": {"/": {0: "BIGINT"}}, "digits": False} from split()[i]::type
@@ -959,6 +960,10 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                             use.whole_days.add(hit[1])
                 if named_numbers(parent, col):
                     use.equals.setdefault(hit[1], set()).update(named_numbers(parent, col))
+                if isinstance(parent, exp.Coalesce) and parent.this is col and hit[1].endswith("ID"):
+                    # `coalesce(plan_id, 34)`: the plan every row without one is counted under is a plan that exists
+                    use.fallbacks.setdefault(hit[1], set()).update(
+                        int(e.name) for e in parent.expressions if isinstance(e, exp.Literal) and not e.is_string and re.fullmatch(r"[1-9]\d{0,17}", e.name))
                 if isinstance(parent, (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ, exp.Between)):
                     # `where block_number between 9820000 and 10000000`: the numbers that should select something
                     sides = [parent.args.get("low"), parent.args.get("high")] if isinstance(parent, exp.Between) else \
@@ -2205,8 +2210,8 @@ def analyse(manifest: dict, database: str) -> Analysis:
     for name, table in tables.items():
         for col, gen in table["columns"].items():
             kind = gen.get("gen")
-            asked = sorted({*uses[name].literals.get(col, ()), *map(str, uses[name].equals.get(col, ()))}) \
-                if kind in ("fk", "sequence", "hash_id") and name in uses else []
+            asked = sorted({*uses[name].literals.get(col, ()), *map(str, uses[name].equals.get(col, ())),
+                            *map(str, uses[name].fallbacks.get(col, ()))}) if kind in ("fk", "sequence", "hash_id") and name in uses else []
             parent = (table if kind != "fk" else tables.get(str(gen.get("ref", "")).upper())) if asked else None
             key = next((g for g in parent["columns"].values() if g.get("gen") in ("sequence", "hash_id")), None) if parent else None
             if key is None:
@@ -2291,11 +2296,16 @@ def analyse(manifest: dict, database: str) -> Analysis:
         settings["role"] = role
         notes.append(f"the project's masking policies show real values to the role `{role}`, the one that builds the "
                      f"warehouse: the build runs as that role (`dbt: {{role: {role}}}`).")
+    least = rows_asked(manifest)
+    if least:
+        notes.append(f"the project lists tables by their size (`row_count >= {least}` in INFORMATION_SCHEMA.TABLES): every "
+                     f"generated table holds at least {least} rows, whatever the scale (`least_rows` in the spec).")
     if (start, history) != (date(2025, 1, 1), None):
         notes.append(f"the SQL compares with dates between {min(d for _, d in dates)} and {max(d for _, d in dates)}: "
                      f"the generated history starts {start}" + (f" and spans {history} days." if history else "."))
     analysis = Analysis({"seed": 42, "start": start.isoformat(), **({"history": history} if history else {}),
                          **({"recent": RECENT, "older": older} if older else {}),
+                         **({"least_rows": least} if least else {}),
                          "dbt": settings, "tables": tables}, notes, locate, place)
     analysis.bounds = {(name, col): numbers for name, use in uses.items() for col, numbers in use.bounds.items()}
     return analysis
@@ -2305,6 +2315,25 @@ HEADER = """# Written by `fauxflake init` from the dbt project. Keys, relationsh
 # from your tests; columns and types from how models use each source. Volumes, lateness and
 # distributions are placeholders: run `fauxflake profile` to measure them, or edit by hand.
 """
+
+
+def rows_asked(manifest: dict) -> int | None:
+    """`from information_schema.tables where row_count >= {{ min_rows }}`: the project lists the tables
+    worth reading by how many rows they hold (event tables of a tracking schema, unioned by a macro).
+    A generated table has to hold that many, or the list comes back empty and the model does not compile."""
+    texts = [m.get("macro_sql") or "" for uid, m in (manifest.get("macros") or {}).items()
+             if not uid.startswith(("macro.dbt.", "macro.dbt_snowflake."))]
+    texts += [node.get("raw_code") or "" for node in (manifest.get("nodes") or {}).values()]
+    asked = 0
+    for text in texts:
+        if "row_count" not in text.lower() or "information_schema" not in text.lower():
+            continue
+        for strict, number, name in re.findall(r"(?i)\brow_count\s*>(=?)\s*(?:(\d+)|\{\{\s*(\w+)\s*\}\})", text):
+            # a macro argument: its default, or the largest number any caller passes
+            numbers = [int(number)] if number else [int(n) for t in texts for n in re.findall(rf"\b{name}\s*=\s*(\d+)", t)]
+            for n in numbers:
+                asked = max(asked, n + (0 if strict else 1))
+    return min(asked, 10_000) or None
 
 
 def builder_role(manifest: dict) -> str | None:

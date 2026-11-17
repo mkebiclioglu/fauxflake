@@ -93,6 +93,7 @@ class _Readings:
 
 
 _MADE_UP_NUMBER = re.compile(r"Could not convert string '[a-z][a-z0-9_]*_[0-9a-f]{12}' to (?:DOUBLE|FLOAT|INT\d+|DECIMAL)")
+_MADE_UP_FLAG = re.compile(r"Could not convert string '[a-z][a-z0-9_]*_[0-9a-f]{12}' to BOOL")
 _NUMBER_OF = (exp.Sum, exp.Avg, exp.Max, exp.Min, exp.Abs, exp.Round, exp.Floor, exp.Ceil, exp.Nullif, exp.AnyValue, exp.Window,
               exp.Paren, exp.Cast, exp.TryCast, exp.Neg)
 
@@ -112,6 +113,26 @@ def _entry(entry: dict, fields: dict, i: int) -> dict:
         elif gen.get("gen") == "dist":
             entry[name] = i + 1
     return entry
+
+
+def _value_flow(node: exp.Expression | None, depth: int = 0) -> list[exp.Column]:
+    """The columns whose value an expression hands on as it is: through casts, COALESCE, IFF and CASE answers,
+    MAX / MIN / ANY_VALUE and window functions over them."""
+    if depth > 12 or node is None:
+        return []
+    if isinstance(node, exp.Column):
+        return [node]
+    if isinstance(node, exp.Coalesce):
+        return [c for e in [node.this, *node.expressions] for c in _value_flow(e, depth + 1)]
+    if isinstance(node, exp.If):
+        return _value_flow(node.args.get("true"), depth + 1) + _value_flow(node.args.get("false"), depth + 1)
+    if isinstance(node, exp.Case):
+        values = [branch.args.get("true") for branch in node.args.get("ifs") or []] + [node.args.get("default")]
+        return [c for e in values for c in _value_flow(e, depth + 1)]
+    if isinstance(node, (exp.Paren, exp.Cast, exp.TryCast, exp.Max, exp.Min, exp.AnyValue, exp.Window, exp.Nullif,
+                         exp.FirstValue, exp.LastValue, exp.IgnoreNulls, exp.RespectNulls)):
+        return _value_flow(node.this, depth + 1)
+    return []
 
 
 def _number_flow(node: exp.Expression, depth: int = 0) -> list[exp.Column]:
@@ -902,6 +923,8 @@ class Fitter:
             elif numeric and kind == "fk":
                 parent = self.tables.get(str(gen.get("ref", "")).upper(), {}).get("columns") or {}
                 key = next((c for c, d in parent.items() if d.get("gen") == "hash_id"), None)
+                if key is not None and _text_ids(parent[key]) and (table, name) in kept_text:
+                    continue  # compared with text elsewhere, and its key is text: the number that failed is not this column's
                 if key is not None and _text_ids(parent[key]):
                     # the key it refers to is text the SQL takes apart or names (`1.2.3`), and this column is read as
                     # a number: it does not hold that key. A number of its own
@@ -2423,10 +2446,16 @@ class Fitter:
             # grouped). A tenth of the rows, then (down to a handful a day), and only in a real build: a trial pass
             # runs on a few hundred rows whatever the volumes say.
             model = self.nodes.get(sql_key, {}).get("name", sql_key)
+            # a table is cut once a round: the failure reaches more than one lesson, and a model and the tests
+            # that read it fail together on the same rows
+            cut, n_round = self.__dict__.setdefault("_cut", set()), self.__dict__.get("n_round")
             for table in self.sources_of(sql_key):
+                if n_round is not None and (table, n_round) in cut:
+                    continue
                 volume = self.tables[table].setdefault("volume", {})
                 rows = float(volume.get("rows_per_day", 1000))
                 if rows > 20:
+                    cut.add((table, n_round))
                     volume["rows_per_day"] = max(20, int(rows / 10))
                     self.retyped.add(table)
                     changed = True
@@ -2569,12 +2598,48 @@ class Fitter:
         self.dirty |= changed
         return changed
 
+    def flags_upstream(self, sql_key: str) -> bool:
+        """Made-up text met a BOOLEAN in this model. The error names one column, and a model that reads a hundred
+        settings (`enable_x::boolean`, each from its own table) would learn them one build at a time. Every column the
+        model and the models before it cast to a boolean, followed back through the names it is given, is one."""
+        uids = [u for u in [sql_key, *sorted(self._ancestors(sql_key))] if u == sql_key or u.startswith(("model.", "snapshot."))]
+        made: dict[str, list[exp.Expression]] = {}
+        pile: list[str] = []
+        for tree in (t for t in (self.tree(u) for u in uids) if t is not None):
+            for cast in tree.find_all(exp.Cast, exp.TryCast):
+                if cast.to.is_type("boolean"):
+                    pile += [c.name.upper() for c in _value_flow(cast.this)]
+            for alias in tree.find_all(exp.Alias):
+                made.setdefault(alias.alias.upper(), []).append(alias.this)
+        names: set[str] = set()
+        while pile and len(names) < 5000:
+            name = pile.pop()
+            if name in names:
+                continue
+            names.add(name)
+            for inner in made.get(name, []):
+                pile += [c.name.upper() for c in _value_flow(inner) if c.name.upper() not in names]
+        changed = False
+        for table in self.sources_of(sql_key):
+            columns = self.tables[table].get("columns") or {}
+            for name in sorted(names & set(columns)):
+                gen = columns[name]
+                if gen.get("gen") == "template" and gen.get("template") == f"{name.lower()}_{{hex}}" and not gen.get("templates"):
+                    columns[name] = guess(name, "BOOLEAN")
+                    self.retyped.add(table)
+                    self.learned.append(f"{table}.{name}: cast to a boolean by the models that read it; retyped as BOOLEAN.")
+                    changed = True
+        self.dirty |= changed
+        return changed
+
     def learn(self, sql_key: str, message: str) -> bool:
         """Apply whatever one error message teaches. True when the spec changed."""
         before = self._watched()  # for working on the fitter: FAUXFLAKE_FIT_WATCH=TABLE.COLUMN,... whose changes are written down
         done = self._learn(sql_key, message)
         if done and _MADE_UP_NUMBER.search(message):
             self.numbers_upstream(sql_key)
+        if done and _MADE_UP_FLAG.search(message):
+            self.flags_upstream(sql_key)
         self._watch(before, f"{sql_key}: {message[:600]}")
         return done
 
@@ -2667,7 +2732,9 @@ class Fitter:
                                 # source column behind one of them. The source columns behind the others, as long as
                                 # nothing is known about them yet, are numbers too, learned in this round and not one
                                 # round each.
-                                for origin in dict.fromkeys(self.origins(sql_key, c)):
+                                # (only the columns whose value it is: not the stage name a `case when stage = ...
+                                # then 1` counts by)
+                                for origin in dict.fromkeys(self.origins(sql_key, c, strict=True)):
                                     for t in sources:
                                         held = (self.tables[t].get("columns") or {}).get(origin)
                                         if held and held.get("gen") == "template" and not held.get("templates") \
@@ -3288,6 +3355,7 @@ class Fitter:
         fresh = True
         redo: set[str] = set()  # models that failed in the round before
         for n_round in range(1, rounds + 1):
+            self.n_round = n_round
             # at the scale and history `fauxflake build` uses, so that what is reported here is what a build gives
             self.generate(scale=0.001, history=int(self.spec.get("history") or 60))
             before = len(self.learned)
@@ -3971,6 +4039,14 @@ class Fitter:
             if gen["gen"] in ("sequence", "hash_id"):
                 return False
             numeric = gen["gen"] == "dist" or str(gen.get("type", "")).upper().startswith(("BIGINT", "INT", "DECIMAL", "DOUBLE"))
+            if gen["gen"] == "fk" and not gen.get("per_parent") and not gen.get("first"):
+                # a reference nobody shares (one invoice line per charge): each row takes the next parent in turn; it
+                # still is a reference, and the join it feeds still meets
+                columns[col] = {**gen, "per_parent": 1}
+                self.learned.append(f"{table}.{col}: a `unique` test failed; each row refers to a parent of its own now.")
+                self.retyped.add(table)
+                self.dirty = True
+                return True
             if gen["gen"] in ("time_offset", "event_time", "updated_at"):
                 if gen.get("unique"):
                     return False
