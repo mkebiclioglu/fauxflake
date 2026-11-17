@@ -804,3 +804,19 @@ def test_an_empty_filter_on_made_up_text_gets_the_values_it_names():
     assert f.learn_from_empty("m", Finding("final", "where", "LOWER(status) IN ('pass', 'warn') AND id = '7'"))
     assert tables["RAW.S.RUNS"]["columns"]["STATUS"] == {"gen": "template", "templates": ["pass", "warn", "status_{hex}"]}
     assert tables["RAW.S.RUNS"]["columns"]["ID"] == {"gen": "sequence"}
+
+
+def test_flags_are_followed_back_through_the_models_before():
+    """One made-up value fails as a boolean; every source column the models cast to one is learned with it."""
+    stage = parse("select server_id, enable_testing as testing, enable_gitlab, coalesce(enable_sso, 'false') as sso, version, "
+                  "max(plugins_on) as plugins from RAW.MM.CONFIG group by 1, 2, 3, 4, 5")
+    mart = parse("select server_id, testing::boolean as testing, cast(enable_gitlab as boolean) as gitlab, sso::boolean as sso, "
+                 "plugins::boolean as plugins, version from stg")
+    template = lambda name: {"gen": "template", "template": f"{name.lower()}_{{hex}}"}  # noqa: E731
+    columns = {name: template(name) for name in ("SERVER_ID", "ENABLE_TESTING", "ENABLE_GITLAB", "ENABLE_SSO", "VERSION", "PLUGINS_ON")}
+    f = fitter(trees={"model.p.mart": mart, "model.p.stg": stage}, tables={"RAW.MM.CONFIG": {"columns": columns}})
+    f._ancestors = lambda uid: {"model.p.stg"}
+    f.sources_of = lambda uid: ["RAW.MM.CONFIG"]
+    assert f.flags_upstream("model.p.mart")
+    flags = {name for name, gen in columns.items() if gen.get("type") == "BOOLEAN"}
+    assert flags == {"ENABLE_TESTING", "ENABLE_GITLAB", "ENABLE_SSO", "PLUGINS_ON"}  # not the id or the version

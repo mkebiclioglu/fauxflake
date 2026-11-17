@@ -93,6 +93,7 @@ class _Readings:
 
 
 _MADE_UP_NUMBER = re.compile(r"Could not convert string '[a-z][a-z0-9_]*_[0-9a-f]{12}' to (?:DOUBLE|FLOAT|INT\d+|DECIMAL)")
+_MADE_UP_FLAG = re.compile(r"Could not convert string '[a-z][a-z0-9_]*_[0-9a-f]{12}' to BOOL")
 _NUMBER_OF = (exp.Sum, exp.Avg, exp.Max, exp.Min, exp.Abs, exp.Round, exp.Floor, exp.Ceil, exp.Nullif, exp.AnyValue, exp.Window,
               exp.Paren, exp.Cast, exp.TryCast, exp.Neg)
 
@@ -112,6 +113,26 @@ def _entry(entry: dict, fields: dict, i: int) -> dict:
         elif gen.get("gen") == "dist":
             entry[name] = i + 1
     return entry
+
+
+def _value_flow(node: exp.Expression | None, depth: int = 0) -> list[exp.Column]:
+    """The columns whose value an expression hands on as it is: through casts, COALESCE, IFF and CASE answers,
+    MAX / MIN / ANY_VALUE and window functions over them."""
+    if depth > 12 or node is None:
+        return []
+    if isinstance(node, exp.Column):
+        return [node]
+    if isinstance(node, exp.Coalesce):
+        return [c for e in [node.this, *node.expressions] for c in _value_flow(e, depth + 1)]
+    if isinstance(node, exp.If):
+        return _value_flow(node.args.get("true"), depth + 1) + _value_flow(node.args.get("false"), depth + 1)
+    if isinstance(node, exp.Case):
+        values = [branch.args.get("true") for branch in node.args.get("ifs") or []] + [node.args.get("default")]
+        return [c for e in values for c in _value_flow(e, depth + 1)]
+    if isinstance(node, (exp.Paren, exp.Cast, exp.TryCast, exp.Max, exp.Min, exp.AnyValue, exp.Window, exp.Nullif,
+                         exp.FirstValue, exp.LastValue, exp.IgnoreNulls, exp.RespectNulls)):
+        return _value_flow(node.this, depth + 1)
+    return []
 
 
 def _number_flow(node: exp.Expression, depth: int = 0) -> list[exp.Column]:
@@ -2550,12 +2571,48 @@ class Fitter:
         self.dirty |= changed
         return changed
 
+    def flags_upstream(self, sql_key: str) -> bool:
+        """Made-up text met a BOOLEAN in this model. The error names one column, and a model that reads a hundred
+        settings (`enable_x::boolean`, each from its own table) would learn them one build at a time. Every column the
+        model and the models before it cast to a boolean, followed back through the names it is given, is one."""
+        uids = [u for u in [sql_key, *sorted(self._ancestors(sql_key))] if u == sql_key or u.startswith(("model.", "snapshot."))]
+        made: dict[str, list[exp.Expression]] = {}
+        pile: list[str] = []
+        for tree in (t for t in (self.tree(u) for u in uids) if t is not None):
+            for cast in tree.find_all(exp.Cast, exp.TryCast):
+                if cast.to.is_type("boolean"):
+                    pile += [c.name.upper() for c in _value_flow(cast.this)]
+            for alias in tree.find_all(exp.Alias):
+                made.setdefault(alias.alias.upper(), []).append(alias.this)
+        names: set[str] = set()
+        while pile and len(names) < 5000:
+            name = pile.pop()
+            if name in names:
+                continue
+            names.add(name)
+            for inner in made.get(name, []):
+                pile += [c.name.upper() for c in _value_flow(inner) if c.name.upper() not in names]
+        changed = False
+        for table in self.sources_of(sql_key):
+            columns = self.tables[table].get("columns") or {}
+            for name in sorted(names & set(columns)):
+                gen = columns[name]
+                if gen.get("gen") == "template" and gen.get("template") == f"{name.lower()}_{{hex}}" and not gen.get("templates"):
+                    columns[name] = guess(name, "BOOLEAN")
+                    self.retyped.add(table)
+                    self.learned.append(f"{table}.{name}: cast to a boolean by the models that read it; retyped as BOOLEAN.")
+                    changed = True
+        self.dirty |= changed
+        return changed
+
     def learn(self, sql_key: str, message: str) -> bool:
         """Apply whatever one error message teaches. True when the spec changed."""
         before = self._watched()  # for working on the fitter: FAUXFLAKE_FIT_WATCH=TABLE.COLUMN,... whose changes are written down
         done = self._learn(sql_key, message)
         if done and _MADE_UP_NUMBER.search(message):
             self.numbers_upstream(sql_key)
+        if done and _MADE_UP_FLAG.search(message):
+            self.flags_upstream(sql_key)
         self._watch(before, f"{sql_key}: {message[:600]}")
         return done
 
