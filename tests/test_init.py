@@ -807,3 +807,26 @@ def test_the_columns_of_one_coalesce_share_what_is_known_of_one():
     columns = build_spec(manifest, "A")[0]["tables"]["RAW.S.LEADS"]["columns"]
     assert columns["COGNISM_EMPLOYEES"]["gen"] == columns["ZOOMINFO_EMPLOYEES"]["gen"] == "dist"
     assert columns["NICKNAME"]["gen"] == "template"
+
+
+def test_builder_role_is_the_one_policies_let_through():
+    from fauxflake.init import builder_role
+
+    manifest = {"macros": {"macro.p.create_masking_policy": {"macro_sql": """
+        CREATE MASKING POLICY IF NOT EXISTS p AS (val TEXT) RETURNS TEXT ->
+        CASE WHEN CURRENT_ROLE() IN ('TRANSFORMER','LOADER') THEN val
+             WHEN IS_ROLE_IN_SESSION('{{ policy }}') THEN val ELSE '***MASKED***' END"""},
+        "macro.p.other": {"macro_sql": "select current_role() = 'NOBODY'"}}, "nodes": {}}
+    assert builder_role(manifest) == "TRANSFORMER"
+    assert builder_role({"macros": {}, "nodes": {}}) is None
+
+
+def test_memory_is_bounded_below_duckdb_default():
+    import duckdb
+
+    from fauxflake import emulator
+
+    default = duckdb.connect().execute("select current_setting('memory_limit')").fetchone()[0]
+    with emulator.engine() as emu:
+        bounded = emu.duck.execute("select current_setting('memory_limit')").fetchone()[0]
+    assert bounded != default

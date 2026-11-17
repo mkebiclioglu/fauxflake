@@ -2102,6 +2102,11 @@ def analyse(manifest: dict, database: str) -> Analysis:
         settings["target"] = os.environ["FAUXFLAKE_TARGET"]
         notes.append(f"the project names its schemas differently for the target `{settings['target']}` and refers to those names "
                      f"directly, so it is built as that target (`dbt: {{target: {settings['target']}}}`). Nothing leaves this machine.")
+    role = builder_role(manifest)
+    if role:
+        settings["role"] = role
+        notes.append(f"the project's masking policies show real values to the role `{role}`, the one that builds the "
+                     f"warehouse: the build runs as that role (`dbt: {{role: {role}}}`).")
     if (start, history) != (date(2025, 1, 1), None):
         notes.append(f"the SQL compares with dates between {min(d for _, d in dates)} and {max(d for _, d in dates)}: "
                      f"the generated history starts {start}" + (f" and spans {history} days." if history else "."))
@@ -2115,6 +2120,28 @@ HEADER = """# Written by `fauxflake init` from the dbt project. Keys, relationsh
 # from your tests; columns and types from how models use each source. Volumes, lateness and
 # distributions are placeholders: run `fauxflake profile` to measure them, or edit by hand.
 """
+
+
+def builder_role(manifest: dict) -> str | None:
+    """The role a project's own masking and row access policies let through: `WHEN CURRENT_ROLE() IN
+    ('TRANSFORMER', 'LOADER') THEN val ELSE '***MASKED***'`. In production the models are built by that
+    role (otherwise every downstream table would hold the mask); built as any other, a masked amount
+    meets a cast to a number and the build stops there."""
+    roles: collections.Counter = collections.Counter()
+    texts = [m.get("macro_sql") or "" for uid, m in (manifest.get("macros") or {}).items()
+             if not uid.startswith(("macro.dbt.", "macro.dbt_snowflake."))]
+    for node in (manifest.get("nodes") or {}).values():
+        texts.append(node.get("raw_code") or "")
+        for hook in (node.get("config") or {}).get("pre-hook", []) + (node.get("config") or {}).get("post-hook", []):
+            texts.append(hook.get("sql") or "" if isinstance(hook, dict) else str(hook))
+    quoted = r"'([A-Za-z_][\w$]*)'"
+    for text in texts:
+        if not re.search(r"(?i)\b(masking|row\s+access)\s+policy\b", text):
+            continue
+        for listed, single in re.findall(r"(?i)current_role\(\s*\)\s*(?:in\s*\(([^)]*)\)|=\s*" + quoted + ")", text):
+            found = re.findall(quoted, listed) if listed else [single]
+            roles.update(r.upper() for r in found[:1])  # the first one named is the one that transforms
+    return roles.most_common(1)[0][0] if roles else None
 
 
 _MISSING_ENV = re.compile(r"Env var required but not provided: '(\w+)'")
@@ -2273,6 +2300,8 @@ def update_spec(project, path: Path, database: str, emu, log=print) -> list[str]
             if col not in columns and gen.get("gen") != "loaded_at":  # no model reads that one: it stays out if it was taken out
                 columns[col] = gen
                 added.append(f"{name}.{col}")
+    if analysis.spec["dbt"].get("role"):
+        spec.setdefault("dbt", {}).setdefault("role", analysis.spec["dbt"]["role"])  # a role set by hand stays
     known = spec.get("udfs") or {}
     stubs = {k: v for k, v in udf_stubs(unknown_functions(manifest, emu)).items() if k not in known}
     if stubs:

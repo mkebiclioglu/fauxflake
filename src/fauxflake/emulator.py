@@ -1032,10 +1032,28 @@ def _spill_directory(duck: duckdb.DuckDBPyConnection) -> str:
         free = shutil.disk_usage(path).free
         limit = f"{max(256, min(8192, free // 4 // 2**20))}MiB"
     duck.execute(f"set max_temp_directory_size = '{limit}'")
+    _bound_memory(duck)
     import atexit
 
     atexit.register(shutil.rmtree, path, ignore_errors=True)  # also when the run is interrupted
     return path
+
+
+def _bound_memory(duck: duckdb.DuckDBPyConnection) -> None:
+    """DuckDB takes up to 80% of the machine's memory before it spills to disk. dbt, the generator and
+    the rest of the machine live in what is left: on an 8 GB laptop or a small CI runner that starves
+    the system (the run gets killed) well before DuckDB would have spilled. Take three quarters of
+    DuckDB's own figure, which already accounts for a container's limit. `FAUXFLAKE_MEMORY=4GB` sets it."""
+    limit = os.environ.get("FAUXFLAKE_MEMORY")
+    if not limit:
+        try:
+            (default,) = duck.execute("select current_setting('memory_limit')").fetchone()
+            number, unit = re.fullmatch(r"\s*([\d.]+)\s*([KMGT]i?B)\s*", default).groups()
+            mib = float(number) * {"K": 2**-10, "M": 1, "G": 2**10, "T": 2**20}[unit[0]]
+            limit = f"{max(512, int(mib * 0.75))}MiB"
+        except Exception:  # noqa: BLE001 - a setting we cannot read is left as it is
+            return
+    duck.execute(f"set memory_limit = '{limit}'")
 
 
 @contextlib.contextmanager
