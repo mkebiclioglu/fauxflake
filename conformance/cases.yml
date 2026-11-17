@@ -348,3 +348,25 @@
 - {id: counts_given_as_text, sql: "select repeat('a', n), lpad('7', n, '0'), left('abcdefgh', n), substr('abcdefgh', n, n), rpad('7', n, 'x'), right('abcdefgh', n), substring('abcdefgh', n), substr(n, 1, 1), left(n, 1), repeat('a', v), left('abcdefgh', v) from (select '5'::varchar n, '5'::variant v)"}
 - {id: counts_given_as_fractions, sql: "select left('abc', 1.6), substr('abcdef', 2.5), substr('abcdef', '2', '3'), lpad('a', 3.7, 'x'), left('abcdef', f), right('abcdef', f) from (select 2.5::float f)"}
 - {id: numbers_given_as_text_literals, sql: "select abs('5'), round('5', 1), floor('5'), ceil('5'), -'5', sign('5'), trunc('5'), sum('5'), avg('5')"}
+- {id: group_by_variant_path, sql: "select lower(v:name), count(*) from (select parse_json('{\"name\": \"A\", \"n\": [1,2]}') v) group by v:name"}
+- {id: group_by_variant_reads_paths, sql: "select array_size(v:n), v:name::string || 'x', coalesce(v:name, 'z'), iff(v:name = 'A', 1, 0), length(v:name), count(*) from (select parse_json('{\"name\": \"A\", \"n\": [1,2]}') v) group by v"}
+- {id: array_size_of_non_arrays, sql: "select array_size(parse_json('{\"a\":1}')), array_size(parse_json('[1,2]')), array_size(parse_json('\"x\"')), array_size(parse_json('null')), array_size(null), array_size(array_construct()), array_size(to_variant(5)), array_size(1)"}
+- {id: array_size_of_arrays, sql: "select array_size(split('a,b', ',')), array_size(array_agg(x)), array_size(array_construct(1, 2)), array_size(v:a), array_size(strtok_to_array('a b', ' ')), array_size(array_append(array_construct(1), 2)) from (select 1 x, parse_json('{\"a\": [1, 2, 3]}') v) group by v"}
+- {id: strict_date_minus_text, sql: "select d - '2024-01-01' from (select '2024-01-09'::date d)"}
+- {id: strict_text_minus_date, sql: "select x - d from (select '2024-01-05'::varchar x, '2024-01-09'::date d)"}
+- {id: strict_text_plus_interval, sql: "select x + interval '1 day' from (select '2024-01-09'::varchar x)"}
+- {id: strict_timestamp_minus_text, sql: "select ts - x from (select '2024-01-05'::varchar x, '2024-01-09'::timestamp ts)"}
+- {id: arithmetic_on_text_numbers, sql: "select x + 1, x - 1, d + 1, d - d, x * 2, x / 2, coalesce(y, d) - d from (select '5'::varchar x, '2024-01-09'::date d, '2024-01-05'::varchar y)"}
+- {id: strict_iff_number, sql: "select iff(n, 'a', 'b') from (select 1 n)"}
+- {id: strict_iff_text, sql: "select iff(x, 'a', 'b') from (select 'true'::varchar x)"}
+- {id: strict_iff_literal, sql: "select iff('true', 1, 0)"}
+- {id: strict_case_when_number, sql: "select case when n then 'a' else 'b' end from (select 1 n)"}
+- {id: strict_case_when_variant, sql: "select case when v:a then 1 end from (select parse_json('{\"a\": true}') v)"}
+- {id: strict_where_number, sql: "select 1 from (select 1 n) where n"}
+- {id: strict_where_text, sql: "select 1 from (select 'true'::varchar x) where x"}
+- {id: strict_where_variant, sql: "select 1 from (select parse_json('{\"a\": true}') v) where v:a"}
+- {id: strict_qualify_number, sql: "select 1 from (select 1 n) qualify n"}
+- {id: strict_join_on_number, sql: "select 1 from (select 1 n) a join (select 1 m) b on n"}
+- {id: strict_count_if_number, sql: "select count_if(n) from (select 1 n)"}
+- {id: conditions_that_are_boolean, sql: "select iff(b, 1, 0), case when b then 1 else 0 end, count_if(b) over (), iff(n and true, 1, 0), iff(not n, 1, 0), iff(null, 1, 0), iff(v:a::boolean, 1, 0), iff(n = true, 1, 0), iff(n::boolean, 1, 0) from (select true b, 1 n, parse_json('{\"a\": true}') v) where b and (n and true) qualify b"}
+- {id: null_column_as_condition, sql: "select iff(b, 1, 0) from (select null as b) where b is null"}

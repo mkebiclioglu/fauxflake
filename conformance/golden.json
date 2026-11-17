@@ -128,6 +128,19 @@
    ]
   ]
  },
+ "arithmetic_on_text_numbers": {
+  "rows": [
+   [
+    "6",
+    "4",
+    "2024-01-10",
+    "0",
+    "10",
+    "2.5",
+    "-4"
+   ]
+  ]
+ },
  "arithmetic_scale": {
   "rows": [
    [
@@ -358,6 +371,32 @@
     ],
     "2",
     "2"
+   ]
+  ]
+ },
+ "array_size_of_arrays": {
+  "rows": [
+   [
+    "2",
+    "1",
+    "2",
+    "3",
+    "2",
+    "2"
+   ]
+  ]
+ },
+ "array_size_of_non_arrays": {
+  "rows": [
+   [
+    null,
+    "2",
+    null,
+    null,
+    null,
+    "0",
+    null,
+    null
    ]
   ]
  },
@@ -741,6 +780,21 @@
     "1",
     "0",
     "other"
+   ]
+  ]
+ },
+ "conditions_that_are_boolean": {
+  "rows": [
+   [
+    "1",
+    "1",
+    "1",
+    "1",
+    "0",
+    "0",
+    "1",
+    "1",
+    "1"
    ]
   ]
  },
@@ -1799,6 +1853,26 @@
    ]
   ]
  },
+ "group_by_variant_path": {
+  "rows": [
+   [
+    "a",
+    "1"
+   ]
+  ]
+ },
+ "group_by_variant_reads_paths": {
+  "rows": [
+   [
+    "2",
+    "Ax",
+    "A",
+    "1",
+    "1",
+    "1"
+   ]
+  ]
+ },
  "grouping_sets": {
   "rows": [
    [
@@ -2517,6 +2591,13 @@
     "2",
     "2",
     "2"
+   ]
+  ]
+ },
+ "null_column_as_condition": {
+  "rows": [
+   [
+    "0"
    ]
   ]
  },
@@ -3486,6 +3567,18 @@
    ]
   ]
  },
+ "strict_case_when_number": {
+  "error": "001038 (22023): SQL compilation error:"
+ },
+ "strict_case_when_variant": {
+  "error": "001038 (22023): SQL compilation error:"
+ },
+ "strict_count_if_number": {
+  "error": "001044 (42P13): SQL compilation error: error line 1 at position 7"
+ },
+ "strict_date_minus_text": {
+  "error": "001044 (42P13): SQL compilation error: error line 1 at position 9"
+ },
  "strict_date_trunc_of_literal": {
   "error": "002016 (22000): SQL compilation error:"
  },
@@ -3498,6 +3591,18 @@
  "strict_hour_of_text": {
   "error": "002016 (22000): SQL compilation error:"
  },
+ "strict_iff_literal": {
+  "error": "001044 (42P13): SQL compilation error: error line 1 at position 7"
+ },
+ "strict_iff_number": {
+  "error": "001044 (42P13): SQL compilation error: error line 1 at position 7"
+ },
+ "strict_iff_text": {
+  "error": "001044 (42P13): SQL compilation error: error line 1 at position 7"
+ },
+ "strict_join_on_number": {
+  "error": "002034 (22000): SQL compilation error:"
+ },
  "strict_last_day_of_text": {
   "error": "002016 (22000): SQL compilation error:"
  },
@@ -3507,11 +3612,32 @@
  "strict_months_between_text": {
   "error": "002016 (22000): SQL compilation error:"
  },
+ "strict_qualify_number": {
+  "error": "002034 (22000): SQL compilation error:"
+ },
+ "strict_text_minus_date": {
+  "error": "001044 (42P13): SQL compilation error: error line 1 at position 9"
+ },
+ "strict_text_plus_interval": {
+  "error": "001044 (42P13): SQL compilation error: error line 1 at position 9"
+ },
  "strict_time_slice_of_text": {
   "error": "002016 (22000): SQL compilation error:"
  },
+ "strict_timestamp_minus_text": {
+  "error": "001044 (42P13): SQL compilation error: error line 1 at position 10"
+ },
  "strict_trunc_of_text": {
   "error": "002016 (22000): SQL compilation error:"
+ },
+ "strict_where_number": {
+  "error": "002034 (22000): SQL compilation error:"
+ },
+ "strict_where_text": {
+  "error": "002034 (22000): SQL compilation error:"
+ },
+ "strict_where_variant": {
+  "error": "002034 (22000): SQL compilation error:"
  },
  "strict_year_of_number": {
   "error": "002016 (22000): SQL compilation error:"

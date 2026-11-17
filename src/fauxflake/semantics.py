@@ -1678,6 +1678,12 @@ def patch_upstream() -> None:
 
     upstream.trim_cast_varchar = trim_cast_varchar
 
+    # `select lower(v:name), count(*) ... group by v:name` (or `group by v`): DuckDB does not recognise a grouped
+    # expression written with `->` inside another expression. The same access as a function call binds.
+    from sqlglot.dialects.duckdb import DuckDB
+
+    DuckDB.Generator.TRANSFORMS[exp.JSONExtract] = lambda self, e: self.func("json_extract", e.this, e.expression)
+
     # NULL timestamps were sent to the client as 1970-01-01: the struct that carries a
     # timestamp on the wire was built without its null mask.
     import fakesnow.arrow as wire
