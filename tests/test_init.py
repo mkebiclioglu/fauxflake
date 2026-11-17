@@ -972,3 +972,56 @@ def test_a_table_listed_by_its_row_count_holds_that_many_rows():
     assert sum(n for _, _, n in whole) == 100
     part = table.calendar(date(2023, 2, 1), date(2023, 6, 1), 42, 0.001, None, None, (100, 683))
     assert part == whole[:len(part)]  # the same days hold the same rows however far the clock has moved
+
+
+def test_a_surrogate_key_is_traced_to_the_column_it_hashes():
+    from fauxflake.init import _ANY, _HASHED, scan_model, SourceUse
+
+    uses = {"RAW.T.SERVER": SourceUse(), "RAW.L.SERVER": SourceUse(), "RAW.N.FEEDBACK": SourceUse()}
+    staged = scan_model("select id, split_part(version, '-', 1) as version_full from RAW.T.SERVER", uses)
+    assert staged[_ANY + "VERSION_FULL"] == (("RAW.T.SERVER", "VERSION", "-"),)
+    models = {"A.B.STG": staged, "A.B.LEGACY": scan_model("select id, version as version_full from RAW.L.SERVER", uses)}
+    spined = scan_model("select coalesce(t.version_full, l.version_full, 'x' || t.id) as version_full "
+                        "from A.B.STG t left join A.B.LEGACY l on t.id = l.id", uses, models)
+    dim = scan_model("with versions as (select distinct version_full from A.B.SPINED) "
+                     "select md5(cast(coalesce(cast(version_full as text), '_null_') as text)) as version_id, version_full from versions",
+                     uses, {**models, "A.B.SPINED": spined})
+    assert dim[_HASHED + "VERSION_ID"] == (("RAW.T.SERVER", "VERSION", "-"), ("RAW.L.SERVER", "VERSION"))
+    fact = scan_model("select coalesce(f.server_version, f.old_version) as all_versions, "
+                      "md5(cast(coalesce(cast(all_versions as text), '_null_') as text)) as version_id, "
+                      "md5(cast(f.a as text) || '-' || cast(f.b as text)) as pair_id from RAW.N.FEEDBACK f", uses)
+    assert fact[_HASHED + "VERSION_ID"] == (("RAW.N.FEEDBACK", "SERVER_VERSION"), ("RAW.N.FEEDBACK", "OLD_VERSION"))
+    assert _HASHED + "PAIR_ID" not in fact  # a key of two columns: neither decides it
+
+
+def test_a_text_whose_shapes_begin_with_a_category_follows_it():
+    from fauxflake.generate import begins_with
+    from fauxflake.init import follow_categories
+
+    columns = {"CATEGORY": {"gen": "categorical", "values": {"cli elt": 0.3, "cli invoke": 0.3, "cli run": 0.2, "other": 0.2}},
+               "KIND": {"gen": "categorical", "values": {"a": 0.5, "b": 0.5}},
+               "COMMAND": {"gen": "template", "templates": ["cli elt{hex} --transform run{hex}", "cli invoke dbt{hex}",
+                                                            "{hex} --environment={hex}", "command_{hex}"]}}
+    follow_categories(columns)
+    assert columns["COMMAND"] == {"gen": "template", "begins_with": "CATEGORY", "templates": [
+        "cli elt{hex} --transform run{hex}", "cli invoke dbt{hex}", "cli run {hex} --environment={hex}"]}
+    again = {k: dict(v) for k, v in columns.items()}
+    follow_categories(columns)
+    assert columns == again
+    assert begins_with(columns["COMMAND"]["templates"] + ["exactly this"], list(columns["CATEGORY"]["values"])) == {
+        "cli elt": ["cli elt{hex} --transform run{hex}", "exactly this"], "cli invoke": ["cli invoke dbt{hex}"],
+        "cli run": ["cli run {hex} --environment={hex}"], "other": ["other {hex}"]}
+    from datetime import datetime
+
+    from fauxflake.emulator import serve
+    from fauxflake.generate import Warehouse
+
+    spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "tables": {"RAW.P.EVENTS": {
+        "volume": {"rows_per_day": 2000, "weekly": [1] * 7}, "lateness": {"p": [0, 1], "seconds": [0, 1]},
+        "columns": {"ID": {"gen": "sequence"}, **columns}}}}, ".")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 3))
+        total, begin, kinds = emu.cursor().execute(
+            "select count(*), sum(case when starts_with(command, category) then 1 else 0 end), count(distinct category) "
+            "from RAW.P.EVENTS").fetchone()
+    assert total > 1000 and begin == total and kinds == 4

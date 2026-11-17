@@ -35,7 +35,7 @@ import yaml
 from sqlglot import exp
 
 from . import emulator
-from .init import guess, periods_have_length, unique_together, within_bounds
+from .init import follow_categories, guess, periods_have_length, unique_together, within_bounds
 from .spec import quoted
 
 Log = Callable[[str], None]
@@ -1199,6 +1199,16 @@ class Fitter:
                     # a number type left over from before the column's values were known to be text: the cast would fail
                     gen.pop("type")
                     self.learned.append(f"{table}.{col}: holds text now; the number type an earlier guess gave it is dropped.")
+            # a category learned by running the project (the values a model pivots or filters on) may be what the
+            # shapes of a text in the same table begin with
+            columns = spec.get("columns") or {}
+            before = {col: gen.get("begins_with") for col, gen in columns.items()}
+            follow_categories(columns)
+            for col, gen in columns.items():
+                if gen.get("begins_with") and gen.get("begins_with") != before.get(col):
+                    self.retyped.add(table)
+                    self.learned.append(f"{table}.{col}: its shapes begin with values of {gen['begins_with']}; each row's text "
+                                        "begins with the row's own.")
 
     def _holds_text(self, gen: dict) -> bool:
         number = lambda v: isinstance(v, (int, float)) or re.fullmatch(r"-?\d+(\.\d+)?", str(v)) is not None  # noqa: E731
@@ -3492,8 +3502,10 @@ class Fitter:
                     continue
                 if "Compilation Error" in message and self.empty_lookup(node["unique_id"], message):
                     continue
-                if ("RecursionError" in message or "MB of SQL text" in message) and self.few_values(node["unique_id"]):
-                    continue  # a pivot with one column per row: too long a statement to even read
+                if ("RecursionError" in message or "MB of SQL text" in message) and (
+                        self.few_values(node["unique_id"])
+                        or any([self.few_values(a) for a in sorted(self._ancestors(node["unique_id"]))])):
+                    continue  # a pivot with one column per row (here, or in a model this one lists the columns of)
                 compiled = self._compiled(project, node)
                 if compiled and node.get("relation_name") and _fq(node["relation_name"]).count(".") == 2:
                     uid, fq = node["unique_id"], _fq(node["relation_name"])
