@@ -2116,6 +2116,89 @@ def coerce_union_literals(transformed: exp.Expression, conn) -> exp.Expression: 
     return transformed
 
 
+def _evident_kind(node: exp.Expression) -> str | None:
+    """What a branch of COALESCE / IFF / CASE plainly is, read off its text: 'number', 'date', 'timestamp',
+    'boolean', 'text', 'null', or None when only its place in the query can tell."""
+    node = node.unnest()
+    if isinstance(node, exp.Null):
+        return "null"
+    if isinstance(node, exp.Boolean):
+        return "boolean"
+    if isinstance(node, exp.Literal):
+        return "text" if node.is_string else "number"
+    if isinstance(node, exp.Neg) and isinstance(node.this, exp.Literal) and not node.this.is_string:
+        return "number"
+    if isinstance(node, (exp.CurrentDate,)):
+        return "date"
+    if isinstance(node, (exp.CurrentTimestamp,)):
+        return "timestamp"
+    if isinstance(node, (exp.Cast, exp.TryCast)):
+        to = node.to
+        if to.is_type(*exp.DataType.NUMERIC_TYPES):
+            return "number"
+        if to.is_type("date"):
+            return "date"
+        if to.is_type(*exp.DataType.TEMPORAL_TYPES) and not to.is_type("time"):
+            return "timestamp"
+        if to.is_type("boolean"):
+            return "boolean"
+        if to.is_type(*exp.DataType.TEXT_TYPES):
+            return "text"
+    return None
+
+
+# (not booleans: COALESCE(text, FALSE) stays text in Snowflake while COALESCE(a_boolean, text) is a boolean)
+_BRANCH_CASTS = {"number": "double", "date": "date", "timestamp": "timestamp"}
+
+
+def unify_text_branches(transformed: exp.Expression, conn) -> exp.Expression:  # noqa: ANN001
+    """`coalesce(amount, 0)`, `iff(paid, closed_on, current_date)`, `case when x then flag else false end` with a
+    text column: Snowflake gives the type of the number, date or boolean beside it, converting the text (and
+    failing when it does not convert). DuckDB makes the whole expression text. Where one branch plainly is a
+    number, a date or a boolean and another's type is not written down, ask DuckDB for it and convert the text
+    ones, so the value, its type and what sorts and compares after it are Snowflake's. A VARIANT stays one."""
+    for select in list(transformed.find_all(exp.Select)):
+        if select.args.get("from_") is None:
+            continue
+        wanted: list[tuple[exp.Expression, str]] = []
+        for node in select.find_all(exp.Coalesce, exp.If, exp.Case):
+            if node.find_ancestor(exp.Select) is not select:
+                continue
+            if isinstance(node, exp.Coalesce):
+                branches = [node.this, *node.expressions]
+            elif isinstance(node, exp.Case):
+                branches = [branch.args.get("true") for branch in node.args.get("ifs") or []] + [node.args.get("default")]
+            elif isinstance(node.parent, exp.Case):
+                continue  # one arm of a CASE: taken with the others
+            else:
+                branches = [node.args.get("true"), node.args.get("false")]
+            branches = [b for b in branches if b is not None]
+            kinds = [_evident_kind(b) for b in branches]
+            plain = {k for k in kinds if k in _BRANCH_CASTS}
+            if len(plain) != 1 or "text" in kinds:
+                continue  # nothing to go by, or text written out beside it: then the SQL means text
+            for branch, kind in zip(branches, kinds):
+                if kind is None and not branch.find(exp.AggFunc, exp.Window, exp.Subquery, exp.Placeholder, exp.JSONExtract,
+                                                    exp.JSONExtractScalar, exp.ParseJSON):
+                    wanted.append((branch, next(iter(plain))))
+        if not wanted:
+            continue
+        probe = exp.Select(expressions=[exp.alias_(branch.copy(), f"_u{i}") for i, (branch, _) in enumerate(wanted)])
+        probe.set("from_", select.args["from_"].copy())
+        if select.args.get("joins"):
+            probe.set("joins", [j.copy() for j in select.args["joins"]])
+        try:
+            described = conn.execute("describe " + _cte_prefix(select) + probe.sql(dialect="duckdb")).fetchall()
+        except Exception:  # noqa: BLE001 - a branch that names another column of the same SELECT, say: left as written
+            continue
+        if len(described) != len(wanted):
+            continue
+        for (branch, kind), (_, held, *_rest) in zip(wanted, described):
+            if held == "VARCHAR":
+                _convert(branch, _BRANCH_CASTS[kind])
+    return transformed
+
+
 def text_beside_variant(transformed: exp.Expression, conn) -> exp.Expression | None:  # noqa: ANN001
     """`select * from a union all select * from b` where a column is a VARIANT in one branch and text in
     another: Snowflake keeps the text as a VARIANT string. DuckDB parses it as JSON and stops at the first
