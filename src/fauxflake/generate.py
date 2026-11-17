@@ -455,12 +455,22 @@ class TableSQL:
             elif d.get("per_parent") and self.base == "g":
                 # at most so many rows for one parent (`having count(*) > 2` is a test): rows share parents in turn
                 idx = f"((g // {max(int(d['per_parent']), 1)}) % greatest(_pe_{col}, 1))::bigint"
+            flag = parent.columns.get(str(d.get("spares") or ""))
+            if flag and flag.get("every") and int(flag["every"]) > 1:
+                # the rows a flag of the parent marks (deleted ones) are never referred to: the row before, instead
+                every = int(flag["every"])
+                idx = f"(select case when (i % {every}) = {every - 1} then i - 1 else i end from (select {idx} as i))"
             expr = self.key_expr(parent, idx)
         elif gen == "categorical" and col in self.grain() and self.base == "g":
             sizes = self.grain()
             stride = math.prod(list(sizes.values())[:list(sizes).index(col)])
             known = "[" + ", ".join(lit(v) for v in d["values"]) + "]"
             expr = f"list_extract({known}, 1 + ((_n // {stride}) % {sizes[col]})::bigint)"
+        elif gen == "categorical" and d.get("every") and self.base == "g" and "." not in col:
+            # a flag that marks one row in so many, always the same ones (the deleted accounts): what refers to the
+            # table can leave those rows alone (`spares`)
+            marked = f"((g % {int(d['every'])}) = {int(d['every']) - 1})"
+            expr = marked if d.get("marks", True) else f"(not {marked})"
         elif gen == "categorical":
             total = sum(d["values"].values())
             x, arms, acc = self.u(col), [], 0.0
@@ -566,8 +576,10 @@ class TableSQL:
                                   for name, kind in d["fields"].items())
                 expr = f"to_json(list_transform(range(1 + {n}), lambda i: json_object({pairs})))::JSON"
             elif d.get("values"):  # elements drawn from a known list
-                known = "[" + ", ".join(lit(v) for v in d["values"]) + "]"
-                expr = f"to_json(list_slice({known}, 1, {n}))::JSON"
+                # (a few of them, from a place in the list that differs from row to row: each value is in some lists)
+                known = "[" + ", ".join(lit(v) for v in [*d["values"], *d["values"]]) + "]"
+                at = f"floor({self.u(col + ':from')} * {len(d['values'])})::bigint"
+                expr = f"to_json(list_slice({known}, 1 + {at}, {at} + {n}))::JSON"
             else:
                 expr = f"to_json(list_transform(range({n}), lambda i: concat({lit(col.lower() + '_')}, i)))::JSON"
         elif gen == "event_time":
@@ -604,7 +616,11 @@ class TableSQL:
             # an id of a given length (`length(server_id) = 26`): the value rewritten, the same way wherever it is
             # written, so what matched still matches and what differed still differs
             text = f"({expr})::varchar"
-            expr = f"substr(md5({text}) || md5({text} || '+'), 1, {int(d['length'])})"
+            # (the values the models ask for by name stay as they are named, here and in what refers to them)
+            parent = self.spec.tables.get(str(d.get("ref") or "").upper()) if gen == "fk" else None
+            named = [str(v) for v in (d.get("named") or (parent.key[1].get("named") if parent is not None else None) or [])]
+            rewritten = f"substr(md5({text}) || md5({text} || '+'), 1, {int(d['length'])})"
+            expr = f"(case when {text} in ({', '.join(lit(v) for v in named)}) then {text} else {rewritten} end)" if named else rewritten
         rate = repr(float(d.get("null_rate") or 0.0))
         if self.sc and self.sc.null_rate is not None and gen in ("fk", "categorical", "dist", "pool", "template", "time_offset", "object", "array"):
             rate = self.during(repr(self.sc.null_rate), rate)

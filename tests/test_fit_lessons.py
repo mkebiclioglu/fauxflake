@@ -917,3 +917,69 @@ def test_a_comparison_of_two_systems_is_tried_as_one_taking_over_from_the_other(
     f = fitter(tables=tables, spec={"history": 60, "start": "2025-01-11"}, n_round=3, failing_now={"assert_counts"})
     f.sources_of = lambda uid: behind[uid]
     assert f.learn_from_singular(node, None, sql) and tables["RAW.GA.EVENTS"]["until_day"] == 21  # 2025-02-01
+
+
+def test_a_key_that_repeats_because_a_join_meets_several_rows_makes_the_other_side_hold_one(monkeypatch):
+    import sqlglot
+
+    from fauxflake import why
+
+    sql = {"model.p.dim_project": "select p.id, s.flag from a.ci.projects p left join a.ci.settings s on s.project_id = p.id",
+           "model.p.prep_job": "with dim_project as (select * from a.ci.dim_project), jobs as (select * from a.ci.jobs) "
+                               "select j.id as job_id, d.flag from jobs j left join dim_project d on j.project_id = d.id"}
+    tables = {"RAW.T.SETTINGS": {"columns": {"ID": {"gen": "sequence"}, "PROJECT_ID": {"gen": "fk", "ref": "RAW.T.PROJECTS", "skew": 1.5}}},
+              "RAW.T.PROJECTS": {"columns": {"ID": {"gen": "sequence"}}}}
+    nodes = {uid: {"name": uid.split(".")[-1], "database": "A", "schema": "CI"} for uid in (*sql, "model.p.settings")}
+
+    class Emu:
+        class _fs:  # noqa: N801
+            @staticmethod
+            def connect(**_):
+                return type("C", (), {"cursor": lambda self: None, "close": lambda self: None})()
+
+    class Walk:
+        def __init__(self, cursor, text, key):
+            self.tree = sqlglot.parse_one(text, read="snowflake")
+            self.ctes = list(self.tree.args["with_"].expressions) if self.tree.args.get("with_") else []
+
+        def find(self):
+            # the job model meets several rows of dim_project; dim_project meets several settings
+            return why.Finding("the final select", "join", node=self.tree.args["joins"][0])
+
+    monkeypatch.setattr(why, "Twice", Walk)
+    f = fitter(tables=tables, sql_of=sql, nodes=nodes, emu=Emu(),
+               by_rel={"A.CI.DIM_PROJECT": "model.p.dim_project", "A.CI.SETTINGS": "model.p.settings"})
+    places = _Places({("model.p.settings", "PROJECT_ID"): ("RAW.T.SETTINGS", "PROJECT_ID", ""),
+                      ("model.p.dim_project", "ID"): ("RAW.T.PROJECTS", "ID", "")})
+    test = {"name": "unique_prep_job_job_id", "attached_node": "model.p.prep_job", "column_name": "job_id",
+            "test_metadata": {"name": "unique", "kwargs": {}}, "depends_on": {"nodes": ["model.p.prep_job"]}}
+    assert f.learn_from_twice(test, places)
+    assert tables["RAW.T.SETTINGS"]["columns"]["PROJECT_ID"]["per_parent"] == 1  # one row of settings for a project
+    assert "unique_prep_job_job_id" in f.learned[-1] and not f.learn_from_twice(test, places)
+    # another test that leads to the same place is taken as taught too
+    other = {**test, "name": "unique_dim_project_id", "attached_node": "model.p.dim_project", "column_name": "id"}
+    assert f.learn_from_twice(other, places)
+
+
+def test_a_failing_relationship_makes_a_reference_or_spares_the_rows_the_parent_model_leaves_out():
+    tables = {"RAW.T.ACCOUNTS": {"columns": {"ID": {"gen": "hash_id"},
+                                             "ISDELETED": {"gen": "categorical", "type": "BOOLEAN", "values": {True: 0.15, False: 0.85}}}},
+              "RAW.T.REVIEWS": {"columns": {"ID": {"gen": "sequence"}, "ACCOUNT": {"gen": "template", "template": "account_{hex}"}}}}
+    sql = {"model.p.accounts": "with s as (select id as account_id, isdeleted as is_deleted from raw.t.accounts) "
+                               "select * from s where account_id is not null and is_deleted = false"}
+    nodes = {"model.p.accounts": {"name": "accounts", "depends_on": {"nodes": []}}}
+    f = fitter(tables=tables, sql_of=sql, nodes=nodes)
+    places = _Places({("model.p.reviews", "ACCOUNT_ID"): ("RAW.T.REVIEWS", "ACCOUNT", ""),
+                      ("model.p.accounts", "ACCOUNT_ID"): ("RAW.T.ACCOUNTS", "ID", ""),
+                      ("model.p.accounts", "IS_DELETED"): ("RAW.T.ACCOUNTS", "ISDELETED", "")})
+    test = {"name": "relationships_reviews_account", "attached_node": "model.p.reviews", "column_name": "account_id",
+            "test_metadata": {"name": "relationships", "kwargs": {"to": "ref('accounts')", "field": "account_id"}},
+            "depends_on": {"nodes": ["model.p.accounts", "model.p.reviews"]}}
+    # first the column becomes a reference to what the other model is built from
+    assert f.learn_from_test(test, places)
+    assert tables["RAW.T.REVIEWS"]["columns"]["ACCOUNT"] == {"gen": "fk", "ref": "RAW.T.ACCOUNTS", "skew": 1.5}
+    # it still fails: the model leaves deleted accounts out, and nothing refers to those from now on
+    assert f.learn_from_test(test, places)
+    assert tables["RAW.T.REVIEWS"]["columns"]["ACCOUNT"]["spares"] == "ISDELETED"
+    assert tables["RAW.T.ACCOUNTS"]["columns"]["ISDELETED"]["every"] == 7 and tables["RAW.T.ACCOUNTS"]["columns"]["ISDELETED"]["marks"] is True
+    assert not f.learn_from_test(test, places)

@@ -399,7 +399,7 @@ def test_pieces_of_a_split_text_that_rows_are_kept_by_are_generated():
     }
     request = build_spec(manifest, "A")[0]["tables"]["RAW.S.LOG"]["columns"]["REQUEST"]
     assert request["gen"] == "template"
-    assert request["templates"] == ["POST {hex}/api/v1/ack {hex}", "POST {hex}/api/v1/sendxpush {hex}", "{hex} {hex} {hex}"]  # `_` in LIKE stands for any one character
+    assert request["templates"] == ["POST {hex}/api/v1/ack {hex}", "POST {hex}/api/v1/send_push {hex}", "{hex} {hex} {hex}"]  # `_` in LIKE stands for any one character
 
 
 def test_an_id_asked_for_by_name_through_a_foreign_key_exists_in_the_table_it_refers_to(emu, tmp_path):
@@ -934,7 +934,7 @@ def test_a_reference_to_a_column_that_is_not_the_key_holds_its_values():
 def test_values_that_contain_something_also_begin_the_way_that_is_asked():
     from fauxflake.init import like_shapes
 
-    assert like_shapes({"http%", "%utm_content=partner%"}) == ["http{hex}", "http{hex}utmxcontent=partner{hex}"]
+    assert like_shapes({"http%", "%utm_content=partner%"}) == ["http{hex}", "http{hex}utm_content=partner{hex}"]
     assert like_shapes({"%a%", "%.com"}) == ["{hex}.com", "{hex}a{hex}"]
 
 
@@ -1218,15 +1218,17 @@ def test_joined_columns_keep_the_values_asked_for_by_name_beside_a_pattern():
         assert held["gen"] == "template" and "cli elt" in held["templates"], held
 
 
-def test_what_is_read_in_the_values_of_a_flattened_object_is_in_each_of_its_keys():
+def test_what_is_read_in_the_values_of_a_flattened_object_stays_when_no_key_is_read_deeper():
     from fauxflake.init import flattened_objects
 
+    paths = {"actions[]": None, "actions[].Transfer": None, "actions[].FunctionCall": None, "actions[][]": None, "actions[][].method_name": "TEXT"}
+    # one key for each value, which is one kind of thing or another: the generator writes the object that way
+    assert flattened_objects(paths) == {k: v for k, v in paths.items() if k != "actions[][]"}
+    # a key read deeper by name holds an object: what is read in the values is read in it
     moved = {}
-    paths = flattened_objects({"actions[]": None, "actions[].Transfer": None, "actions[].FunctionCall": None,
-                               "actions[][]": None, "actions[][].method_name": "TEXT"}, moved)
-    assert paths == {"actions[]": None, "actions[].Transfer": None, "actions[].FunctionCall": None,
-                     "actions[].Transfer.method_name": "TEXT", "actions[].FunctionCall.method_name": "TEXT"}
-    assert moved["actions[][].method_name"] == ["actions[].FunctionCall.method_name", "actions[].Transfer.method_name"]
+    deeper = flattened_objects({**paths, "actions[].FunctionCall.gas": "DOUBLE"}, moved)
+    assert deeper["actions[].FunctionCall.method_name"] == "TEXT" and "actions[][].method_name" not in deeper
+    assert moved["actions[][].method_name"] == ["actions[].FunctionCall.method_name"]
 
 
 def test_columns_joined_to_a_category_bring_the_values_they_are_asked_for_by_name():
@@ -1289,7 +1291,7 @@ def test_the_reading_still_says_where_a_column_comes_from_when_a_flattened_objec
     }
     analysis = analyse(manifest, "A")
     fields = analysis.spec["tables"]["RAW.S.SHARDS"]["columns"]["VALUE"]["fields"]
-    assert "stake" in str(fields.get("actions[].FunctionCall.method_name")), fields
+    assert "stake" in str(fields.get("actions[][].method_name")), fields
     assert analysis.place("model.p.m", "ID") == ("RAW.S.SHARDS", "ID", "")
 
 
@@ -1326,3 +1328,37 @@ def test_a_test_that_returns_things_with_two_facts_at_odds_deals_the_facts_to_tw
     columns = {t: d["columns"] for t, d in build_spec(manifest, "A")[0]["tables"].items()}
     rules = {columns["RAW.S.LICENSES"]["LICENSE_ID"].get("null_unless"), columns["RAW.S.SERVERS"]["INSTALLATION"].get("null_unless")}
     assert rules == {"HASH(({{SERVER_ID}})::VARCHAR) % 2 = 0", "HASH(({{ID}})::VARCHAR) % 2 = 1"}, columns
+
+
+def test_tests_that_state_the_shape_of_an_id_and_the_order_of_two_times_are_read():
+    from fauxflake.init import build_spec
+
+    def source(name, cols):
+        return {"database": "RAW", "schema": "S", "name": name, "identifier": name,
+                "columns": {c: {"data_type": t} for c, t in cols.items()}}
+
+    def test(name, kwargs, column=None):
+        return {"resource_type": "test", "name": name, "attached_node": "model.p.orders", "column_name": column,
+                "depends_on": {"nodes": ["model.p.orders"]}, "test_metadata": {"name": "expression_is_true", "kwargs": kwargs}}
+
+    manifest = {
+        "sources": {"source.p.s.orders": source("orders", {"id": "NUMBER", "valid_from": "TIMESTAMP", "valid_to": "TIMESTAMP"}),
+                    "source.p.s.lines": source("lines", {"line": "NUMBER", "order_id": "NUMBER"})},
+        "nodes": {
+            "model.p.orders": {"resource_type": "model", "name": "orders", "depends_on": {"nodes": []}, "relation_name": "A.B.ORDERS",
+                               "compiled_code": "select o.id, o.valid_from, o.valid_to, l.line from raw.s.orders o join raw.s.lines l on l.order_id = o.id"},
+            "test.p.shape": test("shape", {"expression": "REGEXP '[0-9a-z]{32}'", "column_name": "id"}, "id"),
+            "test.p.order": test("order", {"expression": ">= valid_from", "column_name": "valid_to"}, "valid_to")},
+    }
+    columns = {t: d["columns"] for t, d in build_spec(manifest, "A")[0]["tables"].items()}
+    assert columns["RAW.S.ORDERS"]["ID"] == {"gen": "hash_id", "length": 32}
+    assert columns["RAW.S.LINES"]["ORDER_ID"]["gen"] == "fk" and columns["RAW.S.LINES"]["ORDER_ID"]["length"] == 32
+    assert min(columns["RAW.S.ORDERS"]["VALID_TO"]["seconds"]) > max(columns["RAW.S.ORDERS"]["VALID_FROM"].get("seconds", [0]))
+
+
+def test_a_list_holds_what_the_models_ask_whether_it_contains():
+    sources = {"RAW.S.MRS": SourceUse()}
+    scan_model("""select id from raw.s.mrs where array_contains('database::approved'::variant, labels)
+                  and contains(title, 'All') and not array_contains('wip'::variant, labels)""", sources)
+    assert sources["RAW.S.MRS"].array_values == {"LABELS": {"database::approved"}} and "LABELS" in sources["RAW.S.MRS"].arrays
+    assert sources["RAW.S.MRS"].patterns == {"TITLE": {"%All%"}}

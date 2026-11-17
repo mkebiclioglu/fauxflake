@@ -25,6 +25,7 @@ class Finding:
     said: str = "rows stop in"
     # for a join that matches nothing: (the condition's side, the one column it reads, distinct values of that column)
     sides: list[tuple[str, str, list]] = field(default_factory=list)
+    node: object = None  # the join that pairs a row with several, or the relation that already repeats (a sqlglot node)
 
     def text(self) -> str:
         lines = [f"{self.said} {self.scope}: {self.kind}" + (f" ({self.detail})" if self.detail else "")]
@@ -318,7 +319,8 @@ class Twice(Why):
         if before:
             inputs[name] = before[0]
             if before[0] > before[1]:
-                return Finding(scope, "input", detail=f"{name} already holds {before[0] - before[1]} repeated value(s) of {', '.join(parts)}", inputs=inputs)
+                return Finding(scope, "input", detail=f"{name} already holds {before[0] - before[1]} repeated value(s) of {', '.join(parts)}", inputs=inputs,
+                               node=source, columns=[(part, []) for part in parts])
         def total(select: exp.Select) -> int | None:
             try:
                 return int(self.rows(f"{self.prefix(upto)}select count(*) from {self._relation(select)}")[0][0])
@@ -344,7 +346,7 @@ class Twice(Why):
                 before, after = (was, was), (became, became)
             if culprit is not None:
                 join = culprit
-                finding = Finding(scope, "join", join.sql(dialect="snowflake")[:600], inputs=inputs,
+                finding = Finding(scope, "join", join.sql(dialect="snowflake")[:600], inputs=inputs, node=join,
                                   detail=f"{before[0]} row(s) before it, {after[0]} after: a row meets several on the other side")
                 on = join.args.get("on")
                 alias = (join.this.alias_or_name or "").upper()

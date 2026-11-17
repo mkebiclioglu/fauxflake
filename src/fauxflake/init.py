@@ -53,6 +53,7 @@ class SourceUse:
         self.columns: dict[str, str | None] = {}  # column -> type hint from a cast
         self.paths: dict[str, dict[str, str | None]] = {}  # variant column -> {"a.b": type hint}
         self.arrays: set[str] = set()  # variant columns that are flattened or indexed
+        self.array_values: dict[str, set[str]] = {}  # list column -> the values the SQL asks whether it contains
         self.formats: dict[str, str] = {}  # text column -> strftime format it is parsed with
         self.json_text: set[str] = set()  # text columns holding JSON (passed to PARSE_JSON)
         self.texts: set[str] = set()  # columns compared with string literals
@@ -80,6 +81,10 @@ class SourceUse:
         # list is empty (or the column null) wherever the rule, written in the table's own columns, does not hold
         self.implied: list[tuple[str, str, str]] = []
         self.readings: set[tuple[str, str]] = set()
+        # (the thing, the start, the end): rows looked up by a thing and a moment inside their period (`on a.namespace_id =
+        # h.namespace_id and a.created_at >= h.valid_from and a.created_at < coalesce(h.valid_to, '2099-01-01')`):
+        # the history of each thing, whose periods never overlap
+        self.histories: set[tuple[str, str, str]] = set()
         self.lengths: dict[str, int] = {}  # text column -> how long the models take its values to be (`length(server_id) <> 26`: invalid)
         # ((column, path), (column, path)): rows kept as the latest of each of the first, then looked up by the
         # second (`partition by dns` ... `on x.installation_id = l.installation_id`): the first belongs to one of the second
@@ -916,6 +921,29 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                         continue  # (a calendar that is itself a generated table: `join dates d on d.date between start and end`)
                     if len(owners) == 1 and probes and not owners & probes and "" not in owners:
                         role.setdefault(next(iter(owners)), []).append(bound)
+            if keyed and on is not None:
+                looked = (join.this.alias_or_name or "").upper()
+                of_looked = lambda e: [resolve_path(c) for c in e.find_all(exp.Column) if c.table.upper() == looked]  # noqa: E731
+                things = [spot for e in on.find_all(exp.EQ) if isinstance(e.this, exp.Column) and isinstance(e.expression, exp.Column)
+                          and e.this.table != e.expression.table for spot in of_looked(e)]
+                starts, ends = [], []
+                for test in on.find_all(exp.GT, exp.GTE, exp.LT, exp.LTE, exp.Between):
+                    if isinstance(test, exp.Between):
+                        if not of_looked(test.this):
+                            starts += of_looked(test.args["low"])
+                            ends += of_looked(test.args["high"])
+                        continue
+                    above = isinstance(test, (exp.GT, exp.GTE))
+                    if of_looked(test.expression) and not of_looked(test.this):
+                        (starts if above else ends).extend(of_looked(test.expression))  # `a.at >= h.valid_from`
+                    elif of_looked(test.this) and not of_looked(test.expression):
+                        (ends if above else starts).extend(of_looked(test.this))  # `h.valid_from <= a.at`
+                columns_of = lambda spots: {spot[:2] for spot in spots if isinstance(spot, tuple) and not spot[2] and spot[0] in sources}  # noqa: E731
+                thing, start, end = columns_of(things), columns_of(starts), columns_of(ends)
+                if len(thing) == len(start) == len(end) == 1 and len({t for t, _ in thing | start | end}) == 1 \
+                        and len({c for _, c in thing | start | end}) == 3:
+                    table = next(iter(thing))[0]
+                    sources[table].histories.add((next(iter(thing))[1], next(iter(start))[1], next(iter(end))[1]))
             for owner in set(lower) & set(upper):
                 for role, bounds in (("start", lower[owner]), ("end", upper[owner])):
                     for column in (c for bound in bounds for c in bound.find_all(exp.Column)):
@@ -1047,6 +1075,10 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     col, parent = parent, parent.parent
                     if not (isinstance(parent, exp.JSONExtract) and parent.this is col):
                         use.paths.setdefault(hit[1], {})
+                elif isinstance(parent, (exp.Contains, exp.StartsWith, exp.EndsWith)) and parent.this is col:
+                    if within_pattern(parent) and not isinstance(parent.parent, exp.Not):
+                        use.patterns.setdefault(hit[1], set()).add(within_pattern(parent))  # contains(area, 'All')
+                        use.texts.add(hit[1])
                 elif isinstance(parent, (exp.EQ, exp.NEQ, exp.Like, exp.ILike, exp.In)):
                     if isinstance(parent, (exp.Like, exp.ILike)) and parent.this is col and isinstance(parent.expression, exp.Any) \
                             and not isinstance(parent.parent, exp.Not) and _like_patterns(parent):
@@ -1093,6 +1125,14 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 elif isinstance(parent, exp.Bracket) or col.find_ancestor(exp.Explode, exp.Lateral, exp.Unnest) is not None \
                         or (isinstance(parent, _ARRAY_READERS) and parent.this is col):
                     use.arrays.add(hit[1])  # array_to_string(tags, ','), array_size(tags): a list
+                    if isinstance(parent, (exp.ArrayContains, exp.ArrayOverlaps)) and not isinstance(parent.parent, exp.Not):
+                        # array_contains('database::approved'::variant, labels): the list holds that, in some rows
+                        asked = parent.expression
+                        while isinstance(asked, (exp.Cast, exp.TryCast, exp.Paren)):
+                            asked = asked.this
+                        for one in (asked.expressions if isinstance(asked, (exp.Array, exp.Tuple)) else [asked]):
+                            if isinstance(one, exp.Literal) and one.is_string and 0 < len(one.name) <= 80:
+                                use.array_values.setdefault(hit[1], set()).add(one.name)
                 elif isinstance(parent, (exp.StrToTime, exp.StrToDate, exp.TsOrDsToDate)) and parent.this is col \
                         and isinstance(parent.args.get("format"), exp.Literal):
                     use.formats[hit[1]] = parent.args["format"].name  # a text column holding dates
@@ -1605,7 +1645,7 @@ def pool_name(m) -> str:  # noqa: ANN001
     return (m[2].replace("[]", "").split(".")[-1] or m[1]).lower()
 
 
-def as_long_as(tables: dict[str, dict], uses: dict, pairs: list, notes: list[str]) -> None:
+def as_long_as(tables: dict[str, dict], uses: dict, pairs: list, notes: list[str], said_text: set | None = None) -> None:
     """`length(server_id) <> 26` marks the invalid ids: an id is 26 characters, in that column and in every
     column a join or a UNION lines up with it (`length`: the made-up value, rewritten at that length). Left alone
     where any of them holds values known by name: those are as long as they are."""
@@ -1628,6 +1668,10 @@ def as_long_as(tables: dict[str, dict], uses: dict, pairs: list, notes: list[str
             held = [tables[t]["columns"][c] for t, c in sorted(group)]
             made_up = lambda d: (d.get("gen") in ("hash_id", "fk", "pool") and not d.get("numeric") and not d.get("template")) or (  # noqa: E731
                 d.get("gen") == "template" and not d.get("templates") and re.fullmatch(r"\w+_\{(n|hex)\}", str(d.get("template", ""))))
+            if (name, col) in (said_text or ()) and all(d.get("gen") in ("sequence", "fk", "hash_id") for d in held):
+                for d in held:  # (a key of numbers that a test says is text: ids of letters and digits)
+                    if d.get("gen") == "sequence":
+                        d["gen"] = "hash_id"
             if not all(made_up(d) and not d.get("suffix") and not d.get("format") for d in held):
                 continue
             for d in held:
@@ -1899,10 +1943,13 @@ def flattened_objects(paths: dict[str, str | None], moved: dict[str, list[str]] 
             keys = {other[len(base) + 1:].split(".")[0].split("[")[0] for other in paths
                     if base and other.startswith(base + ".") and other != path}
             if keys:
-                out.pop(path, None)
                 holders = [k for k in sorted(keys) if any(o.startswith(f"{base}.{k}.") or o.startswith(f"{base}.{k}[") for o in paths)]
-                # (no key is read any deeper by name: what is read in the values is in each of them)
-                holders = holders or sorted(keys)
+                if rest and not holders:
+                    # no key is read any deeper by name (`{"FunctionCall": {...}}` or `{"Transfer": {...}}`, each
+                    # flattened for what it holds): the value is one kind of thing or another, and what is read
+                    # in it stays where it is; the generator writes one key for each value
+                    break
+                out.pop(path, None)
                 for k in holders if rest else []:
                     out.setdefault(f"{base}.{k}{rest}", paths[path])
                     if moved is not None:
@@ -1944,8 +1991,25 @@ def asked_shapes(use: "SourceUse", col: str) -> set[str]:
 
 
 def like_shape(pattern: str) -> str:
-    """A template whose values match the LIKE pattern: `%.pool%.near` -> `{hex}.pool{hex}.near`."""
-    return pattern.replace("\\", "").replace("%", "{hex}").replace("_", "x")
+    """A template whose values match the LIKE pattern: `%.pool%.near` -> `{hex}.pool{hex}.near`. `_` (any one
+    character) is written as an underscore, which is what the pattern nearly always means by it."""
+    out, i = "", 0
+    while i < len(pattern):
+        if pattern[i] == "\\" and i + 1 < len(pattern):
+            out, i = out + pattern[i + 1], i + 2
+            continue
+        out, i = out + ("{hex}" if pattern[i] == "%" else pattern[i]), i + 1
+    return out
+
+
+def within_pattern(test: exp.Expression) -> str | None:
+    """`contains(name, 'All')`, `startswith(name, 'tap-')`, `endswith(name, '.near')` as the LIKE pattern they are."""
+    said = test.expression
+    if not isinstance(test, (exp.Contains, exp.StartsWith, exp.EndsWith)) or not isinstance(said, exp.Literal) or not said.is_string \
+            or not re.search(r"[A-Za-z0-9]", said.name) or len(said.name) > 60 or "{" in said.name:
+        return None
+    text = said.name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"{'' if isinstance(test, exp.StartsWith) else '%'}{text}{'' if isinstance(test, exp.EndsWith) else '%'}"
 
 
 def history_window(dates: list[tuple[str, date]], default: date = date(2025, 1, 1), days: int = 60) -> tuple[date, int | None]:
@@ -2305,6 +2369,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 either.append((sides[0], sides[1]))
             break
     gated: list[tuple[tuple[str, str], str]] = []  # (a column, the rule about the row that holds wherever it is not null)
+    said_text: set[tuple[str, str]] = set()  # columns a test says are text of a given shape, whatever the reading took them for
     keys: dict[str, str] = {}
     ordered: list[tuple[tuple[str, str, str], tuple[str, str, str]]] = []  # (the later, the earlier) of two times a test compares
     together: list[tuple[str, list[str]]] = []  # (table, columns a test says are unique together)
@@ -2327,10 +2392,21 @@ def analyse(manifest: dict, database: str) -> Analysis:
             if spots and all(spots) and len(spots) == len(listed) and len({spot[0] for spot in spots}) == 1:
                 together.append((spots[0][0], [spot[1] for spot in spots]))
             continue
+        written = str((meta["kwargs"].get("arguments") or meta["kwargs"]).get("expression") or "").strip() \
+            if meta["name"] == "expression_is_true" else ""
+        shaped = re.fullmatch(r"(?i)(?:REGEXP|RLIKE)\s+'\^?\[(?:0-9a-[fz]|a-[fz]0-9)\]\{(\d+)\}\$?'", written) if column else None
+        spot = locate(tested, str(column)) if shaped and re.fullmatch(r"\w+", str(column)) else None
+        if spot and spot[0] in uses and 8 <= int(shaped[1]) <= 64:
+            # `id` tested with `REGEXP '[0-9a-z]{32}'`: an id of 32 letters and digits, wherever it is written
+            uses[spot[0]].lengths[spot[1]] = int(shaped[1])
+            said_text.add((spot[0], spot[1]))
+            continue
+        if column and re.fullmatch(r"\w+", str(column)) and re.match(r"(>=|<=|>|<)\s*\w+\s*$", written):
+            written, column = f"{column} {written}", None  # `valid_to` tested with `>= valid_from`
         if meta["name"] == "expression_is_true" and not column:
             # `expression: "release_date > rc1_date"`: one of the two comes after the other
             try:
-                said = sqlglot.parse_one(str((meta["kwargs"].get("arguments") or meta["kwargs"]).get("expression") or ""), read="snowflake")
+                said = sqlglot.parse_one(written, read="snowflake")
             except Exception:  # noqa: BLE001
                 said = None
             if isinstance(said, (exp.GT, exp.GTE, exp.LT, exp.LTE)) and isinstance(said.this, exp.Column) and isinstance(said.expression, exp.Column):
@@ -2504,6 +2580,8 @@ def analyse(manifest: dict, database: str) -> Analysis:
                     out[col]["type"] = "VARCHAR"
             elif col in use.arrays:
                 out[col] = {"gen": "array"}
+                if use.array_values.get(col):  # (what it is asked to contain, beside values of its own)
+                    out[col]["values"] = [*sorted(use.array_values[col])[:40], f"{col.lower()}_1", f"{col.lower()}_2"]
             elif col in use.formats:
                 out[col] = {"gen": "time_offset", "format": use.formats[col], **WEEK}
             elif col == loaded:
@@ -2675,7 +2753,31 @@ def analyse(manifest: dict, database: str) -> Analysis:
             held[column] = {"gen": "row_of", "group": seed, "values": [row[i] for row in rows]}
         joined.append(f"{table} ({', '.join(columns)}): joined together to the seed {seed}, generated as the rows it lists.")
     _share_join_values(tables, joins, joined, lookups)
-    as_long_as(tables, uses, [*joins, *((a, b) for group in links for a in sorted(group, key=str)[:1] for b in sorted(group, key=str)[1:])], notes)
+    for name, use in uses.items():
+        columns = tables.get(name, {}).get("columns") or {}
+        for thing, start, end in sorted(use.histories):
+            if (thing, end, start) in use.histories and re.search(r"(^|_)(TO|END|UNTIL|ENDED|CLOSED)(_|$)", start):
+                continue  # (read both ways round by two joins: the one that starts at the start)
+            # rows looked up by a thing and a moment between two of their times: the history of the thing, in periods
+            # that never overlap (a moment in two of them would bring every row that looks it up twice). One period
+            # for each thing here, most of them still open
+            held, since, until = columns.get(thing) or {}, columns.get(start) or {}, columns.get(end) or {}
+            if since.get("gen") not in ("time_offset", "event_time", "updated_at", "loaded_at") or until.get("gen") != "time_offset" \
+                    or until.get("unique") or since.get("unique"):
+                continue
+            if held.get("gen") == "fk" and not held.get("per_parent") and not held.get("first"):
+                held["per_parent"] = 1
+            elif held.get("gen") == "dist" and not held.get("unique") and str(held.get("type", "BIGINT")).upper() in ("BIGINT", "INTEGER", "INT"):
+                held["unique"] = True
+            elif held.get("gen") not in _KEYS and not held.get("unique") and held.get("per_parent") != 1:
+                continue
+            until["null_rate"] = max(float(until.get("null_rate") or 0), 0.8)
+            if since.get("gen") == "time_offset":
+                ordered.append(((name, end, ""), (name, start, "")))
+            notes.append(f"{name}: models look rows up by {thing} and a moment between {start} and {end}; generated as one period "
+                         f"for each {thing.lower()}, most of them still open.")
+    as_long_as(tables, uses, [*joins, *((a, b) for group in links for a in sorted(group, key=str)[:1] for b in sorted(group, key=str)[1:])], notes,
+               said_text)
     _share_union_values(tables, links)
     if joined:
         notes.append(f"{len(joined)} group(s) of columns are joined in models and generated to match, for example: {' '.join(joined[:3])}")
