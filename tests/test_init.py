@@ -860,3 +860,20 @@ def test_numbers_asked_for_by_name_are_generated():
     use = uses["RAW.T.LINES"]
     assert use.equals == {"CALENDAR_ID": {2}, "FORM_ID": {334447, 426148}}
     assert use.scales[("SENT_AT", "")] == 6 and use.scales[("V", "at")] == 3
+
+
+def test_a_document_is_followed_through_object_insert_and_delete():
+    from fauxflake.init import _PATHS, scan_model, SourceUse
+
+    uses = {"RAW.G.DETAIL": SourceUse()}
+    out = scan_model("""
+        with source as (
+          select object_delete(parse_json(value), 'exported_at') as trimmed,
+                 object_insert(trimmed, 'credits', array_sort(value['credits']::variant), true) as sorted_credits
+          from RAW.G.DETAIL),
+        grouped as (select sorted_credits as value, count(*) as n from source group by 1),
+        renamed as (select value['account_id']::varchar as account_id, value['usage']['amount']::float as amount,
+                           value['credits']::variant as credits from grouped)
+        select * from renamed""", uses)
+    assert {"account_id", "usage.amount", "credits[]"} <= set(uses["RAW.G.DETAIL"].paths["VALUE"])
+    assert out[_PATHS]["CREDITS"] == ("RAW.G.DETAIL", "VALUE", ("credits",))

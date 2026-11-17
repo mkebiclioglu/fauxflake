@@ -498,6 +498,11 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                         return base if int(index.name) == 0 else None
                     return base[0], base[1], base[2] + ("~part", taken.expression.name, str(int(index.name)))
                 return into(resolve_path(node.this, depth + 1), [index.name if index.is_string else "[]"])
+            if isinstance(node, exp.ObjectInsert) or (isinstance(node, exp.Anonymous) and node.expressions
+                                                    and node.name.upper() in ("OBJECT_DELETE", "OBJECT_PICK")):
+                # object_insert(doc, 'credits', array_sort(doc['credits']), true), object_delete(doc, 'loaded_at'):
+                # still that document, give or take a key
+                return resolve_path(node.this if isinstance(node, exp.ObjectInsert) else node.expressions[0], depth + 1)
             if isinstance(node, exp.If):  # iff(kind = 'a', v:msg, v): what the first answer that is known holds
                 for value in (node.args.get("true"), node.args.get("false")):
                     found = resolve_path(value, depth + 1) if value is not None else None
