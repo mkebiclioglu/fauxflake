@@ -385,3 +385,9 @@
 - {id: no_duplicate_names_in_ctas, sql: "create or replace temporary table analytics.ci.fx_no_dupes as select s.*, u.y, u.id as id_1, 7 as x_1 from (select 1 as id, 2 as x) s join (select 1 as id, 3 as y) u on s.id = u.id"}
 - {id: no_duplicate_names_with_using, sql: "create or replace temporary table analytics.ci.fx_no_dupes as select * from (select 1 as id, 2 as x) s join (select 1 as id, 3 as y) u using (id)"}
 - {id: quoted_names_differ_by_case_in_ctas, sql: "create or replace temporary table analytics.ci.fx_no_dupes as select 1 as \"a\", 2 as \"A\""}
+- {id: to_char_of_dates_and_times, sql: "select to_char(d, 'YYYY-MM-DD HH24:MI'), to_char(ts, 'DY, DD MON YYYY'), to_char(t, 'HH12:MI AM'), to_char(t, 'HH24:MI:SS'), to_varchar(t), t::varchar, to_char(null::date, 'YYYY'), to_char(date_trunc('month', d), 'MON-YY'), to_char(1234.5, '9,999.00'), to_char(d), to_char(42) from (select '2024-01-09'::date d, '2024-01-09 15:04:05'::timestamp ts, '15:04:05'::time t)"}
+- {id: to_char_of_a_chosen_type, sql: "select to_char(coalesce(x, d), 'YYYY-MM'), to_char(nvl(d, current_date), 'YYYY'), to_char(dateadd(day, 1, x), 'YYYY-MM-DD'), to_char(to_date(x), 'MM/DD'), to_char(x::date, 'DD') from (select '2024-01-05'::varchar x, '2024-01-09'::date d)"}
+- {id: strict_to_char_of_text, sql: "select to_char(x, 'YYYY-MM') from (select '2024-01-05'::varchar x)"}
+- {id: strict_to_char_of_variant, sql: "select to_char(v, 'YYYY-MM') from (select '2024-01-05'::variant v)"}
+- {id: strict_to_char_of_literal, sql: "select to_char('2024-01-05', 'YYYY-MM')"}
+- {id: strict_to_char_date_format_of_number, sql: "select to_char(n, 'YYYY') from (select 2024 n)"}

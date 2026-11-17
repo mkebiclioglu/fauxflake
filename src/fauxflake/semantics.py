@@ -26,6 +26,11 @@ MACROS = [
     # argument is only marked here; when DuckDB refuses the statement, `text_as_written` converts the marked
     # arguments that turn out to be text.
     f"create or replace macro {_NS}_sf_reads(x, kind) as x",
+    f"""create or replace macro {_NS}_sf_formattable
+          (x time) as (date '1970-01-01' + x),
+          (x date) as x::timestamp,
+          (x timestamp) as x,
+          (x timestamptz) as x""",
     # WHERE, IFF and CASE WHEN take a BOOLEAN and nothing else in Snowflake (`where is_deleted` on a NUMBER or
     # text column does not compile; AND, OR and NOT do convert). The macro has no other overload, so DuckDB
     # refuses what Snowflake refuses, and `strict_conditions` words the error.
@@ -904,7 +909,9 @@ def _fix(node: exp.Expression) -> exp.Expression:
 
             model = node.args["format"].name.replace("Mon", "MON").replace("Dy", "DY")
             fmt = format_time(model, Snowflake.TIME_MAPPING, Snowflake.TIME_TRIE)
-            return exp.TimeToStr(this=exp.cast(node.this, "timestamp"), format=exp.Literal.string(fmt))
+            # (text does not compile: Snowflake has no TO_CHAR(text, format). A time of day is formatted on any date.)
+            return exp.TimeToStr(this=_fn("_sf_formattable", _fn("_sf_strict", node.this, exp.Literal.string("TO_CHAR"))),
+                                 format=exp.Literal.string(fmt))
     if isinstance(node, exp.Avg) and not (isinstance(node.parent, exp.Window) and node.parent.this is node):
         return _avg(node)
     if isinstance(node, exp.Window):
@@ -1545,13 +1552,17 @@ def strict_dates(tree: exp.Expression, conn, params=None) -> bool:  # noqa: ANN0
                     continue  # this one binds: something else is wrong with the statement
                 kind = found.group(1).strip('"\\')
         if kind == "NULL" or (isinstance(arg.unnest(), _CHOOSES_A_TYPE) and kind in ("VARCHAR", "JSON")):
-            marker.replace(arg)
+            marker.replace(exp.cast(arg.copy(), "timestamp"))  # what Snowflake makes of it
             loosened = True
             continue
         named = _SNOWFLAKE_TYPE.get(kind) or ("NUMBER(38,0)" if "INT" in kind else kind.replace("DECIMAL", "NUMBER"))
         if kind == "STRING_LITERAL":
             named = f"VARCHAR({len(arg.name)})"
         shown = arg.sql(dialect="snowflake")
+        if fn == "TO_CHAR" and kind in ("VARCHAR", "JSON", "STRING_LITERAL"):
+            raise ProgrammingError(msg=f"SQL compilation error:\ntoo many arguments for function [TO_CHAR({shown}, ...)] expected 1, got 2"
+                                       f"\n(TO_CHAR with a format takes a date, a time or a number; this argument is {named})",
+                                   errno=939, sqlstate="22023")
         raise ProgrammingError(msg=f"SQL compilation error:\nFunction {fn} does not support {named} argument type"
                                    f"\n(the argument: {shown if len(shown) <= 200 else shown[:200] + ' ...'})",
                                errno=2016, sqlstate="22000")
