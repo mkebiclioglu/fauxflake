@@ -1278,3 +1278,38 @@ def test_the_reading_still_says_where_a_column_comes_from_when_a_flattened_objec
     fields = analysis.spec["tables"]["RAW.S.SHARDS"]["columns"]["VALUE"]["fields"]
     assert "stake" in str(fields.get("actions[].FunctionCall.method_name")), fields
     assert analysis.place("model.p.m", "ID") == ("RAW.S.SHARDS", "ID", "")
+
+
+def test_two_texts_that_begin_with_each_others_values_do_not_follow_each_other():
+    from fauxflake.init import follow_categories
+
+    columns = {"A": {"gen": "template", "templates": ["run", "run fast {hex}", "a_{hex}"]},
+               "B": {"gen": "template", "templates": ["run", "run fast", "run slow {hex}", "b_{hex}"]}}
+    follow_categories(columns)
+    assert [c for c, d in columns.items() if d.get("begins_with")] in (["A"], ["B"], [])
+
+
+def test_a_test_that_returns_things_with_two_facts_at_odds_deals_the_facts_to_two_halves():
+    from fauxflake.init import build_spec
+
+    def source(name, cols):
+        return {"database": "RAW", "schema": "S", "name": name, "identifier": name,
+                "columns": {c: {"data_type": t} for c, t in cols.items()}}
+
+    manifest = {
+        "sources": {"source.p.s.servers": source("servers", {"id": "VARCHAR", "installation": "VARCHAR", "at": "TIMESTAMP"}),
+                    "source.p.s.licenses": source("licenses", {"server_id": "VARCHAR", "license_id": "VARCHAR", "company": "VARCHAR"}),
+                    "source.p.s.clouds": source("clouds", {"installation": "VARCHAR", "company": "VARCHAR"})},
+        "nodes": {
+            "model.p.info": {"resource_type": "model", "name": "info", "depends_on": {"nodes": []}, "relation_name": "A.B.INFO", "compiled_code": """
+                with every as (select coalesce(l.server_id, s.id) as server_id, l.license_id, s.installation as installation_id, l.company
+                               from raw.s.licenses l full outer join raw.s.servers s on l.server_id = s.id)
+                select e.server_id, e.license_id, e.installation_id, e.company as license_company, c.company as cloud_company
+                from every e left join raw.s.clouds c on c.installation = e.installation_id"""},
+            "test.p.one_source": {"resource_type": "test", "name": "one_source", "depends_on": {"nodes": ["model.p.info"]}, "compiled_code": """
+                select server_id, license_id, installation_id from a.b.info
+                where (license_company is not null and cloud_company is not null and license_company <> cloud_company)"""}},
+    }
+    columns = {t: d["columns"] for t, d in build_spec(manifest, "A")[0]["tables"].items()}
+    rules = {columns["RAW.S.LICENSES"]["LICENSE_ID"].get("null_unless"), columns["RAW.S.SERVERS"]["INSTALLATION"].get("null_unless")}
+    assert rules == {"HASH(({{SERVER_ID}})::VARCHAR) % 2 = 0", "HASH(({{ID}})::VARCHAR) % 2 = 1"}, columns

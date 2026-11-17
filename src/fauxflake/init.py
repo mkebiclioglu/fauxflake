@@ -2258,6 +2258,41 @@ def analyse(manifest: dict, database: str) -> Analysis:
         names = {c.name.upper() for c in told[1].find_all(exp.Column)} if told else set()
         return (told[0], names.pop(), "") if len(names) == 1 else None
 
+    # a test the project wrote out returns (the thing, one fact about it, another) where both facts are there and
+    # say different things (`where license_company is not null and cloud_company is not null and license_company
+    # <> cloud_company`): one thing has the one or the other. ((table, columns, its column for the thing), (same))
+    either: list[tuple[tuple[str, tuple[str, ...], str], tuple[str, tuple[str, ...], str]]] = []
+    for node in manifest["nodes"].values():
+        owners = [n for n in (node.get("depends_on") or {}).get("nodes") or [] if n.startswith(("model.", "snapshot."))]
+        if node["resource_type"] != "test" or node.get("test_metadata") or not node.get("compiled_code") or len(owners) != 1:
+            continue
+        try:
+            asked = sqlglot.parse_one(node["compiled_code"], read="snowflake")
+        except Exception:  # noqa: BLE001
+            continue
+        where = asked.args.get("where") if isinstance(asked, exp.Select) and not asked.args.get("joins") else None
+        arms = list(where.this.flatten()) if where is not None and isinstance(where.this, exp.Or) else [where.this] if where is not None else []
+
+        def both_there(arm) -> bool:  # noqa: ANN001
+            arm = arm.unnest()
+            parts = [part.unnest() for part in (arm.flatten() if isinstance(arm, exp.And) else [arm])]
+            there = {p.this.this.name.upper() for p in parts if isinstance(p, exp.Not) and isinstance(p.this, exp.Is)
+                     and isinstance(p.this.this, exp.Column) and isinstance(p.this.expression, exp.Null)}
+            return any(isinstance(p, exp.NEQ) and isinstance(p.this, exp.Column) and isinstance(p.expression, exp.Column)
+                       and {p.this.name.upper(), p.expression.name.upper()} <= there for p in parts)
+
+        named = [e.name.upper() for e in asked.expressions if isinstance(e, exp.Column)] if arms and all(both_there(a) for a in arms) else []
+        if len(named) != 3 or len(named) != len(asked.expressions):
+            continue
+        for thing in named:
+            among = dict(outputs.get(owners[0], {}).get(_ANY + thing) or ())  # table -> its column for the thing
+            facts = [worked_out(owners[0], n) for n in named if n != thing]
+            if len(among) < 2 or not all(facts) or facts[0][0] == facts[1][0] or not {facts[0][0], facts[1][0]} <= set(among):
+                continue
+            sides = [(t, tuple(sorted({c.name.upper() for c in e.find_all(exp.Column)} - {among[t]})), among[t]) for t, e in facts]
+            if all(side[1] for side in sides):
+                either.append((sides[0], sides[1]))
+            break
     gated: list[tuple[tuple[str, str], str]] = []  # (a column, the rule about the row that holds wherever it is not null)
     keys: dict[str, str] = {}
     ordered: list[tuple[tuple[str, str, str], tuple[str, str, str]]] = []  # (the later, the earlier) of two times a test compares
@@ -2871,6 +2906,28 @@ def analyse(manifest: dict, database: str) -> Analysis:
         if col in columns and columns[col].get("gen") not in _KEYS and rule_binds(rule, col, columns):
             columns[col]["null_unless"] = rule
             notes.append(f"{name}.{col}: a test states a rule about the rows that have one; it is empty in the other rows (`null_unless`).")
+    for sides in either:
+        # the things are dealt in two halves by what they are called: one half has the one fact, the other half the other
+        shared = {(t, e) for t, _, e in sides}
+        group = next((g for g in ({m[:2] for m in g} for g in [*links, *({a, b} for a, b in joins)]) if shared <= g), None)
+        linked = lambda a, b: a == b or any(a in {m[:2] for m in g} and b in {m[:2] for m in g} for g in links)  # noqa: E731
+        if group is None and not all(tables.get(t, {}).get("columns", {}).get(e, {}).get("gen") in (*_KEYS, "fk") for t, e in shared):
+            continue
+        for half, (table, facts, thing) in enumerate(sides):
+            places = [(table, fact, thing) for fact in facts]
+            for other, columns in ((n, t.get("columns") or {}) for n, t in tables.items() if n != table):
+                # (a table lined up with it in a UNION says the same of the same things)
+                places += [(other, c, e) for fact in facts for c in columns for e in columns
+                           if linked((table, fact), (other, c)) and (other, c) != (table, fact) and linked((table, thing), (other, e)) and c != e]
+            for name, fact, entity in places:
+                columns = tables.get(name, {}).get("columns") or {}
+                rule = f"HASH(({{{{{entity}}}}})::VARCHAR) % 2 = {half}"
+                referred = any(d.get("gen") == "fk" and str(d.get("ref", "")).upper() == name for t in tables.values() for d in t["columns"].values())
+                if fact in columns and not columns[fact].get("null_unless") and not (columns[fact].get("gen") in _KEYS and referred) \
+                        and rule_binds(rule, fact, columns):
+                    columns[fact]["null_unless"] = rule
+                    notes.append(f"{name}.{fact}: a test says nothing has both this and {sides[1 - half][0]}.{', '.join(sides[1 - half][1])}; "
+                                 f"half of the {entity.lower()}s have the one, half the other (`null_unless`).")
     least = rows_asked(manifest)
     if least:
         notes.append(f"the project lists tables by their size (`row_count >= {least}` in INFORMATION_SCHEMA.TABLES): every "
@@ -2954,6 +3011,11 @@ def rule_binds(rule: str, col: str, columns: dict) -> bool:
     return True
 
 
+def led_by(columns: dict, name: str) -> bool:
+    """Whether another column's text already begins with this one's values."""
+    return any(gen.get("begins_with") == name for gen in columns.values())
+
+
 def follow_categories(columns: dict) -> None:
     """`where command_category = 'meltano elt'` here, `command like 'meltano elt%--transform run%'` there: the
     shapes the SQL asks of a text begin with the values of a category in the same table. In the real data the
@@ -2966,7 +3028,8 @@ def follow_categories(columns: dict) -> None:
             continue
         best, owned = None, 0
         for other, cat in columns.items():
-            values = named_values(cat) if other != name else []
+            # (a category leads, it does not follow: two texts that each begin with the other's values stay apart)
+            values = named_values(cat) if other != name and not cat.get("begins_with") and not led_by(columns, name) else []
             leads = {v for v in values if any(s.startswith(v) and not s[len(v):len(v) + 1].isalnum() for s in shapes)}
             if len(leads) > max(owned, 1):
                 best, owned = other, len(leads)

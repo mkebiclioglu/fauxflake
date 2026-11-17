@@ -525,7 +525,7 @@ class TableSQL:
                     f"case {pick} {' '.join(f'when {i} then {fill(t)}' for i, t in enumerate(some))} end"
 
             lead = self.t.columns.get(str(d.get("begins_with") or "")) if "." not in col else None
-            if lead and named_values(lead):
+            if lead and named_values(lead) and not lead.get("begins_with"):
                 # the text begins with the row's category (a command and its command category): each row takes a
                 # shape that begins with the value its category column holds
                 by_value = begins_with(shapes, named_values(lead))
