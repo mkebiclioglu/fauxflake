@@ -1044,8 +1044,33 @@ def _set_comment(cursor, original, state: State, m):  # noqa: ANN001, ANN202
     return _status(cursor, original, "Statement executed successfully.")
 
 
+def _set_many(cursor, original, state: State, m):  # noqa: ANN001, ANN202
+    """SET (a, b) = (1, 'two'): each variable in turn."""
+    values, depth, quote, start, text = [], 0, None, 0, m.group("values")
+    for i, ch in enumerate(text):
+        if quote:
+            quote = None if ch == quote else quote
+        elif ch in "'\"":
+            quote = ch
+        elif ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            values.append(text[start:i])
+            start = i + 1
+    values.append(text[start:])
+    names = [n.strip() for n in m.group("names").split(",")]
+    if len(names) != len(values):
+        raise error("SQL compilation error:\nThe number of variables does not match the number of values.", 1003, "42000")
+    for name, value in zip(names, values):
+        _run(cursor, f"set {name} = {value.strip()}")
+    return _status(cursor, original, "Statement executed successfully.")
+
+
 _RELATION = r"(?:table|view|materialized\s+view|dynamic\s+table|external\s+table)"
 _SIMPLE[:0] = [
+    (re.compile(_LEAD + r"set\s*\((?P<names>[\w$\s,]+)\)\s*=\s*\((?P<values>.*)\)\s*;?\s*$"), "set_many"),
     (re.compile(_LEAD + r"comment\s+(?P<exists>if\s+exists\s+)?on\s+(?P<kind>" + _RELATION + r"|column)\s+(?P<name>" + _NAME + r")\s+is\s+(?P<rest>.*)$"),
      "comment_on"),
     (re.compile(_LEAD + r"alter\s+" + _RELATION + r"\s+(?:if\s+exists\s+)?(?P<name>" + _NAME + r")\s+(?:alter|modify)\s+"
@@ -1097,7 +1122,7 @@ def intercept(cursor, command: str, original):  # noqa: ANN001, ANN201
     """Handle a statement about one of the objects above. Returns None for everything else."""
     head = re.match(_LEAD + r"(\w+)", command)
     command = _TRAILING_COMMENT.sub("", command)  # dbt appends its query comment after the statement
-    if not head or head.group(1).lower() not in ("create", "alter", "drop", "show", "call", "execute", "declare", "begin", "use", "with", "copy", "comment"):
+    if not head or head.group(1).lower() not in ("create", "alter", "drop", "show", "call", "execute", "declare", "begin", "use", "with", "copy", "comment", "set"):
         return None
     state = state_of(cursor._conn)
     with state.lock:
