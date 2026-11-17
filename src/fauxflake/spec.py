@@ -62,8 +62,10 @@ class Table:
             seconds += max(step["delay"]["seconds"])
         return math.ceil(seconds / DAY) + 1
 
-    def calendar(self, start: date, end: date, seed: int, scale: float, scenario=None) -> list[tuple[date, int, int]]:
-        """(day, cumulative rows before day, rows on day) for every event day in [start, end]."""
+    def calendar(self, start: date, end: date, seed: int, scale: float, scenario=None,
+                 thin: tuple[date, float] | None = None) -> list[tuple[date, int, int]]:
+        """(day, cumulative rows before day, rows on day) for every event day in [start, end].
+        `thin`: days before that date hold that share of the volume (the far end of a long history)."""
         vol = self.raw.get("volume", {})
         base = float(vol.get("rows_per_day", 1000))
         if self.raw.get("scale", True):
@@ -76,7 +78,9 @@ class Table:
         while day <= end:
             rng = random.Random(f"{seed}:{self.name}:{day.isoformat()}")
             level = base * (1 + growth) ** ((day - anchor).days / 365.0) * weekly[day.weekday()]
-            if base < 1:
+            if thin and day < thin[0]:
+                level *= thin[1]
+            if base < 1 or level < 1:
                 # less than a row a day (a long history of a small table): a row every few days, the first on day one
                 carry += level * max(0.0, 1 + noise * rng.gauss(0, 1))
                 n = int(carry) or (1 if day == start else 0)
@@ -106,6 +110,14 @@ class Spec:
     # relations the project reads before it builds them (hard-coded names): DB.SCHEMA.NAME -> {columns: {COL: type}}
     existing: dict[str, dict] = field(default_factory=dict)
     history: int | None = None  # days of history present at the start, when the project's own date filters need more than the default
+    recent: int | None = None  # the last days of that history that hold the full volume ...
+    older: float | None = None  # ... and the share of it the days before them hold (a long history costs what a short one does)
+
+    @property
+    def thin(self) -> tuple[date, float] | None:
+        if not (self.history and self.recent and self.older) or self.recent >= self.history:
+            return None
+        return self.start + timedelta(days=self.history - self.recent), float(self.older)
 
     def loose_names(self) -> None:
         """Generated tables hold their columns in capitals whatever the real ones are called, so a quoted
@@ -132,7 +144,9 @@ class Spec:
                    dbt=raw.get("dbt") or {}, path=Path(path),
                    udfs={k.lower(): v for k, v in (raw.get("udfs") or {}).items()},
                    existing={k.upper(): dict(v or {}) for k, v in (raw.get("existing") or {}).items()},
-                   history=int(raw["history"]) if raw.get("history") else None)
+                   history=int(raw["history"]) if raw.get("history") else None,
+                   recent=int(raw["recent"]) if raw.get("recent") else None,
+                   older=float(raw["older"]) if raw.get("older") else None)
         spec.validate()
         spec.loose_names()
         for var, value in (spec.dbt.get("env") or {}).items():

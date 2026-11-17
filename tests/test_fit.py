@@ -31,12 +31,18 @@ def test_init_learns_the_spec_by_running_the_project(tmp_path):
     assert "udfs" not in spec
     # a test about production data is listed, not hidden
     assert spec["dbt"]["expected_failures"] == ["no_small_totals"]
-    assert "4/4 models" in out.output and "expected_failures" in out.output
+    assert "6/6 models" in out.output and "expected_failures" in out.output
+    # a model that built with no rows said what the data lacked: the names the project's own list of quarters holds
+    assert set(columns["FISCAL_QUARTER"]["values"]) == {"FY24-Q1", "FY24-Q2", "FY24-Q3"}
+    assert "came out empty" in out.output
 
     built = runner.invoke(main, ["build", "--project-dir", str(PROJECT), "--spec", str(spec_path), "--keep"])
     assert built.exit_code == 0, built.output
     rows = runner.invoke(main, ["query", "--project-dir", str(PROJECT), "--spec", str(spec_path),
                                 "select count(*) as n, count(distinct size) as sizes from fct_events"])
+    assert rows.exit_code == 0 and int(rows.output.strip().splitlines()[-2].split()[0]) > 0, rows.output
+    rows = runner.invoke(main, ["query", "--project-dir", str(PROJECT), "--spec", str(spec_path),
+                                "select count(*) as n from events_by_quarter"])
     assert rows.exit_code == 0 and int(rows.output.strip().splitlines()[-2].split()[0]) > 0, rows.output
 
 

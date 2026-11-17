@@ -843,3 +843,106 @@ def test_a_column_given_to_a_date_part_function_is_a_time():
         assert hints[column] == "TIMESTAMP", column
     # DATEADD reads text as a date in Snowflake: it says nothing certain about the column
     assert not hints.get("LATER") and not hints.get("NAME")
+
+
+def test_a_long_history_keeps_its_recent_end_and_thins_the_rest():
+    from fauxflake.init import LONGEST, history_window, thinned
+    from fauxflake.spec import Spec
+
+    # one old upper limit no longer leaves out what is asked of the last years
+    start, span = history_window([("before", date(2018, 1, 15)), ("after", date(2024, 6, 21)), ("after", date(2026, 11, 1))])
+    assert start <= date(2017, 12, 1) and start + timedelta(days=span) > date(2026, 11, 1)
+    start, span = history_window([("before", date(2015, 1, 15)), ("after", date(2034, 6, 21))])
+    assert span == LONGEST and start + timedelta(days=span) > date(2034, 6, 21)
+    assert thinned(1500) is None and 0 < thinned(3300) < 0.5
+    spec = Spec.from_raw({"seed": 1, "start": "2018-01-01", "history": 3300, "recent": 365, "older": thinned(3300), "tables": {
+        "RAW.T.EVENTS": {"volume": {"rows_per_day": 1000}, "columns": {"ID": {"gen": "sequence"}}}}}, "x.yml")
+    cal = spec.tables["RAW.T.EVENTS"].calendar(spec.start, spec.start + timedelta(days=3300), 1, 0.001, None, spec.thin)
+    cut = spec.thin[0]
+    assert all(n >= 1 for day, _, n in cal if day >= cut)  # a row a day in the last year
+    assert 1300 < sum(n for _, _, n in cal) < 1700  # as many rows as four years would hold
+    assert sum(n for day, _, n in cal if day < date(2018, 3, 1)) >= 10  # and the first weeks are not empty
+
+
+def test_numbers_asked_for_by_name_are_generated():
+    from fauxflake.init import scan_model, SourceUse
+
+    uses = {"RAW.T.LINES": SourceUse()}
+    scan_model("select to_timestamp(sent_at::int, 6) as sent, v['at']::int as at_raw, to_timestamp(v['at']::int, 3) as at "
+               "from RAW.T.LINES where calendar_id = 2 and form_id in (334447, 426148) and not other_id = 7", uses)
+    use = uses["RAW.T.LINES"]
+    assert use.equals == {"CALENDAR_ID": {2}, "FORM_ID": {334447, 426148}}
+    assert use.scales[("SENT_AT", "")] == 6 and use.scales[("V", "at")] == 3
+
+
+def test_a_document_is_followed_through_object_insert_and_delete():
+    from fauxflake.init import _PATHS, scan_model, SourceUse
+
+    uses = {"RAW.G.DETAIL": SourceUse()}
+    out = scan_model("""
+        with source as (
+          select object_delete(parse_json(value), 'exported_at') as trimmed,
+                 object_insert(trimmed, 'credits', array_sort(value['credits']::variant), true) as sorted_credits
+          from RAW.G.DETAIL),
+        grouped as (select sorted_credits as value, count(*) as n from source group by 1),
+        renamed as (select value['account_id']::varchar as account_id, value['usage']['amount']::float as amount,
+                           value['credits']::variant as credits from grouped)
+        select * from renamed""", uses)
+    assert {"account_id", "usage.amount", "credits[]"} <= set(uses["RAW.G.DETAIL"].paths["VALUE"])
+    assert out[_PATHS]["CREDITS"] == ("RAW.G.DETAIL", "VALUE", ("credits",))
+
+
+def test_text_ranges_and_named_values_beside_patterns():
+    from fauxflake.init import scan_model, SourceUse
+
+    uses = {"RAW.N.ACCOUNTS": SourceUse()}
+    scan_model("select * from RAW.N.ACCOUNTS where account_number between '4000' and '4999' "
+               "and (plan like 'saas%' or plan in ('1,000 CI Minutes')) and namespace_id = '4347861'", uses)
+    use = uses["RAW.N.ACCOUNTS"]
+    assert use.text_bounds == {"ACCOUNT_NUMBER": {4000, 4999}}
+    assert use.equals == {"NAMESPACE_ID": {4347861}}
+    assert use.literals["PLAN"] == {"1,000 CI Minutes"} and use.patterns["PLAN"]
+
+
+def test_a_reference_to_a_column_that_is_not_the_key_holds_its_values():
+    from fauxflake.init import build_spec
+
+    def model(name, sql, **more):
+        return {"resource_type": "model", "name": name, "unique_id": f"model.p.{name}", "compiled_code": sql, "database": "A", "schema": "S",
+                "relation_name": f"A.S.{name}", "depends_on": {"nodes": more.pop("deps", [])}, "package_name": "p",
+                "original_file_path": f"models/{name}.sql", "config": {"materialized": "table"}, **more}
+
+    def source(name):
+        return {"resource_type": "source", "name": name, "unique_id": f"source.p.raw.{name}", "database": "RAW", "schema": "S",
+                "identifier": name, "relation_name": f"RAW.S.{name}", "source_name": "raw", "package_name": "p", "columns": {}}
+
+    manifest = {"nodes": {
+        "model.p.opps": model("opps", "select id, stagename as stage_name from RAW.S.OPPS", deps=["source.p.raw.OPPS"]),
+        "model.p.stages": model("stages", "select id as stage_id, masterlabel as primary_label from RAW.S.STAGES "
+                                          "where masterlabel in ('1-Discovery', '8-Closed Lost')", deps=["source.p.raw.STAGES"]),
+        "test.p.rel": {"resource_type": "test", "name": "rel", "unique_id": "test.p.rel", "package_name": "p", "column_name": "stage_name",
+                       "attached_node": "model.p.opps", "depends_on": {"nodes": ["model.p.stages", "model.p.opps"]},
+                       "test_metadata": {"name": "relationships", "kwargs": {"column_name": "stage_name", "to": "ref('stages')",
+                                                                              "field": "primary_label"}},
+                       "refs": [{"name": "stages"}, {"name": "opps"}]}},
+        "sources": {"source.p.raw.OPPS": source("OPPS"), "source.p.raw.STAGES": source("STAGES")}}
+    spec, _notes = build_spec(manifest, "A")[:2]
+    child = spec["tables"]["RAW.S.OPPS"]["columns"]["STAGENAME"]
+    assert child["gen"] == "categorical" and {"1-Discovery", "8-Closed Lost"} <= set(child["values"])
+
+
+def test_values_that_contain_something_also_begin_the_way_that_is_asked():
+    from fauxflake.init import like_shapes
+
+    assert like_shapes({"http%", "%utm_content=partner%"}) == ["http{hex}", "http{hex}utmxcontent=partner{hex}"]
+    assert like_shapes({"%a%", "%.com"}) == ["{hex}.com", "{hex}a{hex}"]
+
+
+def test_a_time_matched_with_a_calendar_day_is_a_whole_day():
+    from fauxflake.init import scan_model, SourceUse
+
+    uses = {"RAW.P.PINGS": SourceUse()}
+    scan_model("with pings as (select ping_date::timestamp as ping_date, sent_at from RAW.P.PINGS), "
+               "days as (select date_day from A.B.DIM_DATE) "
+               "select * from pings inner join days on ping_date = date_day", uses, None, [], [])
+    assert uses["RAW.P.PINGS"].whole_days == {"PING_DATE"}

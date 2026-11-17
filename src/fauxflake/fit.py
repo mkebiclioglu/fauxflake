@@ -23,6 +23,7 @@ import graphlib
 import json
 import os
 import re
+import zlib
 import threading
 import time
 from datetime import datetime, timedelta
@@ -94,6 +95,23 @@ class _Readings:
 _MADE_UP_NUMBER = re.compile(r"Could not convert string '[a-z][a-z0-9_]*_[0-9a-f]{12}' to (?:DOUBLE|FLOAT|INT\d+|DECIMAL)")
 _NUMBER_OF = (exp.Sum, exp.Avg, exp.Max, exp.Min, exp.Abs, exp.Round, exp.Floor, exp.Ceil, exp.Nullif, exp.AnyValue, exp.Window,
               exp.Paren, exp.Cast, exp.TryCast, exp.Neg)
+
+
+def _entry(entry: dict, fields: dict, i: int) -> dict:
+    """One entry of a list written out whole, with the fields the reading knows its entries have (`[].time_frame`:
+    one of the values the SQL names, each in its turn; a text of its own otherwise)."""
+    for path, gen in sorted(fields.items()):
+        name = path[3:] if path.startswith("[].") else ""
+        if not re.fullmatch(r"\w+", name) or name in entry or f"{path}[]" in fields:
+            continue
+        if gen.get("gen") == "categorical" and gen.get("values"):
+            values = list(gen["values"])
+            entry[name] = values[zlib.crc32(f"{name}:{i}".encode()) % len(values)]
+        elif gen.get("gen") == "template" and gen.get("template") and not gen.get("templates"):
+            entry[name] = str(gen["template"]).replace("{hex}", f"{zlib.crc32(f'{name}:{i}'.encode()):08x}").replace("{n}", str(i + 1))
+        elif gen.get("gen") == "dist":
+            entry[name] = i + 1
+    return entry
 
 
 def _number_flow(node: exp.Expression, depth: int = 0) -> list[exp.Column]:
@@ -245,6 +263,11 @@ class Fitter:
         os.environ.setdefault("FAUXFLAKE_STATEMENT_TIMEOUT", str(self.model_timeout))  # the same limit inside the emulator
         self.learned: list[str] = []
         self.dirty = False
+        # what each column referred to when the fitting began, and the ones put back once since
+        self.links: dict[tuple[str, str], dict] = {
+            (table, col): dict(gen) for table, held in self.tables.items()
+            for col, gen in (held.get("columns") or {}).items() if gen.get("gen") == "fk"}
+        self.relinked: set[tuple[str, str]] = set()
         self.trees: dict[str, exp.Expression | None] = {}
         self.sql_of: dict[str, str] = {}
         self.by_rel: dict[str, str] = {}
@@ -1132,12 +1155,23 @@ class Fitter:
 
     def repair(self) -> None:
         """Keep the spec loadable whatever was learned: a reference needs a parent with a key."""
+        if os.environ.get("FAUXFLAKE_FIT_WATCH"):
+            self._watch(self.__dict__.get("_last_watched") or self._watched(), "something other than an error's lesson (seen at repair)")
         keyed = {t for t, spec in self.tables.items()
                  if any(d.get("gen") in ("sequence", "hash_id") for d in (spec.get("columns") or {}).values())}
         for table, spec in self.tables.items():
             for col, gen in list((spec.get("columns") or {}).items()):
                 if gen.get("gen") == "fk" and str(gen.get("ref", "")).upper() not in keyed:
                     spec["columns"][col] = guess(col, None)
+                    self.learned.append(f"{table}.{col}: {gen.get('ref')} has no key any more; no longer a reference to it.")
+                elif (table, col) in self.links and gen.get("gen") != "fk" and (table, col) not in self.relinked \
+                        and str(self.links[table, col].get("ref", "")).upper() in keyed and gen in (guess(col, None), guess(col, "VARCHAR")):
+                    # a reference a lesson about its table (or about the key it points at) turned into made-up values,
+                    # with nothing learned about the column itself: the rows it joined would never meet again. Put back, once
+                    spec["columns"][col] = dict(self.links[table, col])
+                    self.relinked.add((table, col))
+                    self.retyped.add(table)
+                    self.learned.append(f"{table}.{col}: refers to {self.links[table, col].get('ref')} again.")
                 elif self._holds_text(gen) and re.match(r"BIGINT|INT|SMALLINT|DECIMAL|NUMERIC|DOUBLE|FLOAT|HUGEINT", str(gen.get("type") or "").upper()):
                     # a number type left over from before the column's values were known to be text: the cast would fail
                     gen.pop("type")
@@ -2115,10 +2149,15 @@ class Fitter:
                 except (TypeError, ValueError):
                     held = []
                 known = {entry.get(key) for entry in held if isinstance(entry, dict)}
-                entries = held + [{key: value, **flags} for value in named if value not in known]
+                # what else is known of an entry (its `time_frame` is one of '28d', '7d', 'all'; its status 'active'):
+                # the entries listed have those fields too, or every model that filters on one keeps nothing
+                others = gen.get("fields") if gen.get("gen") == "object" else gen.get("of")
+                entries = held + [_entry({key: value, **flags}, others or {}, len(held) + i)
+                                  for i, value in enumerate(v for v in named if v not in known)]
                 if len(entries) == len(held):
                     continue
-                self.tables[table]["columns"][document] = {"gen": "constant", "value": json.dumps(entries), "type": gen.get("type") or "VARCHAR"}
+                self.tables[table]["columns"][document] = {"gen": "constant", "value": json.dumps(entries), "type": gen.get("type") or "VARCHAR",
+                                                           **({"of": others} if others else {})}
                 self.retyped.add(table)
                 self.learned.append(f"{table}.{document}: {self.nodes[parent]['name']} pivots the {key} of its entries into columns that "
                                     f"{self.nodes[sql_key]['name']} names; it now lists those {len(named)} entries.")
@@ -2532,20 +2571,24 @@ class Fitter:
 
     def learn(self, sql_key: str, message: str) -> bool:
         """Apply whatever one error message teaches. True when the spec changed."""
-        watch = os.environ.get("FAUXFLAKE_FIT_WATCH")  # for working on the fitter: TABLE.COLUMN, whose changes are written down
-        if not watch:
-            done = self._learn(sql_key, message)
-            if done and _MADE_UP_NUMBER.search(message):
-                self.numbers_upstream(sql_key)
-            return done
-        table, column = watch.upper().rsplit(".", 1)
-        before = copy.deepcopy((self.tables.get(table, {}).get("columns") or {}).get(column))
+        before = self._watched()  # for working on the fitter: FAUXFLAKE_FIT_WATCH=TABLE.COLUMN,... whose changes are written down
         done = self._learn(sql_key, message)
-        after = (self.tables.get(table, {}).get("columns") or {}).get(column)
-        if after != before:
-            with open(os.environ.get("FAUXFLAKE_FIT_DEBUG", "fit") + ".watch.txt", "a") as out:
-                out.write(f"{watch}: {before} -> {after}\n  by {sql_key}: {message[:600]}\n  learned: {self.learned[-3:]}\n")
+        if done and _MADE_UP_NUMBER.search(message):
+            self.numbers_upstream(sql_key)
+        self._watch(before, f"{sql_key}: {message[:600]}")
         return done
+
+    def _watched(self) -> dict[str, dict | None]:
+        spots = [w for w in os.environ.get("FAUXFLAKE_FIT_WATCH", "").upper().split(",") if "." in w]
+        return {w: copy.deepcopy((self.tables.get(w.rsplit(".", 1)[0], {}).get("columns") or {}).get(w.rsplit(".", 1)[1])) for w in spots}
+
+    def _watch(self, before: dict[str, dict | None], by: str) -> None:
+        for spot, held in before.items():
+            now = (self.tables.get(spot.rsplit(".", 1)[0], {}).get("columns") or {}).get(spot.rsplit(".", 1)[1])
+            if now != held:
+                with open(os.environ.get("FAUXFLAKE_FIT_DEBUG", "fit") + ".watch.txt", "a") as out:
+                    out.write(f"{spot}: {held} -> {now}\n  by {by}\n  learned: {self.learned[-3:]}\n")
+        self.__dict__["_last_watched"] = self._watched()
 
     def _learn(self, sql_key: str, message: str) -> bool:
         if self.text_into_a_document(sql_key, message):
@@ -3444,7 +3487,15 @@ class Fitter:
                         self.log(f"  a second look at the listed tests: {len(taught)} can be taught to the spec; building again")
                         fresh, selected = True, []
                         continue
-                break
+                # and the models that built, but with no rows: where the rows stop may be something the data can meet
+                looks = self.__dict__.setdefault("_row_looks", 0)
+                if not failed and looks < 2 and n_round < rounds and not os.environ.get("FAUXFLAKE_FIT_NO_ROWS_LOOK"):
+                    self._row_looks = looks + 1
+                    taught = self.learn_from_empties(nodes)
+                    if taught:
+                        self.log(f"  {taught} model(s) that came out empty said what the data lacks; building what reads it again")
+                if len(self.learned) == before or failed:
+                    break
             # next round: what failed, what reads a source whose values changed, and everything downstream
             changed = [f"source:{n['source_name']}.{n['name']}+" for uid, n in manifest.get("sources", {}).items()
                        if self.source_names.get(uid) in self.retyped]
@@ -3471,6 +3522,104 @@ class Fitter:
         self.save()
         return summary
 
+    # --- rows: a model that builds with no rows proves little
+
+    _MADE_UP_VALUE = re.compile(r"[a-z0-9_ ]*_?[0-9a-f]{8,12}|[0-9a-f]{12}.*[0-9a-f]{12}|other_\w+", re.I)
+
+    def _made_up(self, uid: str, column: str) -> list[tuple[str, str]]:
+        """The source columns behind a model's column that hold made-up text: nothing is known of them yet."""
+        names = list(dict.fromkeys([column, *self.origins(uid, column, strict=True)]))
+        out = []
+        for table in self.sources_of(uid):
+            columns = self.tables[table].get("columns") or {}
+            for name in names:
+                gen = columns.get(name)
+                if gen and gen.get("gen") == "template" and not gen.get("format") and (
+                        gen.get("template") == f"{name.lower()}_{{hex}}" or gen.get("templates")):
+                    out.append((table, name))
+        return out
+
+    def learn_from_empty(self, uid: str, finding) -> bool:  # noqa: ANN001
+        """A model came out empty and `finding` names where its rows stop. Two things the spec can do about it:
+        a join whose one side is made-up text and whose other side holds real values (the months of a calendar, the
+        names in a seed) gets those values; a filter on made-up text for values it names gets them too."""
+        changed = False
+        if finding.kind == "join" and len(finding.sides) == 2:
+            shape = lambda side: side[0].replace(side[1], "_")  # noqa: E731 - how the condition reshapes the column
+            if shape(finding.sides[0]) != shape(finding.sides[1]):
+                return False  # the two sides are reshaped differently: equal columns would not make them meet
+            for mine, theirs in (finding.sides, finding.sides[::-1]):
+                column = sqlglot.parse_one(mine[1], read="snowflake")
+                real = [v for v in theirs[2] if isinstance(v, str) and v.strip() and not self._MADE_UP_VALUE.fullmatch(v)]
+                if not isinstance(column, exp.Column) or len(real) < max(1, len(theirs[2]) // 2):
+                    continue
+                for table, name in self._made_up(uid, column.name.upper()):
+                    values = real[:200]
+                    self.tables[table]["columns"][name] = {"gen": "categorical", "values": {v: round(1 / len(values), 6) for v in values}}
+                    self.retyped.add(table)
+                    self.learned.append(f"{table}.{name}: {self.nodes[uid]['name']} joins it to {theirs[1]}, which holds "
+                                        f"{len(theirs[2])} value(s) such as {values[0]!r}; it holds those now.")
+                    changed = True
+                if changed:
+                    break
+        elif finding.kind == "where" and finding.clause and finding.clause != "LIMIT 0":
+            try:
+                tests = sqlglot.parse_one(f"select 1 from t where {finding.clause}", read="snowflake").args["where"].this
+            except Exception:  # noqa: BLE001
+                return False
+            for test in tests.find_all(exp.EQ, exp.In):
+                held = test.this
+                while isinstance(held, (exp.Lower, exp.Upper, exp.Trim, exp.Cast, exp.TryCast, exp.Paren)):
+                    held = held.this
+                values = test.expressions if isinstance(test, exp.In) else [test.expression]
+                named = [v.name for v in values if isinstance(v, exp.Literal) and v.is_string and v.name and len(v.name) <= 80]
+                if not isinstance(held, exp.Column) or not named or isinstance(test.parent, exp.Not):
+                    continue
+                for table, name in self._made_up(uid, held.name.upper()):
+                    gen = self.tables[table]["columns"][name]
+                    known = [t for t in gen.get("templates") or [] if t not in named]
+                    self.tables[table]["columns"][name] = {"gen": "template", "templates": [
+                        *(known or [f"{name.lower()}_{{hex}}"])[:-1], *named, (known or [f"{name.lower()}_{{hex}}"])[-1]]}
+                    self.retyped.add(table)
+                    self.learned.append(f"{table}.{name}: {self.nodes[uid]['name']} keeps only {', '.join(map(repr, named[:4]))}"
+                                        f"{' ...' if len(named) > 4 else ''}; some rows hold those now.")
+                    changed = True
+        self.dirty |= changed
+        return changed
+
+    def learn_from_empties(self, nodes: dict, limit: int = 200) -> int:
+        """After a build with nothing failing: the models that came out empty although everything they read has
+        rows. Where the rows stop is asked of the warehouse the build left (`why.explain`), and what that says about
+        the generated data is taught to the spec. Returns how many models taught something."""
+        from . import why
+
+        def rows(fq: str) -> int | None:
+            try:
+                return int(self.emu.duck.execute(f"select count(*) from {quoted(fq)}").fetchone()[0])
+            except Exception:  # noqa: BLE001
+                return None
+
+        built = {uid: _fq(n["relation_name"]) for uid, n in nodes.items() if n.get("resource_type") in ("model", "snapshot", "seed")
+                 and n.get("relation_name") and _fq(n["relation_name"]).count(".") == 2}
+        counts = {uid: rows(fq) for uid, fq in built.items()}
+        frontier = [uid for uid, n in counts.items() if n == 0 and nodes[uid].get("resource_type") == "model" and uid in self.sql_of
+                    and all(counts.get(p) != 0 for p in nodes[uid].get("depends_on", {}).get("nodes", []))]
+        taught = 0
+        for uid in sorted(frontier)[:limit]:
+            node = nodes[uid]
+            conn = self.emu._fs.connect(database=node["database"], schema=node["schema"])
+            try:
+                finding = why.Why(conn.cursor(), self.sql_of[uid], timeout=30.0).find()
+            except Exception:  # noqa: BLE001 - a query the walk cannot take apart teaches nothing
+                continue
+            finally:
+                conn.close()
+            before = self._watched()
+            if self.learn_from_empty(uid, finding):
+                taught += 1
+            self._watch(before, f"{uid} came out empty: {finding.kind} {finding.clause[:300]}")
+        return taught
+
     def read_again(self, manifest: dict, analysis, keep: bool = False):  # noqa: ANN001, ANN201
         """Models written by macros that look at the warehouse (dbt_utils.union_relations, star, pivot) have
         their real SQL only once a build has compiled them. Read the project again with that SQL: what those
@@ -3492,9 +3641,9 @@ class Fitter:
         except Exception:  # noqa: BLE001 - the first reading stands
             return analysis
         fresh = _Readings(fresh, analysis)
-        watch = os.environ.get("FAUXFLAKE_FIT_WATCH")  # for working on the fitter: what this reading says of TABLE.COLUMN
-        if watch:
-            table, column = watch.upper().rsplit(".", 1)
+        for watch in [w for w in os.environ.get("FAUXFLAKE_FIT_WATCH", "").upper().split(",") if "." in w]:
+            # for working on the fitter: what this reading says of TABLE.COLUMN
+            table, column = watch.rsplit(".", 1)
             said = (fresh.spec["tables"].get(table, {}).get("columns") or {}).get(column)
             held = (self.tables.get(table, {}).get("columns") or {}).get(column)
             stem = os.environ.get("FAUXFLAKE_FIT_DEBUG", "fit")

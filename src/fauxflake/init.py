@@ -57,6 +57,12 @@ class SourceUse:
         self.texts: set[str] = set()  # columns compared with string literals
         self.ips: set[str] = set()  # text columns handed to PARSE_IP
         self.bounds: dict[str, set[float]] = {}  # column -> numbers the SQL compares it with
+        self.text_bounds: dict[str, set[int]] = {}  # text column -> numbers written as text it is ranged by (`between '4000' and '4999'`)
+        # column -> texts and LIKE patterns asked of the columns it is lined up with in a UNION
+        self.united: dict[str, dict[str, set[str]]] = {"literals": {}, "patterns": {}}
+        self.whole_days: set[str] = set()  # time columns matched with a calendar's day (`on ping_date = date_day`)
+        self.equals: dict[str, set[int]] = {}  # column -> whole numbers the SQL asks for by name (`project_id = 278964`, `in (1, 2)`)
+        self.scales: dict[tuple[str, str], int] = {}  # (column, path in its document) -> digits of an epoch number below the second
         self.splits: dict[str, dict] = {}  # text column -> {"seps": {"/": {0: "BIGINT"}}, "digits": False} from split()[i]::type
         self.numbers: set[str] = set()  # columns that are summed, averaged or used in arithmetic
         self.literals: dict[str, set[str]] = {}  # column -> string values the SQL compares it with
@@ -96,6 +102,31 @@ _DATE_LITERAL = re.compile(r"(\d{4})-(\d{2})-(\d{2})(?:[ T]00:00:00(?:\.0+)?)?")
 CONTEXT = {"CURRENT_ACCOUNT": "FAUXFLAKE", "CURRENT_ACCOUNT_NAME": "FAUXFLAKE", "CURRENT_ORGANIZATION_NAME": "FAUXFLAKE",
            "CURRENT_REGION": "LOCAL", "CURRENT_WAREHOUSE": "LOCAL"}
 _PATHS = "\0paths"  # in a model's outputs: {column: (source, source column, path inside its document)}
+
+
+_CALENDAR_DAY = re.compile(r"DATE_DAY|DATE_ACTUAL|CALENDAR_DATE|CALENDAR_DAY|DAY_DATE|DATE|DAY")
+
+
+def a_calendar_day(node: exp.Expression | None) -> bool:
+    """`dim_date.date_day`, `date_spine.date_actual`: a calendar's column of days, by its name."""
+    while isinstance(node, (exp.Paren, exp.Cast, exp.TryCast)):
+        node = node.this
+    return isinstance(node, exp.Column) and bool(_CALENDAR_DAY.fullmatch(node.name.upper()))
+
+
+def named_numbers(test: exp.Expression | None, held: exp.Expression) -> set[int]:
+    """The whole numbers a column is asked for by name: `project_id = 278964`, `form_id in (334447, 426148)`."""
+    if isinstance(test, exp.EQ) and held in (test.this, test.expression):
+        values = [test.expression if test.this is held else test.this]
+    elif isinstance(test, exp.In) and test.this is held:
+        values = test.expressions
+    else:
+        return set()
+    if isinstance(test.parent, exp.Not):
+        return set()
+    # (`namespace_id = '4347861'`: a number all the same, written as text)
+    return {int(v.name) for v in values if isinstance(v, exp.Literal) and re.fullmatch(r"\d{1,18}", v.name)
+            and not (v.is_string and v.name.startswith("0") and len(v.name) > 1)}
 
 
 def named_value(node: exp.Expression | None) -> str | None:
@@ -187,6 +218,27 @@ _WRAPPERS = (exp.Cast, exp.TryCast, exp.Paren, exp.Lower, exp.Upper, exp.Trim)
 _SAME_VALUE = (exp.Lower, exp.Upper, exp.Trim, exp.Initcap, exp.Nullif, exp.Lag, exp.Lead, exp.FirstValue, exp.LastValue, exp.Max,
                exp.Min, exp.AnyValue, exp.IgnoreNulls, exp.RespectNulls, exp.Window) + tuple(
     getattr(exp, name) for name in ("Replace",) if hasattr(exp, name))
+
+
+def _epoch_scale(node: exp.Expression) -> int | None:
+    """3, 6 or 9 when the number is read as `to_timestamp(x::int, 6)`: milli-, micro- or nanoseconds since 1970."""
+    top = node
+    while isinstance(top.parent, (exp.Cast, exp.TryCast, exp.Paren)):
+        top = top.parent
+    reader = top.parent
+    if not isinstance(reader, exp.Func):
+        return None
+    if (reader.expressions[0] if isinstance(reader, exp.Anonymous) and reader.expressions else reader.args.get("this")) is not top:
+        return None
+    named = reader.name.upper() if isinstance(reader, exp.Anonymous) else reader.sql_name().upper()
+    if not re.fullmatch(r"(TRY_)?TO_TIMESTAMP(_NTZ|_LTZ|_TZ)?|UNIX_TO_TIME", named):
+        return None
+    rest = reader.expressions[1:] if isinstance(reader, exp.Anonymous) else \
+        [reader.args.get(k) for k in ("scale", "format", "expression") if reader.args.get(k) is not None]
+    for arg in rest:
+        if isinstance(arg, exp.Literal) and not arg.is_string and arg.name in ("3", "6", "9"):
+            return int(arg.name)
+    return None
 
 
 def _parsed_as(node: exp.Expression) -> str | None:
@@ -473,6 +525,11 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                         return base if int(index.name) == 0 else None
                     return base[0], base[1], base[2] + ("~part", taken.expression.name, str(int(index.name)))
                 return into(resolve_path(node.this, depth + 1), [index.name if index.is_string else "[]"])
+            if isinstance(node, exp.ObjectInsert) or (isinstance(node, exp.Anonymous) and node.expressions
+                                                    and node.name.upper() in ("OBJECT_DELETE", "OBJECT_PICK")):
+                # object_insert(doc, 'credits', array_sort(doc['credits']), true), object_delete(doc, 'loaded_at'):
+                # still that document, give or take a key
+                return resolve_path(node.this if isinstance(node, exp.ObjectInsert) else node.expressions[0], depth + 1)
             if isinstance(node, exp.If):  # iff(kind = 'a', v:msg, v): what the first answer that is known holds
                 for value in (node.args.get("true"), node.args.get("false")):
                     found = resolve_path(value, depth + 1) if value is not None else None
@@ -621,6 +678,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 if isinstance(side.parent, exp.EQ):
                     other = side.parent.expression if side.parent.this is side else side.parent.this
                     there = resolve_path(other) if not isinstance(other, exp.Literal) else None
+                    if there is None and not found[2] and a_calendar_day(other):
+                        sources[found[0]].whole_days.add(found[1])  # matched with a calendar: a day, not a moment in it
                     if isinstance(there, tuple) and there[0] in sources and not there[2]:
                         sources[found[0]].embeds.setdefault(found[1], []).append((found[2][1], found[2][2], (there[0], there[1])))
                 continue
@@ -657,6 +716,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     sources[found[0]].paths.setdefault(found[1], {}).setdefault(path_text(inside), None)
                 continue
             use, text = sources[found[0]], path_text(found[2])
+            if _epoch_scale(top):
+                use.scales[(found[1], text)] = _epoch_scale(top)
             if joins is not None and "{}" not in found[2]:
                 # a.x = b.y, where either side may sit inside a document: the two must share values
                 side = cast if cast is not None else top
@@ -716,6 +777,10 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                                 use.bounds.setdefault(found[1], set()).add(-float(number.name) if negative else float(number.name))
                             except ValueError:
                                 pass
+                        elif isinstance(number, exp.Literal) and not isinstance(test, exp.EQ) and re.fullmatch(r"[1-9]\d{0,17}", number.name):
+                            use.text_bounds.setdefault(found[1], set()).add(int(number.name))
+                if named_numbers(test, held):
+                    use.equals.setdefault(found[1], set()).update(named_numbers(test, held))
                 if isinstance(test, (exp.EQ, exp.In)) and held in (test.this, test.args.get("expression")) \
                         and not isinstance(test.parent, exp.Not) and not _stands_for_null(test):
                     values = test.expressions if isinstance(test, exp.In) else [test.expression if test.this is held else test.this]
@@ -874,6 +939,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     use.columns[hit[1]] = _parsed_as(col)
                 elif cast and _parsed_as(col) == "EPOCH":
                     use.columns[hit[1]] = "EPOCH"  # cast to a number only to be read as a point in time
+                if _epoch_scale(col):
+                    use.scales[(hit[1], "")] = _epoch_scale(col)
                 if isinstance(parent, (exp.Sum, exp.Avg, exp.Add, exp.Sub, exp.Mul, exp.Div)):
                     use.numbers.add(hit[1])
                 if joins is not None:
@@ -888,6 +955,10 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                         there = resolve(other) if isinstance(other, exp.Column) else None
                         if there and there[0] != hit[0]:
                             joins.append((hit, there))
+                        if not there and a_calendar_day(other):
+                            use.whole_days.add(hit[1])
+                if named_numbers(parent, col):
+                    use.equals.setdefault(hit[1], set()).update(named_numbers(parent, col))
                 if isinstance(parent, (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ, exp.Between)):
                     # `where block_number between 9820000 and 10000000`: the numbers that should select something
                     sides = [parent.args.get("low"), parent.args.get("high")] if isinstance(parent, exp.Between) else \
@@ -901,6 +972,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                                 read.append(-float(number.name) if negative else float(number.name))
                             except ValueError:
                                 pass
+                        elif isinstance(number, exp.Literal) and not isinstance(parent, exp.EQ) and re.fullmatch(r"[1-9]\d{0,17}", number.name):
+                            use.text_bounds.setdefault(hit[1], set()).add(int(number.name))
                     use.bounds.setdefault(hit[1], set()).update(read)
                     if hit[0] in read_here:
                         use.read_bounds.setdefault(hit[1], set()).update(read)
@@ -963,6 +1036,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     outer = parent.parent
                     hint = outer.to.sql(dialect="duckdb") if isinstance(outer, (exp.Cast, exp.TryCast)) else None
                     hint = _parsed_as(parent) or hint
+                    if keys and _epoch_scale(parent):
+                        use.scales[(hit[1], ".".join(keys))] = _epoch_scale(parent)
                     if keys:
                         known = use.paths.setdefault(hit[1], {})
                         previous = known.get(".".join(keys))
@@ -1237,6 +1312,11 @@ _FLAGS = {"ISDELETED", "ISWON", "ISCLOSED", "ISACTIVE", "ISCONVERTED", "ISARCHIV
 _RUN_ON_DATE = re.compile(r"(?<!UP)(?<!CANDI)(?<!VALI)(?<!MAN)(?<!CONSOLI)(?<!LIQUI)DATE$")
 
 
+_RARELY_TRUE = re.compile(r"(?<![A-Z])(DELETED|ISDELETED|ARCHIVED|REMOVED|HIDDEN|BLOCKED|BANNED|SPAM|DUPLICATE|CANCELL?ED|DISABLED|"
+                          r"EXPIRED|INACTIVE|VOID(ED)?|DRAFT|TEST|SANDBOX|BOT|EXCLUDED?|SUSPENDED|REVOKED|FAILED|INTERNAL)(?![A-Z])")
+_USUALLY_TRUE = re.compile(r"(?<![A-Z])(ACTIVE|ENABLED|VALID|CURRENT|VERIFIED|CONFIRMED|PUBLISHED|VISIBLE|LATEST)(?![A-Z])")
+
+
 def guess(column: str, hint: str | None) -> dict:
     """A generator for a column we know only by name and (maybe) a cast."""
     c, h = column.upper(), (hint or "").upper()
@@ -1261,7 +1341,10 @@ def guess(column: str, hint: str | None) -> dict:
         return {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1 if top > 1 else 0, top]}
     c = re.sub(r"__P?C$", "", c)  # Salesforce's suffix for a custom field: the name before it says what it holds
     if h == "BOOLEAN" or (not h and (re.match(r"^(IS|HAS|WAS)_", c) or c in _FLAGS)):
-        return {"gen": "categorical", "type": "BOOLEAN", "values": {True: 0.5, False: 0.5}}
+        # most rows are not deleted, archived or test data, and most are active: a filter on either flag keeps
+        # most of the table, as it does in production, and the rarer side is still there
+        share = 0.15 if _RARELY_TRUE.search(c) else 0.85 if _USUALLY_TRUE.search(c) else 0.5
+        return {"gen": "categorical", "type": "BOOLEAN", "values": {True: share, False: round(1 - share, 2)}}
     if h == "DATE" or (not h.startswith("TIMESTAMP") and (c.endswith(("_DATE", "_DAY")) or _RUN_ON_DATE.search(c))):
         return {"gen": "time_offset", "type": "DATE", **WEEK}
     if h.startswith("TIMESTAMP") or c.endswith(("_AT", "_TS", "_TIME", "_TIMESTAMP")) or c in ("SYSTEMMODSTAMP", "TIMESTAMP", "DATETIME"):
@@ -1396,6 +1479,30 @@ def flattened_objects(paths: dict[str, str | None]) -> dict[str, str | None]:
     return out
 
 
+def like_shapes(patterns) -> list[str]:  # noqa: ANN001
+    """Templates for the LIKE patterns asked of one column. A value has to get past all the filters on its way:
+    where some say how it begins (`like 'http%'`) and others what it contains (`like '%utm_content=x%'`), the
+    values that contain something also begin the way that is asked."""
+    patterns = sorted(set(patterns))
+    begins = [p for p in patterns if p.endswith("%") and "%" not in p[:-1] and "_" not in p.replace("\\_", "") and len(p) > 1]
+    out = []
+    for i, pattern in enumerate(p for p in patterns if p not in begins):
+        shape = like_shape(pattern)
+        if begins and pattern.startswith("%"):
+            shape = like_shape(begins[i % len(begins)]) + shape.removeprefix("{hex}")
+        out.append(shape)
+    return sorted([*map(like_shape, begins), *out])
+
+
+def asked_texts(use: "SourceUse", col: str) -> set[str]:
+    """The texts asked of a column, by name or of a column it is lined up with in a UNION."""
+    return use.literals.get(col, set()) | use.united["literals"].get(col, set())
+
+
+def asked_shapes(use: "SourceUse", col: str) -> set[str]:
+    return use.patterns.get(col, set()) | use.united["patterns"].get(col, set())
+
+
 def like_shape(pattern: str) -> str:
     """A template whose values match the LIKE pattern: `%.pool%.near` -> `{hex}.pool{hex}.near`."""
     return pattern.replace("\\", "").replace("%", "{hex}").replace("_", "x")
@@ -1418,8 +1525,23 @@ def history_window(dates: list[tuple[str, date]], default: date = date(2025, 1, 
         end = max(end, inside[-1] + timedelta(days=31))
     if after and after[-1] >= end - timedelta(days=7):
         end = after[-1] + timedelta(days=45)
-    span = min((end - start).days, 1500)  # four years at most: beyond that the volume is the cost
+    span = (end - start).days
+    if span > LONGEST:
+        # more than the longest history: the recent end stays (what is asked of the last years is asked most)
+        start, span = end - timedelta(days=LONGEST), LONGEST
     return start, (span if (start, span) != (default, days) else None)
+
+
+LONGEST = 4000  # days: eleven years of history at most
+RECENT, FULL = 365, 1500  # a long history holds what FULL days would; the last RECENT days at a row a day or more
+
+
+def thinned(history: int | None) -> float | None:
+    """The share of the daily volume that days before the last year hold, in a history longer than four
+    years: as many rows in all as four years would have, so that a build costs what it did."""
+    if not history or history <= FULL:
+        return None
+    return round((FULL - RECENT) / (history - RECENT), 4)
 
 
 def field_gen(path: str, hint: str | None, literals: set[str] | None = None, patterns: set[str] | None = None) -> dict:
@@ -1427,7 +1549,7 @@ def field_gen(path: str, hint: str | None, literals: set[str] | None = None, pat
     name = re.sub(r"~\w+|\[\]", "", path).split(".")[-1] or "value"
     if patterns and not hint_is_number(hint):
         # `like '%.pool%.near'` keeps some rows, and the values compared by name are there too
-        return {"gen": "template", "templates": [*sorted(like_shape(p) for p in patterns), *sorted(literals or ()),
+        return {"gen": "template", "templates": [*like_shapes(patterns), *sorted(literals or ()),
                                                   f"{name.lower()}_{{hex}}"]}
     if literals and (hint or "").upper().startswith(("DATE", "TIMESTAMP")) and all(not re.search(r"[1-9]", v) for v in literals):
         return guess(name, hint)  # compared with '' and '0000-00-00' before it is cast to a date: a date, those stand for none
@@ -1655,6 +1777,13 @@ def analyse(manifest: dict, database: str) -> Analysis:
             if any(c in u.texts for u, c in members):
                 for u, c in members:
                     u.texts.add(c)
+            # (`stage_name` of the snapshots united with `stage_name` of the live table, then joined to the list of
+            # stages: both hold the names the SQL asks for, not only the branch written first)
+            # (kept apart from what is asked of the column itself: ids named in one branch are not ids of the other)
+            for kind in ("literals", "patterns"):
+                asked = set().union(*(getattr(u, kind).get(c, set()) | u.united[kind].get(c, set()) for u, c in members))
+                for u, c in members if asked else ():
+                    u.united[kind].setdefault(c, set()).update(asked - getattr(u, kind).get(c, set()))
             hint = next((u.columns.get(c) for u, c in members if u.columns.get(c)), None)
             for u, c in members:
                 if hint and not u.columns.get(c):
@@ -1779,19 +1908,22 @@ def analyse(manifest: dict, database: str) -> Analysis:
             elif (name, col) in accepted:
                 values = accepted[(name, col)]
                 out[col] = {"gen": "categorical", "values": {v: round(1 / len(values), 4) for v in values}}
-            elif 0 < len(use.literals.get(col, ())) <= 30 and not hint_is_number(hint) \
+            elif 0 < len(asked_texts(use, col)) <= 30 and not hint_is_number(hint) and not asked_shapes(use, col) \
                     and not (hint or "").upper().startswith(("BOOL", "DATE", "TIMESTAMP")) \
                     and not (col in use.json_text or use.paths.get(col)):
                 # (a document compared with '[{}]' is still a document; `isdeleted::boolean` compared with 'true' is a
                 # boolean; `closedate::date` compared with '2020-02-01' is a date)
                 # `where status = 'open'` should select something: use the values the SQL names
-                named = sorted(use.literals[col] | set(sorted(use.examples.get(col, ()))[:12]))
+                named = sorted(asked_texts(use, col) | set(sorted(use.examples.get(col, ()))[:12]))
                 share = round(0.8 / len(named), 4)
                 out[col] = {"gen": "categorical", "values": {**{v: share for v in named}, f"other_{col.lower()}": 0.2}}
-            elif (col in use.patterns or col in use.examples) and not hint_is_number(hint):
-                # `where name like 'tap-%'` should keep some rows: make values that fit each pattern
-                shapes = sorted(like_shape(p) for p in use.patterns.get(col, ())) + sorted(use.examples.get(col, ()))[:24]
-                out[col] = {"gen": "template", "templates": [*shapes, f"{col.lower()}_{{hex}}"]}
+            elif not hint_is_number(hint) and (asked_shapes(use, col) or col in use.examples or (asked_texts(use, col) and not (
+                    (hint or "").upper().startswith(("BOOL", "DATE", "TIMESTAMP")) or col in use.json_text or use.paths.get(col)))):
+                # `where name like 'tap-%'` should keep some rows: make values that fit each pattern, beside the
+                # values asked for by name (`name in ('1,000 CI Minutes', ...)`, however many there are)
+                shapes = like_shapes(asked_shapes(use, col)) + sorted(use.examples.get(col, ()))[:24]
+                named = sorted(v for v in asked_texts(use, col) if "{" not in v)[:80]
+                out[col] = {"gen": "template", "templates": [*shapes, *named, f"{col.lower()}_{{hex}}"]}
             elif col in use.part_shapes and not hint_is_number(hint):
                 out[col] = {"gen": "template", "templates": part_templates(use.part_shapes[col], (use.splits.get(col) or {}).get("seps", {}))}
             elif col in use.ips and not hint_is_number(hint):
@@ -1858,6 +1990,16 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 window = None  # another model reads the table itself and asks for something outside it
             ranged = bool(window and len(window) >= 2)
             within_bounds(out[col], {min(window), max(window)} if ranged else use.bounds.get(col), exact=ranged)
+            if len(use.text_bounds.get(col, ())) >= 2 and out[col] == {"gen": "template", "template": f"{col.lower()}_{{hex}}"}:
+                # `account_number between '4000' and '4999'`: numbers kept as text, most of them in the range asked for
+                low, high = min(use.text_bounds[col]), max(use.text_bounds[col])
+                out[col] = {"gen": "dist", "type": "VARCHAR", "p": [0, 0.8, 1], "v": [low, high, high + max(high - low, 1)]}
+            if use.equals.get(col) and out[col].get("gen") == "dist" and not out[col].get("unique") and not ranged:
+                # `where fiscal_calendar_id = 2`, `form_id in (334447, 426148)`: four rows in ten hold one of the numbers asked for
+                # (not a zero in a number the SQL calculates with: it may be divided by)
+                asked = sorted(n for n in use.equals[col] if n or col not in use.numbers)[:30]
+                if asked:
+                    out[col]["exactly"] = asked
             if col in use.future and out[col].get("gen") == "time_offset" and not out[col].get("format") and not out[col].get("epoch"):
                 out[col].update(p=[0, 0.3, 1], seconds=[-30 * 86400, 30 * 86400, 400 * 86400])  # from last month to next year
             if col in use.single_null and out[col].get("gen") not in ("sequence", "hash_id", "loaded_at", "lifecycle"):
@@ -1866,6 +2008,10 @@ def analyse(manifest: dict, database: str) -> Analysis:
             elif col in use.nullable and out[col].get("gen") not in ("sequence", "hash_id", "loaded_at", "event_time", "lifecycle") \
                     and not out[col].get("null_rate"):
                 out[col]["null_rate"] = 0.3
+        for (col, path), digits in use.scales.items():
+            held = out.get(col) if not path else ((out.get(col) or {}).get("fields") or {}).get(path)
+            if held and held.get("epoch"):
+                held["scale"] = digits  # to_timestamp(x, 6): microseconds since 1970
         for col, habit in catalog.habits(name, out).items():
             if out[col].get("gen") in ("event_time", "time_offset", "updated_at") and not out[col].get("format"):
                 out[col] = {**habit, **({"type": out[col]["type"]} if out[col].get("type") else {})}
@@ -2006,6 +2152,12 @@ def analyse(manifest: dict, database: str) -> Analysis:
         return (column.get("fields") or {}).get(spot[2]) if column.get("gen") == "object" else None
 
     for name, use in uses.items():
+        for c in sorted(use.whole_days):
+            held = (tables.get(name, {}).get("columns") or {}).get(c) or {}
+            if held.get("gen") in ("event_time", "time_offset") and not held.get("trunc") and not held.get("format") \
+                    and not held.get("epoch") and str(held.get("type", "")).upper() != "DATE":
+                held["trunc"] = "day"  # `on ping_date = date_day`: a time of day would never meet the calendar's day
+    for name, use in uses.items():
         # a table matched on an entity and its period together (`on q.warehouse_id = m.entity_id and q.hour = m.start_time`)
         # holds one row per period for each of a few entities, as a meter or a daily balance does: generated so, and
         # whatever is joined to the entity draws from the same few
@@ -2053,7 +2205,8 @@ def analyse(manifest: dict, database: str) -> Analysis:
     for name, table in tables.items():
         for col, gen in table["columns"].items():
             kind = gen.get("gen")
-            asked = sorted(uses[name].literals.get(col, ())) if kind in ("fk", "sequence", "hash_id") and name in uses else []
+            asked = sorted({*uses[name].literals.get(col, ()), *map(str, uses[name].equals.get(col, ()))}) \
+                if kind in ("fk", "sequence", "hash_id") and name in uses else []
             parent = (table if kind != "fk" else tables.get(str(gen.get("ref", "")).upper())) if asked else None
             key = next((g for g in parent["columns"].values() if g.get("gen") in ("sequence", "hash_id")), None) if parent else None
             if key is None:
@@ -2065,8 +2218,25 @@ def analyse(manifest: dict, database: str) -> Analysis:
     for (child, col), (parent, pcol) in fks.items():
         if child in tables and parent in tables and tables[parent]["columns"].get(pcol, {}).get("gen") not in ("sequence", "hash_id") \
                 and tables[child]["columns"].get(col, {}).get("gen") == "fk":  # (a key of its own table stays one)
-            notes.append(f"{child}.{col}: references {parent}.{pcol}, which is not that table's key; generated as a plain column.")
-            tables[child]["columns"][col] = guess(col, None)
+            # (a `relationships` test to a column that is not the key: stage names tested against the list of stages)
+            held = tables[parent]["columns"].get(pcol) or {}
+            label = pcol.lower()
+            if held.get("gen") == "categorical":
+                tables[child]["columns"][col] = {"gen": "categorical", "values": dict(held["values"]),
+                                                 **({"type": held["type"]} if held.get("type") else {})}
+            elif held == {"gen": "template", "template": f"{label}_{{hex}}"}:
+                # nothing known of either: the parent holds each value once, the child takes its values from them
+                tables[parent]["columns"][pcol] = {"gen": "template", "template": f"{label}_{{n}}"}
+                tables[child]["columns"][col] = {"gen": "pool", "pool": label, "size": 200}
+            elif held.get("gen") in ("pool", "dist") and not held.get("unique"):
+                tables[child]["columns"][col] = dict(held)
+            elif held.get("gen") == "template" and re.fullmatch(r"\w+_\{n\}", str(held.get("template") or "")) and not held.get("templates"):
+                tables[child]["columns"][col] = {"gen": "pool", "pool": str(held["template"])[: -len("_{n}")], "size": 200}
+            else:
+                tables[child]["columns"][col] = guess(col, None)
+                notes.append(f"{child}.{col}: references {parent}.{pcol}, which is not that table's key; generated as a plain column.")
+                continue
+            notes.append(f"{child}.{col}: references {parent}.{pcol}, which is not that table's key; it holds the same values.")
     # INFORMATION_SCHEMA is the warehouse describing itself: the emulator answers it, nothing to generate
     tables = {name: t for name, t in tables.items() if name.split(".")[1] != "INFORMATION_SCHEMA"}
     # a source that names what the project itself builds (a seed or a model, declared as a source so
@@ -2088,15 +2258,18 @@ def analyse(manifest: dict, database: str) -> Analysis:
     # a history longer than the usual sixty days holds the same number of rows, spread thinner: the dates the SQL
     # asks for are there, and a build costs what it did
     start, history = history_window(dates)
+    older = None
     if history and history > 60:
+        if any(float(table["volume"]["rows_per_day"]) * 60 / history < 1000 for table in tables.values()):
+            older = thinned(history)  # (a table with rows to spare is thinned too: one rule for the whole history)
         for table in tables.values():
-            table["volume"]["rows_per_day"] = max(1000, int(float(table["volume"]["rows_per_day"]) * 60 / history))
+            table["volume"]["rows_per_day"] = max(1000, int(float(table["volume"]["rows_per_day"]) * 60 / min(history, FULL)))
     # a shared pool as large as the table: two tables of a few thousand rows joined on a column drawn from
     # 200 values pair every row with dozens of others, and three such joins in a row fill the disk. Drawn from
     # about as many values as there are rows, each row finds a partner or two, as with real ids. (The smaller
     # table's values are the first of the larger one's, so they still meet.)
     for table in tables.values():
-        rows = int(float(table["volume"]["rows_per_day"]) * 0.001 * (history or 60))  # at the default scale
+        rows = int(float(table["volume"]["rows_per_day"]) * 0.001 * (min(history, FULL) if older else history or 60))  # at the default scale
 
         def widen(gens: dict) -> None:
             for d in gens.values():
@@ -2122,6 +2295,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
         notes.append(f"the SQL compares with dates between {min(d for _, d in dates)} and {max(d for _, d in dates)}: "
                      f"the generated history starts {start}" + (f" and spans {history} days." if history else "."))
     analysis = Analysis({"seed": 42, "start": start.isoformat(), **({"history": history} if history else {}),
+                         **({"recent": RECENT, "older": older} if older else {}),
                          "dbt": settings, "tables": tables}, notes, locate, place)
     analysis.bounds = {(name, col): numbers for name, use in uses.items() for col, numbers in use.bounds.items()}
     return analysis

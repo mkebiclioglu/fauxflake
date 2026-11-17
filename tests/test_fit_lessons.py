@@ -14,6 +14,7 @@ def fitter(**state):
     f = object.__new__(Fitter)
     f.trees, f.sql_of, f.nodes, f.tables, f.by_rel, f.relation_owner = {}, {}, {}, {}, {}, {}
     f.retyped, f.learned, f.dirty = set(), [], False
+    f.links, f.relinked = {}, set()
     for key, value in state.items():
         setattr(f, key, value)
     return f
@@ -765,3 +766,62 @@ def test_numbers_are_followed_back_through_the_models_before():
     assert f.numbers_upstream("model.p.mart")
     numbers = {name for name, gen in columns.items() if gen.get("gen") != "template"}
     assert numbers == {"AMOUNT__C", "PROBABILITY", "ARR__C", "DISCOUNT__C"}  # not the stage, the date or the ids
+
+
+def test_a_reference_lost_without_a_lesson_about_it_is_put_back_once():
+    link = {"gen": "fk", "ref": "RAW.Z.CHARGES", "skew": 1.5}
+    tables = {"RAW.Z.CHARGES": {"columns": {"ID": {"gen": "sequence"}}},
+              "RAW.Z.ITEMS": {"columns": {"ID": {"gen": "sequence"}, "CHARGEID": {"gen": "template", "template": "chargeid_{hex}"},
+                                          "NOTE": {"gen": "template", "template": "note_{hex}"}}}}
+    f = fitter(tables=tables, links={("RAW.Z.ITEMS", "CHARGEID"): link})
+    f.repair()
+    assert tables["RAW.Z.ITEMS"]["columns"]["CHARGEID"] == link and "RAW.Z.ITEMS" in f.retyped
+    # a lesson that turns it into something else again stands: no going back and forth
+    tables["RAW.Z.ITEMS"]["columns"]["CHARGEID"] = {"gen": "template", "template": "chargeid_{hex}"}
+    f.repair()
+    assert tables["RAW.Z.ITEMS"]["columns"]["CHARGEID"]["gen"] == "template"
+
+
+def test_entries_written_into_a_document_have_the_fields_the_reading_knows():
+    from fauxflake.fit import _entry
+
+    fields = {"[].key_path": {"gen": "template", "template": "key_path_{hex}"},
+              "[].time_frame": {"gen": "categorical", "values": {"28d": 0.4, "7d": 0.4, "all": 0.2}},
+              "[].description": {"gen": "template", "template": "description_{hex}"},
+              "[].tags": {"gen": "template", "template": "tags_{hex}"}, "[].tags[]": {"gen": "template", "template": "tags_{hex}"},
+              "[].options.event": {"gen": "template", "template": "event_{hex}"}}
+    entries = [_entry({"key_path": f"counts.metric_{i}", "is_gmau": True}, fields, i) for i in range(40)]
+    assert {e["time_frame"] for e in entries} == {"28d", "7d", "all"}
+    assert entries[0]["key_path"] == "counts.metric_0" and entries[0]["description"].startswith("description_")
+    assert "tags" not in entries[0] and "options.event" not in entries[0]
+
+
+def test_an_empty_join_gives_the_made_up_side_the_values_of_the_other():
+    from fauxflake.why import Finding
+
+    tables = {"RAW.S.TARGETS": {"columns": {"MONTH": {"gen": "template", "template": "month_{hex}"},
+                                            "KPI": {"gen": "template", "template": "kpi_{hex}"}}}}
+    f = fitter(tables=tables, nodes={"m": {"name": "targets_by_month"}})
+    f.sources_of, f.origins = (lambda uid: ["RAW.S.TARGETS"]), (lambda uid, name, depth=0, strict=False: [name])
+    finding = Finding("final", "join", "INNER JOIN months ON LOWER(targets.month) = LOWER(months.fiscal_month_name)", sides=[
+        ("LOWER(targets.month)", "targets.month", ["month_0a1b2c3d4e5f", "month_1a1b2c3d4e5f"]),
+        ("LOWER(months.fiscal_month_name)", "months.fiscal_month_name", ["FY23-Jun", "FY23-Jul", "FY24-Jan"])])
+    assert f.learn_from_empty("m", finding)
+    assert set(tables["RAW.S.TARGETS"]["columns"]["MONTH"]["values"]) == {"FY23-Jun", "FY23-Jul", "FY24-Jan"}
+    assert tables["RAW.S.TARGETS"]["columns"]["KPI"]["gen"] == "template" and "RAW.S.TARGETS" in f.retyped
+    # sides the condition reshapes differently would not meet whatever the column held
+    tables["RAW.S.TARGETS"]["columns"]["MONTH"] = {"gen": "template", "template": "month_{hex}"}
+    finding.sides[0] = ("LEFT(targets.month, 3)", "targets.month", ["mon"])
+    assert not f.learn_from_empty("m", finding)
+
+
+def test_an_empty_filter_on_made_up_text_gets_the_values_it_names():
+    from fauxflake.why import Finding
+
+    tables = {"RAW.S.RUNS": {"columns": {"STATUS": {"gen": "template", "template": "status_{hex}"},
+                                         "ID": {"gen": "sequence"}}}}
+    f = fitter(tables=tables, nodes={"m": {"name": "passed_runs"}})
+    f.sources_of, f.origins = (lambda uid: ["RAW.S.RUNS"]), (lambda uid, name, depth=0, strict=False: [name])
+    assert f.learn_from_empty("m", Finding("final", "where", "LOWER(status) IN ('pass', 'warn') AND id = '7'"))
+    assert tables["RAW.S.RUNS"]["columns"]["STATUS"] == {"gen": "template", "templates": ["pass", "warn", "status_{hex}"]}
+    assert tables["RAW.S.RUNS"]["columns"]["ID"] == {"gen": "sequence"}
