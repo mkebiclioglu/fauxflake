@@ -1034,3 +1034,25 @@ def test_a_column_named_as_an_email_holds_addresses():
     assert tables["B"]["columns"]["OWNER_EMAIL"]["templates"] == ["a@b.cc", "owner_email_{hex}" + MAILBOX]
     assert tables["A"]["columns"]["NAME"] == {"gen": "template", "template": "name_{hex}"}
     assert address_emails(tables) == []
+
+
+def test_a_text_cast_handed_to_a_timestamp_parser_says_the_column_is_a_time():
+    sources = {"RAW.T.LICENSE": SourceUse()}
+    scan_model("""
+        with source as (select * from raw.t.license)
+        select try_to_timestamp_ntz(cast(_start as varchar)) as starts_at, cast(name as varchar) as name from source""", sources)
+    assert sources["RAW.T.LICENSE"].columns["_START"] == "TIMESTAMP"
+    assert sources["RAW.T.LICENSE"].columns["NAME"].upper() in ("VARCHAR", "TEXT")
+
+
+def test_a_join_on_surrogate_keys_of_several_columns_links_what_they_are_made_of():
+    key = "md5(cast(coalesce(cast(server_id as text), '_null_') || '-' || coalesce(cast(server_date as text), '_null_') as text))"
+    uses, outputs, joins, *_ = _scan({
+        "a.b.servers": f"select user_id as server_id, cast(timestamp as date) as server_date, {key} as daily_server_id "
+                       "from raw.t.server",
+        "a.b.activity": f"select user_id as server_id, cast(timestamp as date) as server_date, {key} as daily_server_id, "
+                        "mau from raw.t.activity",
+        "a.b.joined": "select s.server_id, a.mau from a.b.servers s left join a.b.activity a "
+                      "on s.daily_server_id = a.daily_server_id",
+    }, ["RAW.T.SERVER", "RAW.T.ACTIVITY"])
+    assert joins == [(("RAW.T.SERVER", "USER_ID"), ("RAW.T.ACTIVITY", "USER_ID"))]  # the servers, not the days

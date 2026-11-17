@@ -104,6 +104,7 @@ CONTEXT = {"CURRENT_ACCOUNT": "FAUXFLAKE", "CURRENT_ACCOUNT_NAME": "FAUXFLAKE", 
            "CURRENT_REGION": "LOCAL", "CURRENT_WAREHOUSE": "LOCAL"}
 _PATHS = "\0paths"  # in a model's outputs: {column: (source, source column, path inside its document)}
 _ANY = "\0any:"  # in a model's outputs: _ANY + column -> the source columns a COALESCE takes the value from, in order
+_KEYED = "\0key:"  # in a model's outputs: _KEYED + column -> the parts of a surrogate key of several columns, in order
 _HASHED = "\0md5:"  # in a model's outputs: _HASHED + column -> the source columns a surrogate key is the hash of
 
 
@@ -931,6 +932,9 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     use.columns[hit[1]] = _parsed_as(col)
                 elif cast and _parsed_as(col) == "EPOCH":
                     use.columns[hit[1]] = "EPOCH"  # cast to a number only to be read as a point in time
+                elif cast and cast.to.is_type(*exp.DataType.TEXT_TYPES) and _parsed_as(col) in ("TIMESTAMP", "DATE") \
+                        and (use.columns.get(hit[1]) or "").upper() in ("", "VARCHAR", "TEXT", "STRING"):
+                    use.columns[hit[1]] = _parsed_as(col)  # try_to_timestamp(cast(issued as varchar)): a point in time
                 if _epoch_scale(col):
                     use.scales[(hit[1], "")] = _epoch_scale(col)
                 if isinstance(parent, (exp.Sum, exp.Avg, exp.Add, exp.Sub, exp.Mul, exp.Div)):
@@ -1110,6 +1114,53 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
             alias = written(e)
             return hashed(alias, depth + 1) if alias is not None else upstream(_HASHED, e)
 
+        def keyed(e, depth: int = 0):  # noqa: ANN001, ANN202
+            """`md5(server_id || '-' || activity_date) as daily_server_id`: the source column behind each part of a
+            surrogate key of several columns (None for a part that is computed, a day cut out of a time among them)."""
+            while isinstance(e, (exp.Cast, exp.TryCast, exp.Paren)):
+                e = e.this
+            if isinstance(e, (exp.MD5, exp.SHA, exp.SHA2)):
+                pieces, todo = [], [e.this]
+                while todo:
+                    piece = todo.pop()
+                    while isinstance(piece, exp.Paren) or (isinstance(piece, (exp.Cast, exp.TryCast))
+                                                           and piece.to.is_type(*exp.DataType.TEXT_TYPES)):
+                        piece = piece.this
+                    if isinstance(piece, exp.DPipe):
+                        todo += [piece.expression, piece.this]
+                    elif isinstance(piece, exp.Concat):
+                        todo += reversed(piece.expressions)
+                    elif isinstance(piece, exp.Coalesce) and all(isinstance(x, exp.Literal) for x in piece.expressions):
+                        todo.append(piece.this)
+                    elif not isinstance(piece, exp.Literal):
+                        pieces.append(piece)
+                parts = []
+                for piece in pieces:
+                    for _ in range(4):  # (an alias written earlier in the select, as long as it is a plain value)
+                        if isinstance(piece, exp.Column) and written(piece) is not None:
+                            piece = written(piece)
+                            while isinstance(piece, exp.Paren) or (isinstance(piece, (exp.Cast, exp.TryCast))
+                                                                   and piece.to.is_type(*exp.DataType.TEXT_TYPES)):
+                                piece = piece.this
+                    hit = resolve(piece) if isinstance(piece, exp.Column) and not isinstance(piece.this, exp.Star) else None
+                    parts.append(tuple(hit[:2]) if hit else None)
+                return tuple(parts) if len(parts) >= 2 and any(parts) else None
+            if not isinstance(e, exp.Column) or isinstance(e.this, exp.Star) or depth >= 4:
+                return None
+            alias = written(e)
+            return keyed(alias, depth + 1) if alias is not None else upstream(_KEYED, e)
+
+        if joins is not None:
+            # `on s.daily_server_id = a.daily_server_id`, each the hash of a server and a day: the join matches when
+            # the two tables hold the same servers, so the columns behind the same part share values
+            for test in select.find_all(exp.EQ):
+                if not (isinstance(test.this, exp.Column) and isinstance(test.expression, exp.Column)) \
+                        or test.find_ancestor(exp.Select) is not select or resolve(test.this) or resolve(test.expression):
+                    continue
+                one, two = keyed(test.this), keyed(test.expression)
+                if one and two and len(one) == len(two):
+                    joins.extend((a, b) for a, b in zip(one, two) if a and b and a != b and a[0] != b[0])
+
         outputs: dict[str, tuple[str, str]] = {}
         stars = [p for p in select.expressions if isinstance(p, exp.Star) or (isinstance(p, exp.Column) and isinstance(p.this, exp.Star))]
         positional[id(select)] = by_position = []
@@ -1125,6 +1176,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 outputs[proj.alias_or_name.upper()] = hit
             elif not isinstance(proj, exp.Star):
                 key, among = hashed(proj.unalias()), None
+                if not key and keyed(proj.unalias()):
+                    outputs[_KEYED + proj.alias_or_name.upper()] = keyed(proj.unalias())
                 if key:
                     outputs[_HASHED + proj.alias_or_name.upper()] = key
                 else:
