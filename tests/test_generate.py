@@ -379,7 +379,8 @@ def test_a_column_is_empty_where_the_rule_about_its_rows_does_not_hold_and_email
     spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "tables": {"RAW.T.RELEASES": {
         "volume": {"rows_per_day": 200}, "columns": {
             "VERSION": {"gen": "hash_id", "template": "{n}.{n}.{n}"},
-            "CONTACT": {"gen": "pool", "pool": "email", "size": 20, "suffix": "@fauxmail.net"},
+            "CONTACT": {"gen": "pool", "pool": "email", "size": 20, "suffix": "@{org}.fauxmail.net"},
+            "OWNER": {"gen": "template", "template": "user_{hex}@{org}.fauxmail.net"},
             "RC1_DATE": {"gen": "time_offset", "type": "DATE", "p": [0, 1], "seconds": [0, 86400],
                          "null_unless": "SPLIT_PART(({{VERSION}}), '.', 3) = '0'"}}}}}, tmp_path / "x.yml")
     with serve() as emu:
@@ -389,8 +390,14 @@ def test_a_column_is_empty_where_the_rule_about_its_rows_does_not_hold_and_email
             """select count(*), count("RC1_DATE"), count_if("RC1_DATE" is not null and split_part("VERSION", '.', 3) <> '0')
                from "RAW"."T"."RELEASES" """).fetchone()
         assert 0 < cut < rows and wrong == 0
-        assert cur.execute("""select count(*), count_if("CONTACT" like 'email\\__%@fauxmail.net' escape '\\')
+        assert cur.execute("""select count(*), count_if("CONTACT" like 'email\\__%@org%.fauxmail.net' escape '\\')
                               from "RAW"."T"."RELEASES" """).fetchone() == (rows, rows)
+        # an address is at one organisation wherever it is written, and the addresses are spread over several
+        names, hosts, pairs = cur.execute("""select count(distinct split_part("CONTACT", '@', 1)), count(distinct split_part("CONTACT", '@', 2)),
+                                             count(distinct "CONTACT") from "RAW"."T"."RELEASES" """).fetchone()
+        assert names == pairs and hosts > 3
+        assert cur.execute("""select count(distinct split_part("OWNER", '@', 2)) > 3, count_if("OWNER" not like 'user\\_%@org%.fauxmail.net' escape '\\')
+                              from "RAW"."T"."RELEASES" """).fetchone() == (True, 0)
 
 
 def test_a_table_of_readings_holds_a_row_a_day_for_each_of_a_few_things(tmp_path):
@@ -400,14 +407,15 @@ def test_a_table_of_readings_holds_a_row_a_day_for_each_of_a_few_things(tmp_path
     from fauxflake.generate import Warehouse
     from fauxflake.spec import Spec
 
-    spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "tables": {
+    raw = {"seed": 1, "start": "2025-01-01", "tables": {
         "RAW.T.SERVER": {"volume": {"rows_per_day": 2}, "grain": ["TIMESTAMP", "USER_ID"], "columns": {
             "USER_ID": {"gen": "hash_id", "of": 5, "named": ["93myk"]},
             "INSTALLATION": {"gen": "template", "template": "installation_{hex}", "follows": "USER_ID", "named": ["u85ky", "qe3n8"]},
             "TIMESTAMP": {"gen": "event_time"}, "RECEIVED_AT": {"gen": "loaded_at"}}},
         "RAW.T.EVENT": {"volume": {"rows_per_day": 300}, "columns": {
             "ID": {"gen": "sequence"}, "SERVER": {"gen": "fk", "ref": "RAW.T.SERVER", "skew": 1.5},
-            "TIMESTAMP": {"gen": "event_time"}}}}}, tmp_path / "x.yml")
+            "TIMESTAMP": {"gen": "event_time"}}}}}
+    spec = Spec.from_raw(raw, tmp_path / "x.yml")
     with serve() as emu:
         Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 11))
         cur = emu.cursor()
@@ -427,6 +435,15 @@ def test_a_table_of_readings_holds_a_row_a_day_for_each_of_a_few_things(tmp_path
         assert cur.execute("""select count(*) from "RAW"."T"."EVENT" e left join "RAW"."T"."SERVER" s
                               on s."USER_ID" = e."SERVER" and s."TIMESTAMP"::date = e."TIMESTAMP"::date
                               where e."TIMESTAMP" < '2025-01-10' and s."USER_ID" is null""").fetchone()[0] == 0
+
+    # a reading in five never arrives (`gaps`): every server is still there, with days missing
+    raw["tables"]["RAW.T.SERVER"]["gaps"] = 0.2
+    spec = Spec.from_raw(raw, tmp_path / "y.yml")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 31))
+        things, rows = emu.cursor().execute("""select count(distinct "USER_ID"), count(*) from "RAW"."T"."SERVER"
+                                               where "TIMESTAMP" < '2025-01-30'""").fetchone()
+        assert things == 5 and 5 * 29 * 0.6 < rows < 5 * 29 * 0.95
 
 
 def test_a_table_another_took_over_from_has_rows_only_while_it_was_in_use():
@@ -465,3 +482,41 @@ def test_a_list_is_empty_where_the_rule_about_its_rows_does_not_hold(tmp_path):
             """select count(*), count_if("NAME" = 'Calls' and json_array_length("SKUS") > 0), count_if(json_array_length("SKUS") = 0),
                       count_if("NAME" <> 'Calls' and json_array_length("SKUS") > 0) from "RAW"."T"."CALLS" """).fetchone()
         assert known > 0 and unknown > 0 and lost == 0 and known + unknown == rows
+
+
+def test_a_field_that_follows_another_of_its_document_is_the_same_wherever_that_one_is(tmp_path):
+    from datetime import datetime
+
+    from fauxflake.emulator import serve
+    from fauxflake.generate import Warehouse
+    from fauxflake.spec import Spec
+
+    spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "tables": {"RAW.T.SUBS": {
+        "volume": {"rows_per_day": 300}, "columns": {
+            "ID": {"gen": "sequence"},
+            "META": {"gen": "object", "fields": {
+                "inst": {"gen": "categorical", "values": {"a": 0.25, "b": 0.25, "c": 0.25, "d": 0.25}},
+                "dns": {"gen": "template", "template": "dns_{hex}", "follows": "inst"}}}}}}}, tmp_path / "x.yml")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 3))
+        assert emu.cursor().execute("""select count(distinct "META"->>'inst'), count(distinct "META"->>'dns'),
+            count(distinct ("META"->>'inst') || ("META"->>'dns')) from "RAW"."T"."SUBS" """).fetchone() == (4, 4, 4)
+
+
+def test_ids_of_a_given_length_still_match_what_refers_to_them(tmp_path):
+    from datetime import datetime
+
+    from fauxflake.emulator import serve
+    from fauxflake.generate import Warehouse
+    from fauxflake.spec import Spec
+
+    spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "tables": {
+        "RAW.T.SERVERS": {"volume": {"rows_per_day": 50}, "columns": {"ID": {"gen": "hash_id", "length": 26}}},
+        "RAW.T.PINGS": {"volume": {"rows_per_day": 300}, "columns": {
+            "N": {"gen": "sequence"}, "SERVER_ID": {"gen": "fk", "ref": "RAW.T.SERVERS", "length": 26}}}}}, tmp_path / "x.yml")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 3))
+        cur = emu.cursor()
+        assert cur.execute("""select count(*) = count(distinct "ID"), min(length("ID")), max(length("ID")) from "RAW"."T"."SERVERS" """).fetchone() == (True, 26, 26)
+        assert cur.execute("""select count(*), count(s."ID") from "RAW"."T"."PINGS" p left join "RAW"."T"."SERVERS" s
+                              on s."ID" = p."SERVER_ID" where length(p."SERVER_ID") = 26""").fetchone()[1] > 100

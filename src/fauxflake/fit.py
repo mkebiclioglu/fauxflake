@@ -26,7 +26,7 @@ import re
 import zlib
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
@@ -4026,7 +4026,17 @@ class Fitter:
         if not trial["left"]:
             return False
         early, late = trial["left"].pop(0)
-        half = max(2, int((self.__dict__.get("spec") or {}).get("history") or 60) // 2)
+        spec = self.__dict__.get("spec") or {}
+        days = int(spec.get("history") or 60)
+        half = max(2, days // 2)
+        try:
+            # one system takes over from another when a month begins, more often than not: what the project counts
+            # by calendar month then sees one system in each month. The month that begins nearest the middle
+            begun = date.fromisoformat(str(spec.get("start")))
+            firsts = [d for d in range(2, days - 1) if (begun + timedelta(days=d)).day == 1]
+            half = min(firsts, key=lambda d: (abs(d - half), d)) if firsts else half
+        except (TypeError, ValueError):
+            pass
         for table in early:
             self.tables[table]["until_day"] = half
         for table in late:

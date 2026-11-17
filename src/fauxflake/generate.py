@@ -48,6 +48,27 @@ def begins_with(shapes: list[str], values: list[str]) -> dict[str, list[str]]:
     return out
 
 
+def named_values(gen: dict) -> list[str]:
+    """The values a category holds by name: those of a `categorical`, or the texts without a made-up part among
+    the shapes of a `template` (`meltano elt` beside `meltano add {hex}`)."""
+    if gen.get("gen") == "categorical":
+        return [str(v) for v in gen.get("values") or {} if isinstance(v, str)]
+    if gen.get("gen") == "template":
+        return [str(t) for t in gen.get("templates") or () if "{" not in str(t)]
+    return []
+
+
+ORGS = 24  # how many large organisations the generated addresses are at (`{org}`): org1 ... org24
+
+
+def org_of(text: str) -> str:
+    """SQL for the organisation the text `text` (SQL as well) belongs to: half of the texts are spread over a few
+    large ones (what a list of accounts matches, what a count by domain shows), the others each at a small one
+    nearly its own, as the long tail of company domains is."""
+    return (f"concat('org', case when hash(concat({text}, '~')) % 2 = 0 then 1 + (hash({text}) % {ORGS})::bigint "
+            f"else {ORGS + 1} + (hash({text}) % 1000000)::bigint end)")
+
+
 def lit(v) -> str:
     if v is None:
         return "NULL"
@@ -190,9 +211,18 @@ class TableSQL:
         return self._key_expr(table, d, index)
 
     @staticmethod
-    def ending(d: dict) -> str:
-        """What every value of a pool ends with (`email_7@fauxmail.net`), as one more argument of its concat."""
-        return f", {lit(str(d['suffix']))}" if d.get("suffix") else ""
+    def ending(d: dict, head: str = "''") -> str:
+        """What every value of a pool ends with (`email_7@org3.fauxmail.net`), as more arguments of its concat.
+        `{org}` in it is one of a few organisations, always the same one for the same text before it (`head`)."""
+        if not d.get("suffix"):
+            return ""
+        return "".join(f", {org_of(head)}" if piece == "{org}" else f", {lit(piece)}"
+                       for piece in re.split(r"(\{org\})", str(d["suffix"])) if piece)
+
+    def pooled(self, d: dict, n: str) -> str:
+        """The n-th text of a pool: `plan_7`, or `email_7@org3.fauxmail.net` when the pool has an ending."""
+        head = f"concat({lit(str(d['pool']) + '_')}, {n})"
+        return f"concat({lit(str(d['pool']) + '_')}, {n}{self.ending(d, head)})"
 
     def _key_expr(self, table: Table, d: dict, index: str) -> str:
         if d.get("template") and d["gen"] == "hash_id":
@@ -276,6 +306,14 @@ class TableSQL:
                 self.base = "(g - 1)"
                 try:
                     return self._expr(f"{col}.{value[2]['of']}", fields[value[2]["of"]])
+                finally:
+                    self.base = "g"
+            if value[2].get("follows") in fields and value[2]["follows"] != value[1] and self.base == "g":
+                # a field that belongs to another of the same document: one hostname for one installation
+                other = value[2]["follows"]
+                self.base = f"({self.expr(f'{col}.{other}', {k: v for k, v in fields[other].items() if k != 'follows'})})"
+                try:
+                    return self._expr(f"{col}.{value[1]}", value[2])
                 finally:
                     self.base = "g"
             if key_expr and value[1] != keyed_by and self.base == "g":
@@ -438,11 +476,11 @@ class TableSQL:
         elif gen == "pool" and col in self.grain() and self.base == "g":
             sizes = self.grain()
             n = f"((_n // {math.prod(list(sizes.values())[:list(sizes).index(col)])}) % {sizes[col]})::bigint"
-            expr = f"({n} + 1)" if d.get("numeric") else f"concat({lit(str(d['pool']) + '_')}, {n}{self.ending(d)})"
+            expr = f"({n} + 1)" if d.get("numeric") else self.pooled(d, n)
         elif gen == "pool":
             # one of `size` values shared by every column that names the same pool: joins between them match
             n = f"floor({self.u(col)} * {int(d.get('size', 200))})::bigint"
-            expr = f"({n} + 1)" if d.get("numeric") else f"concat({lit(str(d['pool']) + '_')}, {n}{self.ending(d)})"
+            expr = f"({n} + 1)" if d.get("numeric") else self.pooled(d, n)
         elif gen == "dist":
             # (in a log, a number filtered by ranges grows with time: a range is a stretch of consecutive rows)
             expr = piecewise(self.log_fraction() if self.in_order() and len(d["p"]) > 2 and "." not in col else self.u(col), d["p"], d["v"])
@@ -462,7 +500,7 @@ class TableSQL:
                 parts = []
                 for i, part in enumerate(d.get("parts") or []):
                     template = template.replace("{" + str(i) + "}", f"\0part{i}\0")
-                for chunk in template.replace("{n}", "\0n\0").replace("{hex}", "\0hex\0").split("\0"):
+                for chunk in template.replace("{n}", "\0n\0").replace("{hex}", "\0hex\0").replace("{org}", "\0org\0").split("\0"):
                     if chunk.startswith("part") and chunk[4:].isdigit() and int(chunk[4:]) < len(d.get("parts") or []):
                         # another generator's value inside the text: an id a model parses back out of it
                         parts.append(f"({self._expr(f'{col}:{chunk}', d['parts'][int(chunk[4:])])})::varchar")
@@ -472,6 +510,9 @@ class TableSQL:
                                      f"(hash({self.base}) % 1000)::varchar" if template.count("{n}") > 1 else f"({self.base})::varchar")
                     elif chunk == "hex":
                         parts.append(f"substr(md5(concat({lit(self.salt(col) + ':')}, {self.base})), 1, 12)")
+                    elif chunk == "org":
+                        # the organisation an address is at: the same one wherever the same name is written
+                        parts.append(org_of(f"concat({', '.join(parts)})" if parts else "''"))
                     elif chunk:
                         parts.append(lit(chunk))
                 return f"concat({', '.join(parts)})"
@@ -484,10 +525,10 @@ class TableSQL:
                     f"case {pick} {' '.join(f'when {i} then {fill(t)}' for i, t in enumerate(some))} end"
 
             lead = self.t.columns.get(str(d.get("begins_with") or "")) if "." not in col else None
-            if lead and lead.get("gen") == "categorical" and lead.get("values"):
+            if lead and named_values(lead) and not lead.get("begins_with"):
                 # the text begins with the row's category (a command and its command category): each row takes a
                 # shape that begins with the value its category column holds
-                by_value = begins_with(shapes, [str(v) for v in lead["values"]])
+                by_value = begins_with(shapes, named_values(lead))
                 arms = " ".join(f"when {lit(v)} then {one_of(some)}" for v, some in by_value.items())
                 expr = f"case ({self._expr(str(d['begins_with']), lead)})::varchar {arms} else {one_of(shapes)} end"
             else:
@@ -559,6 +600,11 @@ class TableSQL:
                 f"(day::timestamp + to_hours(((_n // {math.prod(self.grain().values())}) % 24)::integer))"
         if d.get("trunc") and gen in ("event_time", "time_offset", "updated_at") and not d.get("format") and not d.get("epoch"):
             expr = f"date_trunc({lit(str(d['trunc']))}, {expr})"  # reported per hour (or day): on the boundary
+        if d.get("length") and "." not in col:
+            # an id of a given length (`length(server_id) = 26`): the value rewritten, the same way wherever it is
+            # written, so what matched still matches and what differed still differs
+            text = f"({expr})::varchar"
+            expr = f"substr(md5({text}) || md5({text} || '+'), 1, {int(d['length'])})"
         rate = repr(float(d.get("null_rate") or 0.0))
         if self.sc and self.sc.null_rate is not None and gen in ("fk", "categorical", "dist", "pool", "template", "time_offset", "object", "array"):
             rate = self.during(repr(self.sc.null_rate), rate)
@@ -628,6 +674,14 @@ class TableSQL:
         # one row a day for each combination of the listed values: the rows of a day take them in turn, and
         # a day has no more rows than there are combinations
         grain = f" and _n < {math.prod(self.grain().values()) * (24 if self.grain_hour() else 1)}" if self.grain() else ""
+        things = next((c for c in self.grain() if t.columns.get(c, {}).get("of")), None)
+        if things and t.raw.get("gaps"):
+            # readings miss a day now and then (a server that was down, a report that never arrived): the thing has
+            # no row that day, which is what the models that fill the days in between are written for
+            sizes = self.grain()
+            turn = f"((_n // {math.prod(list(sizes.values())[:list(sizes).index(things)])}) % {sizes[things]})"
+            grain += (f" and hash(concat({lit(f'{self.spec.seed}:{t.name}:gap:')}, day::varchar, ':', {turn})) % 1000 "
+                      f">= {int(float(t.raw['gaps']) * 1000)}")
         if with_new_column:
             since = f"timestamp '{self.sc.start} 00:00:00'"
             cols += f',\n  case when _loaded >= {since} then \'v2\' end as "{self.sc.new_column}"'

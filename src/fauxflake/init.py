@@ -32,6 +32,7 @@ from sqlglot import exp
 from sqlglot.optimizer.scope import traverse_scope
 
 from . import catalog, semantics
+from .generate import named_values
 
 LOADED_AT = ["_LOADED_AT", "_FIVETRAN_SYNCED", "_AIRBYTE_EXTRACTED_AT", "_SDC_BATCHED_AT", "_ETL_LOADED_AT",
              "LOADED_AT", "_INGESTED_AT", "INGESTED_AT", "_PARTITIONTIME"]
@@ -79,6 +80,10 @@ class SourceUse:
         # list is empty (or the column null) wherever the rule, written in the table's own columns, does not hold
         self.implied: list[tuple[str, str, str]] = []
         self.readings: set[tuple[str, str]] = set()
+        self.lengths: dict[str, int] = {}  # text column -> how long the models take its values to be (`length(server_id) <> 26`: invalid)
+        # ((column, path), (column, path)): rows kept as the latest of each of the first, then looked up by the
+        # second (`partition by dns` ... `on x.installation_id = l.installation_id`): the first belongs to one of the second
+        self.one_per: set[tuple[tuple[str, str], tuple[str, str]]] = set()
         self.series: set[frozenset[str]] = set()  # columns a join matches on together (`on a.id = b.id and a.hour = b.hour`)
         self.read_bounds: dict[str, set[float]] = {}  # number column -> what the models that read the table itself compare it with
         self.windows: dict[str, set[float]] = {}  # number column -> the range the model that reads the table itself keeps (`between a and b`)
@@ -112,6 +117,7 @@ CONTEXT = {"CURRENT_ACCOUNT": "FAUXFLAKE", "CURRENT_ACCOUNT_NAME": "FAUXFLAKE", 
 _PATHS = "\0paths"  # in a model's outputs: {column: (source, source column, path inside its document)}
 _ANY = "\0any:"  # in a model's outputs: _ANY + column -> the source columns a COALESCE takes the value from, in order
 _KEYED = "\0key:"  # in a model's outputs: _KEYED + column -> the parts of a surrogate key of several columns, in order
+_LATEST = "\0latest"  # in a CTE's outputs: the one place its rows are the latest of (`qualify row_number() over (partition by x) = 1`)
 _EXPR = "\0sql:"  # in a model's outputs: _EXPR + column -> (table, the value written in that source table's own columns)
 _HASHED = "\0md5:"  # in a model's outputs: _HASHED + column -> the source columns a surrogate key is the hash of
 
@@ -985,7 +991,7 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                         if not there and isinstance(other, exp.SplitPart) and getattr(other.args.get("delimiter"), "name", "") == "@" \
                                 and getattr(other.args.get("part_index"), "name", "") == "2":
                             # `on a.domain = split_part(l.email, '@', 2)`: the domain the generated addresses are at
-                            use.literals.setdefault(hit[1], set()).add(MAILBOX[1:])
+                            use.literals.setdefault(hit[1], set()).update(mail_hosts())
                             use.texts.add(hit[1])
                 if named_numbers(parent, col):
                     use.equals.setdefault(hit[1], set()).update(named_numbers(parent, col))
@@ -1224,9 +1230,57 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 if one and two and len(one) == len(two):
                     joins.extend((a, b) for a, b in zip(one, two) if a and b and a != b and a[0] != b[0])
 
+        def place(e):  # noqa: ANN001, ANN202
+            """(table, column, path in its document or "") for a value that is one source column or one place in one."""
+            for _ in range(6):
+                if isinstance(e, exp.Column) and written(e) is not None:
+                    e = written(e)
+                elif isinstance(e, (exp.Cast, exp.TryCast, exp.Paren)):
+                    e = e.this
+                else:
+                    break
+            hit = resolve(e) if isinstance(e, exp.Column) and not isinstance(e.this, exp.Star) else None
+            if hit:
+                return hit[0], hit[1], ""
+            try:
+                placed = resolve_path(e)
+            except Exception:  # noqa: BLE001
+                placed = None
+            if isinstance(placed, tuple) and len(placed) == 3 and placed[0] in sources and placed[2] \
+                    and not any(k in path_text(placed[2]) for k in ("{}", "~", "[]")):
+                return placed[0], placed[1], path_text(placed[2])
+            return None
+
+        # `on l.installation_id = s.installation_id`, s the latest row of each hostname: were a hostname's rows of
+        # several installations the join would find one of them only, and an installation with several hostnames
+        # comes out once for each. The models take each hostname to be of one installation
+        for test in select.find_all(exp.EQ):
+            for side in (test.this, test.expression):
+                latest = renames.get(side.table.upper(), {}).get(_LATEST) if isinstance(side, exp.Column) and side.table else None
+                by = place(side) if latest else None
+                if by and by[0] == latest[0] and by != latest and by[0] in sources and (by[1] == latest[1] or not (by[2] or latest[2])):
+                    sources[by[0]].one_per.add(((latest[1], latest[2]), (by[1], by[2])))
+
+        # `where length(server_id) <> 26` (the invalid ones), `length(id) = 26`: how long an id is
+        for test in select.find_all(exp.EQ, exp.NEQ):
+            for measured, number in ((test.this, test.expression), (test.expression, test.this)):
+                if not (isinstance(measured, exp.Length) and isinstance(number, exp.Literal) and not number.is_string
+                        and number.name.isdigit() and 8 <= int(number.name) <= 64):
+                    continue
+                inner = measured.this
+                while isinstance(inner, (exp.Trim, exp.Cast, exp.TryCast, exp.Paren, exp.Lower, exp.Upper)):
+                    inner = inner.this
+                for got in behind(inner) or ():
+                    if len(got) == 2 and got[0] in sources:
+                        sources[got[0]].lengths.setdefault(got[1], int(number.name))
+
+        latest_of = None
         kept = select.args.get("qualify")
         for test in (kept.find_all(exp.EQ) if kept is not None else []):
             window, one = (test.this, test.expression) if isinstance(test.this, exp.Window) else (test.expression, test.this)
+            if isinstance(window, exp.Window) and isinstance(window.this, exp.RowNumber) and isinstance(one, exp.Literal) \
+                    and one.name == "1" and len(window.args.get("partition_by") or []) == 1:
+                latest_of = place(window.args["partition_by"][0])
             if not (isinstance(window, exp.Window) and isinstance(window.this, exp.RowNumber) and isinstance(one, exp.Literal)
                     and one.name == "1" and len(window.args.get("partition_by") or []) == 2):
                 continue
@@ -1374,6 +1428,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
             inner_name = next(iter(selected)).upper()
             if inner_name in cte_positions:  # `select * from cte` keeps the CTE's column order
                 by_position[:] = cte_positions[inner_name]
+        if latest_of:
+            outputs[_LATEST] = latest_of
         outputs_of[id(select)] = outputs
         if name:
             lineage[name] = outputs
@@ -1499,8 +1555,18 @@ def _share_join_values(tables: dict[str, dict], joins: list, notes: list[str], l
             for d in named:
                 for v, w in d["values"].items():
                     values.setdefault(v, w)
+            for m in free:  # and the values another side is asked for by name, beside shapes it matches
+                for t in (gen[m].get("templates") or ()) if gen[m]["gen"] == "template" else ():
+                    if "{" not in t:
+                        values.setdefault(t, 0.16)
             for m in free:
                 put(m, {"gen": "categorical", "values": dict(values)})
+        elif any(gen[m]["gen"] == "template" and any("{" not in t for t in gen[m].get("templates") or ()) for m in free):
+            # values the models ask for by name, beside shapes they match (`= 'meltano elt'`, `like 'meltano add%'`):
+            # every side holds those; a pool of made-up values would leave the filters with nothing
+            shapes = list(dict.fromkeys(t for m in free for t in gen[m].get("templates") or () if not t.endswith("_{hex}")))
+            for m in free:
+                put(m, {"gen": "template", "templates": [*shapes, f"{pool_name(m)}_{{hex}}"]})
         else:
             pool = (free[0][2].replace("[]", "").split(".")[-1] or free[0][1]).lower()
             numeric = any(gen[m]["gen"] == "dist" for m in free)
@@ -1532,6 +1598,64 @@ def _share_join_values(tables: dict[str, dict], joins: list, notes: list[str], l
                 else:
                     put(m, {"gen": "pool", "pool": pool, "size": 200, **({"numeric": True} if numeric else {})})
         notes.append(f"{', '.join(name(m) for m in free)}: joined in a model, generated from the same values.")
+
+
+def pool_name(m) -> str:  # noqa: ANN001
+    """What the made-up values of a (table, column, path) are called."""
+    return (m[2].replace("[]", "").split(".")[-1] or m[1]).lower()
+
+
+def as_long_as(tables: dict[str, dict], uses: dict, pairs: list, notes: list[str]) -> None:
+    """`length(server_id) <> 26` marks the invalid ids: an id is 26 characters, in that column and in every
+    column a join or a UNION lines up with it (`length`: the made-up value, rewritten at that length). Left alone
+    where any of them holds values known by name: those are as long as they are."""
+    group_of: dict[tuple[str, str], set] = {}
+    for a, b in pairs:
+        if len(a) != 2 or len(b) != 2 or any(m[0] not in tables or m[1] not in tables[m[0]].get("columns", {}) for m in (a, b)):
+            continue
+        merged = group_of.get(a, {a}) | group_of.get(b, {b})
+        for m in merged:
+            group_of[m] = merged
+    done: set[int] = set()
+    for name, use in uses.items():
+        for col, size in sorted(getattr(use, "lengths", {}).items()):
+            if name not in tables or col not in tables[name].get("columns", {}):
+                continue
+            group = group_of.get((name, col), {(name, col)})
+            if id(group) in done:
+                continue
+            done.add(id(group))
+            held = [tables[t]["columns"][c] for t, c in sorted(group)]
+            made_up = lambda d: (d.get("gen") in ("hash_id", "fk", "pool") and not d.get("numeric") and not d.get("template")) or (  # noqa: E731
+                d.get("gen") == "template" and not d.get("templates") and re.fullmatch(r"\w+_\{(n|hex)\}", str(d.get("template", ""))))
+            if not all(made_up(d) and not d.get("suffix") and not d.get("format") for d in held):
+                continue
+            for d in held:
+                d["length"] = size
+            # and whatever else is generated from the same values: references to a key, keys of one domain, a pool
+            for _ in range(3):
+                first = {t: next((d for d in table.get("columns", {}).values() if d.get("gen") in ("hash_id", "sequence")), None)
+                         for t, table in tables.items()}
+                for table in tables.values():  # (a reference of that length is to a key of that length)
+                    for d in table.get("columns", {}).values():
+                        if d.get("gen") == "fk" and d.get("length") and first.get(d.get("ref")) and first[d["ref"]].get("gen") == "hash_id":
+                            first[d["ref"]].setdefault("length", d["length"])
+                keys = {t: d for t, d in first.items() if d and d.get("length")}
+                domains = {d["domain"]: d["length"] for d in keys.values() if d.get("domain")}
+                pools = {d["pool"]: d["length"] for table in tables.values() for d in table.get("columns", {}).values()
+                         if d.get("gen") == "pool" and d.get("length")}
+                for table in tables.values():
+                    for d in table.get("columns", {}).values():
+                        if d.get("length"):
+                            continue
+                        if d.get("gen") == "fk" and d.get("ref") in keys:
+                            d["length"] = keys[d["ref"]]["length"]
+                        elif d.get("gen") == "hash_id" and d.get("domain") in domains:
+                            d["length"] = domains[d["domain"]]
+                        elif d.get("gen") == "pool" and d.get("pool") in pools:
+                            d["length"] = pools[d["pool"]]
+            notes.append(f"{name}.{col}: models take its values to be {size} characters long; generated so, as are the "
+                         f"{len(held) - 1} column(s) matched with it (`length`).")
 
 
 def _share_union_values(tables: dict[str, dict], links: list) -> None:
@@ -1582,9 +1706,15 @@ _USUALLY_TRUE = re.compile(r"(?<![A-Z])(ACTIVE|ENABLED|VALID|CURRENT|VERIFIED|CO
 
 
 # a domain no project filters out: `example.com`, `test.com` and the company's own are what `not like` drops
-MAILBOX = "@fauxmail.net"
+MAILBOX = "@{org}.fauxmail.net"  # (`{org}`: one of a few organisations, so that domains can be counted and compared)
 _EMAIL = re.compile(r"^(?!HAS|IS_|ISDEFAULT|SUPPRESS|RECEIVE|SEND|ALLOW|ENABLE|OPT|DO_?NOT|NO_)"
                     r".*E_?MAIL(_?ADDRESS)?(_\d+)?(_FOR_TEMPLA\w*)?(__C)?$")
+
+
+def mail_hosts() -> list[str]:
+    """The domains the generated addresses are at."""
+    from .generate import ORGS
+    return [MAILBOX[1:].replace("{org}", f"org{i}") for i in range(1, ORGS + 1)]
 
 
 def holds_email(column: str) -> bool:
@@ -1757,7 +1887,7 @@ def part_templates(shapes: dict[str, dict[int, set[str]]], casts: dict[str, dict
     return [*out, free]
 
 
-def flattened_objects(paths: dict[str, str | None]) -> dict[str, str | None]:
+def flattened_objects(paths: dict[str, str | None], moved: dict[str, list[str]] | None = None) -> dict[str, str | None]:
     """`flatten(input => doc:query)` beside `doc:query:success`: what is flattened is an object, not a list (a
     place cannot be both), and its "elements" are the values of its keys. What the SQL reads in an element
     (`value:data:resultType`) is read in the keys that hold objects (`query.body.data.resultType`)."""
@@ -1771,8 +1901,12 @@ def flattened_objects(paths: dict[str, str | None]) -> dict[str, str | None]:
             if keys:
                 out.pop(path, None)
                 holders = [k for k in sorted(keys) if any(o.startswith(f"{base}.{k}.") or o.startswith(f"{base}.{k}[") for o in paths)]
+                # (no key is read any deeper by name: what is read in the values is in each of them)
+                holders = holders or sorted(keys)
                 for k in holders if rest else []:
                     out.setdefault(f"{base}.{k}{rest}", paths[path])
+                    if moved is not None:
+                        moved.setdefault(path, []).append(f"{base}.{k}{rest}")
                 break
             at = path.find("[]", at + 2)
     # a place the SQL casts to a number, a date or a boolean and also takes apart (a `factor` that is a number in
@@ -2135,6 +2269,41 @@ def analyse(manifest: dict, database: str) -> Analysis:
         names = {c.name.upper() for c in told[1].find_all(exp.Column)} if told else set()
         return (told[0], names.pop(), "") if len(names) == 1 else None
 
+    # a test the project wrote out returns (the thing, one fact about it, another) where both facts are there and
+    # say different things (`where license_company is not null and cloud_company is not null and license_company
+    # <> cloud_company`): one thing has the one or the other. ((table, columns, its column for the thing), (same))
+    either: list[tuple[tuple[str, tuple[str, ...], str], tuple[str, tuple[str, ...], str]]] = []
+    for node in manifest["nodes"].values():
+        owners = [n for n in (node.get("depends_on") or {}).get("nodes") or [] if n.startswith(("model.", "snapshot."))]
+        if node["resource_type"] != "test" or node.get("test_metadata") or not node.get("compiled_code") or len(owners) != 1:
+            continue
+        try:
+            asked = sqlglot.parse_one(node["compiled_code"], read="snowflake")
+        except Exception:  # noqa: BLE001
+            continue
+        where = asked.args.get("where") if isinstance(asked, exp.Select) and not asked.args.get("joins") else None
+        arms = list(where.this.flatten()) if where is not None and isinstance(where.this, exp.Or) else [where.this] if where is not None else []
+
+        def both_there(arm) -> bool:  # noqa: ANN001
+            arm = arm.unnest()
+            parts = [part.unnest() for part in (arm.flatten() if isinstance(arm, exp.And) else [arm])]
+            there = {p.this.this.name.upper() for p in parts if isinstance(p, exp.Not) and isinstance(p.this, exp.Is)
+                     and isinstance(p.this.this, exp.Column) and isinstance(p.this.expression, exp.Null)}
+            return any(isinstance(p, exp.NEQ) and isinstance(p.this, exp.Column) and isinstance(p.expression, exp.Column)
+                       and {p.this.name.upper(), p.expression.name.upper()} <= there for p in parts)
+
+        named = [e.name.upper() for e in asked.expressions if isinstance(e, exp.Column)] if arms and all(both_there(a) for a in arms) else []
+        if len(named) != 3 or len(named) != len(asked.expressions):
+            continue
+        for thing in named:
+            among = dict(outputs.get(owners[0], {}).get(_ANY + thing) or ())  # table -> its column for the thing
+            facts = [worked_out(owners[0], n) for n in named if n != thing]
+            if len(among) < 2 or not all(facts) or facts[0][0] == facts[1][0] or not {facts[0][0], facts[1][0]} <= set(among):
+                continue
+            sides = [(t, tuple(sorted({c.name.upper() for c in e.find_all(exp.Column)} - {among[t]})), among[t]) for t, e in facts]
+            if all(side[1] for side in sides):
+                either.append((sides[0], sides[1]))
+            break
     gated: list[tuple[tuple[str, str], str]] = []  # (a column, the rule about the row that holds wherever it is not null)
     keys: dict[str, str] = {}
     ordered: list[tuple[tuple[str, str, str], tuple[str, str, str]]] = []  # (the later, the earlier) of two times a test compares
@@ -2178,8 +2347,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 parts = {c.name.upper(): worked_out(node["attached_node"], c.name) for c in said.find_all(exp.Column)}
                 if parts and all(parts.values()) and {part[0] for part in parts.values()} == {gate[0]}:
                     rule = said.transform(lambda n: exp.Paren(this=parts[n.name.upper()][1].copy()) if isinstance(n, exp.Column) else n)
-                    rule = rule.transform(lambda n: exp.Var(this=f"__col_{n.name.upper()}__") if isinstance(n, exp.Column) else n)
-                    gated.append((gate, re.sub(r"__col_(\w+?)__", r"{{\1}}", rule.sql(dialect="duckdb"))))
+                    gated.append((gate, rule_text(rule)))
             continue
         here = locate(node["attached_node"], column) if column else None
         if not here and column and meta["name"] == "relationships":
@@ -2296,7 +2464,12 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 # other separators the SQL splits on come after: 123/456.json
                 out[col] = {"gen": "template", "template": sep.join(shape) + "".join(f"{other}x" for other, _ in others)}
             elif col in use.paths:
-                use.paths[col] = flattened_objects(use.paths[col])
+                moved: dict[str, list[str]] = {}
+                use.paths[col] = flattened_objects(use.paths[col], moved)
+                for asked in (use.path_literals.get(col), use.path_patterns.get(col)):
+                    for path, places in moved.items() if asked else ():  # what is asked of a value is asked in each key
+                        for moved_to in places if path in asked else ():
+                            asked.setdefault(moved_to, asked[path])
                 out[col] = {"gen": "object", "fields": {
                     path: field_gen(path, h, use.path_literals.get(col, {}).get(path), use.path_patterns.get(col, {}).get(path))
                     for path, h in sorted(use.paths[col].items())
@@ -2502,6 +2675,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
             held[column] = {"gen": "row_of", "group": seed, "values": [row[i] for row in rows]}
         joined.append(f"{table} ({', '.join(columns)}): joined together to the seed {seed}, generated as the rows it lists.")
     _share_join_values(tables, joins, joined, lookups)
+    as_long_as(tables, uses, [*joins, *((a, b) for group in links for a in sorted(group, key=str)[:1] for b in sorted(group, key=str)[1:])], notes)
     _share_union_values(tables, links)
     if joined:
         notes.append(f"{len(joined)} group(s) of columns are joined in models and generated to match, for example: {' '.join(joined[:3])}")
@@ -2522,6 +2696,18 @@ def analyse(manifest: dict, database: str) -> Analysis:
         # holds one row per period for each of a few entities, as a meter or a daily balance does: generated so, and
         # whatever is joined to the entity draws from the same few
         columns = tables.get(name, {}).get("columns") or {}
+        for (one, one_path), (by, by_path) in sorted(use.one_per):
+            # a hostname is of one installation: written from the installation's value, the same in each of its rows
+            if one_path or by_path:
+                fields = (columns.get(one) or {}).get("fields") or {}
+                held, known = fields.get(one_path) or {}, by_path in fields and one == by
+            else:
+                held, known = columns.get(one) or {}, by in columns
+            made_up = f"{(one_path or one).split('.')[-1].lower()}_{{hex}}"
+            if known and held.get("gen") == "template" and held.get("template") == made_up and not held.get("follows") and not held.get("unique"):
+                held["follows"] = by_path or by
+                notes.append(f"{name}.{one}{'.' + one_path if one_path else ''}: models keep the latest row of each and look it up by "
+                             f"{by_path or by}; each belongs to one {(by_path or by).lower()} (`follows`).")
         for thing, moment in sorted(use.readings):
             # the latest row of each server each day is what the models keep: the table holds readings, the same few
             # things reporting day after day. A key that gives every row a thing of its own would leave each with
@@ -2531,6 +2717,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
                     and not when.get("format") and not when.get("epoch") and not when.get("unique") and not tables[name].get("grain"):
                 held["of"] = 20
                 tables[name]["grain"] = [moment, thing]
+                tables[name]["gaps"] = 0.05  # (a reading in twenty never arrives: days the models have to fill in)
                 for other, gen in columns.items():
                     # what a reading says about the thing in words (its installation, its address) is the same in
                     # every reading of it; what it counts changes from day to day
@@ -2582,6 +2769,11 @@ def analyse(manifest: dict, database: str) -> Analysis:
         elif after and before and after.get("gen") == before.get("gen") == "time_offset" and before.get("unique") \
                 and after.get("unique") and before.get("plus_days") and not after.get("plus_days"):
             after["plus_days"] = before.pop("plus_days")  # the two ends of a period: the test says which one closes it
+        elif after and before and after.get("gen") == before.get("gen") == "time_offset" and after.get("unique") and after.get("every_days") \
+                and not before.get("unique") and not before.get("format") and not before.get("epoch"):
+            # releases follow one another every so often, and each has a date that comes before its release (the
+            # first candidate is cut two weeks ahead): on the release's own schedule, some days earlier
+            before.update(unique=True, every_days=after["every_days"], plus_days=int(after.get("plus_days") or 0) - 14)
     # `where server_id = '93myk...'` on a column that refers to another table's key: that table has a row with that id
     for name, table in tables.items():
         for col, gen in table["columns"].items():
@@ -2704,8 +2896,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 rule = sqlglot.parse_one(said, read="snowflake")
             except Exception:  # noqa: BLE001
                 continue
-            rule = rule.transform(lambda n: exp.Var(this=f"__col_{n.name.upper()}__") if isinstance(n, exp.Column) else n)
-            rule = re.sub(r"__col_(\w+?)__", r"{{\1}}", rule.sql(dialect="duckdb"))
+            rule = rule_text(rule)
             # the tables lined up with this one in a UNION (the same event, one table per kind) hold the same rule
             same = {(name, col)} | {(m[0], m[1]) for group in links if any((m[0], m[1]) == (name, col) for m in group) for m in group}
             # (and the other tables of its schema with the same columns: one table per kind of event, read as one)
@@ -2726,6 +2917,28 @@ def analyse(manifest: dict, database: str) -> Analysis:
         if col in columns and columns[col].get("gen") not in _KEYS and rule_binds(rule, col, columns):
             columns[col]["null_unless"] = rule
             notes.append(f"{name}.{col}: a test states a rule about the rows that have one; it is empty in the other rows (`null_unless`).")
+    for sides in either:
+        # the things are dealt in two halves by what they are called: one half has the one fact, the other half the other
+        shared = {(t, e) for t, _, e in sides}
+        group = next((g for g in ({m[:2] for m in g} for g in [*links, *({a, b} for a, b in joins)]) if shared <= g), None)
+        linked = lambda a, b: a == b or any(a in {m[:2] for m in g} and b in {m[:2] for m in g} for g in links)  # noqa: E731
+        if group is None and not all(tables.get(t, {}).get("columns", {}).get(e, {}).get("gen") in (*_KEYS, "fk") for t, e in shared):
+            continue
+        for half, (table, facts, thing) in enumerate(sides):
+            places = [(table, fact, thing) for fact in facts]
+            for other, columns in ((n, t.get("columns") or {}) for n, t in tables.items() if n != table):
+                # (a table lined up with it in a UNION says the same of the same things)
+                places += [(other, c, e) for fact in facts for c in columns for e in columns
+                           if linked((table, fact), (other, c)) and (other, c) != (table, fact) and linked((table, thing), (other, e)) and c != e]
+            for name, fact, entity in places:
+                columns = tables.get(name, {}).get("columns") or {}
+                rule = f"HASH(({{{{{entity}}}}})::VARCHAR) % 2 = {half}"
+                referred = any(d.get("gen") == "fk" and str(d.get("ref", "")).upper() == name for t in tables.values() for d in t["columns"].values())
+                if fact in columns and not columns[fact].get("null_unless") and not (columns[fact].get("gen") in _KEYS and referred) \
+                        and rule_binds(rule, fact, columns):
+                    columns[fact]["null_unless"] = rule
+                    notes.append(f"{name}.{fact}: a test says nothing has both this and {sides[1 - half][0]}.{', '.join(sides[1 - half][1])}; "
+                                 f"half of the {entity.lower()}s have the one, half the other (`null_unless`).")
     least = rows_asked(manifest)
     if least:
         notes.append(f"the project lists tables by their size (`row_count >= {least}` in INFORMATION_SCHEMA.TABLES): every "
@@ -2773,6 +2986,20 @@ def created_comes_first(columns: dict) -> None:
                 columns[name].update(p=[0, 0.5, 1], seconds=[top + 60, top + 3 * 86400, top + 30 * 86400])
 
 
+def rule_text(rule: exp.Expression) -> str:
+    """A rule about a row, read from Snowflake SQL over a table's own columns, as the DuckDB text the generator
+    works out: `{{VERSION}}` stands for a column, and what the translation spelled out at length is put briefly."""
+    marked = rule.transform(lambda n: exp.Var(this=f"FXCOL0{n.name.upper()}0FXEND") if isinstance(n, exp.Column) else n)
+    text = marked.sql(dialect="duckdb")
+    try:
+        from sqlglot.optimizer.simplify import simplify
+
+        text = simplify(sqlglot.parse_one(text, read="duckdb")).sql(dialect="duckdb")
+    except Exception:  # noqa: BLE001, S110
+        pass
+    return re.sub(r'"?FXCOL0(\w+?)0FXEND"?', r"{{\1}}", text)
+
+
 def rule_binds(rule: str, col: str, columns: dict) -> bool:
     """Whether a rule about a row (`{{VERSION}}` standing for a column) is one the generator can work out: it names
     columns the table has, not the one it gates, and DuckDB takes it with values of their kinds."""
@@ -2795,6 +3022,11 @@ def rule_binds(rule: str, col: str, columns: dict) -> bool:
     return True
 
 
+def led_by(columns: dict, name: str) -> bool:
+    """Whether another column's text already begins with this one's values."""
+    return any(gen.get("begins_with") == name for gen in columns.values())
+
+
 def follow_categories(columns: dict) -> None:
     """`where command_category = 'meltano elt'` here, `command like 'meltano elt%--transform run%'` there: the
     shapes the SQL asks of a text begin with the values of a category in the same table. In the real data the
@@ -2807,13 +3039,14 @@ def follow_categories(columns: dict) -> None:
             continue
         best, owned = None, 0
         for other, cat in columns.items():
-            values = [v for v in (cat.get("values") or {}) if isinstance(v, str)] if cat.get("gen") == "categorical" else []
+            # (a category leads, it does not follow: two texts that each begin with the other's values stay apart)
+            values = named_values(cat) if other != name and not cat.get("begins_with") and not led_by(columns, name) else []
             leads = {v for v in values if any(s.startswith(v) and not s[len(v):len(v) + 1].isalnum() for s in shapes)}
             if len(leads) > max(owned, 1):
                 best, owned = other, len(leads)
         if best is None:
             continue
-        values = [str(v) for v in columns[best]["values"]]
+        values = named_values(columns[best])
         filler, kept, loose = f"{name.lower()}_{{hex}}", [], []
         for shape in shapes:
             if shape == filler:

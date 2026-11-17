@@ -1077,7 +1077,7 @@ def test_a_column_joined_to_the_domain_of_an_email_holds_the_domain_addresses_ar
     uses, *_ = _scan({"a.b.link": "select l.id, a.id from raw.t.lead l left join raw.t.account a "
                                   "on a.domain = split_part(l.email, '@', 2) where a.id is not null"},
                      ["RAW.T.LEAD", "RAW.T.ACCOUNT"])
-    assert uses["RAW.T.ACCOUNT"].literals["DOMAIN"] == {MAILBOX[1:]}
+    assert "org3.fauxmail.net" in uses["RAW.T.ACCOUNT"].literals["DOMAIN"] and len(uses["RAW.T.ACCOUNT"].literals["DOMAIN"]) == 24
 
 
 def test_a_rule_a_test_states_about_the_rows_that_have_a_value_is_kept_by_leaving_the_others_empty():
@@ -1197,3 +1197,132 @@ def test_a_case_and_its_complement_say_when_a_list_has_something():
     for table in ("RAW.CALLS.STARTED", "RAW.CALLS.ENDED"):  # (the other table of the schema has the same columns)
         skus = spec["tables"][table]["columns"]["CONTEXT_FEATURE_SKUS"]
         assert skus["gen"] == "array" and "{{CONTEXT_FEATURE_NAME}}" in skus["empty_unless"] and not skus.get("null_rate")
+
+
+def test_joined_columns_keep_the_values_asked_for_by_name_beside_a_pattern():
+    from fauxflake.init import build_spec
+
+    def source(name, cols):
+        return {"database": "RAW", "schema": "S", "name": name, "identifier": name,
+                "columns": {c: {"data_type": t} for c, t in cols.items()}}
+
+    manifest = {
+        "sources": {"source.p.s.old": source("old", {"category": "VARCHAR", "n": "NUMBER"}),
+                    "source.p.s.new": source("new", {"kind": "VARCHAR", "n": "NUMBER"})},
+        "nodes": {"model.p.m": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.M", "compiled_code": """
+            select o.n from raw.s.old o join raw.s.new w on o.category = w.kind
+            where o.category = 'cli elt' or o.category like 'cli add%'"""}},
+    }
+    columns = {t: d["columns"] for t, d in build_spec(manifest, "A")[0]["tables"].items()}
+    for held in (columns["RAW.S.OLD"]["CATEGORY"], columns["RAW.S.NEW"]["KIND"]):
+        assert held["gen"] == "template" and "cli elt" in held["templates"], held
+
+
+def test_what_is_read_in_the_values_of_a_flattened_object_is_in_each_of_its_keys():
+    from fauxflake.init import flattened_objects
+
+    moved = {}
+    paths = flattened_objects({"actions[]": None, "actions[].Transfer": None, "actions[].FunctionCall": None,
+                               "actions[][]": None, "actions[][].method_name": "TEXT"}, moved)
+    assert paths == {"actions[]": None, "actions[].Transfer": None, "actions[].FunctionCall": None,
+                     "actions[].Transfer.method_name": "TEXT", "actions[].FunctionCall.method_name": "TEXT"}
+    assert moved["actions[][].method_name"] == ["actions[].FunctionCall.method_name", "actions[].Transfer.method_name"]
+
+
+def test_columns_joined_to_a_category_bring_the_values_they_are_asked_for_by_name():
+    from fauxflake.init import build_spec
+
+    def source(name, cols):
+        return {"database": "RAW", "schema": "S", "name": name, "identifier": name,
+                "columns": {c: {"data_type": t} for c, t in cols.items()}}
+
+    manifest = {
+        "sources": {"source.p.s.rates": source("rates", {"usage": "VARCHAR", "service": "VARCHAR"})},
+        "nodes": {"model.p.m": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.M", "compiled_code": """
+            select a.usage from raw.s.rates a join raw.s.rates b on a.usage = b.service
+            where b.service in ('STORAGE', 'COMPUTE') and (a.usage = 'compute' or a.usage like '%adj%')"""}},
+    }
+    columns = build_spec(manifest, "A")[0]["tables"]["RAW.S.RATES"]["columns"]
+    assert "compute" in columns["USAGE"]["values"] and "STORAGE" in columns["USAGE"]["values"], columns
+
+
+def test_the_latest_row_of_each_hostname_looked_up_by_installation_makes_a_hostname_of_one_installation():
+    sources = {"RAW.S.SUBS": SourceUse(), "RAW.S.SERVERS": SourceUse()}
+    scan_model("""
+        with latest as (
+            select s.meta:"inst"::varchar as installation_id, s.meta:"dns"::varchar as hostname
+            from raw.s.subs s
+            qualify row_number() over (partition by s.meta:"dns"::varchar order by s.created desc) = 1)
+        select v.id, l.hostname from raw.s.servers v left join latest l on v.installation_id = l.installation_id""",
+               sources, joins=[])
+    assert sources["RAW.S.SUBS"].one_per == {(("META", "dns"), ("META", "inst"))}
+
+
+def test_an_id_the_models_measure_is_that_long_wherever_it_is_matched():
+    from fauxflake.init import build_spec
+
+    def source(name, cols):
+        return {"database": "RAW", "schema": "S", "name": name, "identifier": name,
+                "columns": {c: {"data_type": t} for c, t in cols.items()}}
+
+    manifest = {
+        "sources": {"source.p.s.servers": source("servers", {"id": "VARCHAR", "name": "VARCHAR"}),
+                    "source.p.s.pings": source("pings", {"server_id": "VARCHAR", "at": "TIMESTAMP"})},
+        "nodes": {"model.p.m": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.M", "compiled_code": """
+            select s.id, p.at from raw.s.servers s join raw.s.pings p on p.server_id = s.id where length(p.server_id) = 26"""}},
+    }
+    columns = {t: d["columns"] for t, d in build_spec(manifest, "A")[0]["tables"].items()}
+    assert columns["RAW.S.SERVERS"]["ID"].get("length") == 26 and columns["RAW.S.PINGS"]["SERVER_ID"].get("length") == 26, columns
+
+
+def test_the_reading_still_says_where_a_column_comes_from_when_a_flattened_object_was_moved():
+    from fauxflake.init import analyse
+
+    manifest = {
+        "sources": {"source.p.s.shards": {"database": "RAW", "schema": "S", "name": "shards", "identifier": "shards",
+                                          "columns": {"value": {"data_type": "VARIANT"}, "id": {"data_type": "NUMBER"}}}},
+        "nodes": {"model.p.m": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.M", "name": "m", "compiled_code": """
+            with a as (select s.id, f.value as action, s.value:actions[0]:Transfer as t, s.value:actions[0]:FunctionCall as c
+                       from raw.s.shards s, lateral flatten(input => s.value:actions) f),
+                 b as (select a.id, g.key as name, g.value:method_name::string as method_name from a, lateral flatten(input => a.action) g)
+            select * from b where method_name = 'stake'"""}},
+    }
+    analysis = analyse(manifest, "A")
+    fields = analysis.spec["tables"]["RAW.S.SHARDS"]["columns"]["VALUE"]["fields"]
+    assert "stake" in str(fields.get("actions[].FunctionCall.method_name")), fields
+    assert analysis.place("model.p.m", "ID") == ("RAW.S.SHARDS", "ID", "")
+
+
+def test_two_texts_that_begin_with_each_others_values_do_not_follow_each_other():
+    from fauxflake.init import follow_categories
+
+    columns = {"A": {"gen": "template", "templates": ["run", "run fast {hex}", "a_{hex}"]},
+               "B": {"gen": "template", "templates": ["run", "run fast", "run slow {hex}", "b_{hex}"]}}
+    follow_categories(columns)
+    assert [c for c, d in columns.items() if d.get("begins_with")] in (["A"], ["B"], [])
+
+
+def test_a_test_that_returns_things_with_two_facts_at_odds_deals_the_facts_to_two_halves():
+    from fauxflake.init import build_spec
+
+    def source(name, cols):
+        return {"database": "RAW", "schema": "S", "name": name, "identifier": name,
+                "columns": {c: {"data_type": t} for c, t in cols.items()}}
+
+    manifest = {
+        "sources": {"source.p.s.servers": source("servers", {"id": "VARCHAR", "installation": "VARCHAR", "at": "TIMESTAMP"}),
+                    "source.p.s.licenses": source("licenses", {"server_id": "VARCHAR", "license_id": "VARCHAR", "company": "VARCHAR"}),
+                    "source.p.s.clouds": source("clouds", {"installation": "VARCHAR", "company": "VARCHAR"})},
+        "nodes": {
+            "model.p.info": {"resource_type": "model", "name": "info", "depends_on": {"nodes": []}, "relation_name": "A.B.INFO", "compiled_code": """
+                with every as (select coalesce(l.server_id, s.id) as server_id, l.license_id, s.installation as installation_id, l.company
+                               from raw.s.licenses l full outer join raw.s.servers s on l.server_id = s.id)
+                select e.server_id, e.license_id, e.installation_id, e.company as license_company, c.company as cloud_company
+                from every e left join raw.s.clouds c on c.installation = e.installation_id"""},
+            "test.p.one_source": {"resource_type": "test", "name": "one_source", "depends_on": {"nodes": ["model.p.info"]}, "compiled_code": """
+                select server_id, license_id, installation_id from a.b.info
+                where (license_company is not null and cloud_company is not null and license_company <> cloud_company)"""}},
+    }
+    columns = {t: d["columns"] for t, d in build_spec(manifest, "A")[0]["tables"].items()}
+    rules = {columns["RAW.S.LICENSES"]["LICENSE_ID"].get("null_unless"), columns["RAW.S.SERVERS"]["INSTALLATION"].get("null_unless")}
+    assert rules == {"HASH(({{SERVER_ID}})::VARCHAR) % 2 = 0", "HASH(({{ID}})::VARCHAR) % 2 = 1"}, columns
