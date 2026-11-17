@@ -300,7 +300,8 @@ def test_a_snapshot_keeps_a_column_its_model_no_longer_writes():
                emu=type("Emu", (), {"duck": Duck()})())
     f.passthrough = lambda fq: None
     assert f.blameable("SNAP.S.ARR") and f.blame("SNAP.S.ARR", "BILLING_COUNTRY")
-    assert f.existing["SNAP.S.ARR"] == {"columns": {"ID": "BIGINT", "DBT_VALID_TO": "TIMESTAMP", "BILLING_COUNTRY": "VARCHAR"}, "as": "table"}
+    assert f.existing["SNAP.S.ARR"] == {"columns": {"ID": "BIGINT", "DBT_VALID_TO": "TIMESTAMP", "BILLING_COUNTRY": "VARCHAR"}, "as": "table",
+                                        "keeps": ["BILLING_COUNTRY"]}  # what a fresh build of the snapshot gets back
 
 
 def test_a_built_union_passes_what_its_children_read_to_the_tables_it_lists(tmp_path):

@@ -587,6 +587,12 @@ from d
 where _loaded > $after and _loaded <= $until{grain}"""
 
 
+def kept_columns(rel: dict) -> dict[str, str]:
+    """`existing: {X: {columns: ..., keeps: [A, B]}}`: the columns X has from before, with their types."""
+    columns = rel.get("columns") or {}
+    return {c: columns[c] for c in rel.get("keeps") or [] if c in columns}
+
+
 def existing_view(name: str, columns: dict[str, str], replace: bool = False, table: bool = False) -> str:
     """An empty relation standing for one that exists before the run (the spec's `existing:`).
     A table once its full shape is known, so an incremental model finds what it would in production."""
@@ -663,7 +669,8 @@ class Warehouse:
                 kind = self.cur.execute("select table_type from information_schema.tables where table_catalog = ? and "
                                         "table_schema = ? and table_name = ?", [db, schema, name.split(".")[2]]).fetchone()
                 if kind is None:  # the project has not built it yet in this warehouse
-                    emulator.stand_in(self.cur, name, existing_view(name, rel.get("columns") or {}, table=rel.get("as") == "table"))
+                    emulator.stand_in(self.cur, name, existing_view(name, rel.get("columns") or {}, table=rel.get("as") == "table"),
+                                      keeps=kept_columns(rel))
         self.now = until
         if self.emu.db_path:  # `fauxflake query` reads the clock back from here
             (Path(self.emu.db_path) / "fauxflake.json").write_text(json.dumps({"now": until.isoformat()}))

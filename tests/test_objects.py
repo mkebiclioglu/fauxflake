@@ -790,3 +790,15 @@ def test_merge_refuses_two_source_rows_for_one_target_row(run):
         "when matched and s.go then update set name = s.name")
     run("merge into mg t using (select 3 id union all select 3) s on t.id = s.id when matched then delete")
     assert run("select * from mg order by id") == [(1, "x"), (2, "p")]
+
+
+def test_a_snapshot_keeps_columns_from_before_when_it_is_built_anew(run):
+    """`existing: {S: {columns: ..., as: table, keeps: [OLD]}}`: dbt cannot see the stand-in and creates the snapshot
+    itself; the columns production still has from an earlier version of the model are there afterwards, empty."""
+    from fauxflake.generate import existing_view, kept_columns
+
+    rel = {"columns": {"ID": "BIGINT", "NAME": "VARCHAR", "OLD_REGION": "VARCHAR"}, "as": "table", "keeps": ["OLD_REGION"]}
+    emulator.stand_in(run.emu.duck, "ANALYTICS.CI.SNAP", existing_view("ANALYTICS.CI.SNAP", rel["columns"], table=True), keeps=kept_columns(rel))
+    assert run("show tables like 'SNAP'") == []  # hidden from dbt, as any stand-in
+    run("create or replace transient table ANALYTICS.CI.SNAP as (select 1 as id, 'a' as name)")
+    assert run("select id, name, old_region from snap") == [(1, "a", None)]
