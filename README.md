@@ -36,7 +36,7 @@ them, and every other test is enforced.
 
 | measured | result |
 | --- | --- |
-| 309 queries whose answers were recorded on real Snowflake | 309 match |
+| 379 queries whose answers were recorded on real Snowflake | 379 match |
 | 14 third-party packages (973 models) built here and on Snowflake, compared row for row | 944 identical, 22 differ only because they read the clock, 7 differ in an order Snowflake leaves undefined or hold `RANDOM()` values |
 | dbt-utils, dbt-expectations, dbt-date, dbt_artifacts, Snowplow and The Tuva Project run against their own test suites | all 2,098 models and tests pass |
 
@@ -261,7 +261,7 @@ When the emulator does not know a statement it fails at once with a message that
 Everything here was run; the commands are in this repo.
 
 **1. Answers recorded from Snowflake.** [`conformance/cases.yml`](conformance/cases.yml) holds
-309 small queries. `fauxflake conformance --connection <name>` runs them on real Snowflake
+379 small queries. `fauxflake conformance --connection <name>` runs them on real Snowflake
 and stores the answers; CI replays them against the emulator with no Snowflake access. A case
 that stops matching fails CI.
 
@@ -332,8 +332,13 @@ from at-least-once loaders and out-of-order updates appear without being scripte
 - **External functions, and Java or Scala handlers, return NULL** with a warning: they call
   services or runtimes that are not here. A Python function whose packages are not installed
   does the same. Give them a stand-in under `udfs`.
-- **It is more lenient in a few places.** `DATE_TRUNC` and `YEAR` accept a text column here
-  and are rejected by Snowflake. A cheap stage on Snowflake closes this:
+- **It refuses what Snowflake refuses to compile, with a few exceptions.** `YEAR(text_column)`,
+  `DATE_TRUNC` or `LAST_DAY` on text, `TO_CHAR(text, 'YYYY')`, `where a_number`, `IFF(text, ...)`,
+  `a_date - 'text'` and two columns of one name in a table or view fail here with Snowflake's
+  error, and text is read as a date or number where Snowflake reads it (`ADD_MONTHS`,
+  `COALESCE(text_column, 0)`). Still accepted here and not there: `HOUR` of a `DATE`,
+  `ARRAY_SIZE` of text holding JSON, a date minus a timestamp, and a `FLOAT` added to a date.
+  A cheap stage on Snowflake closes what is left:
   `dbt build --empty --select state:modified+` type-checks changed models and scans no rows.
 - **It says nothing about performance or cost.** Query plans, pruning and warehouse sizing
   cannot be learned from DuckDB.
