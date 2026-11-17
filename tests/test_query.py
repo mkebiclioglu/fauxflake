@@ -21,6 +21,11 @@ def test_query_reads_a_kept_warehouse(tmp_path):
     assert clock.exit_code == 0 and clock.output.strip().splitlines()[-2].strip() in ("0", "1"), clock.output
     by_model = runner.invoke(main, ["query", *args, "--project-dir", str(EXAMPLE), "--model", "fct_orders", "--limit", "1"])
     assert by_model.exit_code == 0 and "more not shown" in by_model.output, by_model.output
+    # a file with several statements: each is run and printed
+    two = tmp_path / "two.sql"
+    two.write_text("select 1 as a; -- first\nselect 'x;y' as b;\n")
+    both = runner.invoke(main, ["query", *args, "-f", str(two)])
+    assert both.exit_code == 0 and both.output.count("(1 row)") == 2 and "x;y" in both.output, both.output
     # any dbt command runs against the kept warehouse, without regenerating or rebuilding
     one = runner.invoke(main, ["dbt", *args, "--project-dir", str(EXAMPLE), "test", "-s", "fct_orders"])
     assert one.exit_code == 0 and "generated" not in one.output, one.output

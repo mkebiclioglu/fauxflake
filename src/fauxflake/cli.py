@@ -331,23 +331,33 @@ def query(spec_path, project_dir, db_path, schema, limit, sql_file, model, sql):
         state = Path(db_path) / "fauxflake.json"
         if state.exists():  # the simulated time of the run that built this warehouse
             emulator.FROZEN_NOW = datetime.fromisoformat(json.loads(state.read_text())["now"])
+        from io import StringIO
+
+        from snowflake.connector.util_text import split_statements
+
+        # a file may hold several statements: each is run in turn, and each result is printed
+        statements = [text.strip().rstrip(";") for text, _ in split_statements(StringIO(sql), remove_comments=True)]
+        statements = [text for text in statements if text.strip()] or [sql.strip().rstrip(";")]
         conn = snowflake.connector.connect(**emu.connect_kwargs(database=database, schema=schema.upper()))
         cur = conn.cursor()
-        try:
-            cur.execute(sql.strip().rstrip(";"))
-        except snowflake.connector.errors.ProgrammingError as e:
-            conn.close()
-            raise click.ClickException(str(e)) from e
-        names = [d[0] for d in cur.description or []]
-        rows = [["" if v is None else str(v) for v in row] for row in cur.fetchmany(limit)]
-        more = cur.fetchone() is not None
+        results = []
+        for statement in statements:
+            try:
+                cur.execute(statement)
+            except snowflake.connector.errors.ProgrammingError as e:
+                conn.close()
+                raise click.ClickException(str(e)) from e
+            names = [d[0] for d in cur.description or []]
+            rows = [["" if v is None else str(v) for v in row] for row in cur.fetchmany(limit)]
+            results.append((names, rows, cur.fetchone() is not None))
         conn.close()
-    widths = [min(60, max(len(n), *(len(r[i]) for r in rows))) if rows else len(n) for i, n in enumerate(names)]
-    click.echo("  ".join(n.ljust(w) for n, w in zip(names, widths)))
-    click.echo("  ".join("-" * w for w in widths))
-    for row in rows:
-        click.echo("  ".join(v[:60].ljust(w) for v, w in zip(row, widths)))
-    click.echo(f"({len(rows)} row{'s' if len(rows) != 1 else ''}{', more not shown' if more else ''})")
+    for names, rows, more in results:
+        widths = [min(60, max(len(n), *(len(r[i]) for r in rows))) if rows else len(n) for i, n in enumerate(names)]
+        click.echo("  ".join(n.ljust(w) for n, w in zip(names, widths)))
+        click.echo("  ".join("-" * w for w in widths))
+        for row in rows:
+            click.echo("  ".join(v[:60].ljust(w) for v, w in zip(row, widths)))
+        click.echo(f"({len(rows)} row{'s' if len(rows) != 1 else ''}{', more not shown' if more else ''})")
 
 
 @main.command()
