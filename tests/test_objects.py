@@ -731,3 +731,15 @@ def test_ratio_to_report_is_null_when_the_total_is_zero(run):
     run("insert into sizes values (1, 0), (1, 0), (2, 1), (2, 3)")
     assert run("select day, gb, ratio_to_report(gb) over (partition by day) from sizes order by day, gb") == [
         (1, 0.0, None), (1, 0.0, None), (2, 1.0, 0.25), (2, 3.0, 0.75)]
+
+
+def test_a_snapshot_keeps_columns_from_before_when_it_is_built_anew(run):
+    """`existing: {S: {columns: ..., as: table, keeps: [OLD]}}`: dbt cannot see the stand-in and creates the snapshot
+    itself; the columns production still has from an earlier version of the model are there afterwards, empty."""
+    from fauxflake.generate import existing_view, kept_columns
+
+    rel = {"columns": {"ID": "BIGINT", "NAME": "VARCHAR", "OLD_REGION": "VARCHAR"}, "as": "table", "keeps": ["OLD_REGION"]}
+    emulator.stand_in(run.emu.duck, "ANALYTICS.CI.SNAP", existing_view("ANALYTICS.CI.SNAP", rel["columns"], table=True), keeps=kept_columns(rel))
+    assert run("show tables like 'SNAP'") == []  # hidden from dbt, as any stand-in
+    run("create or replace transient table ANALYTICS.CI.SNAP as (select 1 as id, 'a' as name)")
+    assert run("select id, name, old_region from snap") == [(1, "a", None)]

@@ -346,10 +346,19 @@ def _record_semi_types(cursor) -> None:  # noqa: ANN001
         pass
 
 
-def stand_in(duck, name: str, statement: str) -> None:  # noqa: ANN001
-    """Create a stand-in with `statement` and keep it out of SHOW OBJECTS / TABLES / VIEWS."""
+KEPT: dict[str, dict[str, str]] = {}  # relation -> the columns (and types) it keeps whatever builds it
+
+
+def stand_in(duck, name: str, statement: str, keeps: dict[str, str] | None = None) -> None:  # noqa: ANN001
+    """Create a stand-in with `statement` and keep it out of SHOW OBJECTS / TABLES / VIEWS. `keeps`: columns the
+    relation has in production from an earlier life (a snapshot whose model stopped writing them); the project's
+    own build of it gets them back, empty, since dbt cannot see the stand-in and builds the relation anew."""
     duck.execute(statement)
     name = name.replace('"', "").upper()
+    if keeps:
+        KEPT[name] = dict(keeps)
+    else:
+        KEPT.pop(name, None)
     if name not in STANDINS:
         STANDINS.add(name)
         duck.execute(f"insert into {_STANDINS_TABLE} values (?)", [name])
@@ -438,6 +447,10 @@ def _variant_takes_text(cursor, tree: exp.Expression) -> None:  # noqa: ANN001
 def _built(cursor, fq: str) -> None:  # noqa: ANN001
     STANDINS.discard(fq)
     cursor._duck_conn.execute(f"delete from {_STANDINS_TABLE} where name = ?", [fq])
+    for column, kind in KEPT.get(fq, {}).items():
+        with contextlib.suppress(duckdb.Error):  # (a view, or the column is written again: nothing to add)
+            cursor._duck_conn.execute('alter table ' + ".".join(f'"{part}"' for part in fq.split(".")) +
+                                      f' add column if not exists "{column}" {kind}')
 
 
 def run_guarded(cursor, work, limit: float | None = None) -> None:  # noqa: ANN001

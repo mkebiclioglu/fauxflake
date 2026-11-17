@@ -379,8 +379,9 @@ class Fitter:
         duck.execute(f"drop {'view' if kind and kind[0] == 'VIEW' else 'table'} if exists {quoted(fq)}")
         duck.execute(f'alter table {built} rename to "{fq.split(".")[2]}"')
         columns = {r[0]: r[1] for r in duck.execute(f"describe {quoted(fq)}").fetchall()}
-        if self.existing[fq] != {"columns": columns, "as": "table"}:
-            self.existing[fq] = {"columns": columns, "as": "table"}
+        keeps = {"keeps": self.existing[fq]["keeps"]} if self.existing[fq].get("keeps") else {}
+        if self.existing[fq] != {"columns": columns, "as": "table", **keeps}:
+            self.existing[fq] = {"columns": columns, "as": "table", **keeps}
             self.learned.append(f"{fq}: built once; later runs start from an empty table with its {len(columns)} columns.")
 
     def reads_itself_before_it_exists(self, uid: str, fq: str, message: str) -> bool:
@@ -1348,7 +1349,9 @@ class Fitter:
                 self.emu.duck.execute(f'alter table {quoted(fq)} add column if not exists "{name}" {columns[name]}')
             except Exception:  # noqa: BLE001, S110
                 pass
-        self.existing[fq] = {"columns": columns, "as": "table"}
+        keeps = sorted({*((self.existing.get(fq) or {}).get("keeps") or []), col, *also})
+        self.existing[fq] = {"columns": columns, "as": "table", "keeps": keeps}
+        emulator.KEPT[fq] = {c: columns[c] for c in keeps if c in columns}
         col = ", ".join([col, *also[:5]]) + (" ..." if len(also) > 5 else "")
         self.learned.append(f"{fq}: {col} is read from this snapshot and the model it snapshots no longer writes it; "
                             f"the snapshot table starts out with the column, as it does where it has history.")
@@ -1424,6 +1427,8 @@ class Fitter:
             self.pending[fq][col] = duck_type(guess(col, None))
             self.create_pending(fq)
             return True
+        if fq in self.existing and self._is_snapshot(fq) and self.kept_by_snapshot(fq, col):
+            return True  # (the snapshot is built and lacks it: the note in the spec alone does not put it there)
         if fq in self.existing:
             columns = self.existing[fq].setdefault("columns", {})
             added = col not in columns
@@ -3150,7 +3155,7 @@ class Fitter:
                 # a full round is the build a fresh warehouse gives (what `fauxflake build` will run): what the
                 # round before left behind goes, and relations the project reads before building them
                 # start empty again
-                from .generate import existing_view
+                from .generate import existing_view, kept_columns
 
                 for node in self.nodes.values():
                     if node.get("resource_type") in ("model", "snapshot", "seed") and node.get("relation_name") \
@@ -3163,7 +3168,8 @@ class Fitter:
                 for fq, rel in self.existing.items():
                     try:
                         self.emu.ensure_database(*fq.split(".")[:2])
-                        emulator.stand_in(self.emu.duck, fq, existing_view(fq, rel.get("columns") or {}, table=rel.get("as") == "table"))
+                        emulator.stand_in(self.emu.duck, fq, existing_view(fq, rel.get("columns") or {}, table=rel.get("as") == "table"),
+                                          keeps=kept_columns(rel))
                     except Exception:  # noqa: BLE001, S110
                         pass
             # for working on the fitter: FAUXFLAKE_FIT_SELECT="+model_a +model_b" builds only those
@@ -3176,7 +3182,7 @@ class Fitter:
             else:
                 # a model that failed and reads its own table: what the round before left of it has the columns of
                 # then. It starts again from the empty relation, which has the ones learned since.
-                from .generate import existing_view
+                from .generate import existing_view, kept_columns
 
                 # and so does every incremental model the round rebuilds: the rows an earlier round left in it were
                 # made from data the spec has changed since
@@ -3196,7 +3202,8 @@ class Fitter:
                     if fq in self.existing:
                         try:
                             emulator.stand_in(self.emu.duck, fq, existing_view(fq, self.existing[fq].get("columns") or {},
-                                                                               table=self.existing[fq].get("as") == "table"))
+                                                                               table=self.existing[fq].get("as") == "table"),
+                                              keeps=kept_columns(self.existing[fq]))
                         except Exception:  # noqa: BLE001, S110
                             pass
             results_path.unlink(missing_ok=True)

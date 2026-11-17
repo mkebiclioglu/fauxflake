@@ -305,7 +305,7 @@ distributions with measurements from production, reading aggregates only.
 | --- | --- |
 | `tables` | one entry per source table: `volume`, `lateness`, `duplicate_rate`, `mode: upsert`, and a generator per column |
 | column generators | `sequence`, `hash_id`, `fk`, `categorical`, `dist`, `template`, `pool`, `time_offset`, `event_time`, `updated_at`, `loaded_at`, `lifecycle`, `object`, `array`, `ip`, `constant`; any column takes `null_rate` and `type` |
-| `existing` | relations the project reads before it builds them; they start each run empty |
+| `existing` | relations the project reads before it builds them; they start each run empty. `keeps` lists columns a snapshot table still has from an earlier version of its model |
 | `udfs` | stand-ins, in DuckDB SQL, for functions that exist only in your account |
 | `locations` | cloud storage prefixes that `COPY INTO` should read from a local directory instead |
 | `dbt` | `database`, `target` (the name `target.name` sees), `role`, `env` (placeholders for environment variables), `expected_failures` |
