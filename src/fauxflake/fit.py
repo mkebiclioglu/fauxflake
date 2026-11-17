@@ -91,6 +91,35 @@ class _Readings:
         return self.latest.locate(node_id, column) or (self.earlier.locate(node_id, column) if self.earlier is not None else None)
 
 
+_MADE_UP_NUMBER = re.compile(r"Could not convert string '[a-z][a-z0-9_]*_[0-9a-f]{12}' to (?:DOUBLE|FLOAT|INT\d+|DECIMAL)")
+_NUMBER_OF = (exp.Sum, exp.Avg, exp.Max, exp.Min, exp.Abs, exp.Round, exp.Floor, exp.Ceil, exp.Nullif, exp.AnyValue, exp.Window,
+              exp.Paren, exp.Cast, exp.TryCast, exp.Neg)
+
+
+def _number_flow(node: exp.Expression, depth: int = 0) -> list[exp.Column]:
+    """The columns whose values make up a number written as `node`: the operands of a product or a quotient, what
+    COALESCE, IFF and CASE give back (not what they test), the argument of SUM, MAX, ROUND and their kind. Not the
+    sides of + and - (two dates subtract to a number) and not the arguments of other functions."""
+    if depth > 12 or node is None:
+        return []
+    if isinstance(node, exp.Column):
+        return [node]
+    if isinstance(node, (exp.Mul, exp.Div)):
+        return _number_flow(node.this, depth + 1) + _number_flow(node.expression, depth + 1)
+    if isinstance(node, exp.Coalesce):
+        return [c for e in [node.this, *node.expressions] for c in _number_flow(e, depth + 1)]
+    if isinstance(node, exp.If):
+        return _number_flow(node.args.get("true"), depth + 1) + _number_flow(node.args.get("false"), depth + 1)
+    if isinstance(node, exp.Case):
+        values = [branch.args.get("true") for branch in node.args.get("ifs") or []] + [node.args.get("default")]
+        return [c for e in values for c in _number_flow(e, depth + 1)]
+    if isinstance(node, _NUMBER_OF):
+        return _number_flow(node.this, depth + 1)
+    if isinstance(node, exp.Anonymous) and node.name.upper() in ("ZEROIFNULL", "NVL", "IFNULL", "NULLIFZERO", "DIV0", "DIV0NULL"):
+        return [c for e in node.expressions for c in _number_flow(e, depth + 1)]
+    return []
+
+
 def _numeric_columns(tree: exp.Expression, known: tuple[str, ...] = ()) -> set[str]:
     """Columns a query uses as numbers: added up, averaged, multiplied, cast to a number, compared with a number,
     or given a number to fall back on (`coalesce(posts, 0)`)."""
@@ -2446,11 +2475,50 @@ class Fitter:
         self.learned.append(f"{fq}.{name}: declared a document, but the model writes text into it; declared VARCHAR.")
         return True
 
+    def numbers_upstream(self, sql_key: str) -> bool:
+        """Made-up text met a number in this model. The error names one column, and a wide model (sixty sums over
+        a snapshot of opportunities) would learn the others one build at a time. What the model and the models
+        before it use as numbers is known from their SQL; followed back through the names they are given
+        (`amount * probability as weighted`, `coalesce(arr, 0) as arr`), the source columns that nothing is
+        known about yet are numbers too, all in this round."""
+        uids = [u for u in [sql_key, *sorted(self._ancestors(sql_key))] if u == sql_key or u.startswith(("model.", "snapshot."))]
+        trees = [t for t in (self.tree(u) for u in uids) if t is not None]
+        made: dict[str, list[exp.Expression]] = {}
+        seeds: set[str] = set()
+        for tree in trees:
+            seeds |= _numeric_columns(tree)
+            seeds |= {c.name.upper() for node in tree.find_all(exp.Sum, exp.Avg, exp.Mul, exp.Div) for c in _number_flow(node)}
+            for alias in tree.find_all(exp.Alias):
+                made.setdefault(alias.alias.upper(), []).append(alias.this)
+        names, pile = set(), list(seeds)
+        while pile and len(names) < 5000:
+            name = pile.pop()
+            if name in names:
+                continue
+            names.add(name)
+            for inner in made.get(name, []):
+                pile += [c.name.upper() for c in _number_flow(inner) if c.name.upper() not in names]
+        changed = False
+        for table in self.sources_of(sql_key):
+            columns = self.tables[table].get("columns") or {}
+            for name in sorted(names & set(columns)):
+                gen = columns[name]
+                if gen.get("gen") == "template" and gen.get("template") == f"{name.lower()}_{{hex}}" and not gen.get("templates"):
+                    columns[name] = guess(name, "DOUBLE")
+                    self.retyped.add(table)
+                    self.learned.append(f"{table}.{name}: used as a number by the models that read it; retyped as DOUBLE.")
+                    changed = True
+        self.dirty |= changed
+        return changed
+
     def learn(self, sql_key: str, message: str) -> bool:
         """Apply whatever one error message teaches. True when the spec changed."""
         watch = os.environ.get("FAUXFLAKE_FIT_WATCH")  # for working on the fitter: TABLE.COLUMN, whose changes are written down
         if not watch:
-            return self._learn(sql_key, message)
+            done = self._learn(sql_key, message)
+            if done and _MADE_UP_NUMBER.search(message):
+                self.numbers_upstream(sql_key)
+            return done
         table, column = watch.upper().rsplit(".", 1)
         before = copy.deepcopy((self.tables.get(table, {}).get("columns") or {}).get(column))
         done = self._learn(sql_key, message)
