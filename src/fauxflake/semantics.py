@@ -1723,6 +1723,7 @@ _DATE_CALLS = {"date_diff", "datediff", "date_add", "date_sub", "date_trunc", "d
                "dayofweek", "dayofyear", "dayofmonth", "hour", "minute", "second", "epoch", "weekofyear", "isodow",
                "yearweek", "time_bucket", "age", "isoyear", "millisecond", "microsecond", "epoch_us", "epoch_ns",
                "julian", "weekday", "century", "decade", "era", "extract"}
+_DAYS_AS = re.compile(r"BIGINT|HUGEINT|UBIGINT|UINTEGER|UHUGEINT|DECIMAL|DOUBLE|FLOAT")  # numbers DuckDB will not add to a date
 _NUMBERS_AT = {"repeat": (1,), "lpad": (1,), "rpad": (1,), "substring": (1, 2), "substr": (1, 2), "left": (1,), "right": (1,)}
 _TEXT_TYPES = {"VARCHAR", "STRING_LITERAL"}
 _DATE_TYPES = ("INTERVAL", "DATE", "TIMESTAMP", "TIME")
@@ -1815,6 +1816,17 @@ def _repair(tree: exp.Expression, text: str, details: dict) -> bool:
                     child.replace(exp.cast(child.copy(), wanted))
                     done = True
             if done:
+                return True
+        return False
+    if name in ("+", "-") and len(raw) == 2 and "DATE" in raw and any(_DAYS_AS.match(t) for t in raw):
+        # a_date - row_number() over (...), a_date + count(*), a_date - 2.5: Snowflake adds whole days (2.5 is 3).
+        # DuckDB adds only an INTEGER to a date.
+        for node in tree.find_all(exp.Add, exp.Sub):
+            sql, left = node.sql(dialect="duckdb"), node.this.sql(dialect="duckdb")
+            if text.startswith(sql, pos) or text.startswith(sql, pos - len(left) - 1):
+                for side, kind in zip((node.this, node.expression), raw):
+                    if _DAYS_AS.match(kind):
+                        side.replace(exp.cast(exp.Round(this=exp.paren(side.copy())), "integer"))
                 return True
         return False
     if "VARCHAR" not in types:
@@ -2373,6 +2385,8 @@ def _repair_by_types(tree: exp.Expression, conn, details: dict) -> bool:  # noqa
     sign = re.search(r"argument types '([-+*/%])\(", details.get("exception_message", ""))
     if not sign or sign.group(1) not in _OPERATORS_BY_SIGN:
         return False
+    days = re.search(r"argument types '[-+]\((.+?)\)'", details.get("exception_message", ""))
+    days = bool(days) and "DATE" in _call_types("f(" + days.group(1) + ")") and any(_DAYS_AS.match(t) for t in _call_types("f(" + days.group(1) + ")"))
     kinds, done = _OPERATORS_BY_SIGN[sign.group(1)], False
     for select in list(tree.find_all(exp.Select)):
         # innermost first: `(a * text) * 2` cannot be asked about until `a * text` is repaired
@@ -2397,6 +2411,12 @@ def _repair_by_types(tree: exp.Expression, conn, details: dict) -> bool:  # noqa
             continue
         for i, n in enumerate(nodes):
             left, right = described[2 * i][1], described[2 * i + 1][1]
+            if days:
+                for side, kind, other in ((n.this, left, right), (n.expression, right, left)):
+                    if other == "DATE" and _DAYS_AS.match(kind):
+                        side.replace(exp.cast(exp.Round(this=exp.paren(side.copy())), "integer"))
+                        done = True
+                continue
             _refuse_arithmetic(sign.group(1), [n.this, n.expression], [left, right])
             for side, kind, other in ((n.this, left, right), (n.expression, right, left)):
                 if kind == "VARCHAR" and other != "VARCHAR":

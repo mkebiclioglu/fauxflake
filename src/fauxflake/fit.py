@@ -2475,6 +2475,17 @@ class Fitter:
             return True
         if re.search(r"Function \w+ does not support (VARCHAR|VARIANT)\S* argument type", message) and self.dates_only(sql_key):
             return True
+        # Snowflake takes only a BOOLEAN where a condition stands, and does not read text as a date beside + or -.
+        # The emulator's wording of those errors names the expression: when it is a column, that is its type.
+        condition = re.search(r"for predicate \[(.+?)\]\s*$|Can not convert parameter '(.+?)' of type \[\w+.*?\] into expected type "
+                              r"\[BOOLEAN\]|\(the condition: (.+?)\)\s*$", message, re.M)
+        column = next((g for g in condition.groups() if g), "") if condition else ""
+        if re.fullmatch(r'(?:[\w$]+\.)*"?[\w$]+"?', column) and self.retype_column(sql_key, column.split(".")[-1].strip('"').upper(), "BOOLEAN"):
+            return True
+        beside = re.search(r"Invalid argument types for function '[-+]': \((.+)\)\s*\n\(the text: (.+?)\)\s*$", message, re.M)
+        if beside and re.fullmatch(r'(?:[\w$]+\.)*"?[\w$]+"?', beside.group(2)) and self.retype_column(
+                sql_key, beside.group(2).split(".")[-1].strip('"').upper(), "TIMESTAMP" if "TIMESTAMP" in beside.group(1) else "DATE"):
+            return True
         named = _FROM_COLUMN.search(message)
         bad = _BAD_CAST.search(message)
         if bad and named and bad.group("from").startswith(("TIMESTAMP", "DATE")) and re.match(r"DECIMAL|DOUBLE|BIGINT|INTEGER|HUGEINT", bad.group("to")):

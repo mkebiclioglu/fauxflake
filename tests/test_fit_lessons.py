@@ -714,3 +714,15 @@ def test_snowflake_refusing_text_in_a_date_part_function_types_every_such_column
     f.retype_column = lambda uid, name, hint, *a, **k: asked.append((name, hint)) or True
     assert f._learn("m", "002016 (22000): SQL compilation error:\nFunction EXTRACT does not support VARCHAR(134217728) argument type")
     assert asked == [("A", "TIMESTAMP"), ("B", "TIMESTAMP")]
+
+
+def test_snowflake_refusing_a_condition_or_date_arithmetic_types_the_column():
+    f = fitter(trees={"m": parse("select 1 from t")})
+    asked = []
+    f.retype_column = lambda uid, name, hint, *a, **k: asked.append((name, hint)) or True
+    assert f._learn("m", "002034 (22000): SQL compilation error:\nInvalid data type [VARCHAR(134217728)] for predicate [IS_DELETED]")
+    assert f._learn("m", "001038 (22023): SQL compilation error:\nCan not convert parameter 't.ACTIVE' of type [NUMBER(38,0)] into expected type [BOOLEAN]")
+    assert f._learn("m", "001044 (42P13): SQL compilation error:\nInvalid argument types for function 'IFF': (VARCHAR(134217728), ...)\n(the condition: WON)")
+    assert f._learn("m", "001044 (42P13): SQL compilation error:\nInvalid argument types for function '-': (DATE, VARCHAR(134217728))\n(the text: CLOSED_ON)")
+    assert f._learn("m", "001044 (42P13): SQL compilation error:\nInvalid argument types for function '-': (VARCHAR(134217728), TIMESTAMP_NTZ(9))\n(the text: a.SEEN)")
+    assert asked == [("IS_DELETED", "BOOLEAN"), ("ACTIVE", "BOOLEAN"), ("WON", "BOOLEAN"), ("CLOSED_ON", "DATE"), ("SEEN", "TIMESTAMP")]

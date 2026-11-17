@@ -370,3 +370,8 @@
 - {id: strict_count_if_number, sql: "select count_if(n) from (select 1 n)"}
 - {id: conditions_that_are_boolean, sql: "select iff(b, 1, 0), case when b then 1 else 0 end, count_if(b) over (), iff(n and true, 1, 0), iff(not n, 1, 0), iff(null, 1, 0), iff(v:a::boolean, 1, 0), iff(n = true, 1, 0), iff(n::boolean, 1, 0) from (select true b, 1 n, parse_json('{\"a\": true}') v) where b and (n and true) qualify b"}
 - {id: null_column_as_condition, sql: "select iff(b, 1, 0) from (select null as b) where b is null"}
+- {id: date_plus_any_whole_number, sql: "select d - n, d + n, n + d, d - m, d + m, -n + d, d - -n from (select '2024-01-09'::date d, 5::bigint n, 5::number(38,0) m)"}
+- {id: date_plus_fractions_rounds, sql: "select d - n, d + n, d - 1.0, d - (k / 2), d + k * 2, d - 0.5, d + 0.4 from (select '2024-01-09'::date d, 2.5 n, 5 k)"}
+- {id: date_minus_window_counts, sql: "select d - sum(n) over (), d + count(*) over (), d - datediff(day, d, d), d + length('ab'), d - row_number() over (order by d) from (select '2024-01-09'::date d, 5 n)"}
+- {id: date_arithmetic_inside_aggregates, sql: "select max(d - n), min(d + n * 1.0), sum(case when d - n > '2024-01-01'::date then 1 else 0 end) from (select '2024-01-09'::date d, 5::bigint n)"}
+- {id: gaps_and_islands_by_date, sql: "select d - row_number() over (partition by g order by d) as island, count(*) over () from (select column1::date d, column2 g from values ('2024-01-01', 1), ('2024-01-02', 1), ('2024-01-05', 1)) order by 1"}
