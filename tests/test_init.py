@@ -933,3 +933,11 @@ def test_a_time_matched_with_a_calendar_day_is_a_whole_day():
                "days as (select date_day from A.B.DIM_DATE) "
                "select * from pings inner join days on ping_date = date_day", uses, None, [], [])
     assert uses["RAW.P.PINGS"].whole_days == {"PING_DATE"}
+
+
+def test_the_id_a_column_falls_back_to_is_recorded():
+    from fauxflake.init import scan_model, SourceUse
+
+    uses = {"RAW.G.NAMESPACES": SourceUse()}
+    scan_model("select id, coalesce(plan_id, 34) as plan_id, coalesce(seats, 0) as seats from RAW.G.NAMESPACES", uses)
+    assert uses["RAW.G.NAMESPACES"].fallbacks == {"PLAN_ID": {34}}

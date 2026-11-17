@@ -61,6 +61,7 @@ class SourceUse:
         # column -> texts and LIKE patterns asked of the columns it is lined up with in a UNION
         self.united: dict[str, dict[str, set[str]]] = {"literals": {}, "patterns": {}}
         self.whole_days: set[str] = set()  # time columns matched with a calendar's day (`on ping_date = date_day`)
+        self.fallbacks: dict[str, set[int]] = {}  # column -> the id it is given when it has none (`coalesce(plan_id, 34)`)
         self.equals: dict[str, set[int]] = {}  # column -> whole numbers the SQL asks for by name (`project_id = 278964`, `in (1, 2)`)
         self.scales: dict[tuple[str, str], int] = {}  # (column, path in its document) -> digits of an epoch number below the second
         self.splits: dict[str, dict] = {}  # text column -> {"seps": {"/": {0: "BIGINT"}}, "digits": False} from split()[i]::type
@@ -948,6 +949,10 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                             use.whole_days.add(hit[1])
                 if named_numbers(parent, col):
                     use.equals.setdefault(hit[1], set()).update(named_numbers(parent, col))
+                if isinstance(parent, exp.Coalesce) and parent.this is col and hit[1].endswith("ID"):
+                    # `coalesce(plan_id, 34)`: the plan every row without one is counted under is a plan that exists
+                    use.fallbacks.setdefault(hit[1], set()).update(
+                        int(e.name) for e in parent.expressions if isinstance(e, exp.Literal) and not e.is_string and re.fullmatch(r"[1-9]\d{0,17}", e.name))
                 if isinstance(parent, (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ, exp.Between)):
                     # `where block_number between 9820000 and 10000000`: the numbers that should select something
                     sides = [parent.args.get("low"), parent.args.get("high")] if isinstance(parent, exp.Between) else \
@@ -2194,8 +2199,8 @@ def analyse(manifest: dict, database: str) -> Analysis:
     for name, table in tables.items():
         for col, gen in table["columns"].items():
             kind = gen.get("gen")
-            asked = sorted({*uses[name].literals.get(col, ()), *map(str, uses[name].equals.get(col, ()))}) \
-                if kind in ("fk", "sequence", "hash_id") and name in uses else []
+            asked = sorted({*uses[name].literals.get(col, ()), *map(str, uses[name].equals.get(col, ())),
+                            *map(str, uses[name].fallbacks.get(col, ()))}) if kind in ("fk", "sequence", "hash_id") and name in uses else []
             parent = (table if kind != "fk" else tables.get(str(gen.get("ref", "")).upper())) if asked else None
             key = next((g for g in parent["columns"].values() if g.get("gen") in ("sequence", "hash_id")), None) if parent else None
             if key is None:
