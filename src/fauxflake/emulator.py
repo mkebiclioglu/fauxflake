@@ -1173,8 +1173,30 @@ def _native_functions(duck: duckdb.DuckDBPyConnection) -> None:
     def sha2(text, bits):  # noqa: ANN001, ANN202
         return None if text is None or bits is None else hashlib.new(f"sha{int(bits)}", text.encode()).hexdigest()
 
-    with contextlib.suppress(duckdb.Error):  # already there, in a process that starts a second emulator on one database
-        duck.create_function("_fx_sha2", sha2, ["VARCHAR", "INTEGER"], "VARCHAR", null_handling="special")
+    def json_text(text):  # noqa: ANN001, ANN202
+        """An OBJECT or ARRAY as Snowflake writes it out: keys in order, no spaces, numbers without padding."""
+        if text is None:
+            return None
+        from decimal import Decimal
+
+        def plain(value):  # noqa: ANN001, ANN202
+            if isinstance(value, dict):
+                return {key: plain(value[key]) for key in sorted(value)}
+            if isinstance(value, list):
+                return [plain(v) for v in value]
+            if isinstance(value, Decimal):
+                whole = value.to_integral_value()
+                return int(whole) if whole == value else float(value)
+            return value
+
+        try:
+            return json.dumps(plain(json.loads(text, parse_float=Decimal)), separators=(",", ":"), ensure_ascii=False)
+        except ValueError:
+            return text
+
+    for name, function, kinds in (("_fx_sha2", sha2, ["VARCHAR", "INTEGER"]), ("_fx_json_text", json_text, ["VARCHAR"])):
+        with contextlib.suppress(duckdb.Error):  # already there, in a process that starts a second emulator on one database
+            duck.create_function(name, function, kinds, "VARCHAR", null_handling="special")
 
 
 def _spill_directory(duck: duckdb.DuckDBPyConnection) -> str:
@@ -1224,6 +1246,7 @@ def engine() -> Iterator[Emulator]:
 
     _patch_fakesnow()
     fs = FakeSnow(nop_regexes=NOPS)
+    _native_functions(fs.duck_conn)  # before the macros that call them
     for macro in semantics.MACROS:
         fs.duck_conn.execute(macro)
     semantics.reserved_words(fs.duck_conn)
@@ -1231,7 +1254,6 @@ def engine() -> Iterator[Emulator]:
     _describe_semi_types(fs.duck_conn)
     fs.duck_conn.execute("set global old_implicit_casting = true")  # text compares with numbers and dates, as in Snowflake
     spill = _spill_directory(fs.duck_conn)
-    _native_functions(fs.duck_conn)
     semantics.UDFS.clear()  # functions belong to the emulator that defined them
     semantics.UDTFS.clear()
     _SPEC_UDFS.clear()
@@ -1273,6 +1295,7 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
         for stale in [*Path(db_path).glob("*.db"), *Path(db_path).glob("*.db.wal"), *Path(db_path).glob(objects.FUNCTIONS_FILE)]:
             stale.unlink()  # every run starts from an empty warehouse
     fs = FakeSnow(db_path=db_path, nop_regexes=NOPS)
+    _native_functions(fs.duck_conn)  # before the macros that call them
     for macro in semantics.MACROS:
         fs.duck_conn.execute(macro)
     semantics.reserved_words(fs.duck_conn)
@@ -1280,7 +1303,6 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
     _describe_semi_types(fs.duck_conn)
     fs.duck_conn.execute("set global old_implicit_casting = true")  # text compares with numbers and dates, as in Snowflake
     spill = _spill_directory(fs.duck_conn)
-    _native_functions(fs.duck_conn)
     semantics.UDFS.clear()  # functions belong to the emulator that defined them
     semantics.UDTFS.clear()
     semantics.MIXED_CASE = None

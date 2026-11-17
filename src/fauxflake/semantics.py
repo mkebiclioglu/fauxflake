@@ -28,6 +28,8 @@ MACROS = [
     # argument is only marked here; when DuckDB refuses the statement, `text_as_written` converts the marked
     # arguments that turn out to be text.
     f"create or replace macro {_NS}_sf_reads(x, kind) as x",
+    f"""create or replace macro {_NS}_sf_changes(l) as coalesce(list_sum(list_transform(range(2, len(l) + 1),
+          lambda i: case when l[i] is distinct from l[i - 1] then 1 else 0 end)), 0)""",
     # CONVERT_TIMEZONE(zone, t) with two arguments: the time of day in that zone. A timestamp without a zone (or a
     # date, or text) is the session's time, which is UTC here. (DuckDB's `t AT TIME ZONE zone` on such a timestamp
     # goes the other way: it takes t as that zone's time.)
@@ -112,7 +114,8 @@ MACROS = [
     # show milliseconds, and a VARIANT string loses its JSON quotes.
     f"""create or replace macro {_NS}_sf_text(x) as case
           when typeof(x) in ('DOUBLE', 'FLOAT') then format('{{:.15g}}', x::double)
-          when typeof(x) = 'JSON' then (x::json ->> '$')
+          when typeof(x) = 'JSON' then (case when json_type(x::json) in ('OBJECT', 'ARRAY') then _fx_json_text(x::varchar)
+                                             else x::json ->> '$' end)
           when typeof(x) in ('TIMESTAMP', 'TIMESTAMP_NS', 'TIMESTAMP_MS', 'TIMESTAMP_S')
             then strftime(try_cast(x::varchar as timestamp), '%Y-%m-%d %H:%M:%S.%g')
           when typeof(x) = 'TIMESTAMP WITH TIME ZONE'
@@ -935,6 +938,11 @@ def _fix(node: exp.Expression) -> exp.Expression:
         start = 17 if type(node).__name__ == "MD5NumberLower64" else 1
         return sqlglot.parse_one(f"('0x' || substr(md5(({node.this.sql(dialect='duckdb')})::varchar), {start}, 16))::ubigint::hugeint",
                                  read="duckdb")
+    if type(node).__name__ == "Hll" and node.this is not None:
+        return exp.ApproxDistinct(this=node.this)
+    if isinstance(node, exp.JSONFormat) and not node.args.get("options"):
+        # TO_JSON writes an object's keys in order, as VARIANT::VARCHAR does
+        return exp.Anonymous(this="_fx_json_text", expressions=[exp.cast(exp.Anonymous(this="to_json", expressions=[node.this]), "varchar")])
     if isinstance(node, exp.AddMonths) and not _type_unseen(node.this):
         return _fn("_sf_add_months", node.this, node.expression)
     if isinstance(node, exp.ConvertTimezone) and node.args.get("source_tz") is None and node.args.get("timestamp") is not None:
@@ -1007,6 +1015,9 @@ def _fix(node: exp.Expression) -> exp.Expression:
                 # (NULL when the group's total is zero, as Snowflake documents: not the error a plain `/` gives)
                 total = _over(node, exp.Sum(this=arg.copy()))
                 return _fn("_sf_div", arg.copy(), exp.Nullif(this=total, expression=exp.Literal.number(0)))
+            if name == "conditional_change_event":
+                # how many times the value has changed so far: counted over the values up to this row
+                return _fn("_sf_changes", _over(node, exp.Anonymous(this="list", expressions=[arg.copy()])))
             if name == "conditional_true_event":
                 flag = exp.Case(ifs=[exp.If(this=arg.copy(), true=exp.Literal.number(1))], default=exp.Literal.number(0))
                 return _over(node, exp.Sum(this=flag))
