@@ -899,8 +899,10 @@ def _patch_fakesnow() -> None:
                     for name, remedy in remedies.items():
                         if used[name] >= 2:
                             continue
-                        repaired = remedy(str(e))
-                        _heal(self)
+                        try:
+                            repaired = remedy(str(e))
+                        finally:
+                            _heal(self)
                         if repaired is not None:
                             used[name] += 1  # only a repair that was made counts against its two tries
                             transformed = repaired

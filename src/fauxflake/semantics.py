@@ -18,6 +18,10 @@ _NS = "_fs_global.main."
 _SCALE = r"coalesce(try_cast(nullif(regexp_extract(typeof(a), ',(\d+)\)', 1), '') as integer), 0)"
 
 MACROS = [
+    # Snowflake's date-part functions take dates and times and nothing else: YEAR(text_column) does not compile
+    # there. The argument is passed through this check, which binds only for a date or time (`microsecond`
+    # has no other overloads) and costs nothing when it does: the condition is constant and folds away.
+    f"create or replace macro {_NS}_sf_strict(x, fn) as if(true, x, if(microsecond(x) is null, x, x))",
     # NUMBER / NUMBER keeps max(s, min(s + 6, 12)) decimals and raises on zero.
     # DuckDB returns a full-precision double, and NULL on zero. The failing cast raises without
     # making the expression volatile, so `a / b as r, r * 2` can still reuse the alias.
@@ -1314,7 +1318,84 @@ def rewrite(node: exp.Expression) -> exp.Expression:
         new = rewrite(child)
         if new is not child:
             parent.set(key, new, index)
+    strict = _DATES_ONLY.get(type(node))
+    if strict:
+        for key in strict[1:]:
+            arg = node.args.get(key)
+            if arg is not None and not isinstance(arg, (exp.Null, exp.Placeholder, exp.Parameter)):
+                node.set(key, _fn("_sf_strict", arg, exp.Literal.string(strict[0])))
     return _fix(node)
+
+
+# The functions that compile in Snowflake only on a date, time or timestamp: its name in their error message,
+# and the arguments that must be one. (DATEADD, DATEDIFF, ADD_MONTHS, DAYNAME and the rest read text as a date.)
+_DATES_ONLY: dict[type, tuple[str, ...]] = {
+    **{kind: ("EXTRACT", "this") for kind in (
+        exp.Year, exp.Month, exp.Day, exp.DayOfMonth, exp.DayOfWeek, exp.DayOfWeekIso, exp.DayOfYear, exp.Week,
+        exp.WeekOfYear, exp.Quarter, exp.YearOfWeek, exp.YearOfWeekIso, exp.Hour, exp.Minute, exp.Second)},
+    exp.Extract: ("EXTRACT", "expression"),
+    exp.MonthsBetween: ("EXTRACT", "this", "expression"),
+    exp.LastDay: ("LAST_DAY", "this"),
+    exp.TimestampTrunc: ("DATE_TRUNC", "this"),
+    exp.DateTrunc: ("TRUNC", "this"),
+    exp.TimeSlice: ("TIME_SLICE", "this"),
+}
+_SNOWFLAKE_TYPE = {"VARCHAR": "VARCHAR(134217728)", "STRING_LITERAL": "VARCHAR(134217728)", "JSON": "VARIANT", "BOOLEAN": "BOOLEAN",
+                   "DOUBLE": "FLOAT", "FLOAT": "FLOAT", "BLOB": "BINARY(8388608)"}
+_CHOOSES_A_TYPE = (exp.Coalesce, exp.If, exp.Case, exp.Nvl2, exp.Greatest, exp.Least, exp.Max, exp.Min, exp.Anonymous)
+
+
+def _unwrap_strict(tree: exp.Expression, keep: exp.Expression | None = None) -> None:
+    for marker in [n for n in tree.find_all(exp.Anonymous) if _is(n, "_sf_strict") and n is not keep]:
+        marker.replace(marker.expressions[0])
+
+
+def strict_dates(tree: exp.Expression, conn, params=None) -> bool:  # noqa: ANN001
+    """DuckDB refused an argument of `_sf_strict`: something that is not a date or time was given to a function
+    that takes only those. Raises Snowflake's compilation error for it. Where the argument has no type yet (a
+    NULL) or its type is chosen among several (COALESCE of a text and a date is a date in Snowflake, and text
+    here), the check is taken off instead and True returned."""
+    from snowflake.connector.errors import ProgrammingError
+
+    markers = [n for n in tree.find_all(exp.Anonymous) if _is(n, "_sf_strict")]
+    loosened = False
+    for marker in markers:
+        arg, fn = marker.expressions[0], marker.expressions[1].name
+        if isinstance(arg, exp.Literal) and arg.is_string:
+            kind = "STRING_LITERAL"
+        else:
+            alone = tree.copy()
+            # the same statement with only this check left in it
+            path = []
+            node = marker
+            while node.parent is not None:
+                path.append((node.arg_key, node.index))
+                node = node.parent
+            twin = alone
+            for key, index in reversed(path):
+                twin = twin.args[key] if index is None else twin.args[key][index]
+            _unwrap_strict(alone, keep=twin)
+            text = "explain " + alone.sql(dialect="duckdb")
+            try:
+                conn.execute(text, params) if params else conn.execute(text)
+                continue
+            except Exception as e:  # noqa: BLE001
+                details = _error_details(str(e)) or {}
+                message = details.get("exception_message", "")
+                found = re.search(r"""microsecond\((.*?)\)['"]""", message)
+                if not found:
+                    continue  # this one binds: something else is wrong with the statement
+                kind = found.group(1).strip('"\\')
+        if kind == "NULL" or (isinstance(arg.unnest(), _CHOOSES_A_TYPE) and kind in ("VARCHAR", "JSON")):
+            marker.replace(arg)
+            loosened = True
+            continue
+        named = _SNOWFLAKE_TYPE.get(kind) or ("NUMBER(38,0)" if "INT" in kind else kind.replace("DECIMAL", "NUMBER"))
+        if kind == "STRING_LITERAL":
+            named = f"VARCHAR({len(arg.name)})"
+        raise ProgrammingError(msg=f"SQL compilation error:\nFunction {fn} does not support {named} argument type",
+                               errno=2016, sqlstate="22000")
+    return loosened
 
 
 _AS_BIGINT = {"TINYINT", "SMALLINT", "UTINYINT", "USMALLINT", "UINTEGER"}
@@ -2250,6 +2331,11 @@ def repair_types(transformed: exp.Expression, conn, params=None) -> exp.Expressi
                 return tree if fixed else None
             except Exception as e:  # noqa: BLE001
                 details = _error_details(str(e))
+                if details and "microsecond(" in details.get("exception_message", ""):
+                    conn.execute("set errors_as_json = true")
+                    if strict_dates(tree, conn, params):  # or raises what Snowflake says
+                        fixed += 1
+                        continue
                 if details and details.get("position"):
                     details["position"] = int(details["position"]) - len("explain ")
                 elif details and _repair_by_types(tree, conn, details):
