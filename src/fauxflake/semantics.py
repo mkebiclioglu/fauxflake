@@ -22,6 +22,26 @@ MACROS = [
     # there. The argument is passed through this check, which binds only for a date or time (`microsecond`
     # has no other overloads) and costs nothing when it does: the condition is constant and folds away.
     f"create or replace macro {_NS}_sf_strict(x, fn) as if(true, x, if(microsecond(x) is null, x, x))",
+    # The opposite case: ADD_MONTHS(text_column, 1) compiles in Snowflake, which reads the text as a date. The
+    # argument is only marked here; when DuckDB refuses the statement, `text_as_written` converts the marked
+    # arguments that turn out to be text.
+    f"create or replace macro {_NS}_sf_reads(x, kind) as x",
+    # ADD_MONTHS keeps the type it is given (a date stays a date) and the last day of a month stays the last
+    # day, with the time of day kept. Text is read as a timestamp.
+    f"""create or replace macro {_NS}_sf_add_months_typed
+          (d date, n) as (case when last_day(d) = d then last_day(d + to_months(round(n)::integer))
+                               else (d + to_months(round(n)::integer))::date end),
+          (t timestamp, n) as (case when last_day(t) = t::date
+                                    then last_day(t + to_months(round(n)::integer))::timestamp + (t - date_trunc('day', t))
+                                    else t + to_months(round(n)::integer) end),
+          (t timestamptz, n) as (case when last_day(t) = t::date
+                                      then (last_day(t + to_months(round(n)::integer))::timestamp + (t - date_trunc('day', t)))::timestamptz
+                                      else t + to_months(round(n)::integer) end)""",
+    f"""create or replace macro {_NS}_sf_add_months
+          (d date, n) as {_NS}_sf_add_months_typed(d, n),
+          (t timestamp, n) as {_NS}_sf_add_months_typed(t, n),
+          (t timestamptz, n) as {_NS}_sf_add_months_typed(t, n),
+          (x varchar, n) as {_NS}_sf_add_months_typed(regexp_replace(x, '^"(.*)"$', '\\1')::timestamp, n)""",  # a VARIANT string arrives quoted
     # NUMBER / NUMBER keeps max(s, min(s + 6, 12)) decimals and raises on zero.
     # DuckDB returns a full-precision double, and NULL on zero. The failing cast raises without
     # making the expression volatile, so `a / b as r, r * 2` can still reuse the alias.
@@ -828,6 +848,8 @@ def _fix(node: exp.Expression) -> exp.Expression:
         node.set("on", exp.and_(cond, node.args["on"]) if node.args.get("on") else cond)
     if isinstance(node, exp.Div):
         return _fn("_sf_div", node.this, node.expression)
+    if isinstance(node, exp.AddMonths):
+        return _fn("_sf_add_months", node.this, node.expression)
     if isinstance(node, (exp.TimestampTrunc, exp.DateTrunc)):
         return _fn("_sf_date_trunc", exp.Literal.string(node.unit.name.lower()), node.this)
     if isinstance(node, _HASHES) and not (isinstance(node.this, exp.Literal) and node.this.is_string):
@@ -1318,6 +1340,10 @@ def rewrite(node: exp.Expression) -> exp.Expression:
         new = rewrite(child)
         if new is not child:
             parent.set(key, new, index)
+    for key, kind in _READS_TEXT.get(type(node), ()):
+        arg = node.args.get(key)
+        if arg is not None and not isinstance(arg, (exp.Null, exp.Placeholder, exp.Parameter, exp.Cast)) and not arg.is_int:
+            node.set(key, _fn("_sf_reads", arg, exp.Literal.string(kind)))
     strict = _DATES_ONLY.get(type(node))
     if strict:
         for key in strict[1:]:
@@ -1340,6 +1366,20 @@ _DATES_ONLY: dict[type, tuple[str, ...]] = {
     exp.DateTrunc: ("TRUNC", "this"),
     exp.TimeSlice: ("TIME_SLICE", "this"),
 }
+# Arguments Snowflake converts from text where DuckDB does not, and what it reads them as.
+_READS_TEXT: dict[type, tuple[tuple[str, str], ...]] = {
+    exp.NextDay: (("this", "timestamp"),),
+    exp.PreviousDay: (("this", "timestamp"),),
+    exp.DateFromParts: (("year", "bigint"), ("month", "bigint"), ("day", "bigint")),
+    exp.BitwiseAnd: (("this", "bigint"), ("expression", "bigint")),
+    exp.BitwiseOr: (("this", "bigint"), ("expression", "bigint")),
+    exp.BitwiseXor: (("this", "bigint"), ("expression", "bigint")),
+    exp.Repeat: (("times", "integer"),),
+    exp.Left: (("expression", "integer"),),
+    exp.Right: (("expression", "integer"),),
+    exp.Substring: (("start", "integer"), ("length", "integer")),
+    exp.Pad: (("expression", "integer"),),
+}
 _SNOWFLAKE_TYPE = {"VARCHAR": "VARCHAR(134217728)", "STRING_LITERAL": "VARCHAR(134217728)", "JSON": "VARIANT", "BOOLEAN": "BOOLEAN",
                    "DOUBLE": "FLOAT", "FLOAT": "FLOAT", "BLOB": "BINARY(8388608)"}
 _CHOOSES_A_TYPE = (exp.Coalesce, exp.If, exp.Case, exp.Nvl2, exp.Greatest, exp.Least, exp.Max, exp.Min, exp.Anonymous)
@@ -1348,6 +1388,49 @@ _CHOOSES_A_TYPE = (exp.Coalesce, exp.If, exp.Case, exp.Nvl2, exp.Greatest, exp.L
 def _unwrap_strict(tree: exp.Expression, keep: exp.Expression | None = None) -> None:
     for marker in [n for n in tree.find_all(exp.Anonymous) if _is(n, "_sf_strict") and n is not keep]:
         marker.replace(marker.expressions[0])
+
+
+def _twin(tree: exp.Expression, node: exp.Expression) -> tuple[exp.Expression, exp.Expression]:
+    """A copy of the tree, and the node in it that stands where `node` does."""
+    path = []
+    while node.parent is not None:
+        path.append((node.arg_key, node.index))
+        node = node.parent
+    copy = tree.copy()
+    twin = copy
+    for key, index in reversed(path):
+        twin = twin.args[key] if index is None else twin.args[key][index]
+    return copy, twin
+
+
+def text_as_written(tree: exp.Expression, conn, params=None) -> bool:  # noqa: ANN001
+    """Convert the first argument marked `_sf_reads` that is text (or a VARIANT) to what Snowflake reads it as.
+    False when none is. The first, because an unconverted one further up would hide the answer about the next."""
+    for marker in [n for n in tree.find_all(exp.Anonymous) if _is(n, "_sf_reads")]:
+        arg, to = marker.expressions[0], marker.expressions[1].name
+        if isinstance(arg, exp.Literal) and arg.is_string:
+            kind = "STRING_LITERAL"
+        else:
+            copy, twin = _twin(tree, marker)
+            check = _fn("_sf_strict", twin.expressions[0].copy(), exp.Literal.string(""))
+            twin.replace(check)
+            _unwrap_strict(copy, keep=check)
+            text = "explain " + copy.sql(dialect="duckdb")
+            kind = None
+            try:
+                conn.execute(text, params) if params else conn.execute(text)
+            except Exception as e:  # noqa: BLE001
+                found = re.search(r"""microsecond\((.*?)\)['"]""", (_error_details(str(e)) or {}).get("exception_message", ""))
+                kind = found.group(1).strip('"\\') if found else None
+        if kind in ("VARCHAR", "JSON", "STRING_LITERAL"):
+            if kind == "JSON":
+                arg = exp.Anonymous(this="json_extract_string", expressions=[arg.copy(), exp.Literal.string("$")])
+            marker.replace(exp.cast(arg.copy(), to))
+            return True
+        if kind and kind.startswith(("DECIMAL", "DOUBLE", "FLOAT")) and to == "integer":
+            marker.replace(exp.cast(exp.Round(this=arg.copy()), to))  # LEFT(s, 1.6) takes two characters
+            return True
+    return False
 
 
 def strict_dates(tree: exp.Expression, conn, params=None) -> bool:  # noqa: ANN001
@@ -1364,16 +1447,7 @@ def strict_dates(tree: exp.Expression, conn, params=None) -> bool:  # noqa: ANN0
         if isinstance(arg, exp.Literal) and arg.is_string:
             kind = "STRING_LITERAL"
         else:
-            alone = tree.copy()
-            # the same statement with only this check left in it
-            path = []
-            node = marker
-            while node.parent is not None:
-                path.append((node.arg_key, node.index))
-                node = node.parent
-            twin = alone
-            for key, index in reversed(path):
-                twin = twin.args[key] if index is None else twin.args[key][index]
+            alone, twin = _twin(tree, marker)  # the same statement with only this check left in it
             _unwrap_strict(alone, keep=twin)
             text = "explain " + alone.sql(dialect="duckdb")
             try:
@@ -1557,6 +1631,7 @@ _DATE_CALLS = {"date_diff", "datediff", "date_add", "date_sub", "date_trunc", "d
                "dayofweek", "dayofyear", "dayofmonth", "hour", "minute", "second", "epoch", "weekofyear", "isodow",
                "yearweek", "time_bucket", "age", "isoyear", "millisecond", "microsecond", "epoch_us", "epoch_ns",
                "julian", "weekday", "century", "decade", "era", "extract"}
+_NUMBERS_AT = {"repeat": (1,), "lpad": (1,), "rpad": (1,), "substring": (1, 2), "substr": (1, 2), "left": (1,), "right": (1,)}
 _TEXT_TYPES = {"VARCHAR", "STRING_LITERAL"}
 _DATE_TYPES = ("INTERVAL", "DATE", "TIMESTAMP", "TIME")
 
@@ -1621,7 +1696,7 @@ def _repair(tree: exp.Expression, text: str, details: dict) -> bool:
     if not name or not call or pos < 0:
         return False
     types = _call_types(call)
-    types = ["VARCHAR" if t == "JSON" else t for t in types]  # a VARIANT converts the same way
+    types = ["VARCHAR" if t in ("JSON", "STRING_LITERAL") else t for t in types]  # a VARIANT converts the same way; so does ABS('5')
     if name.lower() == "to_timestamp" and len(types) == 1 and types[0].startswith(("TIMESTAMP", "DATE")):
         # TO_TIMESTAMP of something that already is a point in time gives it back (as TIMESTAMP_NTZ)
         for node in tree.find_all(exp.Func):
@@ -1694,10 +1769,12 @@ def _repair(tree: exp.Expression, text: str, details: dict) -> bool:
             continue
         children = {c.sql(dialect="duckdb"): c for c in node.iter_expressions()}
         done = False
-        for part, kind in zip(parts, types):
+        for i, (part, kind) in enumerate(zip(parts, types)):
             child = children.get(part) or children.get(part.split(" ORDER BY ")[0])
+            if i not in _NUMBERS_AT.get(lowered, (i,)):
+                continue  # REPEAT('a', text_column): the count is the number, not the text to repeat
             if kind == "VARCHAR" and child is not None:
-                _convert(child, to)
+                _convert(child, "integer" if lowered in _NUMBERS_AT else to)
                 done = True
         if done:
             return True
@@ -2342,6 +2419,9 @@ def repair_types(transformed: exp.Expression, conn, params=None) -> exp.Expressi
                     fixed += 1  # DuckDB did not say where: the operands were asked for their types instead
                     continue
                 if not details or not _repair(tree, text, details):
+                    if text_as_written(tree, conn, params):
+                        fixed += 1
+                        continue
                     return tree if fixed else None  # keep what was fixed: the remaining error is the one to report
                 fixed += 1
         return tree
