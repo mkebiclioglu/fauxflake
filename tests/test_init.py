@@ -916,3 +916,10 @@ def test_a_reference_to_a_column_that_is_not_the_key_holds_its_values():
     spec, _notes = build_spec(manifest, "A")[:2]
     child = spec["tables"]["RAW.S.OPPS"]["columns"]["STAGENAME"]
     assert child["gen"] == "categorical" and {"1-Discovery", "8-Closed Lost"} <= set(child["values"])
+
+
+def test_values_that_contain_something_also_begin_the_way_that_is_asked():
+    from fauxflake.init import like_shapes
+
+    assert like_shapes({"http%", "%utm_content=partner%"}) == ["http{hex}", "http{hex}utmxcontent=partner{hex}"]
+    assert like_shapes({"%a%", "%.com"}) == ["{hex}.com", "{hex}a{hex}"]

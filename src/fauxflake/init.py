@@ -1453,6 +1453,21 @@ def flattened_objects(paths: dict[str, str | None]) -> dict[str, str | None]:
     return out
 
 
+def like_shapes(patterns) -> list[str]:  # noqa: ANN001
+    """Templates for the LIKE patterns asked of one column. A value has to get past all the filters on its way:
+    where some say how it begins (`like 'http%'`) and others what it contains (`like '%utm_content=x%'`), the
+    values that contain something also begin the way that is asked."""
+    patterns = sorted(set(patterns))
+    begins = [p for p in patterns if p.endswith("%") and "%" not in p[:-1] and "_" not in p.replace("\\_", "") and len(p) > 1]
+    out = []
+    for i, pattern in enumerate(p for p in patterns if p not in begins):
+        shape = like_shape(pattern)
+        if begins and pattern.startswith("%"):
+            shape = like_shape(begins[i % len(begins)]) + shape.removeprefix("{hex}")
+        out.append(shape)
+    return sorted([*map(like_shape, begins), *out])
+
+
 def asked_texts(use: "SourceUse", col: str) -> set[str]:
     """The texts asked of a column, by name or of a column it is lined up with in a UNION."""
     return use.literals.get(col, set()) | use.united["literals"].get(col, set())
@@ -1508,7 +1523,7 @@ def field_gen(path: str, hint: str | None, literals: set[str] | None = None, pat
     name = re.sub(r"~\w+|\[\]", "", path).split(".")[-1] or "value"
     if patterns and not hint_is_number(hint):
         # `like '%.pool%.near'` keeps some rows, and the values compared by name are there too
-        return {"gen": "template", "templates": [*sorted(like_shape(p) for p in patterns), *sorted(literals or ()),
+        return {"gen": "template", "templates": [*like_shapes(patterns), *sorted(literals or ()),
                                                   f"{name.lower()}_{{hex}}"]}
     if literals and (hint or "").upper().startswith(("DATE", "TIMESTAMP")) and all(not re.search(r"[1-9]", v) for v in literals):
         return guess(name, hint)  # compared with '' and '0000-00-00' before it is cast to a date: a date, those stand for none
@@ -1880,7 +1895,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
                     (hint or "").upper().startswith(("BOOL", "DATE", "TIMESTAMP")) or col in use.json_text or use.paths.get(col)))):
                 # `where name like 'tap-%'` should keep some rows: make values that fit each pattern, beside the
                 # values asked for by name (`name in ('1,000 CI Minutes', ...)`, however many there are)
-                shapes = sorted(like_shape(p) for p in asked_shapes(use, col)) + sorted(use.examples.get(col, ()))[:24]
+                shapes = like_shapes(asked_shapes(use, col)) + sorted(use.examples.get(col, ()))[:24]
                 named = sorted(v for v in asked_texts(use, col) if "{" not in v)[:80]
                 out[col] = {"gen": "template", "templates": [*shapes, *named, f"{col.lower()}_{{hex}}"]}
             elif col in use.part_shapes and not hint_is_number(hint):
