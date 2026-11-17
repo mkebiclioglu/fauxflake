@@ -421,3 +421,20 @@ def test_a_table_of_readings_holds_a_row_a_day_for_each_of_a_few_things(tmp_path
         assert cur.execute("""select count(*) from "RAW"."T"."EVENT" e left join "RAW"."T"."SERVER" s
                               on s."USER_ID" = e."SERVER" and s."TIMESTAMP"::date = e."TIMESTAMP"::date
                               where e."TIMESTAMP" < '2025-01-10' and s."USER_ID" is null""").fetchone()[0] == 0
+
+
+def test_a_table_another_took_over_from_has_rows_only_while_it_was_in_use():
+    from datetime import date
+
+    from fauxflake.spec import Spec
+
+    spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "history": 60, "least_rows": 100, "tables": {
+        "RAW.T.OLD": {"volume": {"rows_per_day": 3}, "until_day": 30, "columns": {"ID": {"gen": "sequence"}}},
+        "RAW.T.NEW": {"volume": {"rows_per_day": 3}, "from_day": 30, "columns": {"ID": {"gen": "sequence"}}}}}, ".")
+    old = spec.tables["RAW.T.OLD"].calendar(date(2025, 1, 1), date(2025, 3, 1), 1, 1.0, least=spec.least)
+    new = spec.tables["RAW.T.NEW"].calendar(date(2025, 1, 1), date(2025, 3, 1), 1, 1.0, least=spec.least)
+    assert all((n > 0) == (day < date(2025, 1, 31)) for day, _, n in old) and sum(n for _, _, n in old) >= 100
+    assert all((n > 0) == (day >= date(2025, 1, 31)) for day, _, n in new) and sum(n for _, _, n in new) >= 90
+    # the days a table has are the same days however far the clock has got
+    earlier = spec.tables["RAW.T.NEW"].calendar(date(2025, 1, 1), date(2025, 2, 10), 1, 1.0, least=spec.least)
+    assert earlier == new[:len(earlier)]

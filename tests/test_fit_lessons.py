@@ -864,3 +864,30 @@ def test_a_unique_column_keeps_the_values_it_shares_with_a_seed():
     assert tables["RAW.T.SERVER"]["columns"]["INSTALLATION_ID"] == {
         "gen": "template", "template": "installation_id_{hex}", "named": ["u85ky7x", "qe3n8xc"]}
     assert not f.learn_from_test(test, places)
+
+
+def test_a_comparison_of_two_systems_is_tried_as_one_taking_over_from_the_other():
+    time = {"AT": {"gen": "event_time"}}
+    tables = {"RAW.GA.EVENTS": {"columns": dict(time)}, "RAW.SNOWPLOW.EVENTS": {"columns": dict(time)},
+              "RAW.X.PLANS": {"columns": {"NAME": {"gen": "template", "template": "name_{hex}"}}}}
+    behind = {"model.p.stg_ga": ["RAW.GA.EVENTS", "RAW.X.PLANS"], "model.p.blended": ["RAW.GA.EVENTS", "RAW.SNOWPLOW.EVENTS"]}
+    f = fitter(tables=tables, spec={"history": 60}, n_round=3, failing_now={"assert_counts"})
+    f.sources_of = lambda uid: behind[uid]
+    node = {"name": "assert_counts", "depends_on": {"nodes": ["model.p.stg_ga", "model.p.blended"]}}
+    sql = "select 1 from a.ci.blended b left join a.ci.stg_ga g on b.k = g.k where g.n > b.n"
+    assert f.learn_from_singular(node, None, sql)
+    assert tables["RAW.GA.EVENTS"]["until_day"] == 30 and tables["RAW.SNOWPLOW.EVENTS"]["from_day"] == 30
+    assert "from_day" not in tables["RAW.X.PLANS"] and "until_day" not in tables["RAW.X.PLANS"]  # (it holds no times)
+    # another test that passed before and fails in the round after: what was tried is taken back, for good
+    f.n_round = 4
+    assert f.trial_blamed("recent_ga_events") and "until_day" not in tables["RAW.GA.EVENTS"]
+    assert not f.learn_from_singular(node, None, sql)
+
+    # the test still fails with the first order: the other one is tried, then nothing is left to try
+    f = fitter(tables=tables, spec={"history": 60}, n_round=3, failing_now={"assert_counts"})
+    f.sources_of = lambda uid: behind[uid]
+    assert f.learn_from_singular(node, None, sql) and f.learn_from_singular(node, None, sql)
+    assert tables["RAW.SNOWPLOW.EVENTS"]["until_day"] == 30 and tables["RAW.GA.EVENTS"]["from_day"] == 30
+    assert "from_day" not in tables["RAW.SNOWPLOW.EVENTS"] and "until_day" not in tables["RAW.GA.EVENTS"]
+    assert not f.learn_from_singular(node, None, sql)
+    assert all("from_day" not in t and "until_day" not in t for t in tables.values())

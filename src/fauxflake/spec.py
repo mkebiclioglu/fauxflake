@@ -104,27 +104,35 @@ class Table:
         anchor = _date(vol.get("as_of", start))
         out, cum, day, carry = [], 0, start, 0.0
         full = self.grain_rows()  # one row a period for each combination, whatever the scale: no day leaves one out
-        window = start + timedelta(days=max(1, least[1]) - 1) if least else None
+        # a table that another took over from, or that took over (`until_day`, `from_day`: days of the history):
+        # it has rows only on the days it was in use
+        opened, closed = int(self.raw.get("from_day") or 0), self.raw.get("until_day")
+        first = start + timedelta(days=opened)
+        window = first + timedelta(days=max(1, least[1]) - 1) if least else None
         last = max(end, window) if window else end
         while day <= last:
             rng = random.Random(f"{seed}:{self.name}:{day.isoformat()}")
             level = base * (1 + growth) ** ((day - anchor).days / 365.0) * weekly[day.weekday()]
             if thin and day < thin[0]:
                 level *= thin[1]
-            if base < 1 or level < 1:
+            if day < first or (closed is not None and (day - start).days >= int(closed)):
+                n = 0
+            elif base < 1 or level < 1:
                 # less than a row a day (a long history of a small table): a row every few days, the first on day one
                 carry += level * max(0.0, 1 + noise * rng.gauss(0, 1))
-                n = int(carry) or (1 if day == start else 0)
+                n = int(carry) or (1 if day == first else 0)
                 carry -= int(carry)
+                n = max(n, full)
             else:
-                n = max(1, round(level * max(0.0, 1 + noise * rng.gauss(0, 1))))
-            out.append((day, 0, max(n, full)))
+                n = max(1, full, round(level * max(0.0, 1 + noise * rng.gauss(0, 1))))
+            out.append((day, 0, n))
             day += timedelta(days=1)
         if least:
-            days = max(1, least[1])
-            short = least[0] - sum(n for _, _, n in out[:days])
+            days = max(1, least[1]) if closed is None else max(1, min(least[1], int(closed) - opened))
+            short = least[0] - sum(n for _, _, n in out[opened:opened + days])
             if short > 0:
-                out[:days] = [(d, 0, n + (i + 1) * short // days - i * short // days) for i, (d, _, n) in enumerate(out[:days])]
+                out[opened:opened + days] = [(d, 0, n + (i + 1) * short // days - i * short // days)
+                                             for i, (d, _, n) in enumerate(out[opened:opened + days])]
         done, cum = [], 0
         for day, _, n in out:
             if day > end:
