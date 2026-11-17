@@ -29,11 +29,7 @@ MACROS = [
     # CONVERT_TIMEZONE(zone, t) with two arguments: the time of day in that zone. A timestamp without a zone (or a
     # date, or text) is the session's time, which is UTC here. (DuckDB's `t AT TIME ZONE zone` on such a timestamp
     # goes the other way: it takes t as that zone's time.)
-    f"""create or replace macro {_NS}_sf_convert_tz
-          (z, x timestamptz) as timezone(z, x),
-          (z, x timestamp) as timezone(z, timezone('UTC', x)),
-          (z, x date) as timezone(z, timezone('UTC', x::timestamp)),
-          (z, x varchar) as timezone(z, regexp_replace(x, '^"(.*)"$', '\\1')::timestamptz)""",
+    f"create or replace macro {_NS}_sf_convert_tz(z, x) as timezone(z, x::timestamptz)",
     f"""create or replace macro {_NS}_sf_formattable
           (x time) as (date '1970-01-01' + x),
           (x date) as x::timestamp,
@@ -66,6 +62,13 @@ MACROS = [
           when b = 0 and a is not null then cast('Division by zero' as double)
           when typeof(a) in ('DOUBLE', 'FLOAT', 'VARCHAR') or typeof(b) in ('DOUBLE', 'FLOAT', 'VARCHAR') then a::double / b::double
           else round(a::double / b::double, greatest({_SCALE}, least({_SCALE} + 6, 12))) end""",
+    # The `/` a query writes. Two whole numbers divide to a NUMBER with six decimals, and are described as one: a
+    # dbt contract that says `number` for `clicks / views` holds, as it does on Snowflake.
+    f"""create or replace macro {_NS}_sf_div_n
+          (a hugeint, b hugeint) as (case
+            when b = 0 and a is not null then cast('Division by zero' as decimal(38, 6))
+            else cast(a::double / b::double as decimal(38, 6)) end),
+          (a, b) as {_NS}_sf_div(a, b)""",
     # DATE_TRUNC keeps the input type. DuckDB turns a DATE into a TIMESTAMP.
     f"""create or replace macro {_NS}_sf_date_trunc
           (p varchar, x date) as date_trunc(p, x)::date,
@@ -412,6 +415,13 @@ def _number_format(value: exp.Expression, model: str) -> exp.Expression | None:
 
 
 
+def _type_unseen(*args: exp.Expression) -> bool:
+    """DuckDB picks among a macro's typed variants before it knows the type of an aggregate or window function:
+    with one anywhere in an argument it takes the first variant whatever the type (`max(a_timestamp)` would be
+    truncated as a date). Such arguments go to an untyped form instead."""
+    return any(arg is not None and arg.find(exp.AggFunc, exp.Window) is not None for arg in args)
+
+
 def _fn(name: str, *args: exp.Expression) -> exp.Anonymous:
     return exp.Anonymous(this=_NS + name, expressions=list(args))
 
@@ -472,14 +482,14 @@ def _text(node: exp.Expression) -> exp.Expression:
     inner = node.unnest()
     if _is(inner, "_sf_text"):
         return node  # already text: wrapping again only repeats the argument
-    if _is(inner, "_sf_div"):
+    if _is(inner, "_sf_div") or _is(inner, "_sf_div_n"):
         return _fn("_sf_div_text", *inner.expressions)
     if _average(inner):
         inner.set("default", _fn("_sf_div_text", *inner.args["default"].expressions))
         return inner
     if isinstance(inner, exp.Round) and isinstance(inner.args.get("decimals"), exp.Literal) and inner.args["decimals"].is_int:
         of, places = inner.this.unnest(), inner.args["decimals"]
-        if _is(of, "_sf_div"):
+        if _is(of, "_sf_div") or _is(of, "_sf_div_n"):
             return _fn("_sf_round_div_text", *of.expressions, places)
         if _average(of):
             of.set("default", _fn("_sf_round_div_text", *of.args["default"].expressions, places))
@@ -865,12 +875,14 @@ def _fix(node: exp.Expression) -> exp.Expression:
         cond = node.args.pop("match_condition")  # ASOF JOIN ... MATCH_CONDITION (c) is ASOF JOIN ... ON c
         node.set("on", exp.and_(cond, node.args["on"]) if node.args.get("on") else cond)
     if isinstance(node, exp.Div):
-        return _fn("_sf_div", node.this, node.expression)
-    if isinstance(node, exp.AddMonths):
+        return _fn("_sf_div" if _type_unseen(node.this, node.expression) else "_sf_div_n", node.this, node.expression)
+    if isinstance(node, exp.AddMonths) and not _type_unseen(node.this):
         return _fn("_sf_add_months", node.this, node.expression)
     if isinstance(node, exp.ConvertTimezone) and node.args.get("source_tz") is None and node.args.get("timestamp") is not None:
         return _fn("_sf_convert_tz", node.args["target_tz"], node.args["timestamp"])
     if isinstance(node, (exp.TimestampTrunc, exp.DateTrunc)):
+        if _type_unseen(node.this):
+            return exp.Anonymous(this="date_trunc", expressions=[exp.Literal.string(node.unit.name.lower()), exp.cast(node.this, "timestamp")])
         return _fn("_sf_date_trunc", exp.Literal.string(node.unit.name.lower()), node.this)
     if isinstance(node, _HASHES) and not (isinstance(node.this, exp.Literal) and node.this.is_string):
         node.set("this", _fn("_sf_text", node.this))  # MD5(42) hashes the text '42'
@@ -920,7 +932,8 @@ def _fix(node: exp.Expression) -> exp.Expression:
             model = node.args["format"].name.replace("Mon", "MON").replace("Dy", "DY")
             fmt = format_time(model, Snowflake.TIME_MAPPING, Snowflake.TIME_TRIE)
             # (text does not compile: Snowflake has no TO_CHAR(text, format). A time of day is formatted on any date.)
-            return exp.TimeToStr(this=_fn("_sf_formattable", _fn("_sf_strict", node.this, exp.Literal.string("TO_CHAR"))),
+            checked = _fn("_sf_strict", node.this, exp.Literal.string("TO_CHAR"))
+            return exp.TimeToStr(this=exp.cast(checked, "timestamp") if _type_unseen(node.this) else _fn("_sf_formattable", checked),
                                  format=exp.Literal.string(fmt))
     if isinstance(node, exp.Avg) and not (isinstance(node.parent, exp.Window) and node.parent.this is node):
         return _avg(node)

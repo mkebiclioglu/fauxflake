@@ -1,0 +1,18 @@
+select
+    1::number(38,0) as id,
+    'a'::varchar as name,
+    1.5::number(10,2) as amount,
+    1.5::float as ratio,
+    true as is_ok,
+    '2024-01-01'::date as d,
+    '2024-01-01 10:00:00'::timestamp_ntz as ts,
+    '2024-01-01 10:00:00 +0000'::timestamp_tz as tz,
+    '2024-01-01 10:00:00'::timestamp_ltz as ltz,
+    '10:00:00'::time as t,
+    parse_json('{"a": 1}') as v,
+    array_construct(1, 2) as arr,
+    object_construct('a', 1) as obj,
+    count(*) over () as n,
+    sum(1.5) over () as total,
+    10 / 4 as ratio2,
+    to_binary('ab', 'utf-8') as bin

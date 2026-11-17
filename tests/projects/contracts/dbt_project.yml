@@ -1,0 +1,7 @@
+name: contract_me
+version: "1.0"
+profile: contract_me
+model-paths: [models]
+models:
+  contract_me:
+    +materialized: table

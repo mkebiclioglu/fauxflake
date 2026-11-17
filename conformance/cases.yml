@@ -416,3 +416,6 @@
 - {id: distinct_order_by_column_under_a_function, sql: "select distinct upper(name) from (select 'a' name, 1 amount) t order by amount"}
 - {id: distinct_order_by_what_is_selected, sql: "select distinct t.name as n, amount as a, upper(name) from (select column1 name, column2 amount from values ('b', 1), ('a', 2), ('a', 2)) t order by name, n, a desc nulls last, 1, upper(name), name || 'x'"}
 - {id: distinct_star_order_by, sql: "select distinct * from (select column1 name, column2 amount from values ('b', 1), ('a', 2), ('a', 2)) t order by amount"}
+# An aggregate inside: its type is not known to DuckDB's typed macros.
+- {id: date_functions_of_aggregates, sql: "select date_trunc('hour', max(ts)), date_trunc('day', min(ts)), date_trunc('hour', max(ts) over ()), date_trunc('month', max(d))::date, add_months(max(ts), 1), add_months(max(d), 1)::date, to_char(max(d), 'YYYYMM'), to_char(max(ts), 'HH24:MI'), last_day(max(d)), year(max(d)), dayname(min(d)) from (select '2024-01-31 12:34:56'::timestamp ts, '2024-01-31'::date d) group by ts, d"}
+- {id: division_of_aggregates, sql: "select sum(i) / count(*), sum(f) / count(*), sum(x) / 2, max(i) / 4, count(*) / 3, i / 4, sum(i) over () / 4, avg(i) / 2, sum(n) / sum(i), 2 / 3, -2 / 3, 7 / 2, i / 3 * 3 from (select 7 i, 1.5::float f, '5'::varchar x, 2.25::number(10,2) n) group by i"}

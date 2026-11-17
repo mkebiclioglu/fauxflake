@@ -32,3 +32,22 @@ def test_dbt_utils_seeds_snapshots_and_ephemerals(emu):
     users = cur.execute("select count(*) from ANALYTICS.CI.DIM_USERS").fetchone()[0]
     assert cur.execute("select sum(USERS) from ANALYTICS.CI.PY_PLAN_TOTALS").fetchone()[0] == users
     assert cur.execute("select count(*), count(*) filter (where HAS_EMAIL) from ANALYTICS.CI.PY_USER_FLAGS").fetchone() == (users, users)
+
+
+def test_dbt_model_contracts_see_snowflake_types(tmp_path):
+    """An enforced contract compares the types Snowflake would report for the model's columns: numbers (also a
+    division of two whole numbers), text, dates, the three timestamps, VARIANT, ARRAY, OBJECT, BINARY."""
+    from pathlib import Path
+
+    from click.testing import CliRunner
+
+    from fauxflake.cli import main
+
+    project = Path(__file__).parent / "projects" / "contracts"
+    out = CliRunner().invoke(main, ["build", "--project-dir", str(project), "--spec", str(project / "fauxflake.yml")])
+    assert "PASS=1 WARN=0 ERROR=1" in out.output, out.output  # `typed` holds its contract, `wrong` does not
+    assert "in model wrong" in out.output and "in model typed" not in out.output
+    for line in ("| EXTRA       | FIXED           |               | missing in contract   |",
+                 "| ID          | FIXED           | TEXT          | data type mismatch    |",
+                 "| MISSING_COL |                 | DATE          | missing in definition |"):
+        assert line in out.output, out.output

@@ -1,0 +1,29 @@
+version: 2
+models:
+  - name: typed
+    config:
+      contract: {enforced: true}
+    columns:
+      - {name: id, data_type: number}
+      - {name: name, data_type: varchar}
+      - {name: amount, data_type: "number(10,2)"}
+      - {name: ratio, data_type: float}
+      - {name: is_ok, data_type: boolean}
+      - {name: d, data_type: date}
+      - {name: ts, data_type: timestamp_ntz}
+      - {name: tz, data_type: timestamp_tz}
+      - {name: ltz, data_type: timestamp_ltz}
+      - {name: t, data_type: time}
+      - {name: v, data_type: variant}
+      - {name: arr, data_type: array}
+      - {name: obj, data_type: object}
+      - {name: n, data_type: number}
+      - {name: total, data_type: number}
+      - {name: ratio2, data_type: number}
+      - {name: bin, data_type: binary}
+  - name: wrong
+    config:
+      contract: {enforced: true}
+    columns:
+      - {name: id, data_type: varchar}
+      - {name: missing_col, data_type: date}
