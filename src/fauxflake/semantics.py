@@ -1348,7 +1348,9 @@ def rewrite(node: exp.Expression) -> exp.Expression:
     if strict:
         for key in strict[1:]:
             arg = node.args.get(key)
-            if arg is not None and not isinstance(arg, (exp.Null, exp.Placeholder, exp.Parameter)):
+            if isinstance(arg, exp.Null):
+                node.set(key, exp.cast(arg, "timestamp"))  # YEAR(NULL) is NULL; DuckDB cannot pick which YEAR is meant
+            elif arg is not None and not isinstance(arg, (exp.Null, exp.Placeholder, exp.Parameter)):
                 node.set(key, _fn("_sf_strict", arg, exp.Literal.string(strict[0])))
     return _fix(node)
 

@@ -9,6 +9,40 @@
    ]
   ]
  },
+ "add_months_keeps_type": {
+  "rows": [
+   [
+    "2024-02-29",
+    "2023-12-31",
+    "2024-03-31 10:00:00.000",
+    "2024-03-28",
+    "2023-03-31",
+    "2025-01-31",
+    "2023-02-28"
+   ]
+  ]
+ },
+ "add_months_of_text": {
+  "rows": [
+   [
+    "2024-02-29 00:00:00.000",
+    "2024-02-29 00:00:00.000",
+    "2024-02-29 00:00:00.000"
+   ]
+  ]
+ },
+ "add_months_time_of_day": {
+  "rows": [
+   [
+    "2024-01-31 23:59:59.123",
+    "2024-02-29 10:00:00.000",
+    "2024-02-29 10:00:00.000",
+    "2024-03-30 10:00:00.000",
+    null,
+    null
+   ]
+  ]
+ },
  "age_months": {
   "rows": [
    [
@@ -414,6 +448,16 @@
    ]
   ]
  },
+ "bit_functions_of_text": {
+  "rows": [
+   [
+    "1",
+    "7",
+    "0",
+    "1"
+   ]
+  ]
+ },
  "bitwise": {
   "rows": [
    [
@@ -809,6 +853,35 @@
    ]
   ]
  },
+ "counts_given_as_fractions": {
+  "rows": [
+   [
+    "ab",
+    "cdef",
+    "bcd",
+    "xxxa",
+    "abc",
+    "def"
+   ]
+  ]
+ },
+ "counts_given_as_text": {
+  "rows": [
+   [
+    "aaaaa",
+    "00007",
+    "abcde",
+    "efgh",
+    "7xxxx",
+    "defgh",
+    "efgh",
+    "5",
+    "5",
+    "aaaaa",
+    "abcde"
+   ]
+  ]
+ },
  "cte_reuse": {
   "rows": [
    [
@@ -924,6 +997,15 @@
    ]
   ]
  },
+ "date_from_parts_of_text": {
+  "rows": [
+   [
+    "2024-01-05",
+    "2024-05-05",
+    "2024-01-05"
+   ]
+  ]
+ },
  "date_from_parts_overflow": {
   "rows": [
    [
@@ -969,6 +1051,19 @@
     "Sun",
     "Jan",
     "2025-02-28"
+   ]
+  ]
+ },
+ "date_parts_of_a_chosen_type": {
+  "rows": [
+   [
+    "2024",
+    "2024",
+    "2024",
+    "2024",
+    "2024",
+    null,
+    "2024"
    ]
   ]
  },
@@ -2386,6 +2481,18 @@
    ]
   ]
  },
+ "next_day_of_text": {
+  "rows": [
+   [
+    "2024-01-08",
+    "2024-01-01",
+    "2024-01-08",
+    "2024-01-01",
+    "Fri",
+    "Jan"
+   ]
+  ]
+ },
  "next_previous_day": {
   "rows": [
    [
@@ -2628,6 +2735,21 @@
     "100",
     "1",
     "-1"
+   ]
+  ]
+ },
+ "numbers_given_as_text_literals": {
+  "rows": [
+   [
+    "5",
+    "5",
+    "5",
+    "5",
+    "-5",
+    "1",
+    "5",
+    "5",
+    "5"
    ]
   ]
  },
@@ -3363,6 +3485,39 @@
     ]
    ]
   ]
+ },
+ "strict_date_trunc_of_literal": {
+  "error": "002016 (22000): SQL compilation error:"
+ },
+ "strict_date_trunc_of_text": {
+  "error": "002016 (22000): SQL compilation error:"
+ },
+ "strict_extract_of_text": {
+  "error": "002016 (22000): SQL compilation error:"
+ },
+ "strict_hour_of_text": {
+  "error": "002016 (22000): SQL compilation error:"
+ },
+ "strict_last_day_of_text": {
+  "error": "002016 (22000): SQL compilation error:"
+ },
+ "strict_month_of_variant": {
+  "error": "002016 (22000): SQL compilation error:"
+ },
+ "strict_months_between_text": {
+  "error": "002016 (22000): SQL compilation error:"
+ },
+ "strict_time_slice_of_text": {
+  "error": "002016 (22000): SQL compilation error:"
+ },
+ "strict_trunc_of_text": {
+  "error": "002016 (22000): SQL compilation error:"
+ },
+ "strict_year_of_number": {
+  "error": "002016 (22000): SQL compilation error:"
+ },
+ "strict_year_of_text": {
+  "error": "002016 (22000): SQL compilation error:"
  },
  "string_agg_distinct": {
   "rows": [
