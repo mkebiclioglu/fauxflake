@@ -1205,15 +1205,17 @@ def test_joined_columns_keep_the_values_asked_for_by_name_beside_a_pattern():
         assert held["gen"] == "template" and "cli elt" in held["templates"], held
 
 
-def test_what_is_read_in_the_values_of_a_flattened_object_is_in_each_of_its_keys():
+def test_what_is_read_in_the_values_of_a_flattened_object_stays_when_no_key_is_read_deeper():
     from fauxflake.init import flattened_objects
 
+    paths = {"actions[]": None, "actions[].Transfer": None, "actions[].FunctionCall": None, "actions[][]": None, "actions[][].method_name": "TEXT"}
+    # one key for each value, which is one kind of thing or another: the generator writes the object that way
+    assert flattened_objects(paths) == {k: v for k, v in paths.items() if k != "actions[][]"}
+    # a key read deeper by name holds an object: what is read in the values is read in it
     moved = {}
-    paths = flattened_objects({"actions[]": None, "actions[].Transfer": None, "actions[].FunctionCall": None,
-                               "actions[][]": None, "actions[][].method_name": "TEXT"}, moved)
-    assert paths == {"actions[]": None, "actions[].Transfer": None, "actions[].FunctionCall": None,
-                     "actions[].Transfer.method_name": "TEXT", "actions[].FunctionCall.method_name": "TEXT"}
-    assert moved["actions[][].method_name"] == ["actions[].FunctionCall.method_name", "actions[].Transfer.method_name"]
+    deeper = flattened_objects({**paths, "actions[].FunctionCall.gas": "DOUBLE"}, moved)
+    assert deeper["actions[].FunctionCall.method_name"] == "TEXT" and "actions[][].method_name" not in deeper
+    assert moved["actions[][].method_name"] == ["actions[].FunctionCall.method_name"]
 
 
 def test_columns_joined_to_a_category_bring_the_values_they_are_asked_for_by_name():
@@ -1276,7 +1278,7 @@ def test_the_reading_still_says_where_a_column_comes_from_when_a_flattened_objec
     }
     analysis = analyse(manifest, "A")
     fields = analysis.spec["tables"]["RAW.S.SHARDS"]["columns"]["VALUE"]["fields"]
-    assert "stake" in str(fields.get("actions[].FunctionCall.method_name")), fields
+    assert "stake" in str(fields.get("actions[][].method_name")), fields
     assert analysis.place("model.p.m", "ID") == ("RAW.S.SHARDS", "ID", "")
 
 

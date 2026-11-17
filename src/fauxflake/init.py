@@ -1915,10 +1915,13 @@ def flattened_objects(paths: dict[str, str | None], moved: dict[str, list[str]] 
             keys = {other[len(base) + 1:].split(".")[0].split("[")[0] for other in paths
                     if base and other.startswith(base + ".") and other != path}
             if keys:
-                out.pop(path, None)
                 holders = [k for k in sorted(keys) if any(o.startswith(f"{base}.{k}.") or o.startswith(f"{base}.{k}[") for o in paths)]
-                # (no key is read any deeper by name: what is read in the values is in each of them)
-                holders = holders or sorted(keys)
+                if rest and not holders:
+                    # no key is read any deeper by name (`{"FunctionCall": {...}}` or `{"Transfer": {...}}`, each
+                    # flattened for what it holds): the value is one kind of thing or another, and what is read
+                    # in it stays where it is; the generator writes one key for each value
+                    break
+                out.pop(path, None)
                 for k in holders if rest else []:
                     out.setdefault(f"{base}.{k}{rest}", paths[path])
                     if moved is not None:
