@@ -29,7 +29,7 @@ MACROS = [
     # arguments that turn out to be text.
     f"create or replace macro {_NS}_sf_reads(x, kind) as x",
     f"""create or replace macro {_NS}_sf_changes(l) as coalesce(list_sum(list_transform(range(2, len(l) + 1),
-          lambda i: case when l[i] is distinct from l[i - 1] then 1 else 0 end)), 0)""",
+          lambda i: case when l[i] <> l[i - 1] then 1 else 0 end)), 0)""",  # (a NULL beside it is not a change)
     # CONVERT_TIMEZONE(zone, t) with two arguments: the time of day in that zone. A timestamp without a zone (or a
     # date, or text) is the session's time, which is UTC here. (DuckDB's `t AT TIME ZONE zone` on such a timestamp
     # goes the other way: it takes t as that zone's time.)
