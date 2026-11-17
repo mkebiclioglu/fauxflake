@@ -1490,6 +1490,12 @@ def _share_join_values(tables: dict[str, dict], joins: list, notes: list[str], l
                     values.setdefault(v, w)
             for m in free:
                 put(m, {"gen": "categorical", "values": dict(values)})
+        elif any(gen[m]["gen"] == "template" and any("{" not in t for t in gen[m].get("templates") or ()) for m in free):
+            # values the models ask for by name, beside shapes they match (`= 'meltano elt'`, `like 'meltano add%'`):
+            # every side holds those; a pool of made-up values would leave the filters with nothing
+            shapes = list(dict.fromkeys(t for m in free for t in gen[m].get("templates") or () if not t.endswith("_{hex}")))
+            for m in free:
+                put(m, {"gen": "template", "templates": [*shapes, f"{pool_name(m)}_{{hex}}"]})
         else:
             pool = (free[0][2].replace("[]", "").split(".")[-1] or free[0][1]).lower()
             numeric = any(gen[m]["gen"] == "dist" for m in free)
@@ -1521,6 +1527,11 @@ def _share_join_values(tables: dict[str, dict], joins: list, notes: list[str], l
                 else:
                     put(m, {"gen": "pool", "pool": pool, "size": 200, **({"numeric": True} if numeric else {})})
         notes.append(f"{', '.join(name(m) for m in free)}: joined in a model, generated from the same values.")
+
+
+def pool_name(m) -> str:  # noqa: ANN001
+    """What the made-up values of a (table, column, path) are called."""
+    return (m[2].replace("[]", "").split(".")[-1] or m[1]).lower()
 
 
 def _share_union_values(tables: dict[str, dict], links: list) -> None:

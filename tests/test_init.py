@@ -1184,3 +1184,22 @@ def test_a_case_and_its_complement_say_when_a_list_has_something():
     for table in ("RAW.CALLS.STARTED", "RAW.CALLS.ENDED"):  # (the other table of the schema has the same columns)
         skus = spec["tables"][table]["columns"]["CONTEXT_FEATURE_SKUS"]
         assert skus["gen"] == "array" and "{{CONTEXT_FEATURE_NAME}}" in skus["empty_unless"] and not skus.get("null_rate")
+
+
+def test_joined_columns_keep_the_values_asked_for_by_name_beside_a_pattern():
+    from fauxflake.init import build_spec
+
+    def source(name, cols):
+        return {"database": "RAW", "schema": "S", "name": name, "identifier": name,
+                "columns": {c: {"data_type": t} for c, t in cols.items()}}
+
+    manifest = {
+        "sources": {"source.p.s.old": source("old", {"category": "VARCHAR", "n": "NUMBER"}),
+                    "source.p.s.new": source("new", {"kind": "VARCHAR", "n": "NUMBER"})},
+        "nodes": {"model.p.m": {"resource_type": "model", "depends_on": {"nodes": []}, "relation_name": "A.B.M", "compiled_code": """
+            select o.n from raw.s.old o join raw.s.new w on o.category = w.kind
+            where o.category = 'cli elt' or o.category like 'cli add%'"""}},
+    }
+    columns = {t: d["columns"] for t, d in build_spec(manifest, "A")[0]["tables"].items()}
+    for held in (columns["RAW.S.OLD"]["CATEGORY"], columns["RAW.S.NEW"]["KIND"]):
+        assert held["gen"] == "template" and "cli elt" in held["templates"], held
