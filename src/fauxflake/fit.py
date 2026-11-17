@@ -2475,7 +2475,6 @@ class Fitter:
         self.learned.append(f"{fq}.{name}: declared a document, but the model writes text into it; declared VARCHAR.")
         return True
 
-<<<<<<< HEAD
     def dates_only(self, sql_key: str) -> bool:
         """`Function EXTRACT does not support VARCHAR argument type`: Snowflake compiles YEAR, DATE_TRUNC, LAST_DAY
         and their kind on dates and times only, so every column this model hands to one of them is a time. (The
@@ -2493,7 +2492,8 @@ class Fitter:
                     arg = arg.this
                 if isinstance(arg, exp.Column):
                     changed |= self.retype_column(sql_key, arg.name.upper(), "TIMESTAMP")
-=======
+        return changed
+
     def numbers_upstream(self, sql_key: str) -> bool:
         """Made-up text met a number in this model. The error names one column, and a wide model (sixty sums over
         a snapshot of opportunities) would learn the others one build at a time. What the model and the models
@@ -2528,7 +2528,6 @@ class Fitter:
                     self.learned.append(f"{table}.{name}: used as a number by the models that read it; retyped as DOUBLE.")
                     changed = True
         self.dirty |= changed
->>>>>>> main
         return changed
 
     def learn(self, sql_key: str, message: str) -> bool:
