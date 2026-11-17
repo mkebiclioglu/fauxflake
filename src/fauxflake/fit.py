@@ -23,6 +23,7 @@ import graphlib
 import json
 import os
 import re
+import zlib
 import threading
 import time
 from datetime import datetime, timedelta
@@ -94,6 +95,23 @@ class _Readings:
 _MADE_UP_NUMBER = re.compile(r"Could not convert string '[a-z][a-z0-9_]*_[0-9a-f]{12}' to (?:DOUBLE|FLOAT|INT\d+|DECIMAL)")
 _NUMBER_OF = (exp.Sum, exp.Avg, exp.Max, exp.Min, exp.Abs, exp.Round, exp.Floor, exp.Ceil, exp.Nullif, exp.AnyValue, exp.Window,
               exp.Paren, exp.Cast, exp.TryCast, exp.Neg)
+
+
+def _entry(entry: dict, fields: dict, i: int) -> dict:
+    """One entry of a list written out whole, with the fields the reading knows its entries have (`[].time_frame`:
+    one of the values the SQL names, each in its turn; a text of its own otherwise)."""
+    for path, gen in sorted(fields.items()):
+        name = path[3:] if path.startswith("[].") else ""
+        if not re.fullmatch(r"\w+", name) or name in entry or f"{path}[]" in fields:
+            continue
+        if gen.get("gen") == "categorical" and gen.get("values"):
+            values = list(gen["values"])
+            entry[name] = values[zlib.crc32(f"{name}:{i}".encode()) % len(values)]
+        elif gen.get("gen") == "template" and gen.get("template") and not gen.get("templates"):
+            entry[name] = str(gen["template"]).replace("{hex}", f"{zlib.crc32(f'{name}:{i}'.encode()):08x}").replace("{n}", str(i + 1))
+        elif gen.get("gen") == "dist":
+            entry[name] = i + 1
+    return entry
 
 
 def _number_flow(node: exp.Expression, depth: int = 0) -> list[exp.Column]:
@@ -2131,10 +2149,15 @@ class Fitter:
                 except (TypeError, ValueError):
                     held = []
                 known = {entry.get(key) for entry in held if isinstance(entry, dict)}
-                entries = held + [{key: value, **flags} for value in named if value not in known]
+                # what else is known of an entry (its `time_frame` is one of '28d', '7d', 'all'; its status 'active'):
+                # the entries listed have those fields too, or every model that filters on one keeps nothing
+                others = gen.get("fields") if gen.get("gen") == "object" else gen.get("of")
+                entries = held + [_entry({key: value, **flags}, others or {}, len(held) + i)
+                                  for i, value in enumerate(v for v in named if v not in known)]
                 if len(entries) == len(held):
                     continue
-                self.tables[table]["columns"][document] = {"gen": "constant", "value": json.dumps(entries), "type": gen.get("type") or "VARCHAR"}
+                self.tables[table]["columns"][document] = {"gen": "constant", "value": json.dumps(entries), "type": gen.get("type") or "VARCHAR",
+                                                           **({"of": others} if others else {})}
                 self.retyped.add(table)
                 self.learned.append(f"{table}.{document}: {self.nodes[parent]['name']} pivots the {key} of its entries into columns that "
                                     f"{self.nodes[sql_key]['name']} names; it now lists those {len(named)} entries.")

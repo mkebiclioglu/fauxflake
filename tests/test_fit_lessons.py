@@ -759,3 +759,17 @@ def test_a_reference_lost_without_a_lesson_about_it_is_put_back_once():
     tables["RAW.Z.ITEMS"]["columns"]["CHARGEID"] = {"gen": "template", "template": "chargeid_{hex}"}
     f.repair()
     assert tables["RAW.Z.ITEMS"]["columns"]["CHARGEID"]["gen"] == "template"
+
+
+def test_entries_written_into_a_document_have_the_fields_the_reading_knows():
+    from fauxflake.fit import _entry
+
+    fields = {"[].key_path": {"gen": "template", "template": "key_path_{hex}"},
+              "[].time_frame": {"gen": "categorical", "values": {"28d": 0.4, "7d": 0.4, "all": 0.2}},
+              "[].description": {"gen": "template", "template": "description_{hex}"},
+              "[].tags": {"gen": "template", "template": "tags_{hex}"}, "[].tags[]": {"gen": "template", "template": "tags_{hex}"},
+              "[].options.event": {"gen": "template", "template": "event_{hex}"}}
+    entries = [_entry({"key_path": f"counts.metric_{i}", "is_gmau": True}, fields, i) for i in range(40)]
+    assert {e["time_frame"] for e in entries} == {"28d", "7d", "all"}
+    assert entries[0]["key_path"] == "counts.metric_0" and entries[0]["description"].startswith("description_")
+    assert "tags" not in entries[0] and "options.event" not in entries[0]
