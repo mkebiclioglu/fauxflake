@@ -48,12 +48,25 @@ def begins_with(shapes: list[str], values: list[str]) -> dict[str, list[str]]:
     return out
 
 
-ORGS = 24  # how many organisations the generated addresses are at (`{org}`): org1 ... org24
+def named_values(gen: dict) -> list[str]:
+    """The values a category holds by name: those of a `categorical`, or the texts without a made-up part among
+    the shapes of a `template` (`meltano elt` beside `meltano add {hex}`)."""
+    if gen.get("gen") == "categorical":
+        return [str(v) for v in gen.get("values") or {} if isinstance(v, str)]
+    if gen.get("gen") == "template":
+        return [str(t) for t in gen.get("templates") or () if "{" not in str(t)]
+    return []
+
+
+ORGS = 24  # how many large organisations the generated addresses are at (`{org}`): org1 ... org24
 
 
 def org_of(text: str) -> str:
-    """SQL for the organisation the text `text` (SQL as well) belongs to."""
-    return f"concat('org', 1 + (hash({text}) % {ORGS})::bigint)"
+    """SQL for the organisation the text `text` (SQL as well) belongs to: half of the texts are spread over a few
+    large ones (what a list of accounts matches, what a count by domain shows), the others each at a small one
+    nearly its own, as the long tail of company domains is."""
+    return (f"concat('org', case when hash(concat({text}, '~')) % 2 = 0 then 1 + (hash({text}) % {ORGS})::bigint "
+            f"else {ORGS + 1} + (hash({text}) % 1000000)::bigint end)")
 
 
 def lit(v) -> str:
@@ -512,10 +525,10 @@ class TableSQL:
                     f"case {pick} {' '.join(f'when {i} then {fill(t)}' for i, t in enumerate(some))} end"
 
             lead = self.t.columns.get(str(d.get("begins_with") or "")) if "." not in col else None
-            if lead and lead.get("gen") == "categorical" and lead.get("values"):
+            if lead and named_values(lead):
                 # the text begins with the row's category (a command and its command category): each row takes a
                 # shape that begins with the value its category column holds
-                by_value = begins_with(shapes, [str(v) for v in lead["values"]])
+                by_value = begins_with(shapes, named_values(lead))
                 arms = " ".join(f"when {lit(v)} then {one_of(some)}" for v, some in by_value.items())
                 expr = f"case ({self._expr(str(d['begins_with']), lead)})::varchar {arms} else {one_of(shapes)} end"
             else:

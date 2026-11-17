@@ -32,6 +32,7 @@ from sqlglot import exp
 from sqlglot.optimizer.scope import traverse_scope
 
 from . import catalog
+from .generate import named_values
 
 LOADED_AT = ["_LOADED_AT", "_FIVETRAN_SYNCED", "_AIRBYTE_EXTRACTED_AT", "_SDC_BATCHED_AT", "_ETL_LOADED_AT",
              "LOADED_AT", "_INGESTED_AT", "INGESTED_AT", "_PARTITIONTIME"]
@@ -2959,13 +2960,13 @@ def follow_categories(columns: dict) -> None:
             continue
         best, owned = None, 0
         for other, cat in columns.items():
-            values = [v for v in (cat.get("values") or {}) if isinstance(v, str)] if cat.get("gen") == "categorical" else []
+            values = named_values(cat) if other != name else []
             leads = {v for v in values if any(s.startswith(v) and not s[len(v):len(v) + 1].isalnum() for s in shapes)}
             if len(leads) > max(owned, 1):
                 best, owned = other, len(leads)
         if best is None:
             continue
-        values = [str(v) for v in columns[best]["values"]]
+        values = named_values(columns[best])
         filler, kept, loose = f"{name.lower()}_{{hex}}", [], []
         for shape in shapes:
             if shape == filler:

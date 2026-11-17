@@ -891,3 +891,8 @@ def test_a_comparison_of_two_systems_is_tried_as_one_taking_over_from_the_other(
     assert "from_day" not in tables["RAW.SNOWPLOW.EVENTS"] and "until_day" not in tables["RAW.GA.EVENTS"]
     assert not f.learn_from_singular(node, None, sql)
     assert all("from_day" not in t and "until_day" not in t for t in tables.values())
+
+    # one takes over when a month begins: the month that begins nearest the middle of the history
+    f = fitter(tables=tables, spec={"history": 60, "start": "2025-01-11"}, n_round=3, failing_now={"assert_counts"})
+    f.sources_of = lambda uid: behind[uid]
+    assert f.learn_from_singular(node, None, sql) and tables["RAW.GA.EVENTS"]["until_day"] == 21  # 2025-02-01
