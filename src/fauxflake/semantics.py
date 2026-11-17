@@ -99,9 +99,11 @@ MACROS = [
             when 'UBIGINT' then 'INTEGER' when 'BIGINT' then 'INTEGER' when 'DOUBLE' then 'DECIMAL'
             when 'NULL' then 'NULL_VALUE' else json_type(v::varchar) end end""",
     # A windowed AVG keeps three extra decimals, not six.
+    # (The digits beyond are cut off, not rounded: 41 / 3 is 13.666. Rounded two places further out first, so that a
+    # quotient a hair under its true value, 0.29999999999999999, is not cut to 0.299.)
     f"""create or replace macro {_NS}_sf_div3(a, b) as case
           when typeof(a) in ('DOUBLE', 'FLOAT', 'VARCHAR') then a::double / b::double
-          else round(a::double / b::double, {_SCALE} + 3) end""",
+          else trunc(round(a::double / b::double, {_SCALE} + 5), {_SCALE} + 3) end""",
     # VARIANCE of fixed-point input is fixed-point; STDDEV of integers is the root of that.
     f"""create or replace macro {_NS}_sf_var(v, a) as case
           when typeof(a) in ('DOUBLE', 'FLOAT') then v else round(v, least(2 * {_SCALE} + 6, 12)) end""",
@@ -1009,7 +1011,14 @@ def _fix(node: exp.Expression) -> exp.Expression:
     if isinstance(node, exp.Window):
         inner = node.this
         if isinstance(inner, exp.Avg):
-            return _fn("_sf_div3", _over(node, exp.Sum(this=inner.this.copy())), _over(node, exp.Count(this=inner.this.copy())))
+            # a running average (ORDER BY with the default frame, or that frame written out) keeps six more
+            # decimals, rounded, like AVG without a window; any other frame, and no ORDER BY, keeps three
+            spec = node.args.get("spec")
+            running = node.args.get("order") is not None and (spec is None or (
+                str(spec.args.get("kind") or "").upper() == "RANGE" and str(spec.args.get("start") or "").upper() == "UNBOUNDED"
+                and str(spec.args.get("end") or "").upper() == "CURRENT ROW"))
+            return _fn("_sf_div" if running else "_sf_div3", _over(node, exp.Sum(this=inner.this.copy())),
+                       _over(node, exp.Count(this=inner.this.copy())))
         if isinstance(inner, exp.Anonymous) and inner.expressions:
             name, arg = inner.name.lower(), inner.expressions[0]
             if name == "ratio_to_report":
