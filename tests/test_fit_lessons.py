@@ -962,3 +962,18 @@ def test_a_failing_relationship_makes_a_reference_or_spares_the_rows_the_parent_
     assert tables["RAW.T.REVIEWS"]["columns"]["ACCOUNT"]["spares"] == "ISDELETED"
     assert tables["RAW.T.ACCOUNTS"]["columns"]["ISDELETED"]["every"] == 7 and tables["RAW.T.ACCOUNTS"]["columns"]["ISDELETED"]["marks"] is True
     assert not f.learn_from_test(test, places)
+
+
+def test_numbers_beside_references_to_a_text_key_become_references_when_a_union_reads_them_as_numbers():
+    ref = {"gen": "fk", "ref": "RAW.T.SERVER", "skew": 1.5, "length": 26}
+    tables = {
+        "RAW.T.SERVER": {"columns": {"USER_ID": {"gen": "hash_id", "named": ["93mykbogbjfrbbdqphx3zhze5c"], "length": 26}}},
+        "RAW.T.ACTIVITY": {"columns": {"USER_ID": dict(ref)}},
+        "RAW.T.CLICKS": {"columns": {"USER_ID": {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000]}}},
+    }
+    f = fitter(tables=tables)
+    f.sources_of, f.origins = lambda uid: ["RAW.T.CLICKS", "RAW.T.ACTIVITY"], lambda uid, name, strict=False: [name]
+    # `Could not convert string '4a8b...' to INT64 when casting from source column USER_ID`, in a UNION of the two
+    assert f.retype_column("model.p.tracks", "USER_ID", "BIGINT")
+    assert tables["RAW.T.ACTIVITY"]["columns"]["USER_ID"] == ref and tables["RAW.T.CLICKS"]["columns"]["USER_ID"] == ref
+    assert "generated as a reference" in f.learned[-1]

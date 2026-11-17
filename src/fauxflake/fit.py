@@ -926,6 +926,20 @@ class Fitter:
                 if key is not None and _text_ids(parent[key]) and (table, name) in kept_text:
                     continue  # compared with text elsewhere, and its key is text: the number that failed is not this column's
                 if key is not None and _text_ids(parent[key]):
+                    # the model reads the same column of other tables too, and there it holds plain numbers (a UNION
+                    # of event tables takes the type of the first): those are the odd ones out. They refer to the
+                    # same key, as this one does, and the UNION is of text
+                    odd = [t for t in tables if t != table and (self.tables[t].get("columns") or {}).get(name, {}).get("gen") == "dist"
+                           and not self.tables[t]["columns"][name].get("unique")
+                           and str(self.tables[t]["columns"][name].get("type", "BIGINT")).upper() in ("BIGINT", "DOUBLE", "INTEGER")]
+                    for other in odd:
+                        self.tables[other]["columns"][name] = {k: v for k, v in gen.items() if k in ("gen", "ref", "skew", "length", "null_rate")}
+                        self.retyped.add(other)
+                        self.learned.append(f"{other}.{name}: holds numbers where {table}.{name}, read beside it, refers to {gen['ref']}.{key}; "
+                                            "generated as a reference to it too.")
+                    if odd:
+                        changed = True
+                        continue
                     # the key it refers to is text the SQL takes apart or names (`1.2.3`), and this column is read as
                     # a number: it does not hold that key. A number of its own
                     columns[name] = guess(name, hint) if guess(name, hint).get("gen") == "dist" else \
