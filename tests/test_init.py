@@ -1315,3 +1315,29 @@ def test_a_test_that_returns_things_with_two_facts_at_odds_deals_the_facts_to_tw
     columns = {t: d["columns"] for t, d in build_spec(manifest, "A")[0]["tables"].items()}
     rules = {columns["RAW.S.LICENSES"]["LICENSE_ID"].get("null_unless"), columns["RAW.S.SERVERS"]["INSTALLATION"].get("null_unless")}
     assert rules == {"HASH(({{SERVER_ID}})::VARCHAR) % 2 = 0", "HASH(({{ID}})::VARCHAR) % 2 = 1"}, columns
+
+
+def test_tests_that_state_the_shape_of_an_id_and_the_order_of_two_times_are_read():
+    from fauxflake.init import build_spec
+
+    def source(name, cols):
+        return {"database": "RAW", "schema": "S", "name": name, "identifier": name,
+                "columns": {c: {"data_type": t} for c, t in cols.items()}}
+
+    def test(name, kwargs, column=None):
+        return {"resource_type": "test", "name": name, "attached_node": "model.p.orders", "column_name": column,
+                "depends_on": {"nodes": ["model.p.orders"]}, "test_metadata": {"name": "expression_is_true", "kwargs": kwargs}}
+
+    manifest = {
+        "sources": {"source.p.s.orders": source("orders", {"id": "NUMBER", "valid_from": "TIMESTAMP", "valid_to": "TIMESTAMP"}),
+                    "source.p.s.lines": source("lines", {"line": "NUMBER", "order_id": "NUMBER"})},
+        "nodes": {
+            "model.p.orders": {"resource_type": "model", "name": "orders", "depends_on": {"nodes": []}, "relation_name": "A.B.ORDERS",
+                               "compiled_code": "select o.id, o.valid_from, o.valid_to, l.line from raw.s.orders o join raw.s.lines l on l.order_id = o.id"},
+            "test.p.shape": test("shape", {"expression": "REGEXP '[0-9a-z]{32}'", "column_name": "id"}, "id"),
+            "test.p.order": test("order", {"expression": ">= valid_from", "column_name": "valid_to"}, "valid_to")},
+    }
+    columns = {t: d["columns"] for t, d in build_spec(manifest, "A")[0]["tables"].items()}
+    assert columns["RAW.S.ORDERS"]["ID"] == {"gen": "hash_id", "length": 32}
+    assert columns["RAW.S.LINES"]["ORDER_ID"]["gen"] == "fk" and columns["RAW.S.LINES"]["ORDER_ID"]["length"] == 32
+    assert min(columns["RAW.S.ORDERS"]["VALID_TO"]["seconds"]) > max(columns["RAW.S.ORDERS"]["VALID_FROM"].get("seconds", [0]))

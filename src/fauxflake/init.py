@@ -1621,7 +1621,7 @@ def pool_name(m) -> str:  # noqa: ANN001
     return (m[2].replace("[]", "").split(".")[-1] or m[1]).lower()
 
 
-def as_long_as(tables: dict[str, dict], uses: dict, pairs: list, notes: list[str]) -> None:
+def as_long_as(tables: dict[str, dict], uses: dict, pairs: list, notes: list[str], said_text: set | None = None) -> None:
     """`length(server_id) <> 26` marks the invalid ids: an id is 26 characters, in that column and in every
     column a join or a UNION lines up with it (`length`: the made-up value, rewritten at that length). Left alone
     where any of them holds values known by name: those are as long as they are."""
@@ -1644,6 +1644,10 @@ def as_long_as(tables: dict[str, dict], uses: dict, pairs: list, notes: list[str
             held = [tables[t]["columns"][c] for t, c in sorted(group)]
             made_up = lambda d: (d.get("gen") in ("hash_id", "fk", "pool") and not d.get("numeric") and not d.get("template")) or (  # noqa: E731
                 d.get("gen") == "template" and not d.get("templates") and re.fullmatch(r"\w+_\{(n|hex)\}", str(d.get("template", ""))))
+            if (name, col) in (said_text or ()) and all(d.get("gen") in ("sequence", "fk", "hash_id") for d in held):
+                for d in held:  # (a key of numbers that a test says is text: ids of letters and digits)
+                    if d.get("gen") == "sequence":
+                        d["gen"] = "hash_id"
             if not all(made_up(d) and not d.get("suffix") and not d.get("format") for d in held):
                 continue
             for d in held:
@@ -2324,6 +2328,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 either.append((sides[0], sides[1]))
             break
     gated: list[tuple[tuple[str, str], str]] = []  # (a column, the rule about the row that holds wherever it is not null)
+    said_text: set[tuple[str, str]] = set()  # columns a test says are text of a given shape, whatever the reading took them for
     keys: dict[str, str] = {}
     ordered: list[tuple[tuple[str, str, str], tuple[str, str, str]]] = []  # (the later, the earlier) of two times a test compares
     together: list[tuple[str, list[str]]] = []  # (table, columns a test says are unique together)
@@ -2346,10 +2351,21 @@ def analyse(manifest: dict, database: str) -> Analysis:
             if spots and all(spots) and len(spots) == len(listed) and len({spot[0] for spot in spots}) == 1:
                 together.append((spots[0][0], [spot[1] for spot in spots]))
             continue
+        written = str((meta["kwargs"].get("arguments") or meta["kwargs"]).get("expression") or "").strip() \
+            if meta["name"] == "expression_is_true" else ""
+        shaped = re.fullmatch(r"(?i)(?:REGEXP|RLIKE)\s+'\^?\[(?:0-9a-[fz]|a-[fz]0-9)\]\{(\d+)\}\$?'", written) if column else None
+        spot = locate(tested, str(column)) if shaped and re.fullmatch(r"\w+", str(column)) else None
+        if spot and spot[0] in uses and 8 <= int(shaped[1]) <= 64:
+            # `id` tested with `REGEXP '[0-9a-z]{32}'`: an id of 32 letters and digits, wherever it is written
+            uses[spot[0]].lengths[spot[1]] = int(shaped[1])
+            said_text.add((spot[0], spot[1]))
+            continue
+        if column and re.fullmatch(r"\w+", str(column)) and re.match(r"(>=|<=|>|<)\s*\w+\s*$", written):
+            written, column = f"{column} {written}", None  # `valid_to` tested with `>= valid_from`
         if meta["name"] == "expression_is_true" and not column:
             # `expression: "release_date > rc1_date"`: one of the two comes after the other
             try:
-                said = sqlglot.parse_one(str((meta["kwargs"].get("arguments") or meta["kwargs"]).get("expression") or ""), read="snowflake")
+                said = sqlglot.parse_one(written, read="snowflake")
             except Exception:  # noqa: BLE001
                 said = None
             if isinstance(said, (exp.GT, exp.GTE, exp.LT, exp.LTE)) and isinstance(said.this, exp.Column) and isinstance(said.expression, exp.Column):
@@ -2717,7 +2733,8 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 ordered.append(((name, end, ""), (name, start, "")))
             notes.append(f"{name}: models look rows up by {thing} and a moment between {start} and {end}; generated as one period "
                          f"for each {thing.lower()}, most of them still open.")
-    as_long_as(tables, uses, [*joins, *((a, b) for group in links for a in sorted(group, key=str)[:1] for b in sorted(group, key=str)[1:])], notes)
+    as_long_as(tables, uses, [*joins, *((a, b) for group in links for a in sorted(group, key=str)[:1] for b in sorted(group, key=str)[1:])], notes,
+               said_text)
     _share_union_values(tables, links)
     if joined:
         notes.append(f"{len(joined)} group(s) of columns are joined in models and generated to match, for example: {' '.join(joined[:3])}")
