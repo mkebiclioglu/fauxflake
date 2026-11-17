@@ -772,3 +772,21 @@ def test_comments_are_kept_where_information_schema_reads_them(run):
     assert run(listed)[0][2] == "again"
     run("create or replace table docs as select 1 as id")  # a replaced table starts without its comment
     assert run(listed)[0][2] is None
+
+
+def test_merge_refuses_two_source_rows_for_one_target_row(run):
+    """What a dbt incremental model with a repeated unique_key does on Snowflake."""
+    run("create or replace table mg (id int, name varchar)")
+    run("insert into mg values (1, 'a'), (2, 'b')")
+    merge = ("merge into mg as DBT_INTERNAL_DEST using ({source}) as DBT_INTERNAL_SOURCE on ((DBT_INTERNAL_SOURCE.id = DBT_INTERNAL_DEST.id)) "
+             'when matched then update set "NAME" = DBT_INTERNAL_SOURCE."NAME" when not matched then insert ("ID", "NAME") values ("ID", "NAME")')
+    with pytest.raises(Exception, match="Duplicate row detected during DML action"):
+        run(merge.format(source="select 1 id, 'x' name union all select 1, 'y'"))
+    assert run("select * from mg order by id") == [(1, "a"), (2, "b")]  # nothing was changed
+    run(merge.format(source="select 1 id, 'x' name union all select 3, 'c' union all select 3, 'c2'"))  # new rows may repeat
+    assert run("select * from mg order by id, name") == [(1, "x"), (2, "b"), (3, "c"), (3, "c2")]
+    # a row of the source that the WHEN condition leaves out does not count, and DELETE takes any number
+    run("merge into mg t using (select 2 id, 'p' name, true go union all select 2, 'q', false) s on t.id = s.id "
+        "when matched and s.go then update set name = s.name")
+    run("merge into mg t using (select 3 id union all select 3) s on t.id = s.id when matched then delete")
+    assert run("select * from mg order by id") == [(1, "x"), (2, "p")]

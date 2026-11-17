@@ -335,7 +335,8 @@ from at-least-once loaders and out-of-order updates appear without being scripte
 - **It refuses what Snowflake refuses to compile, with a few exceptions.** `YEAR(text_column)`,
   `DATE_TRUNC` or `LAST_DAY` on text, `TO_CHAR(text, 'YYYY')`, `where a_number`, `IFF(text, ...)`,
   `a_date - 'text'`, `"id"` for a column named `ID`, `SELECT DISTINCT a ... ORDER BY b` and two
-  columns of one name in a table or view fail here with Snowflake's error, and text is read as a date or number where Snowflake reads it (`ADD_MONTHS`,
+  columns of one name in a table or view fail here with Snowflake's error, as does a `MERGE`
+  whose source repeats a key it updates (a dbt incremental model with a duplicated `unique_key`), and text is read as a date or number where Snowflake reads it (`ADD_MONTHS`,
   `COALESCE(text_column, 0)`). Still accepted here and not there: `HOUR` of a `DATE`,
   `ARRAY_SIZE` of text holding JSON, a date minus a timestamp, and a `FLOAT` added to a date.
   A cheap stage on Snowflake closes what is left:

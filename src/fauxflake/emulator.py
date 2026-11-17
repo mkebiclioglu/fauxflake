@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Iterator
 
 import duckdb
+import sqlglot
 from sqlglot import exp
 
 from . import objects, semantics
@@ -360,6 +361,31 @@ def _record_semi_types(cursor) -> None:  # noqa: ANN001
         pass
 
 
+_DUPLICATE_ROW = "Duplicate row detected during DML action"
+
+
+def _one_source_row_per_target_row(merge: exp.Merge) -> exp.Expression | None:
+    """A MERGE whose source holds two rows for one row of the target, with an UPDATE to make: Snowflake refuses it
+    (`Duplicate row detected during DML action`), which is how a dbt incremental model with a repeated unique_key
+    fails in production. The matched rows are in the working table by then: two of them with the same values in
+    the source columns the ON condition reads matched the same target rows. A statement that fails when there
+    are such rows, or None when the MERGE has nothing to check."""
+    source, on = merge.args.get("using"), merge.args.get("on")
+    updates = [i for i, when in enumerate(merge.args.get("whens").expressions if isinstance(merge.args.get("whens"), exp.Whens)
+                                          else merge.args.get("whens") or [])
+               if when.args.get("matched") and isinstance(when.args.get("then"), exp.Update)]
+    if source is None or on is None or not updates:
+        return None
+    name = source.alias_or_name.upper()
+    keys = sorted({c.this.sql(dialect="duckdb") for c in on.find_all(exp.Column) if c.table and c.table.upper() == name})
+    if not keys:
+        return None
+    grouped = ", ".join(keys)
+    return sqlglot.parse_one(
+        f"SELECT CASE WHEN EXISTS (SELECT 1 FROM merge_candidates WHERE merge_op IN ({', '.join(map(str, updates))}) "
+        f"GROUP BY {grouped} HAVING COUNT(*) > 1) THEN CAST('{_DUPLICATE_ROW}' AS INT) END", read="duckdb")
+
+
 _KEYS = (exp.PrimaryKeyColumnConstraint, exp.UniqueColumnConstraint, exp.PrimaryKey, exp.ForeignKey, exp.Reference)
 
 
@@ -659,6 +685,11 @@ def _patch_fakesnow() -> None:
             objects.remember(self)
             return done
         except ProgrammingError as e:
+            if _DUPLICATE_ROW in str(e.msg):
+                self._sqlstate = "42P18"
+                raise ProgrammingError(msg=f"{_DUPLICATE_ROW}\n(the source of the MERGE has more than one row for a row of the "
+                                           "target that it updates: in a dbt incremental model, a unique_key that repeats)",
+                                       errno=100090, sqlstate="42P18") from e
             if e.errno == 2003 and "does not exist" in str(e.msg) and "not authorized" not in str(e.msg):
                 # Snowflake's wording, which clients look for: dbt reads "no such table" as "no columns yet"
                 self._sqlstate = "42S02"
@@ -886,7 +917,12 @@ def _patch_fakesnow() -> None:
                 part.args["actions"][0].set("tables", [column.copy()])
                 parts.append(part)
             return parts
-        return original_explode(self, expression)
+        parts = original_explode(self, expression)
+        if isinstance(expression, exp.Merge) and len(parts) >= 3:
+            check = _one_source_row_per_target_row(expression)
+            if check is not None:
+                parts.insert(1, check)  # after the rows are matched, before any of them is changed
+        return parts
 
     FakeSnowflakeCursor._transform_explode = _transform_explode
 
