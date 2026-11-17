@@ -28,6 +28,26 @@ from . import emulator, objects
 from .spec import Spec, Table, quoted
 
 
+def begins_with(shapes: list[str], values: list[str]) -> dict[str, list[str]]:
+    """The shapes of a text for each value of the category it begins with: those that start with the value
+    (the longest one that fits), `<value> {hex}` when none does. Shapes that start with no value at all
+    (texts a lesson asked for by name) are dealt out over the values in turn."""
+    out: dict[str, list[str]] = {v: [] for v in values}
+    loose = []
+    for shape in shapes:
+        owners = [v for v in values if shape.startswith(v) and not shape[len(v):len(v) + 1].isalnum()]
+        if owners:
+            out[max(owners, key=len)].append(shape)
+        else:
+            loose.append(shape)
+    for v in values:
+        if not out[v]:
+            out[v].append(v + " {hex}")
+    for i, shape in enumerate(loose):
+        out[values[i % len(values)]].append(shape)
+    return out
+
+
 def lit(v) -> str:
     if v is None:
         return "NULL"
@@ -446,9 +466,21 @@ class TableSQL:
                 return f"concat({', '.join(parts)})"
 
             shapes = d.get("templates") or [d["template"]]  # several shapes: each row takes one
-            pick = f"floor({self.u(col + ':shape')} * {len(shapes)})::bigint"
-            expr = fill(shapes[0]) if len(shapes) == 1 else \
-                f"case {pick} {' '.join(f'when {i} then {fill(t)}' for i, t in enumerate(shapes))} end"
+
+            def one_of(some: list[str]) -> str:
+                pick = f"floor({self.u(col + ':shape')} * {len(some)})::bigint"
+                return fill(some[0]) if len(some) == 1 else \
+                    f"case {pick} {' '.join(f'when {i} then {fill(t)}' for i, t in enumerate(some))} end"
+
+            lead = self.t.columns.get(str(d.get("begins_with") or "")) if "." not in col else None
+            if lead and lead.get("gen") == "categorical" and lead.get("values"):
+                # the text begins with the row's category (a command and its command category): each row takes a
+                # shape that begins with the value its category column holds
+                by_value = begins_with(shapes, [str(v) for v in lead["values"]])
+                arms = " ".join(f"when {lit(v)} then {one_of(some)}" for v, some in by_value.items())
+                expr = f"case ({self._expr(str(d['begins_with']), lead)})::varchar {arms} else {one_of(shapes)} end"
+            else:
+                expr = one_of(shapes)
         elif gen == "time_offset":
             expr = f"_ev + {ms(piecewise(self.u(col), d['p'], d['seconds']))}"
             if self.in_order() and min(d["seconds"]) >= 0 and max(d["seconds"]) <= 7 * 86400:

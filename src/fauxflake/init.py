@@ -2384,6 +2384,8 @@ def analyse(manifest: dict, database: str) -> Analysis:
         settings["role"] = role
         notes.append(f"the project's masking policies show real values to the role `{role}`, the one that builds the "
                      f"warehouse: the build runs as that role (`dbt: {{role: {role}}}`).")
+    for table in tables.values():
+        follow_categories(table["columns"])
     least = rows_asked(manifest)
     if least:
         notes.append(f"the project lists tables by their size (`row_count >= {least}` in INFORMATION_SCHEMA.TABLES): every "
@@ -2403,6 +2405,36 @@ HEADER = """# Written by `fauxflake init` from the dbt project. Keys, relationsh
 # from your tests; columns and types from how models use each source. Volumes, lateness and
 # distributions are placeholders: run `fauxflake profile` to measure them, or edit by hand.
 """
+
+
+def follow_categories(columns: dict) -> None:
+    """`where command_category = 'meltano elt'` here, `command like 'meltano elt%--transform run%'` there: the
+    shapes the SQL asks of a text begin with the values of a category in the same table. In the real data the
+    category is read off the text; drawn apart, a row's text says one thing and its category another, and models
+    that sort rows by either put a row in two places. The text then follows the category (`begins_with`): every
+    shape begins with a value, and a row takes one that begins with its own."""
+    for name, gen in columns.items():
+        shapes = gen.get("templates") if gen.get("gen") == "template" and not gen.get("parts") and not gen.get("unique") else None
+        if not shapes:
+            continue
+        best, owned = None, 0
+        for other, cat in columns.items():
+            values = [v for v in (cat.get("values") or {}) if isinstance(v, str)] if cat.get("gen") == "categorical" else []
+            leads = {v for v in values if any(s.startswith(v) and not s[len(v):len(v) + 1].isalnum() for s in shapes)}
+            if len(leads) > max(owned, 1):
+                best, owned = other, len(leads)
+        if best is None:
+            continue
+        values = [str(v) for v in columns[best]["values"]]
+        filler, kept, loose = f"{name.lower()}_{{hex}}", [], []
+        for shape in shapes:
+            if shape == filler:
+                continue  # (what stood for "any other text": every value now has a shape of its own)
+            (kept if any(shape.startswith(v) and not shape[len(v):len(v) + 1].isalnum() for v in values) else loose).append(shape)
+        bare = [v for v in values if not any(s.startswith(v) for s in kept)] or values
+        for i, shape in enumerate(loose):  # `%--transform only%`: part of some command, whichever
+            kept.append(f"{bare[i % len(bare)]} {shape}")
+        gen.update(templates=kept, begins_with=best)
 
 
 def rows_asked(manifest: dict) -> int | None:
