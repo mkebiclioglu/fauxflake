@@ -2167,8 +2167,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 parts = {c.name.upper(): worked_out(node["attached_node"], c.name) for c in said.find_all(exp.Column)}
                 if parts and all(parts.values()) and {part[0] for part in parts.values()} == {gate[0]}:
                     rule = said.transform(lambda n: exp.Paren(this=parts[n.name.upper()][1].copy()) if isinstance(n, exp.Column) else n)
-                    rule = rule.transform(lambda n: exp.Var(this=f"__col_{n.name.upper()}__") if isinstance(n, exp.Column) else n)
-                    gated.append((gate, re.sub(r"__col_(\w+?)__", r"{{\1}}", rule.sql(dialect="duckdb"))))
+                    gated.append((gate, rule_text(rule)))
             continue
         here = locate(node["attached_node"], column) if column else None
         if not here and column and meta["name"] == "relationships":
@@ -2693,8 +2692,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 rule = sqlglot.parse_one(said, read="snowflake")
             except Exception:  # noqa: BLE001
                 continue
-            rule = rule.transform(lambda n: exp.Var(this=f"__col_{n.name.upper()}__") if isinstance(n, exp.Column) else n)
-            rule = re.sub(r"__col_(\w+?)__", r"{{\1}}", rule.sql(dialect="duckdb"))
+            rule = rule_text(rule)
             # the tables lined up with this one in a UNION (the same event, one table per kind) hold the same rule
             same = {(name, col)} | {(m[0], m[1]) for group in links if any((m[0], m[1]) == (name, col) for m in group) for m in group}
             # (and the other tables of its schema with the same columns: one table per kind of event, read as one)
@@ -2760,6 +2758,20 @@ def created_comes_first(columns: dict) -> None:
         for name in found.get("ended", ()):
             if min(columns[name]["seconds"]) <= top:
                 columns[name].update(p=[0, 0.5, 1], seconds=[top + 60, top + 3 * 86400, top + 30 * 86400])
+
+
+def rule_text(rule: exp.Expression) -> str:
+    """A rule about a row, read from Snowflake SQL over a table's own columns, as the DuckDB text the generator
+    works out: `{{VERSION}}` stands for a column, and what the translation spelled out at length is put briefly."""
+    marked = rule.transform(lambda n: exp.Var(this=f"FXCOL0{n.name.upper()}0FXEND") if isinstance(n, exp.Column) else n)
+    text = marked.sql(dialect="duckdb")
+    try:
+        from sqlglot.optimizer.simplify import simplify
+
+        text = simplify(sqlglot.parse_one(text, read="duckdb")).sql(dialect="duckdb")
+    except Exception:  # noqa: BLE001, S110
+        pass
+    return re.sub(r'"?FXCOL0(\w+?)0FXEND"?', r"{{\1}}", text)
 
 
 def rule_binds(rule: str, col: str, columns: dict) -> bool:
