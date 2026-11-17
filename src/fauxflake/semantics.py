@@ -400,9 +400,15 @@ _NUMBER_FORMAT = re.compile(r"^(FM)?(\$)?([09,]+)(?:\.([09]+))?$", re.IGNORECASE
 
 def _number_format(value: exp.Expression, model: str) -> exp.Expression | None:
     """TO_CHAR(number, '9,999.00') as a DuckDB format() call, for the common format models."""
-    if re.fullmatch(r"X+", model.strip()):  # hexadecimal
-        return sqlglot.parse_one(f"format('{{:X}}', ({value.sql(dialect='duckdb')})::bigint)", read="duckdb")
-    m = _NUMBER_FORMAT.match(model.strip())
+    model = model.strip()
+    hexa = re.fullmatch(r"(FM)?(0*)([Xx]+)", model)
+    if hexa:  # hexadecimal: in the letters' case, right-aligned in the model's width (zeros where the model has them)
+        fill, zeros, letters = hexa.groups()
+        width = len(zeros) + len(letters)
+        raw = f"format('{{:{'x' if letters.islower() else 'X'}}}', ({value.sql(dialect='duckdb')})::bigint)"
+        text = f"lpad({raw}, {width}, '0')" if zeros else raw if fill else f"lpad({raw}, {width}, ' ')"
+        return sqlglot.parse_one(f"(case when length({raw}) > {width} then repeat('#', {width}) else {text} end)", read="duckdb")
+    m = _NUMBER_FORMAT.match(model)
     if not m:
         return None
     fill, dollar, whole, frac = m.groups()
@@ -413,13 +419,32 @@ def _number_format(value: exp.Expression, model: str) -> exp.Expression | None:
         spec = f"0{len(digits) + (decimals + 1 if decimals else 0)}.{decimals}f"
     v = f"({value.sql(dialect='duckdb')})::double"
     text = f"format('{{:{spec}}}', abs({v}))"
+    optional = len(frac or "") - len((frac or "").rstrip("9"))  # 9s that end the model print a digit only when there is one
+    if optional:
+        trimmed = f"regexp_replace({text}, '0{{1,{optional}}}$', '')"
+        text = trimmed if fill else f"({trimmed} || repeat(' ', length({text}) - length({trimmed})))"
     if dollar:
         text = f"concat('$', {text})"
     text = f"(case when {v} < 0 then '-' else '' end || {text})"
     if not fill:  # Snowflake right-aligns in the model's width, plus one position for the sign
-        text = f"lpad({text}, {len(model.strip()) + 1}, ' ')"
-    return sqlglot.parse_one(text, read="duckdb")
+        text = f"lpad({text}, {len(model) + 1}, ' ')"
+    tree = sqlglot.parse_one(text, read="duckdb")
+    for call in list(tree.find_all(exp.RegexpReplace)):  # as DuckDB's own function: the emulator's transform is for Snowflake's
+        call.replace(exp.Anonymous(this="regexp_replace", expressions=[call.this, call.expression, call.args["replacement"]]))
+    return tree
 
+
+
+_MODEL_NUMBERS = re.compile(r'"[^"]*"|yyyy|yy|mmmm|mon|mm|dd|dy|hh24|hh12|hh|mi|ss|ff\d?|tzh|tzm|am|pm', re.IGNORECASE)
+
+
+def _date_model(model: str) -> str:
+    """A date format model with its elements in capitals: Snowflake reads `yyyy-mm-dd` as `YYYY-MM-DD` (sqlglot
+    takes the lower-case `dd` for a day without its leading zero, and `dy` for the day's number). Quoted text
+    is left alone."""
+    if not _DATE_TOKENS.search(model) or re.fullmatch(r"[\s09,.$XxFfMm]+", model):
+        return model  # a number format
+    return _MODEL_NUMBERS.sub(lambda m: m.group(0) if m.group(0).startswith('"') else m.group(0).upper(), model)
 
 
 def _type_unseen(*args: exp.Expression) -> bool:
@@ -869,7 +894,7 @@ def _fix(node: exp.Expression) -> exp.Expression:
         if not isinstance(node.parent, (exp.Window, exp.WithinGroup)):
             return exp.Coalesce(this=node, expressions=[exp.Literal.string("")])  # and no rows gives ''
     if isinstance(node, (exp.ToChar, exp.StrToTime, exp.StrToDate, exp.TsOrDsToDate)) and isinstance(node.args.get("format"), exp.Literal):
-        node.args["format"].set("this", node.args["format"].name.replace("Mon", "MON").replace("Dy", "DY"))
+        node.args["format"].set("this", _date_model(node.args["format"].name).replace("Mon", "MON").replace("Dy", "DY"))
     if isinstance(node, exp.ArraySize):
         return _fn("_sf_array_size", node.this)
     if isinstance(node, exp.Anonymous) and node.name.lower() in _TIMESTAMP_PARSERS and len(node.expressions) == 1:
@@ -884,7 +909,9 @@ def _fix(node: exp.Expression) -> exp.Expression:
             and re.fullmatch(r"[09,.$]+", node.args["format"].name.strip()):
         declared = node.args.get("scale")  # the format only guides parsing; the result scale is 0 unless given
         scale = int(declared.name) if isinstance(declared, exp.Literal) else 0
-        return exp.cast(exp.func("replace", node.this, exp.Literal.string(","), exp.Literal.string("")), f"decimal(38, {scale})")
+        digits = exp.Anonymous(this="regexp_replace", expressions=[
+            exp.cast(node.this, "varchar"), exp.Literal.string("[$,\\s]"), exp.Literal.string(""), exp.Literal.string("g")])
+        return exp.cast(digits, f"decimal(38, {scale})")
     if isinstance(node, exp.Anonymous) and node.name.lower() in _RENAMED:
         return _fn(_RENAMED[node.name.lower()], *node.expressions)
     if isinstance(node, exp.TableFromRows) and isinstance(node.this, exp.SplitToTable):
@@ -899,6 +926,15 @@ def _fix(node: exp.Expression) -> exp.Expression:
         if _type_unseen(node.this, node.expression):
             return _fn("_sf_div", node.this, node.expression)
         return _fn("_sf_div_n", node.this, node.expression, exp.Anonymous(this="typeof", expressions=[node.this.copy()]))
+    if isinstance(node, (exp.SHA2, exp.SHA2Digest)) and isinstance(node.args.get("length"), exp.Literal) \
+            and node.args["length"].name in ("224", "384", "512"):
+        # DuckDB has SHA-256 only (and sqlglot would quietly use it for every length)
+        digest = exp.Anonymous(this="_fx_sha2", expressions=[exp.cast(node.this, "varchar"), exp.Literal.number(node.args["length"].name)])
+        return exp.Anonymous(this="unhex", expressions=[digest]) if isinstance(node, exp.SHA2Digest) else digest
+    if type(node).__name__ in ("MD5NumberLower64", "MD5NumberUpper64"):
+        start = 17 if type(node).__name__ == "MD5NumberLower64" else 1
+        return sqlglot.parse_one(f"('0x' || substr(md5(({node.this.sql(dialect='duckdb')})::varchar), {start}, 16))::ubigint::hugeint",
+                                 read="duckdb")
     if isinstance(node, exp.AddMonths) and not _type_unseen(node.this):
         return _fn("_sf_add_months", node.this, node.expression)
     if isinstance(node, exp.ConvertTimezone) and node.args.get("source_tz") is None and node.args.get("timestamp") is not None:
@@ -1439,6 +1475,16 @@ def rewrite(node: exp.Expression) -> exp.Expression:
             fn = "IFF" if isinstance(node, exp.CountIf) or (isinstance(node, exp.If) and not isinstance(node.parent, exp.Case)) \
                 else "CASE" if isinstance(node, exp.If) else "predicate"
             node.set(key, _fn("_sf_cond", test, exp.Literal.string(fn)))
+    if isinstance(node, (exp.DateAdd, exp.TimestampAdd)):
+        amount = node.expression
+        negative = isinstance(amount, exp.Neg)
+        number = amount.this if negative else amount
+        if isinstance(number, exp.Literal) and not number.is_string and not number.is_int:
+            # DATEADD(day, 1.5, d) adds two days: the amount is rounded, away from zero at one half
+            from decimal import ROUND_HALF_UP, Decimal
+
+            whole = int(Decimal(number.name).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+            node.set("expression", exp.Literal.number(-whole if negative else whole))
     for key, kind in _READS_TEXT.get(type(node), ()):
         arg = node.args.get(key)
         if arg is not None and not isinstance(arg, (exp.Null, exp.Placeholder, exp.Parameter, exp.Cast)) and not arg.is_int:
@@ -1765,6 +1811,22 @@ def patch_upstream() -> None:
         return trim(e)
 
     upstream.trim_cast_varchar = trim_cast_varchar
+
+    # date format models are read without regard to case, at the point where the parser translates them
+    from sqlglot.dialects.snowflake import Snowflake
+
+    if not getattr(Snowflake, "_fauxflake_models", False):
+        translate = Snowflake.format_time.__func__
+
+        def format_time(cls, expression):  # noqa: ANN001, ANN202
+            if isinstance(expression, str):
+                expression = _date_model(expression)
+            elif isinstance(expression, exp.Literal) and expression.is_string:
+                expression = exp.Literal.string(_date_model(expression.name))
+            return translate(cls, expression)
+
+        Snowflake.format_time = classmethod(format_time)
+        Snowflake._fauxflake_models = True
 
     # `select lower(v:name), count(*) ... group by v:name` (or `group by v`): DuckDB does not recognise a grouped
     # expression written with `->` inside another expression. The same access as a function call binds.

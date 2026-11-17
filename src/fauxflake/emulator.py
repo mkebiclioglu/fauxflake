@@ -1166,6 +1166,17 @@ def sweep_stale(root: str | Path | None = None, older_than: float = 12 * 3600) -
     return removed
 
 
+def _native_functions(duck: duckdb.DuckDBPyConnection) -> None:
+    """What DuckDB has no function for and SQL cannot spell: SHA-2 at lengths other than 256."""
+    import hashlib
+
+    def sha2(text, bits):  # noqa: ANN001, ANN202
+        return None if text is None or bits is None else hashlib.new(f"sha{int(bits)}", text.encode()).hexdigest()
+
+    with contextlib.suppress(duckdb.Error):  # already there, in a process that starts a second emulator on one database
+        duck.create_function("_fx_sha2", sha2, ["VARCHAR", "INTEGER"], "VARCHAR", null_handling="special")
+
+
 def _spill_directory(duck: duckdb.DuckDBPyConnection) -> str:
     """Where DuckDB writes what does not fit in memory. Its default is `.tmp` in the working directory,
     which is the user's dbt repository: use a private directory outside it, removed on exit."""
@@ -1220,6 +1231,7 @@ def engine() -> Iterator[Emulator]:
     _describe_semi_types(fs.duck_conn)
     fs.duck_conn.execute("set global old_implicit_casting = true")  # text compares with numbers and dates, as in Snowflake
     spill = _spill_directory(fs.duck_conn)
+    _native_functions(fs.duck_conn)
     semantics.UDFS.clear()  # functions belong to the emulator that defined them
     semantics.UDTFS.clear()
     _SPEC_UDFS.clear()
@@ -1268,6 +1280,7 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
     _describe_semi_types(fs.duck_conn)
     fs.duck_conn.execute("set global old_implicit_casting = true")  # text compares with numbers and dates, as in Snowflake
     spill = _spill_directory(fs.duck_conn)
+    _native_functions(fs.duck_conn)
     semantics.UDFS.clear()  # functions belong to the emulator that defined them
     semantics.UDTFS.clear()
     semantics.MIXED_CASE = None
