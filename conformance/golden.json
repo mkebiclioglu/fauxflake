@@ -3999,6 +3999,71 @@
    ]
   ]
  },
+ "text_coalesced_through_outer_join": {
+  "rows": [
+   [
+    "1",
+    "7"
+   ],
+   [
+    "2",
+    "0"
+   ]
+  ]
+ },
+ "text_coalesced_with_date": {
+  "rows": [
+   [
+    "2024-01-05",
+    "2024-01-05",
+    true
+   ]
+  ]
+ },
+ "text_coalesced_with_number": {
+  "rows": [
+   [
+    "5",
+    "5",
+    "5",
+    "5",
+    "5",
+    "0",
+    "5",
+    "5",
+    "5",
+    "5",
+    "5"
+   ]
+  ]
+ },
+ "text_coalesced_with_number_aggregates": {
+  "rows": [
+   [
+    "10",
+    "5"
+   ]
+  ]
+ },
+ "text_coalesced_with_number_must_convert": {
+  "error": "100038 (22018): Numeric value 'abc' is not recognized"
+ },
+ "text_coalesced_with_number_sorts_as_number": {
+  "rows": [
+   [
+    "0"
+   ],
+   [
+    "5"
+   ],
+   [
+    "9"
+   ],
+   [
+    "10"
+   ]
+  ]
+ },
  "text_number_formats": {
   "rows": [
    [
@@ -4388,6 +4453,9 @@
     "1.5"
    ]
   ]
+ },
+ "typed_branches_keep_their_type": {
+  "error": "100038 (22018): Numeric value 'n/a' is not recognized"
  },
  "typeof_variant": {
   "rows": [

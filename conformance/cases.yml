@@ -391,3 +391,11 @@
 - {id: strict_to_char_of_variant, sql: "select to_char(v, 'YYYY-MM') from (select '2024-01-05'::variant v)"}
 - {id: strict_to_char_of_literal, sql: "select to_char('2024-01-05', 'YYYY-MM')"}
 - {id: strict_to_char_date_format_of_number, sql: "select to_char(n, 'YYYY') from (select 2024 n)"}
+# Text beside a number or a date in COALESCE / IFF / CASE takes that type.
+- {id: text_coalesced_with_number, sql: "select coalesce(n, 0), nvl(n, 0), ifnull(n, 0), iff(true, n, 0), case when true then n else 0 end, coalesce(0, n), coalesce(null, n, 0), iff(false, 0, n), case when false then 0 when true then n end, coalesce(n, 1.5), coalesce(n, -1) from (select '5'::varchar n)"}
+- {id: text_coalesced_with_date, sql: "select nvl(x, '2024-02-01'::date), case when true then x else '2024-02-01'::date end, coalesce(x, current_date) < '2024-02-01'::date from (select '2024-01-05'::varchar x)"}
+- {id: text_coalesced_with_number_sorts_as_number, sql: "select coalesce(n, 0) c from (select column1::varchar n from values ('5'), ('10'), ('9'), (null)) order by c"}
+- {id: text_coalesced_with_number_aggregates, sql: "with a as (select column1::varchar n, column2 k from values ('5', 1), ('10', 2)), b as (select coalesce(n, 0) n2, k from a) select max(n2), min(n2) from b"}
+- {id: text_coalesced_with_number_must_convert, sql: "select coalesce(n, 0) from (select 'abc'::varchar n)"}
+- {id: text_coalesced_through_outer_join, sql: "select a.k, coalesce(b.n, 0) from (select 1 k union all select 2) a left join (select 1 k, '7'::varchar n) b on a.k = b.k order by 1"}
+- {id: typed_branches_keep_their_type, sql: "select coalesce(i, 0), coalesce(f, 0), coalesce(d, current_date) = d, iff(i > 1, i, 0), case when i > 1 then f else 0 end, coalesce(n, 'none'), nvl(j, 'n/a') from (select 5 i, 1.5::float f, '2024-01-09'::date d, 5 n, null::int j)"}
