@@ -71,6 +71,7 @@ def test_udfs_from_the_spec_are_callable(emu, spec):
     conn = snowflake.connector.connect(**emu.connect_kwargs(database="ANALYTICS", schema="CI"))
     row = conn.cursor().execute(
         "select fiscal_year('2025-03-01'::date), analytics.udfs.fiscal_year('2025-01-15'::date), ID15TO18('abc')").fetchone()
+    conn.close()  # before the emulator stops, or the connector retries its goodbye against a closed port
     assert row == (2026, 2025, "abcAAA")
 
 
