@@ -726,3 +726,24 @@ def test_snowflake_refusing_a_condition_or_date_arithmetic_types_the_column():
     assert f._learn("m", "001044 (42P13): SQL compilation error:\nInvalid argument types for function '-': (DATE, VARCHAR(134217728))\n(the text: CLOSED_ON)")
     assert f._learn("m", "001044 (42P13): SQL compilation error:\nInvalid argument types for function '-': (VARCHAR(134217728), TIMESTAMP_NTZ(9))\n(the text: a.SEEN)")
     assert asked == [("IS_DELETED", "BOOLEAN"), ("ACTIVE", "BOOLEAN"), ("WON", "BOOLEAN"), ("CLOSED_ON", "DATE"), ("SEEN", "TIMESTAMP")]
+
+
+def test_pivoted_values_add_up_over_rounds():
+    """Once the data holds a pivoted value, the compiled pivot selects it and only the others are left to name: the
+    lesson keeps what it learned before, or every round trades one half of the values for the other."""
+    raw = "with p as (select id, {{ dbt_utils.pivot('stage', dbt_utils.get_column_values(ref('stages'), 'stage')) }} from x) select p.screen, p.offer from p"
+    first = parse('with p as (select id, 1 as "made_up_0123456789ab" from x) select p.screen, p.offer from p')
+    later = parse("with p as (select id, 1 as screen from x) select p.screen, p.offer from p")  # `screen` is in the data now
+    tables = {"RAW.T.STAGES": {"columns": {"STAGE": {"gen": "template", "template": "stage_{hex}"}}}}
+    f = fitter(trees={"m": first}, sql_of={"m": "x"}, nodes={"m": {"raw_code": raw}}, tables=tables)
+    f.sources_of = lambda uid: ["RAW.T.STAGES"]
+    f.origins = lambda uid, column, **k: ["STAGE"]
+    message = 'Binder Error: Values list "P" does not have a column named "SCREEN"'
+    assert f.pivot_values("m", message)
+    assert set(tables["RAW.T.STAGES"]["columns"]["STAGE"]["values"]) == {"screen", "offer"}
+    f.trees["m"] = later
+    assert not f.pivot_values("m", message.replace("SCREEN", "OFFER")) or \
+        set(tables["RAW.T.STAGES"]["columns"]["STAGE"]["values"]) == {"screen", "offer"}
+    tables["RAW.T.STAGES"]["columns"]["STAGE"] = {"gen": "categorical", "values": {"screen": 1.0}}
+    assert f.pivot_values("m", message.replace("SCREEN", "OFFER"))
+    assert set(tables["RAW.T.STAGES"]["columns"]["STAGE"]["values"]) == {"screen", "offer"}
