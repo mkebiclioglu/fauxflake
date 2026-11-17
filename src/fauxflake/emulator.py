@@ -361,6 +361,40 @@ def _record_semi_types(cursor) -> None:  # noqa: ANN001
         pass
 
 
+_SHOWN = re.compile(_LEAD + r"(?:show\s+(?P<terse>terse\s+)?(?P<kind>[a-z]+(?:\s+(?!like\b|in\b|starts\b|limit\b|from\b|on\b|to\b|of\b)[a-z]+)*)|"
+                          r"desc(?:ribe)?\s+(?P<described>table|view))\b", re.IGNORECASE)
+_SHOW_COLUMNS: dict[str, list[str]] = {}
+
+
+def _show_kind(command: str) -> str | None:
+    """`show terse tables`, `describe table`, ... for a SHOW or DESCRIBE whose columns were recorded from Snowflake
+    (scripts/record_show_columns.py); None for any other statement."""
+    m = _SHOWN.match(command)
+    if not m:
+        return None
+    if not _SHOW_COLUMNS:
+        _SHOW_COLUMNS.update(json.loads((Path(__file__).parent / "show_columns.json").read_text()))
+    kind = f"describe {m.group('described').lower()}" if m.group("described") else \
+        re.sub(r"\s+", " ", f"show {m.group('terse') or ''}{m.group('kind')}".lower()).strip()
+    return kind if kind in _SHOW_COLUMNS else None
+
+
+def _conform_show(cursor, transformed: exp.Expression) -> exp.Expression:  # noqa: ANN001
+    """The emulator's result for a SHOW or DESCRIBE with the columns Snowflake gives it, in Snowflake's order: what
+    it has under the same name, and NULL for what it does not keep. Tools read these by name and by position."""
+    wanted = _SHOW_COLUMNS.get(cursor._fauxflake_show or "")
+    if not wanted or not isinstance(transformed, exp.Query):
+        return transformed
+    cursor._fauxflake_show = None  # this statement only
+    sql = transformed.sql(dialect="duckdb")
+    held = {r[0].lower(): r[0] for r in cursor._duck_conn.execute("describe " + sql).fetchall()}
+    if [h for h in held] == wanted:
+        return transformed
+    quoted = lambda name: '"' + name.replace('"', '""') + '"'  # noqa: E731
+    listed = ", ".join(f"{quoted(held[c])} as {quoted(c)}" if c in held else f"null::varchar as {quoted(c)}" for c in wanted)
+    return sqlglot.parse_one(f"select {listed} from ({sql}) as _fx_shown", read="duckdb")
+
+
 _DUPLICATE_ROW = "Duplicate row detected during DML action"
 
 
@@ -646,6 +680,7 @@ def _patch_fakesnow() -> None:
             handled = _transaction(self, command, original)
             if handled is not None:
                 return handled
+            self._fauxflake_show = _show_kind(command)  # a SHOW or DESCRIBE: its columns are made Snowflake's below
             handled = objects.intercept(self, command, original)  # functions, procedures, streams, tasks, policies
             if handled is not None:
                 return handled
@@ -1054,6 +1089,9 @@ def _patch_fakesnow() -> None:
                 except Exception:  # noqa: BLE001, S110 - an optional adjustment: the statement runs as written
                     pass
             _heal(self)  # a probe that failed inside a transaction aborted it
+            if getattr(self, "_fauxflake_show", None):
+                with contextlib.suppress(Exception):
+                    transformed = _conform_show(self, transformed)
             try:
                 semantics.exact_names(transformed, self._duck_conn)
             except duckdb.Error:
