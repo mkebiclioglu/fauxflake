@@ -18,6 +18,12 @@ def _start(spec: Spec, history: int | None) -> datetime:
     return datetime.combine(spec.start, datetime.min.time()) + timedelta(days=history or spec.history or 60)
 
 
+def _earlier(spec: Spec, history: int | None) -> datetime:
+    """When the run before this one happened, for what it left behind: a twentieth into the history, a day at least."""
+    days = history or spec.history or 60
+    return datetime.combine(spec.start, datetime.min.time()) + timedelta(days=min(days, max(1, days // 20)))
+
+
 common = [
     click.option("--spec", "spec_path", default="fauxflake.yml", show_default=True, help="Source data spec."),
     click.option("--project-dir", default=".", show_default=True, help="dbt project directory."),
@@ -102,15 +108,24 @@ def build(spec_path, project_dir, scale, history, db_path, keep, dbt_args):
         emu = stack.enter_context(serve(db_path=db_path))
         t0 = time.time()
         wh = Warehouse(emu, spec, scale)
-        counts = wh.advance_to(_start(spec, history))
+        project = DbtProject(project_dir, emulator_output(emu.port, spec.dbt.get("database", "ANALYTICS")))
+        prior, now = 0, _start(spec, history)
+        if project.prior_owners(spec.existing):
+            # what an earlier run left was built from the data there was then: the first days of the history. The
+            # build that follows finds the rest as new, the way a project that keeps a high-water mark does
+            counts = wh.advance_to(_earlier(spec, history))
+            prior = project.build_prior(spec.existing)
+            for name, n in wh.advance_to(now).items():
+                counts[name] = counts.get(name, 0) + n
+        else:
+            counts = wh.advance_to(now)
         click.echo(f"generated {sum(counts.values()):,} rows in {time.time() - t0:.1f}s")
         expected = spec.dbt.get("expected_failures") or []
         if expected:
             click.echo(f"leaving out {len(expected)} test(s) listed under dbt.expected_failures in {spec_path}")
-        project = DbtProject(project_dir, emulator_output(emu.port, spec.dbt.get("database", "ANALYTICS")))
-        prior = project.build_prior(spec.existing)
         if prior:
-            click.echo(f"built {prior} relation(s) the project reads by name before building them, as a warehouse that has run before holds them")
+            click.echo(f"built {prior} relation(s) the project reads by name before building them, as a warehouse that has run before holds "
+                       "them (from the first days of the history)")
         ok = project.invoke(["build", *dbt_args])
     if not ok:
         click.echo("\nto look at the data behind a failure: " + ("fauxflake query \"select ...\"" if keep else

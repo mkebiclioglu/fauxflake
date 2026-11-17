@@ -111,6 +111,16 @@ class DbtProject:
             if all(re.fullmatch(r"[\w$]+", n) for n in names):  # skips names dbt has not rendered yet
                 emulator.CURRENT.ensure_database(*names)
 
+    def prior_owners(self, existing) -> list[str]:  # noqa: ANN001
+        """The models that build a relation the project also reads by a written-out name (see `build_prior`)."""
+        existing = {str(name).replace('"', "").upper() for name in existing or ()}
+        path = self.target_path / "manifest.json"
+        if not existing or not self._local or not path.exists():
+            return []
+        nodes = json.loads(path.read_text())["nodes"]
+        return sorted(n["name"] for n in nodes.values() if n.get("resource_type") in ("model", "snapshot")
+                      and str(n.get("relation_name") or "").replace('"', "").upper() in existing)
+
     def build_prior(self, existing, schema: str = "CI") -> int:  # noqa: ANN001
         """Relations the project reads by a written-out name (not through ref()) and builds itself hold,
         in production, what the last run left. dbt sees no dependency there, so on an empty warehouse
