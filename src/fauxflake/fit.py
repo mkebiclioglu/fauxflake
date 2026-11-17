@@ -3338,10 +3338,7 @@ class Fitter:
         for n_round in range(1, rounds + 1):
             self.n_round = n_round
             # at the scale and history `fauxflake build` uses, so that what is reported here is what a build gives
-            days = int(self.spec.get("history") or 60)
-            # (what an earlier run left is built from the first days of the history, as `fauxflake build` does)
-            early = bool(fresh and not os.environ.get("FAUXFLAKE_FIT_SELECT") and project.prior_owners(self.existing))
-            wh = self.generate(scale=0.001, history=min(days, max(1, days // 20)) if early else days)
+            self.generate(scale=0.001, history=int(self.spec.get("history") or 60))
             before = len(self.learned)
             self.retyped = set()
             results_path = project.target_path / "run_results.json"
@@ -3374,9 +3371,6 @@ class Fitter:
                 selected = []
             if fresh:
                 project.build_prior(self.existing)
-                if early:
-                    wh.advance_to(datetime.combine(wh.spec.start, datetime.min.time()) + timedelta(days=days))
-                    self.dirty = False
             else:
                 # a model that failed and reads its own table: what the round before left of it has the columns of
                 # then. It starts again from the empty relation, which has the ones learned since.
