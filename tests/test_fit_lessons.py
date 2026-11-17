@@ -773,3 +773,34 @@ def test_entries_written_into_a_document_have_the_fields_the_reading_knows():
     assert {e["time_frame"] for e in entries} == {"28d", "7d", "all"}
     assert entries[0]["key_path"] == "counts.metric_0" and entries[0]["description"].startswith("description_")
     assert "tags" not in entries[0] and "options.event" not in entries[0]
+
+
+def test_an_empty_join_gives_the_made_up_side_the_values_of_the_other():
+    from fauxflake.why import Finding
+
+    tables = {"RAW.S.TARGETS": {"columns": {"MONTH": {"gen": "template", "template": "month_{hex}"},
+                                            "KPI": {"gen": "template", "template": "kpi_{hex}"}}}}
+    f = fitter(tables=tables, nodes={"m": {"name": "targets_by_month"}})
+    f.sources_of, f.origins = (lambda uid: ["RAW.S.TARGETS"]), (lambda uid, name, depth=0, strict=False: [name])
+    finding = Finding("final", "join", "INNER JOIN months ON LOWER(targets.month) = LOWER(months.fiscal_month_name)", sides=[
+        ("LOWER(targets.month)", "targets.month", ["month_0a1b2c3d4e5f", "month_1a1b2c3d4e5f"]),
+        ("LOWER(months.fiscal_month_name)", "months.fiscal_month_name", ["FY23-Jun", "FY23-Jul", "FY24-Jan"])])
+    assert f.learn_from_empty("m", finding)
+    assert set(tables["RAW.S.TARGETS"]["columns"]["MONTH"]["values"]) == {"FY23-Jun", "FY23-Jul", "FY24-Jan"}
+    assert tables["RAW.S.TARGETS"]["columns"]["KPI"]["gen"] == "template" and "RAW.S.TARGETS" in f.retyped
+    # sides the condition reshapes differently would not meet whatever the column held
+    tables["RAW.S.TARGETS"]["columns"]["MONTH"] = {"gen": "template", "template": "month_{hex}"}
+    finding.sides[0] = ("LEFT(targets.month, 3)", "targets.month", ["mon"])
+    assert not f.learn_from_empty("m", finding)
+
+
+def test_an_empty_filter_on_made_up_text_gets_the_values_it_names():
+    from fauxflake.why import Finding
+
+    tables = {"RAW.S.RUNS": {"columns": {"STATUS": {"gen": "template", "template": "status_{hex}"},
+                                         "ID": {"gen": "sequence"}}}}
+    f = fitter(tables=tables, nodes={"m": {"name": "passed_runs"}})
+    f.sources_of, f.origins = (lambda uid: ["RAW.S.RUNS"]), (lambda uid, name, depth=0, strict=False: [name])
+    assert f.learn_from_empty("m", Finding("final", "where", "LOWER(status) IN ('pass', 'warn') AND id = '7'"))
+    assert tables["RAW.S.RUNS"]["columns"]["STATUS"] == {"gen": "template", "templates": ["pass", "warn", "status_{hex}"]}
+    assert tables["RAW.S.RUNS"]["columns"]["ID"] == {"gen": "sequence"}

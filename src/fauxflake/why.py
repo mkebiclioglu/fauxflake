@@ -23,6 +23,8 @@ class Finding:
     columns: list[tuple[str, list]] = field(default_factory=list)  # (expression, sample of its values)
     inputs: dict[str, int] = field(default_factory=dict)  # rows in each relation the scope reads
     said: str = "rows stop in"
+    # for a join that matches nothing: (the condition's side, the one column it reads, distinct values of that column)
+    sides: list[tuple[str, str, list]] = field(default_factory=list)
 
     def text(self) -> str:
         lines = [f"{self.said} {self.scope}: {self.kind}" + (f" ({self.detail})" if self.detail else "")]
@@ -71,6 +73,15 @@ class Why:
         try:
             return [r[0] for r in self.rows(
                 f"{self.prefix(upto)}select distinct _v from (select {expression} as _v from {source} limit 20000) where _v is not null limit 5")]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def values(self, column: str, source: str, upto: int | None, limit: int = 200) -> list:
+        """Distinct values of one column of a relation, as they are (not as a condition reshapes them)."""
+        try:
+            return [r[0] for r in self.rows(
+                f"{self.prefix(upto)}select distinct _v from (select {column} as _v from {source} limit 20000) "
+                f"where _v is not null order by 1 limit {int(limit)}")]
         except Exception:  # noqa: BLE001
             return []
 
@@ -179,6 +190,10 @@ class Why:
                             continue
                         finding.columns.append((part.sql(dialect="snowflake"), self.sample(
                             part.sql(dialect="snowflake"), owner.sql(dialect="snowflake"), upto)))
+                        read = list(part.find_all(exp.Column))
+                        if isinstance(test, exp.EQ) and len(read) == 1:
+                            finding.sides.append((part.sql(dialect="snowflake"), read[0].sql(dialect="snowflake"), self.values(
+                                read[0].sql(dialect="snowflake"), owner.sql(dialect="snowflake"), upto)))
                 return finding
         # WHERE, one condition at a time
         where = query.args.get("where")

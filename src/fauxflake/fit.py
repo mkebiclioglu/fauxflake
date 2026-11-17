@@ -3455,7 +3455,15 @@ class Fitter:
                         self.log(f"  a second look at the listed tests: {len(taught)} can be taught to the spec; building again")
                         fresh, selected = True, []
                         continue
-                break
+                # and the models that built, but with no rows: where the rows stop may be something the data can meet
+                looks = self.__dict__.setdefault("_row_looks", 0)
+                if not failed and looks < 2 and n_round < rounds and not os.environ.get("FAUXFLAKE_FIT_NO_ROWS_LOOK"):
+                    self._row_looks = looks + 1
+                    taught = self.learn_from_empties(nodes)
+                    if taught:
+                        self.log(f"  {taught} model(s) that came out empty said what the data lacks; building what reads it again")
+                if len(self.learned) == before or failed:
+                    break
             # next round: what failed, what reads a source whose values changed, and everything downstream
             changed = [f"source:{n['source_name']}.{n['name']}+" for uid, n in manifest.get("sources", {}).items()
                        if self.source_names.get(uid) in self.retyped]
@@ -3481,6 +3489,104 @@ class Fitter:
             self.spec["dbt"].pop("expected_failures", None)
         self.save()
         return summary
+
+    # --- rows: a model that builds with no rows proves little
+
+    _MADE_UP_VALUE = re.compile(r"[a-z0-9_ ]*_?[0-9a-f]{8,12}|[0-9a-f]{12}.*[0-9a-f]{12}|other_\w+", re.I)
+
+    def _made_up(self, uid: str, column: str) -> list[tuple[str, str]]:
+        """The source columns behind a model's column that hold made-up text: nothing is known of them yet."""
+        names = list(dict.fromkeys([column, *self.origins(uid, column, strict=True)]))
+        out = []
+        for table in self.sources_of(uid):
+            columns = self.tables[table].get("columns") or {}
+            for name in names:
+                gen = columns.get(name)
+                if gen and gen.get("gen") == "template" and not gen.get("format") and (
+                        gen.get("template") == f"{name.lower()}_{{hex}}" or gen.get("templates")):
+                    out.append((table, name))
+        return out
+
+    def learn_from_empty(self, uid: str, finding) -> bool:  # noqa: ANN001
+        """A model came out empty and `finding` names where its rows stop. Two things the spec can do about it:
+        a join whose one side is made-up text and whose other side holds real values (the months of a calendar, the
+        names in a seed) gets those values; a filter on made-up text for values it names gets them too."""
+        changed = False
+        if finding.kind == "join" and len(finding.sides) == 2:
+            shape = lambda side: side[0].replace(side[1], "_")  # noqa: E731 - how the condition reshapes the column
+            if shape(finding.sides[0]) != shape(finding.sides[1]):
+                return False  # the two sides are reshaped differently: equal columns would not make them meet
+            for mine, theirs in (finding.sides, finding.sides[::-1]):
+                column = sqlglot.parse_one(mine[1], read="snowflake")
+                real = [v for v in theirs[2] if isinstance(v, str) and v.strip() and not self._MADE_UP_VALUE.fullmatch(v)]
+                if not isinstance(column, exp.Column) or len(real) < max(1, len(theirs[2]) // 2):
+                    continue
+                for table, name in self._made_up(uid, column.name.upper()):
+                    values = real[:200]
+                    self.tables[table]["columns"][name] = {"gen": "categorical", "values": {v: round(1 / len(values), 6) for v in values}}
+                    self.retyped.add(table)
+                    self.learned.append(f"{table}.{name}: {self.nodes[uid]['name']} joins it to {theirs[1]}, which holds "
+                                        f"{len(theirs[2])} value(s) such as {values[0]!r}; it holds those now.")
+                    changed = True
+                if changed:
+                    break
+        elif finding.kind == "where" and finding.clause and finding.clause != "LIMIT 0":
+            try:
+                tests = sqlglot.parse_one(f"select 1 from t where {finding.clause}", read="snowflake").args["where"].this
+            except Exception:  # noqa: BLE001
+                return False
+            for test in tests.find_all(exp.EQ, exp.In):
+                held = test.this
+                while isinstance(held, (exp.Lower, exp.Upper, exp.Trim, exp.Cast, exp.TryCast, exp.Paren)):
+                    held = held.this
+                values = test.expressions if isinstance(test, exp.In) else [test.expression]
+                named = [v.name for v in values if isinstance(v, exp.Literal) and v.is_string and v.name and len(v.name) <= 80]
+                if not isinstance(held, exp.Column) or not named or isinstance(test.parent, exp.Not):
+                    continue
+                for table, name in self._made_up(uid, held.name.upper()):
+                    gen = self.tables[table]["columns"][name]
+                    known = [t for t in gen.get("templates") or [] if t not in named]
+                    self.tables[table]["columns"][name] = {"gen": "template", "templates": [
+                        *(known or [f"{name.lower()}_{{hex}}"])[:-1], *named, (known or [f"{name.lower()}_{{hex}}"])[-1]]}
+                    self.retyped.add(table)
+                    self.learned.append(f"{table}.{name}: {self.nodes[uid]['name']} keeps only {', '.join(map(repr, named[:4]))}"
+                                        f"{' ...' if len(named) > 4 else ''}; some rows hold those now.")
+                    changed = True
+        self.dirty |= changed
+        return changed
+
+    def learn_from_empties(self, nodes: dict, limit: int = 200) -> int:
+        """After a build with nothing failing: the models that came out empty although everything they read has
+        rows. Where the rows stop is asked of the warehouse the build left (`why.explain`), and what that says about
+        the generated data is taught to the spec. Returns how many models taught something."""
+        from . import why
+
+        def rows(fq: str) -> int | None:
+            try:
+                return int(self.emu.duck.execute(f"select count(*) from {quoted(fq)}").fetchone()[0])
+            except Exception:  # noqa: BLE001
+                return None
+
+        built = {uid: _fq(n["relation_name"]) for uid, n in nodes.items() if n.get("resource_type") in ("model", "snapshot", "seed")
+                 and n.get("relation_name") and _fq(n["relation_name"]).count(".") == 2}
+        counts = {uid: rows(fq) for uid, fq in built.items()}
+        frontier = [uid for uid, n in counts.items() if n == 0 and nodes[uid].get("resource_type") == "model" and uid in self.sql_of
+                    and all(counts.get(p) != 0 for p in nodes[uid].get("depends_on", {}).get("nodes", []))]
+        taught = 0
+        for uid in sorted(frontier)[:limit]:
+            node = nodes[uid]
+            conn = self.emu._fs.connect(database=node["database"], schema=node["schema"])
+            try:
+                finding = why.Why(conn.cursor(), self.sql_of[uid], timeout=30.0).find()
+            except Exception:  # noqa: BLE001 - a query the walk cannot take apart teaches nothing
+                continue
+            finally:
+                conn.close()
+            before = self._watched()
+            if self.learn_from_empty(uid, finding):
+                taught += 1
+            self._watch(before, f"{uid} came out empty: {finding.kind} {finding.clause[:300]}")
+        return taught
 
     def read_again(self, manifest: dict, analysis, keep: bool = False):  # noqa: ANN001, ANN201
         """Models written by macros that look at the warehouse (dbt_utils.union_relations, star, pivot) have
