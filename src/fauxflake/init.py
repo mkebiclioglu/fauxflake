@@ -953,6 +953,11 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                             joins.append((hit, there))
                         if not there and a_calendar_day(other):
                             use.whole_days.add(hit[1])
+                        if not there and isinstance(other, exp.SplitPart) and getattr(other.args.get("delimiter"), "name", "") == "@" \
+                                and getattr(other.args.get("part_index"), "name", "") == "2":
+                            # `on a.domain = split_part(l.email, '@', 2)`: the domain the generated addresses are at
+                            use.literals.setdefault(hit[1], set()).add(MAILBOX[1:])
+                            use.texts.add(hit[1])
                 if named_numbers(parent, col):
                     use.equals.setdefault(hit[1], set()).update(named_numbers(parent, col))
                 if isinstance(parent, exp.Coalesce) and parent.this is col and hit[1].endswith("ID"):

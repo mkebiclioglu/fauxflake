@@ -1056,3 +1056,12 @@ def test_a_join_on_surrogate_keys_of_several_columns_links_what_they_are_made_of
                       "on s.daily_server_id = a.daily_server_id",
     }, ["RAW.T.SERVER", "RAW.T.ACTIVITY"])
     assert joins == [(("RAW.T.SERVER", "USER_ID"), ("RAW.T.ACTIVITY", "USER_ID"))]  # the servers, not the days
+
+
+def test_a_column_joined_to_the_domain_of_an_email_holds_the_domain_addresses_are_at():
+    from fauxflake.init import MAILBOX
+
+    uses, *_ = _scan({"a.b.link": "select l.id, a.id from raw.t.lead l left join raw.t.account a "
+                                  "on a.domain = split_part(l.email, '@', 2) where a.id is not null"},
+                     ["RAW.T.LEAD", "RAW.T.ACCOUNT"])
+    assert uses["RAW.T.ACCOUNT"].literals["DOMAIN"] == {MAILBOX[1:]}
