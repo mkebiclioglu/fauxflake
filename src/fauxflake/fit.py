@@ -1338,12 +1338,18 @@ class Fitter:
             return False
         if not columns or col in columns:
             return False
-        columns[col] = duck_type(guess(col, None))
+        # and the other columns its readers name that it lacks, in the same round: a build shows one at a time
+        owner = self.by_rel.get(fq) or self.relation_owner.get(fq)
+        also = [c for c in (self.columns_children_read(owner) if (self.nodes.get(owner) or {}).get("relation_name") else [])
+                if c != col and c not in columns and not _WRITTEN_BY_DBT.match(c)]
+        for name in [col, *also]:
+            columns[name] = duck_type(guess(name, None))
+            try:
+                self.emu.duck.execute(f'alter table {quoted(fq)} add column if not exists "{name}" {columns[name]}')
+            except Exception:  # noqa: BLE001, S110
+                pass
         self.existing[fq] = {"columns": columns, "as": "table"}
-        try:
-            self.emu.duck.execute(f'alter table {quoted(fq)} add column if not exists "{col}" {columns[col]}')
-        except Exception:  # noqa: BLE001, S110
-            pass
+        col = ", ".join([col, *also[:5]]) + (" ..." if len(also) > 5 else "")
         self.learned.append(f"{fq}: {col} is read from this snapshot and the model it snapshots no longer writes it; "
                             f"the snapshot table starts out with the column, as it does where it has history.")
         self.dirty = True
@@ -1921,9 +1927,14 @@ class Fitter:
                 gen = columns.get(name)
                 if gen is None or (gen.get("gen") == "categorical" and set(values) <= {str(v) for v in gen.get("values") or {}}):
                     continue
-                columns[name] = {"gen": "categorical", "values": {v: round(1 / len(values), 4) for v in values}}
+                # (with the values learned before: once the data holds one, the compiled pivot selects it itself and
+                # only the others are left to name, so each round would otherwise trade one half for the other)
+                held = [str(v) for v in gen.get("values") or {} if not re.search(r"_[0-9a-f]{12}$", str(v))] \
+                    if gen.get("gen") == "categorical" else []
+                merged = list(dict.fromkeys([*held, *values]))
+                columns[name] = {"gen": "categorical", "values": {v: round(1 / len(merged), 4) for v in merged}}
                 self.retyped.add(table)
-                self.learned.append(f"{table}.{name}: pivoted into columns the model names; holds {', '.join(values)}.")
+                self.learned.append(f"{table}.{name}: pivoted into columns the model names; holds {', '.join(merged)}.")
                 changed = True
         self.dirty |= changed
         return changed
@@ -2503,6 +2514,19 @@ class Fitter:
                         for c in dict.fromkeys(alike):
                             gens = [(self.tables[t].get("columns") or {}).get(c) for t in sources]
                             gens = [g for g in gens if g]
+                            if not gens and hint in ("DOUBLE", "BIGINT"):
+                                # SUM(created_arr), SUM(net_arr), ... over sixty columns made upstream: the error names the
+                                # source column behind one of them. The source columns behind the others, as long as
+                                # nothing is known about them yet, are numbers too, learned in this round and not one
+                                # round each.
+                                for origin in dict.fromkeys(self.origins(sql_key, c)):
+                                    for t in sources:
+                                        held = (self.tables[t].get("columns") or {}).get(origin)
+                                        if held and held.get("gen") == "template" and not held.get("templates") \
+                                                and held.get("template") == f"{origin.lower()}_{{hex}}":
+                                            self.tables[t]["columns"][origin] = guess(origin, hint)
+                                            self.retyped.add(t)
+                                            self.learned.append(f"{t}.{origin}: behind {c}, which the model adds up; retyped as {hint}.")
                             if not gens and (c not in alike[:casts] or hint in ("DOUBLE", "BIGINT")):
                                 continue  # a name the model gave to something it worked out (`term_days`), not a column it reads
                             if any(g.keys() & {"format", "epoch"} for g in gens):
