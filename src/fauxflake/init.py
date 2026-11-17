@@ -1272,6 +1272,11 @@ _FLAGS = {"ISDELETED", "ISWON", "ISCLOSED", "ISACTIVE", "ISCONVERTED", "ISARCHIV
 _RUN_ON_DATE = re.compile(r"(?<!UP)(?<!CANDI)(?<!VALI)(?<!MAN)(?<!CONSOLI)(?<!LIQUI)DATE$")
 
 
+_RARELY_TRUE = re.compile(r"(?<![A-Z])(DELETED|ISDELETED|ARCHIVED|REMOVED|HIDDEN|BLOCKED|BANNED|SPAM|DUPLICATE|CANCELL?ED|DISABLED|"
+                          r"EXPIRED|INACTIVE|VOID(ED)?|DRAFT|TEST|SANDBOX|BOT|EXCLUDED?|SUSPENDED|REVOKED|FAILED|INTERNAL)(?![A-Z])")
+_USUALLY_TRUE = re.compile(r"(?<![A-Z])(ACTIVE|ENABLED|VALID|CURRENT|VERIFIED|CONFIRMED|PUBLISHED|VISIBLE|LATEST)(?![A-Z])")
+
+
 def guess(column: str, hint: str | None) -> dict:
     """A generator for a column we know only by name and (maybe) a cast."""
     c, h = column.upper(), (hint or "").upper()
@@ -1296,7 +1301,10 @@ def guess(column: str, hint: str | None) -> dict:
         return {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1 if top > 1 else 0, top]}
     c = re.sub(r"__P?C$", "", c)  # Salesforce's suffix for a custom field: the name before it says what it holds
     if h == "BOOLEAN" or (not h and (re.match(r"^(IS|HAS|WAS)_", c) or c in _FLAGS)):
-        return {"gen": "categorical", "type": "BOOLEAN", "values": {True: 0.5, False: 0.5}}
+        # most rows are not deleted, archived or test data, and most are active: a filter on either flag keeps
+        # most of the table, as it does in production, and the rarer side is still there
+        share = 0.15 if _RARELY_TRUE.search(c) else 0.85 if _USUALLY_TRUE.search(c) else 0.5
+        return {"gen": "categorical", "type": "BOOLEAN", "values": {True: share, False: round(1 - share, 2)}}
     if h == "DATE" or (not h.startswith("TIMESTAMP") and (c.endswith(("_DATE", "_DAY")) or _RUN_ON_DATE.search(c))):
         return {"gen": "time_offset", "type": "DATE", **WEEK}
     if h.startswith("TIMESTAMP") or c.endswith(("_AT", "_TS", "_TIME", "_TIMESTAMP")) or c in ("SYSTEMMODSTAMP", "TIMESTAMP", "DATETIME"):
