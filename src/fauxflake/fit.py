@@ -2446,7 +2446,9 @@ class Fitter:
             # grouped). A tenth of the rows, then (down to a handful a day), and only in a real build: a trial pass
             # runs on a few hundred rows whatever the volumes say.
             model = self.nodes.get(sql_key, {}).get("name", sql_key)
-            for table in self.sources_of(sql_key):
+            cut = self.__dict__.setdefault("_cut", set())  # once a round: the failure is reported to more than one lesson
+            mark = (sql_key, self.__dict__.get("n_round"))
+            for table in self.sources_of(sql_key) if mark[1] is None or mark not in cut else ():
                 volume = self.tables[table].setdefault("volume", {})
                 rows = float(volume.get("rows_per_day", 1000))
                 if rows > 20:
@@ -2454,6 +2456,7 @@ class Fitter:
                     self.retyped.add(table)
                     changed = True
             if changed:
+                cut.add(mark)
                 self.learned.append(f"{model}: did not finish with a handful of groups either; the tables it reads hold a tenth of the rows.")
         self.dirty |= changed
         return changed
@@ -3317,6 +3320,7 @@ class Fitter:
         fresh = True
         redo: set[str] = set()  # models that failed in the round before
         for n_round in range(1, rounds + 1):
+            self.n_round = n_round
             # at the scale and history `fauxflake build` uses, so that what is reported here is what a build gives
             self.generate(scale=0.001, history=int(self.spec.get("history") or 60))
             before = len(self.learned)

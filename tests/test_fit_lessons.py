@@ -581,6 +581,10 @@ def test_a_row_a_day_model_that_still_does_not_finish_gets_a_tenth_of_the_rows()
     assert tables["RAW.P.EVENTS"]["volume"]["rows_per_day"] == 100 and columns["USER_ID"]["v"] == [1, 50]
     assert f.runaway("m", "Out of Memory Error") and tables["RAW.P.EVENTS"]["volume"]["rows_per_day"] == 20  # down to a handful a day
     assert not f.runaway("m", "Out of Memory Error")
+    tables["RAW.P.EVENTS"]["volume"]["rows_per_day"] = 1000
+    f.n_round = 3  # in a build round the failure reaches more than one lesson: the rows are cut once
+    assert f.runaway("m", "Out of Memory Error") and not f.runaway("m", "Out of Memory Error")
+    assert tables["RAW.P.EVENTS"]["volume"]["rows_per_day"] == 100
 
 
 def test_a_test_that_returns_rows_not_naming_the_row_before_makes_the_table_a_log():

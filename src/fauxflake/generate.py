@@ -630,7 +630,7 @@ class Warehouse:
         for t in self.spec.tables.values():
             if only is not None and t.name not in only:
                 continue
-            cal = t.calendar(self.spec.start, until.date(), self.spec.seed, self.scale, self.scenario, self.spec.thin)
+            cal = t.calendar(self.spec.start, until.date(), self.spec.seed, self.scale, self.scenario, self.spec.thin, self.spec.least)
             self.cur.execute(f"create or replace temp table cal_{t.ident} (day date, cum bigint, n bigint)")
             self.cur.executemany(f"insert into cal_{t.ident} values (?, ?, ?)", cal)
             cals[t.name] = cal

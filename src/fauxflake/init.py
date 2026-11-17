@@ -2285,11 +2285,16 @@ def analyse(manifest: dict, database: str) -> Analysis:
         settings["role"] = role
         notes.append(f"the project's masking policies show real values to the role `{role}`, the one that builds the "
                      f"warehouse: the build runs as that role (`dbt: {{role: {role}}}`).")
+    least = rows_asked(manifest)
+    if least:
+        notes.append(f"the project lists tables by their size (`row_count >= {least}` in INFORMATION_SCHEMA.TABLES): every "
+                     f"generated table holds at least {least} rows, whatever the scale (`least_rows` in the spec).")
     if (start, history) != (date(2025, 1, 1), None):
         notes.append(f"the SQL compares with dates between {min(d for _, d in dates)} and {max(d for _, d in dates)}: "
                      f"the generated history starts {start}" + (f" and spans {history} days." if history else "."))
     analysis = Analysis({"seed": 42, "start": start.isoformat(), **({"history": history} if history else {}),
                          **({"recent": RECENT, "older": older} if older else {}),
+                         **({"least_rows": least} if least else {}),
                          "dbt": settings, "tables": tables}, notes, locate, place)
     analysis.bounds = {(name, col): numbers for name, use in uses.items() for col, numbers in use.bounds.items()}
     return analysis
@@ -2299,6 +2304,25 @@ HEADER = """# Written by `fauxflake init` from the dbt project. Keys, relationsh
 # from your tests; columns and types from how models use each source. Volumes, lateness and
 # distributions are placeholders: run `fauxflake profile` to measure them, or edit by hand.
 """
+
+
+def rows_asked(manifest: dict) -> int | None:
+    """`from information_schema.tables where row_count >= {{ min_rows }}`: the project lists the tables
+    worth reading by how many rows they hold (event tables of a tracking schema, unioned by a macro).
+    A generated table has to hold that many, or the list comes back empty and the model does not compile."""
+    texts = [m.get("macro_sql") or "" for uid, m in (manifest.get("macros") or {}).items()
+             if not uid.startswith(("macro.dbt.", "macro.dbt_snowflake."))]
+    texts += [node.get("raw_code") or "" for node in (manifest.get("nodes") or {}).values()]
+    asked = 0
+    for text in texts:
+        if "row_count" not in text.lower() or "information_schema" not in text.lower():
+            continue
+        for strict, number, name in re.findall(r"(?i)\brow_count\s*>(=?)\s*(?:(\d+)|\{\{\s*(\w+)\s*\}\})", text):
+            # a macro argument: its default, or the largest number any caller passes
+            numbers = [int(number)] if number else [int(n) for t in texts for n in re.findall(rf"\b{name}\s*=\s*(\d+)", t)]
+            for n in numbers:
+                asked = max(asked, n + (0 if strict else 1))
+    return min(asked, 10_000) or None
 
 
 def builder_role(manifest: dict) -> str | None:
