@@ -1378,6 +1378,48 @@ _RARELY_TRUE = re.compile(r"(?<![A-Z])(DELETED|ISDELETED|ARCHIVED|REMOVED|HIDDEN
 _USUALLY_TRUE = re.compile(r"(?<![A-Z])(ACTIVE|ENABLED|VALID|CURRENT|VERIFIED|CONFIRMED|PUBLISHED|VISIBLE|LATEST)(?![A-Z])")
 
 
+# a domain no project filters out: `example.com`, `test.com` and the company's own are what `not like` drops
+MAILBOX = "@fauxmail.net"
+_EMAIL = re.compile(r"^(?!HAS|IS_|ISDEFAULT|SUPPRESS|RECEIVE|SEND|ALLOW|ENABLE|OPT|DO_?NOT|NO_)"
+                    r".*E_?MAIL(_?ADDRESS)?(_\d+)?(_FOR_TEMPLA\w*)?(__C)?$")
+
+
+def holds_email(column: str) -> bool:
+    """`EMAIL`, `CONTACTEMAIL`, `CUST_EMAIL__C`: an address; `HASOPTEDOUTOFEMAIL`, `EMAILS_SENT`: not one."""
+    return bool(_EMAIL.match(column.upper()))
+
+
+def address_emails(tables: dict) -> list[tuple[str, str]]:
+    """Every text in a column named as an email is an address (`x@y.zz`): models keep the rows whose email is
+    valid, whatever generator the column ended up with. Columns that share values (a pool, the key the pool
+    points at) all get the same ending, so the joins between them still match. Returns what changed."""
+    pools = set()
+    for table in tables.values():
+        for col, gen in (table.get("columns") or {}).items():
+            if not holds_email(col):
+                continue
+            if gen.get("gen") == "pool" and not gen.get("numeric"):
+                pools.add(str(gen["pool"]))
+            elif gen.get("gen") == "template" and not gen.get("templates") and str(gen.get("template", "")).endswith("_{n}"):
+                pools.add(str(gen["template"])[: -len("_{n}")])
+    changed = []
+    for name, table in tables.items():
+        for col, gen in (table.get("columns") or {}).items():
+            before = dict(gen)
+            if gen.get("gen") == "pool" and not gen.get("numeric") and str(gen.get("pool")) in pools:
+                gen["suffix"] = MAILBOX
+            elif gen.get("gen") == "template" and gen.get("templates"):
+                if holds_email(col):
+                    gen["templates"] = [t + MAILBOX if t == f"{col.lower()}_{{hex}}" else t for t in gen["templates"]]
+            elif gen.get("gen") == "template":
+                shape = re.fullmatch(r"(\w+)_\{(n|hex)\}", str(gen.get("template", "")))
+                if shape and ((shape[2] == "n" and shape[1] in pools) or holds_email(col)):
+                    gen["template"] = shape[0] + MAILBOX
+            if gen != before:
+                changed.append((name, col))
+    return changed
+
+
 def guess(column: str, hint: str | None) -> dict:
     """A generator for a column we know only by name and (maybe) a cast."""
     c, h = column.upper(), (hint or "").upper()
@@ -1410,14 +1452,14 @@ def guess(column: str, hint: str | None) -> dict:
         return {"gen": "time_offset", "type": "DATE", **WEEK}
     if h.startswith("TIMESTAMP") or c.endswith(("_AT", "_TS", "_TIME", "_TIMESTAMP")) or c in ("SYSTEMMODSTAMP", "TIMESTAMP", "DATETIME"):
         return {"gen": "time_offset", **({"type": "TIMESTAMPTZ"} if h == "TIMESTAMPTZ" else {}), **WEEK}
+    if holds_email(c) and (not h or h in ("VARCHAR", "TEXT", "STRING")):
+        return {"gen": "template", "template": "user_{hex}" + MAILBOX}
     if h in ("VARCHAR", "TEXT"):
         return {"gen": "template", "template": f"{column.lower()}_{{hex}}"}
     if h in ("BIGINT", "INTEGER", "INT", "SMALLINT") or h.endswith(",0)") or c.endswith(("_ID", "_COUNT", "_QTY", "_QUANTITY")) or c == "ID":
         return {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000]}
     if re.search(r"(AMOUNT|PRICE|TOTAL|COST|REVENUE|VALUE|BALANCE|RATE|SCORE)", c):
         return {"gen": "dist", "type": "DECIMAL(18,2)", **AMOUNT}
-    if "EMAIL" in c:
-        return {"gen": "template", "template": "user_{hex}@example.com"}
     return {"gen": "template", "template": f"{column.lower()}_{{hex}}"}
 
 
@@ -2386,6 +2428,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
                      f"warehouse: the build runs as that role (`dbt: {{role: {role}}}`).")
     for table in tables.values():
         follow_categories(table["columns"])
+    address_emails(tables)
     least = rows_asked(manifest)
     if least:
         notes.append(f"the project lists tables by their size (`row_count >= {least}` in INFORMATION_SCHEMA.TABLES): every "

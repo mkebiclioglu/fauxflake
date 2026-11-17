@@ -1012,3 +1012,25 @@ def test_a_text_whose_shapes_begin_with_a_category_follows_it():
             "select count(*), sum(case when starts_with(command, category) then 1 else 0 end), count(distinct category) "
             "from RAW.P.EVENTS").fetchone()
     assert total > 1000 and begin == total and kinds == 4
+
+
+def test_a_column_named_as_an_email_holds_addresses():
+    from fauxflake.init import MAILBOX, address_emails, guess, holds_email
+
+    assert holds_email("CONTACTEMAIL") and holds_email("CUST_EMAIL__C") and holds_email("context_traits_email")
+    assert not holds_email("HASOPTEDOUTOFEMAIL") and not holds_email("INACTIVE_SERVER_EMAILS_SENT")
+    assert guess("TRIAL_EMAIL", "VARCHAR")["template"].endswith(MAILBOX)
+    assert guess("HASOPTEDOUTOFEMAIL", None)["template"] == "hasoptedoutofemail_{hex}"
+    tables = {
+        "A": {"columns": {"EMAIL": {"gen": "template", "template": "email_{n}"},
+                          "NAME": {"gen": "template", "template": "name_{hex}"}}},
+        "B": {"columns": {"CONTACT": {"gen": "pool", "pool": "email", "size": 200},
+                          "OWNER_EMAIL": {"gen": "template", "templates": ["a@b.cc", "owner_email_{hex}"]},
+                          "N": {"gen": "pool", "pool": "n", "size": 5, "numeric": True}}},
+    }
+    assert sorted(address_emails(tables)) == [("A", "EMAIL"), ("B", "CONTACT"), ("B", "OWNER_EMAIL")]
+    assert tables["A"]["columns"]["EMAIL"]["template"] == "email_{n}" + MAILBOX
+    assert tables["B"]["columns"]["CONTACT"]["suffix"] == MAILBOX
+    assert tables["B"]["columns"]["OWNER_EMAIL"]["templates"] == ["a@b.cc", "owner_email_{hex}" + MAILBOX]
+    assert tables["A"]["columns"]["NAME"] == {"gen": "template", "template": "name_{hex}"}
+    assert address_emails(tables) == []
