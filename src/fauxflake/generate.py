@@ -564,6 +564,10 @@ class TableSQL:
             rate = self.during(repr(self.sc.null_rate), rate)
         if rate != "0.0":
             expr = f"case when {self.u(col + ':null')} < {rate} then NULL else {expr} end"
+        if d.get("empty_unless") and gen == "array" and self.base == "g" and "." not in col:
+            # a list that has something only where a rule about the row holds: empty in the other rows
+            rule = re.sub(r"\{\{(\w+)\}\}", lambda m: f"({self.expr(m[1], self.t.columns[m[1]])})", str(d["empty_unless"]))
+            expr = f"case when ({rule}) then {expr} else '[]'::JSON end"
         if d.get("null_unless") and self.base == "g" and "." not in col:
             # a rule about the row holds wherever the column has a value: no value in the rows it does not hold for
             rule = re.sub(r"\{\{(\w+)\}\}", lambda m: f"({self.expr(m[1], self.t.columns[m[1]])})", str(d["null_unless"]))

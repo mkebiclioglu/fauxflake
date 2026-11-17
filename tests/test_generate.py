@@ -444,3 +444,24 @@ def test_a_table_another_took_over_from_has_rows_only_while_it_was_in_use():
     # the days a table has are the same days however far the clock has got
     earlier = spec.tables["RAW.T.NEW"].calendar(date(2025, 1, 1), date(2025, 2, 10), 1, 1.0, least=spec.least)
     assert earlier == new[:len(earlier)]
+
+
+def test_a_list_is_empty_where_the_rule_about_its_rows_does_not_hold(tmp_path):
+    from datetime import datetime
+
+    from fauxflake.emulator import serve
+    from fauxflake.generate import Warehouse
+    from fauxflake.spec import Spec
+
+    spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "tables": {"RAW.T.CALLS": {
+        "volume": {"rows_per_day": 300}, "columns": {
+            "ID": {"gen": "sequence"},
+            "NAME": {"gen": "categorical", "values": {"Calls": 0.8, "other_name": 0.2}},
+            "SKUS": {"gen": "array", "values": ["professional", "enterprise"],
+                     "empty_unless": "(COALESCE(({{NAME}}), 'Calls')) = 'Calls'"}}}}}, tmp_path / "x.yml")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 3))
+        rows, known, unknown, lost = emu.cursor().execute(
+            """select count(*), count_if("NAME" = 'Calls' and json_array_length("SKUS") > 0), count_if(json_array_length("SKUS") = 0),
+                      count_if("NAME" <> 'Calls' and json_array_length("SKUS") > 0) from "RAW"."T"."CALLS" """).fetchone()
+        assert known > 0 and unknown > 0 and lost == 0 and known + unknown == rows

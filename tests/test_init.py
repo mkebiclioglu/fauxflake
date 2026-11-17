@@ -1153,3 +1153,34 @@ def test_a_row_that_names_another_row_of_its_own_table_refers_to_it():
     columns = spec["tables"]["RAW.S.OPPORTUNITY"]["columns"]
     assert columns["ID"]["gen"] in ("hash_id", "sequence")
     assert columns["RENEWED_BY_OPPORTUNITY_ID__C"]["gen"] == "fk" and columns["RENEWED_BY_OPPORTUNITY_ID__C"]["ref"] == "RAW.S.OPPORTUNITY"
+
+
+def test_a_case_and_its_complement_say_when_a_list_has_something():
+    from fauxflake.init import build_spec
+
+    def source(name):
+        return {"database": "RAW", "schema": "CALLS", "name": name, "identifier": name,
+                "columns": {c: {"data_type": t} for c, t in {"id": "VARCHAR", "user_id": "VARCHAR", "context_feature_name": "VARCHAR",
+                                                             "context_feature_skus": "ARRAY"}.items()}}
+
+    manifest = {
+        "sources": {"source.p.c.started": source("started"), "source.p.c.ended": source("ended")},
+        "nodes": {
+            "model.p.stg": {"resource_type": "model", "depends_on": {"nodes": ["source.p.c.started"]}, "relation_name": "A.B.STG",
+                            "compiled_code": """
+                select id as event_id, user_id, coalesce(context_feature_name, 'Calls') as feature_name,
+                       parse_json(coalesce(context_feature_skus, '[]'))::array as feature_skus
+                from raw.calls.started"""},
+            "model.p.daily": {"resource_type": "model", "depends_on": {"nodes": ["model.p.stg"]}, "relation_name": "A.B.DAILY",
+                              "compiled_code": """
+                select user_id,
+                       count(distinct case when feature_name = 'Calls' and array_size(feature_skus) > 0 then event_id end) as known,
+                       count(distinct case when array_size(feature_skus) = 0 then event_id end) as unknown,
+                       count(distinct event_id) as total
+                from a.b.stg group by 1"""},
+        },
+    }
+    spec, _notes = build_spec(manifest, "A")
+    for table in ("RAW.CALLS.STARTED", "RAW.CALLS.ENDED"):  # (the other table of the schema has the same columns)
+        skus = spec["tables"][table]["columns"]["CONTEXT_FEATURE_SKUS"]
+        assert skus["gen"] == "array" and "{{CONTEXT_FEATURE_NAME}}" in skus["empty_unless"] and not skus.get("null_rate")

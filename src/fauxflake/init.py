@@ -74,6 +74,10 @@ class SourceUse:
         self.truncs: dict[str, str] = {}  # time column -> the unit a model cuts it to before matching on it (`date_trunc('hour', at)`)
         # (the thing, the time): rows kept as the latest of each thing each day (`qualify row_number() over
         # (partition by server_id, cast(timestamp as date) order by timestamp desc) = 1`): readings, taken day after day
+        # (column, "empty" | "null", rule): `case when name = 'Calls' and array_size(skus) > 0` next to `case when
+        # array_size(skus) = 0`: the model has no place for a list that is not empty under another name, so the
+        # list is empty (or the column null) wherever the rule, written in the table's own columns, does not hold
+        self.implied: list[tuple[str, str, str]] = []
         self.readings: set[tuple[str, str]] = set()
         self.series: set[frozenset[str]] = set()  # columns a join matches on together (`on a.id = b.id and a.hour = b.hour`)
         self.read_bounds: dict[str, set[float]] = {}  # number column -> what the models that read the table itself compare it with
@@ -1236,6 +1240,46 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     thing = hit
             if thing and moment and thing[0] == moment[0] and thing[0] in sources and thing[1] != moment[1]:
                 sources[thing[0]].readings.add((thing[1], moment[1]))
+
+        def state(atom):  # noqa: ANN001, ANN202
+            """(the value tested, "empty" | "null", whether the test says it has something) for `array_size(x) > 0`,
+            `array_size(x) = 0`, `x is not null`, `x is null`."""
+            while isinstance(atom, exp.Paren):
+                atom = atom.this
+            if isinstance(atom, exp.Not) and isinstance(atom.this, exp.Is) and isinstance(atom.this.expression, exp.Null):
+                return atom.this.this, "null", True
+            if isinstance(atom, exp.Is) and isinstance(atom.expression, exp.Null):
+                return atom.this, "null", False
+            if isinstance(atom, (exp.GT, exp.EQ, exp.GTE)) and isinstance(atom.this, exp.ArraySize) and isinstance(atom.expression, exp.Literal):
+                if isinstance(atom, exp.GT) and atom.expression.name == "0" or isinstance(atom, exp.GTE) and atom.expression.name == "1":
+                    return atom.this.this, "empty", True
+                if isinstance(atom, exp.EQ) and atom.expression.name == "0":
+                    return atom.this.this, "empty", False
+            return None
+
+        asked = [c.this for case in select.find_all(exp.Case) for c in case.args.get("ifs") or []]
+        asked += [node.this for node in select.find_all(exp.CountIf, exp.If)]
+        asked = [c for c in asked if c is not None and c.find_ancestor(exp.Select) is select]
+        without = {(got[0].sql(), got[1]) for got in map(state, asked) if got and not got[2]}
+        for condition in asked if without else []:
+            parts = list(condition.flatten()) if isinstance(condition, exp.And) else []
+            for part in parts:
+                got = state(part)
+                if not got or not got[2] or (got[0].sql(), got[1]) not in without:
+                    continue
+                # where the list has something, the rest of the condition holds: said by leaving the other case out
+                rest = [p for p in parts if p is not part]
+                try:
+                    held = inline(got[0])
+                    rule = inline(exp.and_(*[p.copy() for p in rest])) if rest else None
+                except Exception:  # noqa: BLE001
+                    held = rule = None
+                names = {c.name.upper() for c in held[1].find_all(exp.Column)} if held else set()
+                if rule and len(names) == 1 and held[0] == rule[0] and held[0] in sources \
+                        and not names & {c.name.upper() for c in rule[1].find_all(exp.Column)}:
+                    found = (names.pop(), got[1], rule[1].sql(dialect="snowflake"))
+                    if found not in sources[held[0]].implied:
+                        sources[held[0]].implied.append(found)
 
         outputs: dict[str, tuple[str, str]] = {}
         stars = [p for p in select.expressions if isinstance(p, exp.Star) or (isinstance(p, exp.Column) and isinstance(p.this, exp.Star))]
@@ -2643,6 +2687,29 @@ def analyse(manifest: dict, database: str) -> Analysis:
         for gen in table["columns"].values():
             if gen.get("gen") == "object" and gen.get("fields"):
                 created_comes_first(gen["fields"])
+    for name, use in uses.items():
+        for col, kind, said in use.implied:
+            try:
+                rule = sqlglot.parse_one(said, read="snowflake")
+            except Exception:  # noqa: BLE001
+                continue
+            rule = rule.transform(lambda n: exp.Var(this=f"__col_{n.name.upper()}__") if isinstance(n, exp.Column) else n)
+            rule = re.sub(r"__col_(\w+?)__", r"{{\1}}", rule.sql(dialect="duckdb"))
+            # the tables lined up with this one in a UNION (the same event, one table per kind) hold the same rule
+            same = {(name, col)} | {(m[0], m[1]) for group in links if any((m[0], m[1]) == (name, col) for m in group) for m in group}
+            # (and the other tables of its schema with the same columns: one table per kind of event, read as one)
+            same |= {(other, col) for other in tables if other.rsplit(".", 1)[0] == name.rsplit(".", 1)[0]}
+            for table, column in sorted(same):
+                columns = tables.get(table, {}).get("columns") or {}
+                held = columns.get(column) or {}
+                key = "empty_unless" if kind == "empty" else "null_unless"
+                if (kind == "empty") != (held.get("gen") == "array") or held.get("gen") in _KEYS or held.get(key) \
+                        or not rule_binds(rule, column, columns):
+                    continue
+                held[key] = rule
+                held.pop("null_rate", None) if kind == "empty" else None
+                notes.append(f"{table}.{column}: the models have a case for it having something only together with another "
+                             f"condition; it is {'empty' if kind == 'empty' else 'null'} in the rows where that does not hold (`{key}`).")
     for (name, col), rule in gated:
         columns = tables.get(name, {}).get("columns") or {}
         if col in columns and columns[col].get("gen") not in _KEYS and rule_binds(rule, col, columns):
