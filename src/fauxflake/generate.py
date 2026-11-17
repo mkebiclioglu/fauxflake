@@ -424,6 +424,8 @@ class TableSQL:
                 expr = "(g + 1)"  # a `unique` test covers it: one value per row
             if "round" in d:
                 expr = f"round({expr}, {int(d['round'])})"
+            if str(d.get("type", "")).upper() in ("VARCHAR", "TEXT", "STRING") and "round" not in d:
+                expr = f"({expr})::bigint"  # numbers kept as text (`account_number between '4000' and '4999'`): whole ones
         elif gen == "template":
             def fill(template: str) -> str:
                 parts = []

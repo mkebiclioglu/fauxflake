@@ -57,6 +57,7 @@ class SourceUse:
         self.texts: set[str] = set()  # columns compared with string literals
         self.ips: set[str] = set()  # text columns handed to PARSE_IP
         self.bounds: dict[str, set[float]] = {}  # column -> numbers the SQL compares it with
+        self.text_bounds: dict[str, set[int]] = {}  # text column -> numbers written as text it is ranged by (`between '4000' and '4999'`)
         self.equals: dict[str, set[int]] = {}  # column -> whole numbers the SQL asks for by name (`project_id = 278964`, `in (1, 2)`)
         self.scales: dict[tuple[str, str], int] = {}  # (column, path in its document) -> digits of an epoch number below the second
         self.splits: dict[str, dict] = {}  # text column -> {"seps": {"/": {0: "BIGINT"}}, "digits": False} from split()[i]::type
@@ -110,7 +111,9 @@ def named_numbers(test: exp.Expression | None, held: exp.Expression) -> set[int]
         return set()
     if isinstance(test.parent, exp.Not):
         return set()
-    return {int(v.name) for v in values if isinstance(v, exp.Literal) and not v.is_string and re.fullmatch(r"\d{1,18}", v.name)}
+    # (`namespace_id = '4347861'`: a number all the same, written as text)
+    return {int(v.name) for v in values if isinstance(v, exp.Literal) and re.fullmatch(r"\d{1,18}", v.name)
+            and not (v.is_string and v.name.startswith("0") and len(v.name) > 1)}
 
 
 def named_value(node: exp.Expression | None) -> str | None:
@@ -748,6 +751,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                                 use.bounds.setdefault(found[1], set()).add(-float(number.name) if negative else float(number.name))
                             except ValueError:
                                 pass
+                        elif isinstance(number, exp.Literal) and not isinstance(test, exp.EQ) and re.fullmatch(r"[1-9]\d{0,17}", number.name):
+                            use.text_bounds.setdefault(found[1], set()).add(int(number.name))
                 if named_numbers(test, held):
                     use.equals.setdefault(found[1], set()).update(named_numbers(test, held))
                 if isinstance(test, (exp.EQ, exp.In)) and held in (test.this, test.args.get("expression")) \
@@ -939,6 +944,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                                 read.append(-float(number.name) if negative else float(number.name))
                             except ValueError:
                                 pass
+                        elif isinstance(number, exp.Literal) and not isinstance(parent, exp.EQ) and re.fullmatch(r"[1-9]\d{0,17}", number.name):
+                            use.text_bounds.setdefault(hit[1], set()).add(int(number.name))
                     use.bounds.setdefault(hit[1], set()).update(read)
                     if hit[0] in read_here:
                         use.read_bounds.setdefault(hit[1], set()).update(read)
@@ -1842,7 +1849,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
             elif (name, col) in accepted:
                 values = accepted[(name, col)]
                 out[col] = {"gen": "categorical", "values": {v: round(1 / len(values), 4) for v in values}}
-            elif 0 < len(use.literals.get(col, ())) <= 30 and not hint_is_number(hint) \
+            elif 0 < len(use.literals.get(col, ())) <= 30 and not hint_is_number(hint) and col not in use.patterns \
                     and not (hint or "").upper().startswith(("BOOL", "DATE", "TIMESTAMP")) \
                     and not (col in use.json_text or use.paths.get(col)):
                 # (a document compared with '[{}]' is still a document; `isdeleted::boolean` compared with 'true' is a
@@ -1851,10 +1858,13 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 named = sorted(use.literals[col] | set(sorted(use.examples.get(col, ()))[:12]))
                 share = round(0.8 / len(named), 4)
                 out[col] = {"gen": "categorical", "values": {**{v: share for v in named}, f"other_{col.lower()}": 0.2}}
-            elif (col in use.patterns or col in use.examples) and not hint_is_number(hint):
-                # `where name like 'tap-%'` should keep some rows: make values that fit each pattern
+            elif not hint_is_number(hint) and (col in use.patterns or col in use.examples or (use.literals.get(col) and not (
+                    (hint or "").upper().startswith(("BOOL", "DATE", "TIMESTAMP")) or col in use.json_text or use.paths.get(col)))):
+                # `where name like 'tap-%'` should keep some rows: make values that fit each pattern, beside the
+                # values asked for by name (`name in ('1,000 CI Minutes', ...)`, however many there are)
                 shapes = sorted(like_shape(p) for p in use.patterns.get(col, ())) + sorted(use.examples.get(col, ()))[:24]
-                out[col] = {"gen": "template", "templates": [*shapes, f"{col.lower()}_{{hex}}"]}
+                named = sorted(v for v in use.literals.get(col, ()) if "{" not in v)[:80]
+                out[col] = {"gen": "template", "templates": [*shapes, *named, f"{col.lower()}_{{hex}}"]}
             elif col in use.part_shapes and not hint_is_number(hint):
                 out[col] = {"gen": "template", "templates": part_templates(use.part_shapes[col], (use.splits.get(col) or {}).get("seps", {}))}
             elif col in use.ips and not hint_is_number(hint):
@@ -1921,6 +1931,10 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 window = None  # another model reads the table itself and asks for something outside it
             ranged = bool(window and len(window) >= 2)
             within_bounds(out[col], {min(window), max(window)} if ranged else use.bounds.get(col), exact=ranged)
+            if len(use.text_bounds.get(col, ())) >= 2 and out[col] == {"gen": "template", "template": f"{col.lower()}_{{hex}}"}:
+                # `account_number between '4000' and '4999'`: numbers kept as text, most of them in the range asked for
+                low, high = min(use.text_bounds[col]), max(use.text_bounds[col])
+                out[col] = {"gen": "dist", "type": "VARCHAR", "p": [0, 0.8, 1], "v": [low, high, high + max(high - low, 1)]}
             if use.equals.get(col) and out[col].get("gen") == "dist" and not out[col].get("unique") and not ranged:
                 # `where fiscal_calendar_id = 2`, `form_id in (334447, 426148)`: four rows in ten hold one of the numbers asked for
                 # (not a zero in a number the SQL calculates with: it may be divided by)

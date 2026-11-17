@@ -877,3 +877,15 @@ def test_a_document_is_followed_through_object_insert_and_delete():
         select * from renamed""", uses)
     assert {"account_id", "usage.amount", "credits[]"} <= set(uses["RAW.G.DETAIL"].paths["VALUE"])
     assert out[_PATHS]["CREDITS"] == ("RAW.G.DETAIL", "VALUE", ("credits",))
+
+
+def test_text_ranges_and_named_values_beside_patterns():
+    from fauxflake.init import scan_model, SourceUse
+
+    uses = {"RAW.N.ACCOUNTS": SourceUse()}
+    scan_model("select * from RAW.N.ACCOUNTS where account_number between '4000' and '4999' "
+               "and (plan like 'saas%' or plan in ('1,000 CI Minutes')) and namespace_id = '4347861'", uses)
+    use = uses["RAW.N.ACCOUNTS"]
+    assert use.text_bounds == {"ACCOUNT_NUMBER": {4000, 4999}}
+    assert use.equals == {"NAMESPACE_ID": {4347861}}
+    assert use.literals["PLAN"] == {"1,000 CI Minutes"} and use.patterns["PLAN"]
