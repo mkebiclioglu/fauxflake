@@ -245,6 +245,11 @@ class Fitter:
         os.environ.setdefault("FAUXFLAKE_STATEMENT_TIMEOUT", str(self.model_timeout))  # the same limit inside the emulator
         self.learned: list[str] = []
         self.dirty = False
+        # what each column referred to when the fitting began, and the ones put back once since
+        self.links: dict[tuple[str, str], dict] = {
+            (table, col): dict(gen) for table, held in self.tables.items()
+            for col, gen in (held.get("columns") or {}).items() if gen.get("gen") == "fk"}
+        self.relinked: set[tuple[str, str]] = set()
         self.trees: dict[str, exp.Expression | None] = {}
         self.sql_of: dict[str, str] = {}
         self.by_rel: dict[str, str] = {}
@@ -1138,6 +1143,15 @@ class Fitter:
             for col, gen in list((spec.get("columns") or {}).items()):
                 if gen.get("gen") == "fk" and str(gen.get("ref", "")).upper() not in keyed:
                     spec["columns"][col] = guess(col, None)
+                    self.learned.append(f"{table}.{col}: {gen.get('ref')} has no key any more; no longer a reference to it.")
+                elif (table, col) in self.links and gen.get("gen") != "fk" and (table, col) not in self.relinked \
+                        and str(self.links[table, col].get("ref", "")).upper() in keyed and gen in (guess(col, None), guess(col, "VARCHAR")):
+                    # a reference a lesson about its table (or about the key it points at) turned into made-up values,
+                    # with nothing learned about the column itself: the rows it joined would never meet again. Put back, once
+                    spec["columns"][col] = dict(self.links[table, col])
+                    self.relinked.add((table, col))
+                    self.retyped.add(table)
+                    self.learned.append(f"{table}.{col}: refers to {self.links[table, col].get('ref')} again.")
                 elif self._holds_text(gen) and re.match(r"BIGINT|INT|SMALLINT|DECIMAL|NUMERIC|DOUBLE|FLOAT|HUGEINT", str(gen.get("type") or "").upper()):
                     # a number type left over from before the column's values were known to be text: the cast would fail
                     gen.pop("type")

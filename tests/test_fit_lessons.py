@@ -14,6 +14,7 @@ def fitter(**state):
     f = object.__new__(Fitter)
     f.trees, f.sql_of, f.nodes, f.tables, f.by_rel, f.relation_owner = {}, {}, {}, {}, {}, {}
     f.retyped, f.learned, f.dirty = set(), [], False
+    f.links, f.relinked = {}, set()
     for key, value in state.items():
         setattr(f, key, value)
     return f
@@ -744,3 +745,17 @@ def test_numbers_are_followed_back_through_the_models_before():
     assert f.numbers_upstream("model.p.mart")
     numbers = {name for name, gen in columns.items() if gen.get("gen") != "template"}
     assert numbers == {"AMOUNT__C", "PROBABILITY", "ARR__C", "DISCOUNT__C"}  # not the stage, the date or the ids
+
+
+def test_a_reference_lost_without_a_lesson_about_it_is_put_back_once():
+    link = {"gen": "fk", "ref": "RAW.Z.CHARGES", "skew": 1.5}
+    tables = {"RAW.Z.CHARGES": {"columns": {"ID": {"gen": "sequence"}}},
+              "RAW.Z.ITEMS": {"columns": {"ID": {"gen": "sequence"}, "CHARGEID": {"gen": "template", "template": "chargeid_{hex}"},
+                                          "NOTE": {"gen": "template", "template": "note_{hex}"}}}}
+    f = fitter(tables=tables, links={("RAW.Z.ITEMS", "CHARGEID"): link})
+    f.repair()
+    assert tables["RAW.Z.ITEMS"]["columns"]["CHARGEID"] == link and "RAW.Z.ITEMS" in f.retyped
+    # a lesson that turns it into something else again stands: no going back and forth
+    tables["RAW.Z.ITEMS"]["columns"]["CHARGEID"] = {"gen": "template", "template": "chargeid_{hex}"}
+    f.repair()
+    assert tables["RAW.Z.ITEMS"]["columns"]["CHARGEID"]["gen"] == "template"
