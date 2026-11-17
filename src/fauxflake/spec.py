@@ -107,6 +107,13 @@ class Spec:
     existing: dict[str, dict] = field(default_factory=dict)
     history: int | None = None  # days of history present at the start, when the project's own date filters need more than the default
 
+    def loose_names(self) -> None:
+        """Generated tables hold their columns in capitals whatever the real ones are called, so a quoted
+        `"userId"` read from one of them is not held to its exact spelling (see semantics.exact_names)."""
+        from . import semantics
+
+        semantics.LOOSE_TABLES = {name.upper() for name in self.tables} | {name.upper() for name in self.existing}
+
     @classmethod
     def load(cls, path: str | Path) -> "Spec":
         return cls.from_raw(yaml.safe_load(Path(path).read_text()), path)
@@ -127,6 +134,7 @@ class Spec:
                    existing={k.upper(): dict(v or {}) for k, v in (raw.get("existing") or {}).items()},
                    history=int(raw["history"]) if raw.get("history") else None)
         spec.validate()
+        spec.loose_names()
         for var, value in (spec.dbt.get("env") or {}).items():
             os.environ.setdefault(var, str(value))  # placeholders for env vars the project requires
         from . import objects

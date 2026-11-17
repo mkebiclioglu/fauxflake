@@ -605,6 +605,7 @@ class Warehouse:
         self.emu, self.spec, self.scale, self.scenario = emu, spec, scale, scenario
         self.freeze_clock = freeze_clock
         emulator.define_udfs(emu, spec.udfs)
+        spec.loose_names()
         if spec.dbt.get("role"):  # the role policies see: `dbt: {role: ANALYST}`
             objects.set_role(emu.duck, str(spec.dbt["role"]))
         self.cur: duckdb.DuckDBPyConnection = emu.cursor()

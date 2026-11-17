@@ -399,3 +399,13 @@
 - {id: text_coalesced_with_number_must_convert, sql: "select coalesce(n, 0) from (select 'abc'::varchar n)"}
 - {id: text_coalesced_through_outer_join, sql: "select a.k, coalesce(b.n, 0) from (select 1 k union all select 2) a left join (select 1 k, '7'::varchar n) b on a.k = b.k order by 1"}
 - {id: typed_branches_keep_their_type, sql: "select coalesce(i, 0), coalesce(f, 0), coalesce(d, current_date) = d, iff(i > 1, i, 0), case when i > 1 then f else 0 end, coalesce(n, 'none'), nvl(j, 'n/a') from (select 5 i, 1.5::float f, '2024-01-09'::date d, 5 n, null::int j)"}
+# A quoted name keeps its exact spelling.
+- {id: quoted_lower_name_of_upper_column, sql: "select \"id\" from (select 1 as id, 'a' as name)"}
+- {id: quoted_mixed_name_of_upper_column, sql: "select t.\"Name\" from (select 1 as id, 'a' as name) t"}
+- {id: unquoted_name_of_quoted_lower_alias, sql: "select x from (select 1 as \"x\")"}
+- {id: quoted_upper_name_of_quoted_lower_alias, sql: "select \"N\" from (select 'a' as \"n\")"}
+- {id: quoted_alias_then_other_case, sql: "select 1 as \"lower\", \"LOWER\" from (select 1 as id)"}
+- {id: quoted_lower_name_in_ctas, sql: "create or replace temporary table analytics.ci.fx_case as select \"id\" from (select 1 as id)"}
+- {id: quoted_lower_name_in_group_by, sql: "select count(*) from (select 1 as id, 'a' as name) group by \"name\""}
+- {id: quoted_names_spelled_exactly, sql: "with c as (select 1 as \"k\", 'a' as name, 2 as \"lowerCol\"), d as (select \"k\" as k2, c.\"k\", \"lowerCol\" as lc, name as \"n\" from c) select k2, \"k\", lc, d.\"n\" from d where \"n\" = 'a' order by \"n\", K2"}
+- {id: quoted_keys_of_a_variant, sql: "select object_construct('userId', 7):\"userId\", parse_json('{\"a\": 1}'):\"a\", v.\"value\" from (select 1 id, 2 as \"value\") v"}

@@ -3203,6 +3203,9 @@
    ]
   ]
  },
+ "quoted_alias_then_other_case": {
+  "error": "000904 (42000): SQL compilation error: error line 1 at position 21"
+ },
  "quoted_identifiers": {
   "rows": [
    [
@@ -3212,12 +3215,46 @@
    ]
   ]
  },
+ "quoted_keys_of_a_variant": {
+  "rows": [
+   [
+    "7",
+    "1",
+    "2"
+   ]
+  ]
+ },
+ "quoted_lower_name_in_ctas": {
+  "error": "000904 (42000): SQL compilation error: error line 1 at position 65"
+ },
+ "quoted_lower_name_in_group_by": {
+  "error": "000904 (42000): SQL compilation error: error line 1 at position 60"
+ },
+ "quoted_lower_name_of_upper_column": {
+  "error": "000904 (42000): SQL compilation error: error line 1 at position 7"
+ },
+ "quoted_mixed_name_of_upper_column": {
+  "error": "000904 (42000): SQL compilation error: error line 1 at position 7"
+ },
  "quoted_names_differ_by_case_in_ctas": {
   "rows": [
    [
     "Table FX_NO_DUPES successfully created."
    ]
   ]
+ },
+ "quoted_names_spelled_exactly": {
+  "rows": [
+   [
+    "1",
+    "1",
+    "2",
+    "a"
+   ]
+  ]
+ },
+ "quoted_upper_name_of_quoted_lower_alias": {
+  "error": "000904 (42000): SQL compilation error: error line 1 at position 7"
  },
  "random_shapes": {
   "rows": [
@@ -4556,6 +4593,9 @@
     null
    ]
   ]
+ },
+ "unquoted_name_of_quoted_lower_alias": {
+  "error": "000904 (42000): SQL compilation error: error line 1 at position 7"
  },
  "using_join_shared_column": {
   "rows": [

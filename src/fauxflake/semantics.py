@@ -2116,6 +2116,83 @@ def coerce_union_literals(transformed: exp.Expression, conn) -> exp.Expression: 
     return transformed
 
 
+LOOSE_TABLES: set[str] = set()  # DATABASE.SCHEMA.TABLE of generated tables: their column names are not case-exact
+MIXED_CASE: set[str] | None = None  # names of relations holding a column with lower-case letters; None: not looked up yet
+
+
+def exact_names(tree: exp.Expression, conn) -> None:  # noqa: ANN001
+    """`select "id" from orders` when the column is ID: Snowflake keeps the exact spelling of a quoted name, and
+    this does not compile there (`invalid identifier '"id"'`). DuckDB matches names without regard to case, so
+    the mistake would pass here. Checked only for statements that quote a name with lower-case letters in it:
+    a name that is spelled exactly nowhere the statement can see (its own aliases, the columns of the tables it
+    reads) while another spelling of it is, is refused. Generated source tables are left out of this."""
+    from snowflake.connector.errors import ProgrammingError
+
+    if not isinstance(tree, (exp.Query, exp.Insert, exp.Merge)) and not (isinstance(tree, exp.Create) and isinstance(tree.expression, exp.Query)):
+        return
+    global MIXED_CASE
+    if MIXED_CASE is None:  # the relations of a warehouse kept from an earlier run that hold such names
+        MIXED_CASE = {r[0] for r in conn.execute(
+            "select distinct upper(table_name) from duckdb_columns() where column_name <> upper(column_name) and not internal").fetchall()}
+    made = tree.this if isinstance(tree, exp.Create) else None
+    tables = [t for t in tree.find_all(exp.Table) if made is None or (t is not made and t.find_ancestor(exp.Schema) is not made)]
+    idents = [i for i in tree.find_all(exp.Identifier) if i.args.get("quoted") and i.name != i.name.upper()]
+    if not idents and not any(t.name.upper() in MIXED_CASE for t in tables):
+        return
+    if tree.find(exp.Pivot, exp.Lateral, exp.TableFromRows, exp.Values, exp.Unnest, exp.MatchRecognize):
+        return
+    ctes = {cte.alias for cte in tree.find_all(exp.CTE)}
+    if any(not isinstance(t.this, exp.Identifier) for t in tables):
+        return  # a table function: its columns are not known here
+    names = sorted({t.name.upper() for t in tables})
+    held: dict[str, list[tuple[str, str, str, str]]] = {}
+    if names:
+        marks = ", ".join("?" for _ in names)
+        for db, schema, table, column in conn.execute(
+                f"select database_name, schema_name, table_name, column_name from duckdb_columns() where upper(table_name) in ({marks})",
+                names).fetchall():
+            held.setdefault(table.upper(), []).append((db, schema, table, column))
+    exact: set[str] = set()
+    loose: set[str] = set()
+    for t in tables:
+        rows = [r for r in held.get(t.name.upper(), []) if (not t.db or r[1].upper() == t.db.upper())
+                and (not t.catalog or r[0].upper() == t.catalog.upper())]
+        mine = [r for r in rows if r[2] == t.name]
+        if mine:
+            for db, schema, table, column in mine:
+                if f"{db}.{schema}.{table}".upper() in LOOSE_TABLES:
+                    loose.add(column.upper())
+                exact.add(column)
+        elif t.name in ctes and not t.db:
+            continue
+        elif rows and t.this.args.get("quoted") and t.name != t.name.upper():
+            raise ProgrammingError(msg=f"SQL compilation error:\nObject '{t.sql(dialect='snowflake')}' does not exist or not authorized."
+                                       f"\n(a table {rows[0][2]} exists: a quoted name keeps its exact spelling)",
+                                   errno=2003, sqlstate="42S02")
+        else:
+            return  # a relation this cannot see into
+    for alias in tree.find_all(exp.Alias):
+        exact.add(alias.alias)
+    for alias in tree.find_all(exp.TableAlias):
+        exact.update(c.name for c in alias.columns)
+    spellings: dict[str, set[str]] = {}
+    for name in exact:
+        spellings.setdefault(name.upper(), set()).add(name)
+    for column in tree.find_all(exp.Column):
+        ident = column.this
+        if not isinstance(ident, exp.Identifier) or column.find_ancestor(exp.Lambda) is not None:
+            continue
+        name = ident.name
+        if not ident.args.get("quoted") and name != name.upper():
+            continue  # written by the emulator itself
+        if name in exact or name.upper() in loose or name.upper() not in spellings:
+            continue  # spelled so somewhere, or not there at all: DuckDB says so itself
+        shown = column.sql(dialect="snowflake") if name != name.upper() else name
+        raise ProgrammingError(msg=f"SQL compilation error:\ninvalid identifier '{shown}'\n(the name is spelled "
+                                   f"{', '.join(sorted(spellings[name.upper()]))} here: a quoted name keeps its exact spelling)",
+                               errno=904, sqlstate="42000")
+
+
 def _evident_kind(node: exp.Expression) -> str | None:
     """What a branch of COALESCE / IFF / CASE plainly is, read off its text: 'number', 'date', 'timestamp',
     'boolean', 'text', 'null', or None when only its place in the query can tell."""

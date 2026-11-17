@@ -360,6 +360,9 @@ def _no_duplicate_columns(cursor, create: exp.Create, params=None) -> None:  # n
     try:
         name = target.sql(dialect="duckdb")
         made = [r[0] for r in duck.execute(f"describe {name}").fetchall()]
+        if semantics.MIXED_CASE is not None and isinstance(target, exp.Table):
+            # (for semantics.exact_names: which relations hold a name with lower-case letters)
+            (semantics.MIXED_CASE.add if any(m != m.upper() for m in made) else semantics.MIXED_CASE.discard)(target.name.upper())
         held = {m.upper() for m in made}
         if not any(re.fullmatch(r"(.+)_\d+", m) and re.fullmatch(r"(.+)_\d+", m).group(1).upper() in held for m in made):
             return
@@ -919,6 +922,10 @@ def _patch_fakesnow() -> None:
                 except Exception:  # noqa: BLE001, S110 - an optional adjustment: the statement runs as written
                     pass
             _heal(self)  # a probe that failed inside a transaction aborted it
+            try:
+                semantics.exact_names(transformed, self._duck_conn)
+            except duckdb.Error:
+                _heal(self)
             remedies = {
                 "times": lambda e: semantics.numbers_as_times(transformed, e) or semantics.offsets_as_written(transformed, e),
                 "by_name": lambda e: semantics.view_past_a_schema_named_like_a_database(transformed, e),
@@ -1167,6 +1174,7 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
     spill = _spill_directory(fs.duck_conn)
     semantics.UDFS.clear()  # functions belong to the emulator that defined them
     semantics.UDTFS.clear()
+    semantics.MIXED_CASE = None
     _SPEC_UDFS.clear()
     state = fs.results_cache.setdefault(objects._KEY, objects.State())
     state.root, state.home = fs.duck_conn, db_path
