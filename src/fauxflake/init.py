@@ -103,6 +103,8 @@ _DATE_LITERAL = re.compile(r"(\d{4})-(\d{2})-(\d{2})(?:[ T]00:00:00(?:\.0+)?)?")
 CONTEXT = {"CURRENT_ACCOUNT": "FAUXFLAKE", "CURRENT_ACCOUNT_NAME": "FAUXFLAKE", "CURRENT_ORGANIZATION_NAME": "FAUXFLAKE",
            "CURRENT_REGION": "LOCAL", "CURRENT_WAREHOUSE": "LOCAL"}
 _PATHS = "\0paths"  # in a model's outputs: {column: (source, source column, path inside its document)}
+_ANY = "\0any:"  # in a model's outputs: _ANY + column -> the source columns a COALESCE takes the value from, in order
+_HASHED = "\0md5:"  # in a model's outputs: _HASHED + column -> the source columns a surrogate key is the hash of
 
 
 _CALENDAR_DAY = re.compile(r"DATE_DAY|DATE_ACTUAL|CALENDAR_DATE|CALENDAR_DAY|DAY_DATE|DATE|DAY")
@@ -1051,6 +1053,63 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                         and isinstance(parent.args.get("format"), exp.Literal):
                     use.formats[hit[1]] = parent.args["format"].name  # a text column holding dates
 
+        def upstream(prefix: str, col: exp.Column):  # noqa: ANN202
+            name, table = prefix + col.name.upper(), col.table.upper()
+            known = [renames[table]] if table in renames else [] if table else list(renames.values())
+            found = [r[name] for r in known if name in r]
+            return found[0] if len(found) == 1 else None
+
+        def written(col: exp.Column):  # noqa: ANN202
+            """The expression an alias written earlier in the same select stands for."""
+            if col.table:
+                return None
+            for other in select.expressions:
+                if isinstance(other, exp.Alias) and other.alias.upper() == col.name.upper() and other.this is not col \
+                        and not any(c.name.upper() == col.name.upper() for c in other.this.find_all(exp.Column)):
+                    return other.this
+            return None
+
+        def behind(e, depth: int = 0):  # noqa: ANN001, ANN202
+            """The source columns a value is taken from, in order: one, or the several a COALESCE chooses among
+            (`coalesce(t.version, legacy.version)`), also when an earlier model wrote the COALESCE."""
+            while isinstance(e, (exp.Cast, exp.TryCast, exp.Paren)):
+                e = e.this
+            if isinstance(e, exp.Coalesce):
+                found: list = []
+                for part in [e.this, *e.expressions]:
+                    if isinstance(part, exp.Literal):
+                        continue
+                    got = behind(part, depth + 1) if depth < 4 else None
+                    if not got and not found:
+                        return None  # (its first choice is what the value usually is: later ones may be anything)
+                    found += [g for g in got or () if g not in found]
+                return tuple(found) or None
+            if isinstance(e, exp.SplitPart) and depth < 4 and isinstance(e.args.get("delimiter"), exp.Literal) \
+                    and isinstance(e.args.get("part_index"), exp.Literal) and e.args["part_index"].name == "1":
+                # `split_part(version, '-', 1)`: what comes before the first '-' of the source's text
+                got = behind(e.this, depth + 1)
+                return tuple((*g, e.args["delimiter"].name) for g in got if len(g) == 2) or None if got else None
+            if not isinstance(e, exp.Column) or isinstance(e.this, exp.Star) or depth >= 4:
+                return None
+            hit = resolve(e)
+            if hit:
+                return (tuple(hit[:2]),)
+            alias = written(e)
+            return behind(alias, depth + 1) if alias is not None else upstream(_ANY, e)
+
+        def hashed(e, depth: int = 0):  # noqa: ANN001, ANN202
+            """`md5(cast(coalesce(cast(version as text), '_null_') as text)) as version_id`: the source columns a
+            one-column surrogate key is the hash of, also when a later model passes the key on. (A key made of
+            several columns is another matter: no single column decides it.)"""
+            while isinstance(e, (exp.Cast, exp.TryCast, exp.Paren)):
+                e = e.this
+            if isinstance(e, (exp.MD5, exp.SHA, exp.SHA2)):
+                return behind(e.this)
+            if not isinstance(e, exp.Column) or isinstance(e.this, exp.Star) or depth >= 4:
+                return None
+            alias = written(e)
+            return hashed(alias, depth + 1) if alias is not None else upstream(_HASHED, e)
+
         outputs: dict[str, tuple[str, str]] = {}
         stars = [p for p in select.expressions if isinstance(p, exp.Star) or (isinstance(p, exp.Column) and isinstance(p.this, exp.Star))]
         positional[id(select)] = by_position = []
@@ -1064,6 +1123,14 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                                        and "{}" not in placed[2] and "~between" not in placed[2] and "~part" not in placed[2] else None))
             if hit:
                 outputs[proj.alias_or_name.upper()] = hit
+            elif not isinstance(proj, exp.Star):
+                key, among = hashed(proj.unalias()), None
+                if key:
+                    outputs[_HASHED + proj.alias_or_name.upper()] = key
+                else:
+                    among = behind(proj.unalias())
+                if among:
+                    outputs[_ANY + proj.alias_or_name.upper()] = among
         paths_out: dict[str, tuple[str, str, tuple[str, ...]]] = {}
         if stars and len(plain) == 1 and plain[0] in path_maps:
             paths_out.update(path_maps[plain[0]])  # `select *` (next to a FLATTEN or not) keeps what is known
@@ -1809,6 +1876,7 @@ def analyse(manifest: dict, database: str) -> Analysis:
     ordered: list[tuple[tuple[str, str, str], tuple[str, str, str]]] = []  # (the later, the earlier) of two times a test compares
     together: list[tuple[str, list[str]]] = []  # (table, columns a test says are unique together)
     fks: dict[tuple[str, str], tuple[str, str]] = {}
+    begins: list[tuple[tuple[str, str], tuple[str, str, str]]] = []  # (a column, the column whose text begins with its values)
     accepted: dict[tuple[str, str], list] = {}
     for node in manifest["nodes"].values():
         meta = node.get("test_metadata")
@@ -1839,6 +1907,21 @@ def analyse(manifest: dict, database: str) -> Analysis:
                     ordered.append((ends[0], ends[1]))
             continue
         here = locate(node["attached_node"], column) if column else None
+        if not here and column and meta["name"] == "relationships":
+            # both ends are surrogate keys, each the hash of one column: `version_id` of a fact is in the
+            # dimension when the version it is the hash of is one the dimension's source holds
+            kw = meta["kwargs"].get("arguments") or meta["kwargs"]
+            others = [n for n in node["depends_on"]["nodes"] if n != node["attached_node"]]
+            mine = outputs.get(node["attached_node"], {}).get(_HASHED + column.upper())
+            theirs = outputs.get(others[0], {}).get(_HASHED + str(kw.get("field", "")).upper()) if others else None
+            if mine and theirs:  # (a COALESCE on the parent's side: its first choice is the one that is there)
+                for spot in mine:
+                    if spot in theirs or len(spot) != 2:
+                        continue
+                    if len(theirs[0]) == 2:
+                        fks.setdefault(spot, theirs[0])
+                    else:
+                        begins.append((spot, theirs[0]))
         if not here:
             continue
         if meta["name"] == "unique":
@@ -2208,6 +2291,22 @@ def analyse(manifest: dict, database: str) -> Analysis:
             if not all(re.fullmatch(r"\d{1,18}", v) for v in asked):
                 key["gen"] = "hash_id"  # named by a text: the ids are texts
             key["named"] = sorted(set(key.get("named") or []) | set(asked))[:50]
+    # `md5(nps.server_version)` tested against `md5(split_part(server.version, '-', 1))`: the versions the one
+    # holds are what the other's texts begin with: both take that part from one short list.
+    for (child, col), (parent, pcol, sep) in begins:
+        held = tables.get(parent, {}).get("columns", {}).get(pcol)
+        mine = tables.get(child, {}).get("columns", {}).get(col)
+        shared = {"gen": "pool", "pool": pcol.lower(), "size": 50}  # (a few dozen: every one of them is in both tables)
+        if not held or not mine or held.get("gen") != "template" or held.get("templates") or sep not in str(held.get("template")):
+            continue
+        head, rest = str(held["template"]).split(sep, 1)
+        if mine.get("gen") not in ("template", "pool") or mine.get("templates") or mine.get("unique") or mine.get("parts"):
+            continue
+        if head == "{hex}" and not held.get("parts"):
+            held.update(template=f"{{0}}{sep}{rest}", parts=[dict(shared)])
+        elif not (head == "{0}" and held.get("parts") == [shared]):
+            continue
+        tables[child]["columns"][col] = dict(shared)
     # a foreign key needs its parent to have a key
     for (child, col), (parent, pcol) in fks.items():
         if child in tables and parent in tables and tables[parent]["columns"].get(pcol, {}).get("gen") not in ("sequence", "hash_id") \

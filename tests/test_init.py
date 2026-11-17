@@ -959,3 +959,23 @@ def test_a_table_listed_by_its_row_count_holds_that_many_rows():
     assert sum(n for _, _, n in whole) == 100
     part = table.calendar(date(2023, 2, 1), date(2023, 6, 1), 42, 0.001, None, None, (100, 683))
     assert part == whole[:len(part)]  # the same days hold the same rows however far the clock has moved
+
+
+def test_a_surrogate_key_is_traced_to_the_column_it_hashes():
+    from fauxflake.init import _ANY, _HASHED, scan_model, SourceUse
+
+    uses = {"RAW.T.SERVER": SourceUse(), "RAW.L.SERVER": SourceUse(), "RAW.N.FEEDBACK": SourceUse()}
+    staged = scan_model("select id, split_part(version, '-', 1) as version_full from RAW.T.SERVER", uses)
+    assert staged[_ANY + "VERSION_FULL"] == (("RAW.T.SERVER", "VERSION", "-"),)
+    models = {"A.B.STG": staged, "A.B.LEGACY": scan_model("select id, version as version_full from RAW.L.SERVER", uses)}
+    spined = scan_model("select coalesce(t.version_full, l.version_full, 'x' || t.id) as version_full "
+                        "from A.B.STG t left join A.B.LEGACY l on t.id = l.id", uses, models)
+    dim = scan_model("with versions as (select distinct version_full from A.B.SPINED) "
+                     "select md5(cast(coalesce(cast(version_full as text), '_null_') as text)) as version_id, version_full from versions",
+                     uses, {**models, "A.B.SPINED": spined})
+    assert dim[_HASHED + "VERSION_ID"] == (("RAW.T.SERVER", "VERSION", "-"), ("RAW.L.SERVER", "VERSION"))
+    fact = scan_model("select coalesce(f.server_version, f.old_version) as all_versions, "
+                      "md5(cast(coalesce(cast(all_versions as text), '_null_') as text)) as version_id, "
+                      "md5(cast(f.a as text) || '-' || cast(f.b as text)) as pair_id from RAW.N.FEEDBACK f", uses)
+    assert fact[_HASHED + "VERSION_ID"] == (("RAW.N.FEEDBACK", "SERVER_VERSION"), ("RAW.N.FEEDBACK", "OLD_VERSION"))
+    assert _HASHED + "PAIR_ID" not in fact  # a key of two columns: neither decides it
