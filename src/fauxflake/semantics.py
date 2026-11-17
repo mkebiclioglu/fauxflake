@@ -17,6 +17,8 @@ from . import catalog
 _NS = "_fs_global.main."
 _SCALE = r"coalesce(try_cast(nullif(regexp_extract(typeof(a), ',(\d+)\)', 1), '') as integer), 0)"
 
+_SCALE_T = r"coalesce(try_cast(nullif(regexp_extract(t, ',(\d+)\)', 1), '') as integer), 0)"
+
 MACROS = [
     # Snowflake's date-part functions take dates and times and nothing else: YEAR(text_column) does not compile
     # there. The argument is passed through this check, which binds only for a date or time (`microsecond`
@@ -64,11 +66,16 @@ MACROS = [
           else round(a::double / b::double, greatest({_SCALE}, least({_SCALE} + 6, 12))) end""",
     # The `/` a query writes. Two whole numbers divide to a NUMBER with six decimals, and are described as one: a
     # dbt contract that says `number` for `clicks / views` holds, as it does on Snowflake.
+    # (Fixed-point numbers likewise: the value is rounded to Snowflake's scale, max(s, min(s + 6, 12)) for a
+    # dividend of scale s, which `t`, the dividend's type as the query has it, tells. FLOAT and text stay as before.)
     f"""create or replace macro {_NS}_sf_div_n
-          (a hugeint, b hugeint) as (case
+          (a hugeint, b hugeint, t) as (case
             when b = 0 and a is not null then cast('Division by zero' as decimal(38, 6))
             else cast(a::double / b::double as decimal(38, 6)) end),
-          (a, b) as {_NS}_sf_div(a, b)""",
+          (a decimal(38, 12), b decimal(38, 12), t) as (case
+            when b = 0 and a is not null then cast('Division by zero' as decimal(38, 12))
+            else cast(round(a::double / b::double, greatest({_SCALE_T}, least({_SCALE_T} + 6, 12))) as decimal(38, 12)) end),
+          (a, b, t) as {_NS}_sf_div(a, b)""",
     # DATE_TRUNC keeps the input type. DuckDB turns a DATE into a TIMESTAMP.
     f"""create or replace macro {_NS}_sf_date_trunc
           (p varchar, x date) as date_trunc(p, x)::date,
@@ -419,7 +426,21 @@ def _type_unseen(*args: exp.Expression) -> bool:
     """DuckDB picks among a macro's typed variants before it knows the type of an aggregate or window function:
     with one anywhere in an argument it takes the first variant whatever the type (`max(a_timestamp)` would be
     truncated as a date). Such arguments go to an untyped form instead."""
-    return any(arg is not None and arg.find(exp.AggFunc, exp.Window) is not None for arg in args)
+    def unseen(node: exp.Expression) -> bool:
+        if node.find(exp.AggFunc, exp.Window) is not None:
+            return True
+        # `amount as a, a / 3`: a name defined beside it in the same SELECT has no type yet either
+        for column in node.find_all(exp.Column):
+            select = column.find_ancestor(exp.Select)
+            if column.table or select is None:
+                continue
+            mine = column.find_ancestor(exp.Alias)
+            if any(isinstance(other, exp.Alias) and other is not mine and other.alias.upper() == column.name.upper()
+                   for other in select.expressions):
+                return True
+        return False
+
+    return any(arg is not None and unseen(arg) for arg in args)
 
 
 def _fn(name: str, *args: exp.Expression) -> exp.Anonymous:
@@ -483,14 +504,14 @@ def _text(node: exp.Expression) -> exp.Expression:
     if _is(inner, "_sf_text"):
         return node  # already text: wrapping again only repeats the argument
     if _is(inner, "_sf_div") or _is(inner, "_sf_div_n"):
-        return _fn("_sf_div_text", *inner.expressions)
+        return _fn("_sf_div_text", *inner.expressions[:2])
     if _average(inner):
         inner.set("default", _fn("_sf_div_text", *inner.args["default"].expressions))
         return inner
     if isinstance(inner, exp.Round) and isinstance(inner.args.get("decimals"), exp.Literal) and inner.args["decimals"].is_int:
         of, places = inner.this.unnest(), inner.args["decimals"]
         if _is(of, "_sf_div") or _is(of, "_sf_div_n"):
-            return _fn("_sf_round_div_text", *of.expressions, places)
+            return _fn("_sf_round_div_text", *of.expressions[:2], places)
         if _average(of):
             of.set("default", _fn("_sf_round_div_text", *of.args["default"].expressions, places))
             return of
@@ -875,7 +896,9 @@ def _fix(node: exp.Expression) -> exp.Expression:
         cond = node.args.pop("match_condition")  # ASOF JOIN ... MATCH_CONDITION (c) is ASOF JOIN ... ON c
         node.set("on", exp.and_(cond, node.args["on"]) if node.args.get("on") else cond)
     if isinstance(node, exp.Div):
-        return _fn("_sf_div" if _type_unseen(node.this, node.expression) else "_sf_div_n", node.this, node.expression)
+        if _type_unseen(node.this, node.expression):
+            return _fn("_sf_div", node.this, node.expression)
+        return _fn("_sf_div_n", node.this, node.expression, exp.Anonymous(this="typeof", expressions=[node.this.copy()]))
     if isinstance(node, exp.AddMonths) and not _type_unseen(node.this):
         return _fn("_sf_add_months", node.this, node.expression)
     if isinstance(node, exp.ConvertTimezone) and node.args.get("source_tz") is None and node.args.get("timestamp") is not None:
@@ -932,8 +955,9 @@ def _fix(node: exp.Expression) -> exp.Expression:
             model = node.args["format"].name.replace("Mon", "MON").replace("Dy", "DY")
             fmt = format_time(model, Snowflake.TIME_MAPPING, Snowflake.TIME_TRIE)
             # (text does not compile: Snowflake has no TO_CHAR(text, format). A time of day is formatted on any date.)
+            unseen = _type_unseen(node.this)
             checked = _fn("_sf_strict", node.this, exp.Literal.string("TO_CHAR"))
-            return exp.TimeToStr(this=exp.cast(checked, "timestamp") if _type_unseen(node.this) else _fn("_sf_formattable", checked),
+            return exp.TimeToStr(this=exp.cast(checked, "timestamp") if unseen else _fn("_sf_formattable", checked),
                                  format=exp.Literal.string(fmt))
     if isinstance(node, exp.Avg) and not (isinstance(node.parent, exp.Window) and node.parent.this is node):
         return _avg(node)
