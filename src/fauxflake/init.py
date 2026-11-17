@@ -2476,6 +2476,12 @@ def analyse(manifest: dict, database: str) -> Analysis:
                     and not when.get("format") and not when.get("epoch") and not when.get("unique") and not tables[name].get("grain"):
                 held["of"] = 20
                 tables[name]["grain"] = [moment, thing]
+                for other, gen in columns.items():
+                    # what a reading says about the thing in words (its installation, its address) is the same in
+                    # every reading of it; what it counts changes from day to day
+                    if other != thing and gen.get("gen") == "template" and gen.get("template") == f"{other.lower()}_{{hex}}" \
+                            and not gen.get("templates") and not gen.get("follows") and not gen.get("unique"):
+                        gen["follows"] = thing
                 notes.append(f"{name}: models keep the latest row of each {thing.lower()} each day; generated as readings, "
                              f"one row a day for each of 20 {thing.lower()}s (`of` on the key).")
                 break

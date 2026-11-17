@@ -4112,7 +4112,14 @@ class Fitter:
                 if held:
                     # the values it shares with a seed or another table (what a join meets on): each once, in the first rows
                     fresh["named"] = list(dict.fromkeys(held))[:500]
-                if gen == fresh or (gen.get("gen") == "template" and gen.get("named")):
+                # in a table of readings, what no two rows of a model share is said of the thing the readings are
+                # about (a server's installation id), not of each reading: one per thing
+                about = next((c for c, d in columns.items() if d.get("gen") in ("sequence", "hash_id") and d.get("of")), None)
+                if about and about != col:
+                    fresh["follows"] = about
+                    if gen.get("gen") == "template" and gen.get("named"):
+                        fresh["named"] = list(gen["named"])
+                if gen == fresh or (gen.get("gen") == "template" and gen.get("named") and gen.get("follows") == fresh.get("follows")):
                     return False
                 columns[col] = fresh
             self.learned.append(f"{table}.{col}: a `unique` test failed, now generated without repeats.")

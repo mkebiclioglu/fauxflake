@@ -403,6 +403,7 @@ def test_a_table_of_readings_holds_a_row_a_day_for_each_of_a_few_things(tmp_path
     spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "tables": {
         "RAW.T.SERVER": {"volume": {"rows_per_day": 2}, "grain": ["TIMESTAMP", "USER_ID"], "columns": {
             "USER_ID": {"gen": "hash_id", "of": 5, "named": ["93myk"]},
+            "INSTALLATION": {"gen": "template", "template": "installation_{hex}", "follows": "USER_ID", "named": ["u85ky", "qe3n8"]},
             "TIMESTAMP": {"gen": "event_time"}, "RECEIVED_AT": {"gen": "loaded_at"}}},
         "RAW.T.EVENT": {"volume": {"rows_per_day": 300}, "columns": {
             "ID": {"gen": "sequence"}, "SERVER": {"gen": "fk", "ref": "RAW.T.SERVER", "skew": 1.5},
@@ -414,6 +415,11 @@ def test_a_table_of_readings_holds_a_row_a_day_for_each_of_a_few_things(tmp_path
         assert cur.execute("""select count(distinct "USER_ID"), count(distinct "TIMESTAMP"::date), count(*),
                                      count(distinct concat("USER_ID", "TIMESTAMP"::date)), count_if("USER_ID" = '93myk')
                               from "RAW"."T"."SERVER" where "TIMESTAMP" < '2025-01-10'""").fetchone() == (5, 9, 45, 45, 9)
+        # what is said of a server is the same in each of its readings, and the first servers have the named values
+        assert cur.execute("""select count(distinct "INSTALLATION"), count(distinct concat("USER_ID", "INSTALLATION")),
+                                     count(distinct case when "INSTALLATION" in ('u85ky', 'qe3n8') then "USER_ID" end),
+                                     min(case when "USER_ID" = '93myk' then "INSTALLATION" end)
+                              from "RAW"."T"."SERVER" where "TIMESTAMP" < '2025-01-10'""").fetchone() == (5, 5, 2, "u85ky")
         # and an event of a server on a day finds that server's reading of the day
         assert cur.execute("""select count(*), count(s."USER_ID") from "RAW"."T"."EVENT" e left join "RAW"."T"."SERVER" s
                               on s."USER_ID" = e."SERVER" and s."TIMESTAMP"::date = e."TIMESTAMP"::date
