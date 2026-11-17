@@ -45,8 +45,10 @@ def test_dbt_model_contracts_see_snowflake_types(tmp_path):
 
     project = Path(__file__).parent / "projects" / "contracts"
     out = CliRunner().invoke(main, ["build", "--project-dir", str(project), "--spec", str(project / "fauxflake.yml")])
-    assert "PASS=1 WARN=0 ERROR=1" in out.output, out.output  # `typed` holds its contract, `wrong` does not
+    assert "PASS=1 WARN=0 ERROR=2" in out.output, out.output  # `typed` holds its contract; `wrong` and `nulls` do not
     assert "in model wrong" in out.output and "in model typed" not in out.output
+    # a NOT NULL constraint is enforced when the table is built, as Snowflake does (keys are recorded only)
+    assert "in model nulls" in out.output and "NULL result in a non-nullable column" in out.output
     for line in ("| EXTRA       | FIXED           |               | missing in contract   |",
                  "| ID          | FIXED           | TEXT          | data type mismatch    |",
                  "| MISSING_COL |                 | DATE          | missing in definition |"):

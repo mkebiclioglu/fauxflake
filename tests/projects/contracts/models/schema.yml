@@ -27,3 +27,8 @@ models:
     columns:
       - {name: id, data_type: varchar}
       - {name: missing_col, data_type: date}
+  - name: nulls
+    config:
+      contract: {enforced: true}
+    columns:
+      - {name: id, data_type: number, constraints: [{type: not_null}, {type: primary_key}]}

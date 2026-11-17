@@ -729,6 +729,13 @@
    ]
   ]
  },
+ "column_names_only_on_create_as": {
+  "rows": [
+   [
+    "Table FX_NAMED successfully created."
+   ]
+  ]
+ },
  "concat_nulls": {
   "rows": [
    [
@@ -2464,6 +2471,13 @@
    ]
   ]
  },
+ "keys_are_not_enforced": {
+  "rows": [
+   [
+    "Table FX_KEYS successfully created."
+   ]
+  ]
+ },
  "last_day_parts": {
   "rows": [
    [
@@ -2798,6 +2812,16 @@
  },
  "not_enough_arguments_nvl2": {
   "error": "000938 (22023): SQL compilation error: error line 1 at position 7"
+ },
+ "not_null_on_create_as": {
+  "error": "100072 (22000): DML operation to table BO94541.ANALYTICS.CI.FX_NN failed on column ID with error: NULL result in a non-n"
+ },
+ "not_null_on_create_as_holds": {
+  "rows": [
+   [
+    "Table FX_NN successfully created."
+   ]
+  ]
  },
  "null_aggregates": {
   "rows": [

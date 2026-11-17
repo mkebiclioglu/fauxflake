@@ -180,6 +180,9 @@ NOPS = [
     _LEAD + r"alter\s+\w+(\s+\w+)?\s+(if\s+exists\s+)?\S+\s+(un)?set\s+(tag|comment|data_retention_time_in_days|change_tracking|query_tag)\b",
     _LEAD + r"alter\s+(table|materialized\s+view|dynamic\s+table)\s+\S+\s+(cluster\s+by|drop\s+clustering|resume|suspend)\b",
     _LEAD + r"(grant|revoke)\s",
+    # keys are recorded by Snowflake and never enforced
+    _LEAD + r"alter\s+table\s+(if\s+exists\s+)?\S+\s+add\s+(constraint\s+\S+\s+)?(primary\s+key|unique|foreign\s+key)\b",
+    _LEAD + r"alter\s+table\s+(if\s+exists\s+)?\S+\s+drop\s+(constraint\s+\S+|primary\s+key|unique|foreign\s+key)\b",
     _LEAD + r"alter\s+dynamic\s+table\s+\S+\s+(?!rename|swap)",
     _LEAD + r"alter\s+(session|warehouse|account)\s",
     _LEAD + r"use\s+(warehouse|secondary\s+roles)\s",
@@ -344,6 +347,63 @@ def _record_semi_types(cursor) -> None:  # noqa: ANN001
             duck.executemany(f"insert into {_SEMI_TABLE} values (?, ?, ?, ?, ?)", rows)
     except Exception:  # noqa: BLE001, S110
         pass
+
+
+_KEYS = (exp.PrimaryKeyColumnConstraint, exp.UniqueColumnConstraint, exp.PrimaryKey, exp.ForeignKey, exp.Reference)
+
+
+def _constraints_as_snowflake_keeps_them(cursor, create: exp.Create) -> None:  # noqa: ANN001
+    """Snowflake records PRIMARY KEY, UNIQUE and FOREIGN KEY and does not enforce them; NOT NULL it enforces.
+    DuckDB enforces the keys (a duplicate would fail here and load in production) and cannot take a column list
+    with constraints on CREATE TABLE ... AS SELECT, which is how dbt writes a model with a contract. The keys are
+    taken out of the statement; the NOT NULL columns of a CREATE ... AS are noted and set once the table is there."""
+    schema = create.this
+    cursor._fauxflake_not_null = None
+    if str(create.args.get("kind") or "").upper() != "TABLE" or not isinstance(schema, exp.Schema):
+        return
+    if create.expression is not None and schema.expressions and all(isinstance(e, exp.Identifier) for e in schema.expressions):
+        # CREATE TABLE t (a, b) AS SELECT ...: names only. The query is given those names instead.
+        named = exp.select("*").from_(exp.Subquery(
+            this=create.expression.unnest() if isinstance(create.expression, (exp.Subquery, exp.Paren)) else create.expression,
+            alias=exp.TableAlias(this=exp.to_identifier("_FX_NAMED"), columns=[e.copy() for e in schema.expressions])))
+        create.set("expression", named)
+        create.set("this", schema.this)
+        return
+    for item in list(schema.expressions):
+        if isinstance(item, (exp.PrimaryKey, exp.ForeignKey, exp.UniqueColumnConstraint)) or (
+                isinstance(item, exp.Constraint) and any(isinstance(e, _KEYS) for e in item.expressions)):
+            item.pop()  # a constraint on the table: PRIMARY KEY (a, b), CONSTRAINT fk FOREIGN KEY ...
+    required = []
+    for column in schema.expressions:
+        if not isinstance(column, exp.ColumnDef):
+            continue
+        for constraint in list(column.args.get("constraints") or []):
+            if isinstance(constraint.kind, _KEYS):
+                constraint.pop()
+            elif isinstance(constraint.kind, exp.NotNullColumnConstraint) and not constraint.kind.args.get("allow_null"):
+                required.append(column.name)
+    if create.expression is not None and required:
+        cursor._fauxflake_not_null = required
+
+
+def _not_null_as_declared(cursor, create: exp.Create) -> None:  # noqa: ANN001
+    required = getattr(cursor, "_fauxflake_not_null", None)
+    cursor._fauxflake_not_null = None
+    target = create.this.this if isinstance(create.this, exp.Schema) else create.this
+    if not required or not isinstance(target, exp.Table):
+        return
+    name = target.sql(dialect="duckdb")
+    duck = cursor._duck_conn
+    held = {r[0].upper(): r[0] for r in duck.execute(f"describe {name}").fetchall()}
+    for column in required:
+        if column.upper() not in held:
+            continue
+        try:
+            duck.execute(f'alter table {name} alter column "{held[column.upper()]}" set not null')
+        except duckdb.Error as e:
+            with contextlib.suppress(duckdb.Error):
+                duck.execute(f"drop table if exists {name}")
+            raise duckdb.ConstraintException(f"NOT NULL constraint failed: {target.name}.{held[column.upper()]}") from e
 
 
 def _no_duplicate_columns(cursor, create: exp.Create, params=None) -> None:  # noqa: ANN001
@@ -597,6 +657,12 @@ def _patch_fakesnow() -> None:
         except Exception as e:  # noqa: BLE001
             # Anything else would surface as an HTTP 500, which the Snowflake
             # connector retries for minutes. Fail the statement immediately instead.
+            missing = re.search(r"NOT NULL constraint failed: (\S+)\.(\S+)", str(e))
+            if missing:
+                self._sqlstate = "22000"
+                raise ProgrammingError(msg=f"DML operation to table {missing.group(1).upper()} failed on column "
+                                           f"{missing.group(2).upper()} with error: NULL result in a non-nullable column",
+                                       errno=100072, sqlstate="22000") from e
             self._sqlstate = "XX000"
             raise ProgrammingError(msg=f"fauxflake emulator: {type(e).__name__}: {e}", errno=9998, sqlstate="XX000") from e
 
@@ -767,6 +833,7 @@ def _patch_fakesnow() -> None:
             expression = semantics.layer_windows(expression)
         if isinstance(expression, exp.Create):
             _note_semi_types(self, expression)
+            _constraints_as_snowflake_keeps_them(self, expression)
         out = original_transform(self, semantics.rewrite(expression), params)
         out = semantics.finish(semantics.parenthesize_arrows(out))
         out = semantics.keep_outer_rows(out, getattr(self, "_fauxflake_outer", []), getattr(self, "_fauxflake_recursive", []))
@@ -886,6 +953,7 @@ def _patch_fakesnow() -> None:
                 if isinstance(tree, exp.Create):
                     _record_semi_types(self)
                     _no_duplicate_columns(self, tree, params)
+                    _not_null_as_declared(self, tree)
             except Exception as e:
                 if replaced and replaced[1]:
                     with contextlib.suppress(Exception):
