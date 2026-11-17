@@ -820,3 +820,18 @@ def test_flags_are_followed_back_through_the_models_before():
     assert f.flags_upstream("model.p.mart")
     flags = {name for name, gen in columns.items() if gen.get("type") == "BOOLEAN"}
     assert flags == {"ENABLE_TESTING", "ENABLE_GITLAB", "ENABLE_SSO", "PLUGINS_ON"}  # not the id or the version
+
+
+def test_a_unique_reference_stays_a_reference():
+    class Reading:
+        @staticmethod
+        def place(node, column):
+            return ("RAW.Z.ITEMS", "CHARGEID", "")
+
+    tables = {"RAW.Z.CHARGES": {"columns": {"ID": {"gen": "sequence"}}},
+              "RAW.Z.ITEMS": {"columns": {"ID": {"gen": "sequence"}, "CHARGEID": {"gen": "fk", "ref": "RAW.Z.CHARGES", "skew": 1.5}}}}
+    f = fitter(tables=tables)
+    test = {"name": "unique_items_charge_id", "attached_node": "model.p.items", "column_name": "charge_id",
+            "test_metadata": {"name": "unique", "kwargs": {"column_name": "charge_id"}}}
+    assert f.learn_from_test(test, Reading)
+    assert tables["RAW.Z.ITEMS"]["columns"]["CHARGEID"] == {"gen": "fk", "ref": "RAW.Z.CHARGES", "skew": 1.5, "per_parent": 1}

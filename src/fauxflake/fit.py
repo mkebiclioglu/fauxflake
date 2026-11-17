@@ -923,6 +923,8 @@ class Fitter:
             elif numeric and kind == "fk":
                 parent = self.tables.get(str(gen.get("ref", "")).upper(), {}).get("columns") or {}
                 key = next((c for c, d in parent.items() if d.get("gen") == "hash_id"), None)
+                if key is not None and _text_ids(parent[key]) and (table, name) in kept_text:
+                    continue  # compared with text elsewhere, and its key is text: the number that failed is not this column's
                 if key is not None and _text_ids(parent[key]):
                     # the key it refers to is text the SQL takes apart or names (`1.2.3`), and this column is read as
                     # a number: it does not hold that key. A number of its own
@@ -2692,7 +2694,9 @@ class Fitter:
                                 # source column behind one of them. The source columns behind the others, as long as
                                 # nothing is known about them yet, are numbers too, learned in this round and not one
                                 # round each.
-                                for origin in dict.fromkeys(self.origins(sql_key, c)):
+                                # (only the columns whose value it is: not the stage name a `case when stage = ...
+                                # then 1` counts by)
+                                for origin in dict.fromkeys(self.origins(sql_key, c, strict=True)):
                                     for t in sources:
                                         held = (self.tables[t].get("columns") or {}).get(origin)
                                         if held and held.get("gen") == "template" and not held.get("templates") \
@@ -3996,6 +4000,14 @@ class Fitter:
             if gen["gen"] in ("sequence", "hash_id"):
                 return False
             numeric = gen["gen"] == "dist" or str(gen.get("type", "")).upper().startswith(("BIGINT", "INT", "DECIMAL", "DOUBLE"))
+            if gen["gen"] == "fk" and not gen.get("per_parent") and not gen.get("first"):
+                # a reference nobody shares (one invoice line per charge): each row takes the next parent in turn; it
+                # still is a reference, and the join it feeds still meets
+                columns[col] = {**gen, "per_parent": 1}
+                self.learned.append(f"{table}.{col}: a `unique` test failed; each row refers to a parent of its own now.")
+                self.retyped.add(table)
+                self.dirty = True
+                return True
             if gen["gen"] in ("time_offset", "event_time", "updated_at"):
                 if gen.get("unique"):
                     return False
