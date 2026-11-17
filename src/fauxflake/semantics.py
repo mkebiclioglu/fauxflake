@@ -26,6 +26,10 @@ MACROS = [
     # argument is only marked here; when DuckDB refuses the statement, `text_as_written` converts the marked
     # arguments that turn out to be text.
     f"create or replace macro {_NS}_sf_reads(x, kind) as x",
+    # WHERE, IFF and CASE WHEN take a BOOLEAN and nothing else in Snowflake (`where is_deleted` on a NUMBER or
+    # text column does not compile; AND, OR and NOT do convert). The macro has no other overload, so DuckDB
+    # refuses what Snowflake refuses, and `strict_conditions` words the error.
+    f"create or replace macro {_NS}_sf_cond(x boolean, fn) as x",
     # ADD_MONTHS keeps the type it is given (a date stays a date) and the last day of a month stays the last
     # day, with the time of day kept. Text is read as a timestamp.
     f"""create or replace macro {_NS}_sf_add_months_typed
@@ -102,8 +106,9 @@ MACROS = [
           else {_NS}_sf_fixed(round({_NS}_sf_div(a, b), n), least(n, greatest({_SCALE}, least({_SCALE} + 6, 12)))) end""",
     f"""create or replace macro {_NS}_sf_width_bucket(x, lo, hi, n) as case
           when x < lo then 0 when x >= hi then n + 1 else floor((x - lo) * n / (hi - lo))::bigint + 1 end""",
+    # ARRAY_SIZE of a VARIANT that is not an array (an object, a number) is NULL
     f"""create or replace macro {_NS}_sf_array_size
-          (x json) as json_array_length(x),
+          (x json) as (case when json_type(x) = 'ARRAY' then json_array_length(x) end),
           (x) as len(x)""",
     f"create or replace macro {_NS}_sf_current_account_name() as 'FAUXFLAKE'",
     # the text behind the base64, as UTF-8; a VARIANT string is read without its JSON quotes
@@ -1340,6 +1345,16 @@ def rewrite(node: exp.Expression) -> exp.Expression:
         new = rewrite(child)
         if new is not child:
             parent.set(key, new, index)
+    if isinstance(node, (exp.Where, exp.Having, exp.Qualify, exp.If, exp.CountIf)) or (isinstance(node, exp.Join) and node.args.get("on")):
+        key = "on" if isinstance(node, exp.Join) else "this"
+        test = node.args.get(key)
+        inner = test.unnest() if test is not None else None
+        simple_case = isinstance(node, exp.If) and isinstance(node.parent, exp.Case) and node.parent.args.get("this") is not None
+        if isinstance(inner, (exp.Column, exp.Literal, exp.JSONExtract, exp.Bracket)) and not simple_case and not (
+                isinstance(inner, exp.Column) and isinstance(inner.this, exp.Star)):  # (CASE x WHEN 1: the 1 is a value)
+            fn = "IFF" if isinstance(node, exp.CountIf) or (isinstance(node, exp.If) and not isinstance(node.parent, exp.Case)) \
+                else "CASE" if isinstance(node, exp.If) else "predicate"
+            node.set(key, _fn("_sf_cond", test, exp.Literal.string(fn)))
     for key, kind in _READS_TEXT.get(type(node), ()):
         arg = node.args.get(key)
         if arg is not None and not isinstance(arg, (exp.Null, exp.Placeholder, exp.Parameter, exp.Cast)) and not arg.is_int:
@@ -1433,6 +1448,73 @@ def text_as_written(tree: exp.Expression, conn, params=None) -> bool:  # noqa: A
             marker.replace(exp.cast(exp.Round(this=arg.copy()), to))  # LEFT(s, 1.6) takes two characters
             return True
     return False
+
+
+def _kind_of(tree: exp.Expression, node: exp.Expression, conn, params=None) -> str | None:  # noqa: ANN001
+    """The DuckDB type of an expression where it stands in the statement, or None when it does not bind."""
+    copy, twin = _twin(tree, node)
+    check = _fn("_sf_strict", twin.copy(), exp.Literal.string(""))
+    twin.replace(check)
+    _unwrap_strict(copy, keep=check)
+    for marker in [n for n in copy.find_all(exp.Anonymous) if _is(n, "_sf_cond")]:
+        marker.replace(marker.expressions[0])
+    text = "explain " + copy.sql(dialect="duckdb")
+    conn.execute("set errors_as_json = true")
+    try:
+        conn.execute(text, params) if params else conn.execute(text)
+        return "TIMESTAMP"  # the check bound: a date or a time
+    except Exception as e:  # noqa: BLE001
+        found = re.search(r"""microsecond\((.*?)\)['"]""", (_error_details(str(e)) or {}).get("exception_message", ""))
+        return found.group(1).strip('"\\') if found else None
+    finally:
+        conn.execute("set errors_as_json = false")
+
+
+def _snowflake_type(kind: str, node: exp.Expression | None = None) -> str:
+    if kind == "STRING_LITERAL" or (isinstance(node, exp.Literal) and node.is_string):
+        return f"VARCHAR({len(node.name)})" if isinstance(node, exp.Literal) else "VARCHAR(134217728)"
+    if kind == "INTEGER_LITERAL" and isinstance(node, exp.Literal):
+        return f"NUMBER({len(node.name)},0)"
+    if kind.startswith("TIMESTAMP WITH"):
+        return "TIMESTAMP_TZ(9)"
+    if kind.startswith("TIMESTAMP"):
+        return "TIMESTAMP_NTZ(9)"
+    return _SNOWFLAKE_TYPE.get(kind) or ("NUMBER(38,0)" if "INT" in kind else kind.replace("DECIMAL", "NUMBER"))
+
+
+def strict_conditions(tree: exp.Expression, conn, params=None) -> None:  # noqa: ANN001
+    """DuckDB refused an argument of `_sf_cond`: a condition that is not a BOOLEAN. Raises what Snowflake says."""
+    from snowflake.connector.errors import ProgrammingError
+
+    for marker in [n for n in tree.find_all(exp.Anonymous) if _is(n, "_sf_cond")]:
+        arg, fn = marker.expressions[0], marker.expressions[1].name
+        kind = _kind_of(tree, arg, conn, params)
+        if kind is None or kind in ("BOOLEAN", "NULL"):
+            continue
+        named, shown = _snowflake_type(kind, arg.unnest()), arg.sql(dialect="snowflake")
+        if fn == "IFF":
+            raise ProgrammingError(msg=f"SQL compilation error:\nInvalid argument types for function 'IFF': ({named}, ...)"
+                                       f"\n(the condition: {shown})", errno=1044, sqlstate="42P13")
+        if fn == "CASE":
+            raise ProgrammingError(msg=f"SQL compilation error:\nCan not convert parameter '{shown}' of type [{named}] into "
+                                       f"expected type [BOOLEAN]", errno=1038, sqlstate="22023")
+        raise ProgrammingError(msg=f"SQL compilation error:\nInvalid data type [{named}] for predicate [{shown}]",
+                               errno=2034, sqlstate="22000")
+
+
+def _refuse_arithmetic(sign: str, sides: list[exp.Expression], kinds: list[str]) -> None:
+    """`created_date - '2024-01-01'`, `text_column + interval '1 day'`: Snowflake does not read text as a date beside
+    + or -. (It does read it as a number: `text_column + 1` compiles.) Raises its error, unless the text side is an
+    expression whose type Snowflake chooses differently (COALESCE of text and a date is a date there)."""
+    from snowflake.connector.errors import ProgrammingError
+
+    if sign not in ("+", "-") or len(sides) != 2 or not any(k.startswith(_DATE_TYPES) for k in kinds):
+        return
+    for side, kind in zip(sides, kinds):
+        if kind in ("VARCHAR", "JSON", "STRING_LITERAL") and not isinstance(side.unnest(), _CHOOSES_A_TYPE):
+            named = ", ".join(_snowflake_type(k, s.unnest()) for s, k in zip(sides, kinds))
+            raise ProgrammingError(msg=f"SQL compilation error:\nInvalid argument types for function '{sign}': ({named})"
+                                       f"\n(the text: {side.sql(dialect='snowflake')})", errno=1044, sqlstate="42P13")
 
 
 def strict_dates(tree: exp.Expression, conn, params=None) -> bool:  # noqa: ANN001
@@ -1699,7 +1781,7 @@ def _repair(tree: exp.Expression, text: str, details: dict) -> bool:
         name, call = ambiguous.group(1), ambiguous.group(1) + ambiguous.group(2)
     if not name or not call or pos < 0:
         return False
-    types = _call_types(call)
+    types = raw = _call_types(call)
     types = ["VARCHAR" if t in ("JSON", "STRING_LITERAL") else t for t in types]  # a VARIANT converts the same way; so does ABS('5')
     if name.lower() == "to_timestamp" and len(types) == 1 and types[0].startswith(("TIMESTAMP", "DATE")):
         # TO_TIMESTAMP of something that already is a point in time gives it back (as TIMESTAMP_NTZ)
@@ -1740,9 +1822,11 @@ def _repair(tree: exp.Expression, text: str, details: dict) -> bool:
             at_operator = len(sides) == 2 and text.startswith(sql, pos - len(left) - 1)
             if not (text.startswith(sql, pos) or at_operator) or len(sides) != len(types):
                 continue
-            for side, kind in zip(sides, types):
+            _refuse_arithmetic(name, sides, raw)
+            for side, kind, other in zip(sides, types, reversed(types)):
                 if kind == "VARCHAR":
-                    _convert(side, "timestamp" if temporal else "double")
+                    # (text Snowflake itself turns into a date: COALESCE(text, a_date) - a_date is a number of days)
+                    _convert(side, ("date" if other == "DATE" else "timestamp") if temporal else "double")
             return True
         for node in tree.find_all(exp.DateAdd, exp.DateSub, exp.TsOrDsAdd, exp.TimestampAdd, exp.DatetimeAdd,
                                   exp.TimestampSub, exp.DatetimeSub, exp.TimeAdd, exp.TimeSub):
@@ -2307,9 +2391,10 @@ def _repair_by_types(tree: exp.Expression, conn, details: dict) -> bool:  # noqa
             continue
         for i, n in enumerate(nodes):
             left, right = described[2 * i][1], described[2 * i + 1][1]
+            _refuse_arithmetic(sign.group(1), [n.this, n.expression], [left, right])
             for side, kind, other in ((n.this, left, right), (n.expression, right, left)):
                 if kind == "VARCHAR" and other != "VARCHAR":
-                    _convert(side, "timestamp" if other.startswith(_DATE_TYPES) else "double")
+                    _convert(side, "date" if other == "DATE" else "timestamp" if other.startswith(_DATE_TYPES) else "double")
                     done = True
     return done
 
