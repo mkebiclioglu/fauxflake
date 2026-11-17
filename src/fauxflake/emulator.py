@@ -193,7 +193,7 @@ NOPS = [
 # that filter on current_date see the same point in time as the synthetic data.
 FROZEN_NOW = None
 _CLOCK = re.compile(
-    r"\b(?:current_timestamp|sysdate|getdate|localtimestamp|current_date)\b(?:\s*\(\s*\))?(?!\s*\()", re.IGNORECASE
+    r"\b(?:current_timestamp|sysdate|getdate|localtimestamp|current_date|current_time|localtime)\b(?:\s*\(\s*\))?(?!\s*\()", re.IGNORECASE
 )
 
 
@@ -204,6 +204,8 @@ def _freeze_clock(sql: str) -> str:
     def sub(m: re.Match[str]) -> str:
         if m.group(0).lower().startswith("current_date"):
             return f"'{FROZEN_NOW:%Y-%m-%d}'::date"
+        if re.match(r"(?i)(current_time|localtime)\b", m.group(0)):
+            return f"'{FROZEN_NOW:%H:%M:%S}'::time"
         return f"'{FROZEN_NOW:%Y-%m-%d %H:%M:%S}'::timestamp"
 
     if "'" not in sql and '"' not in sql and "$$" not in sql:
