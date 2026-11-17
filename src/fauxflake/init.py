@@ -31,7 +31,7 @@ import yaml
 from sqlglot import exp
 from sqlglot.optimizer.scope import traverse_scope
 
-from . import catalog
+from . import catalog, semantics
 
 LOADED_AT = ["_LOADED_AT", "_FIVETRAN_SYNCED", "_AIRBYTE_EXTRACTED_AT", "_SDC_BATCHED_AT", "_ETL_LOADED_AT",
              "LOADED_AT", "_INGESTED_AT", "INGESTED_AT", "_PARTITIONTIME"]
@@ -192,6 +192,12 @@ _SAME_VALUE = (exp.Lower, exp.Upper, exp.Trim, exp.Initcap, exp.Nullif, exp.Lag,
 def _parsed_as(node: exp.Expression) -> str | None:
     """TIMESTAMP or DATE when the value (possibly cast to text first) is handed to a function that
     reads it as a point in time: to_timestamp_ntz(v:header:timestamp::string)."""
+    direct = node
+    while isinstance(direct.parent, exp.Paren):
+        direct = direct.parent
+    only_dates = semantics._DATES_ONLY.get(type(direct.parent))
+    if only_dates and any(direct.parent.args.get(key) is direct for key in only_dates[1:]):
+        return "TIMESTAMP"  # year(billed), date_trunc('month', billed): Snowflake compiles these on dates and times only
     top, as_number = node, False
     while isinstance(top.parent, (exp.Cast, exp.TryCast, exp.Paren)):
         if not isinstance(top.parent, exp.Paren) and not top.parent.to.is_type(*exp.DataType.TEXT_TYPES):

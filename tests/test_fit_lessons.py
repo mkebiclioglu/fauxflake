@@ -705,3 +705,12 @@ def test_pieces_read_as_numbers_through_a_cleaned_alias_keep_the_shapes_the_text
     assert f.split_numbers("m")
     assert tables["RAW.V.PINGS"]["columns"]["VERSION"] == {"gen": "template", "templates": ["{n}.{n}", "{n}.{n}-pre"]}
     assert not f.split_numbers("m")
+
+
+def test_snowflake_refusing_text_in_a_date_part_function_types_every_such_column():
+    tree = parse("select year(a), date_trunc('month', (b)), dateadd(day, 1, c), last_day(d::date) from t")
+    f = fitter(trees={"m": tree})
+    asked = []
+    f.retype_column = lambda uid, name, hint, *a, **k: asked.append((name, hint)) or True
+    assert f._learn("m", "002016 (22000): SQL compilation error:\nFunction EXTRACT does not support VARCHAR(134217728) argument type")
+    assert asked == [("A", "TIMESTAMP"), ("B", "TIMESTAMP")]

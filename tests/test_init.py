@@ -830,3 +830,16 @@ def test_memory_is_bounded_below_duckdb_default():
     with emulator.engine() as emu:
         bounded = emu.duck.execute("select current_setting('memory_limit')").fetchone()[0]
     assert bounded != default
+
+
+def test_a_column_given_to_a_date_part_function_is_a_time():
+    sources = {"RAW.APP.USERS": SourceUse()}
+    scan_model("""
+        select year(signed_up), date_trunc('month', (billed_on)), last_day(renewal), hour(seen),
+               extract(dow from shipped), months_between(closed, opened), dateadd(day, 1, later), left(name, 3)
+        from RAW.APP.USERS""", sources)
+    hints = sources["RAW.APP.USERS"].columns
+    for column in ("SIGNED_UP", "BILLED_ON", "RENEWAL", "SEEN", "SHIPPED", "CLOSED", "OPENED"):
+        assert hints[column] == "TIMESTAMP", column
+    # DATEADD reads text as a date in Snowflake: it says nothing certain about the column
+    assert not hints.get("LATER") and not hints.get("NAME")

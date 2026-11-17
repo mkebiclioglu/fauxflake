@@ -2430,6 +2430,25 @@ class Fitter:
         self.learned.append(f"{fq}.{name}: declared a document, but the model writes text into it; declared VARCHAR.")
         return True
 
+    def dates_only(self, sql_key: str) -> bool:
+        """`Function EXTRACT does not support VARCHAR argument type`: Snowflake compiles YEAR, DATE_TRUNC, LAST_DAY
+        and their kind on dates and times only, so every column this model hands to one of them is a time. (The
+        message names no column: all of them are learned at once.)"""
+        from . import semantics
+
+        tree = self.tree(sql_key)
+        if tree is None:
+            return False
+        changed = False
+        for node in tree.find_all(*semantics._DATES_ONLY):
+            for key in semantics._DATES_ONLY[type(node)][1:]:
+                arg = node.args.get(key)
+                while isinstance(arg, exp.Paren):
+                    arg = arg.this
+                if isinstance(arg, exp.Column):
+                    changed |= self.retype_column(sql_key, arg.name.upper(), "TIMESTAMP")
+        return changed
+
     def learn(self, sql_key: str, message: str) -> bool:
         """Apply whatever one error message teaches. True when the spec changed."""
         watch = os.environ.get("FAUXFLAKE_FIT_WATCH")  # for working on the fitter: TABLE.COLUMN, whose changes are written down
@@ -2453,6 +2472,8 @@ class Fitter:
         if self.udf_input(sql_key, message) or self.pivot_values(sql_key, message) or self.pivoted_upstream(sql_key, message) \
                 or self.missing_column(sql_key, message) or self.missing_relation(sql_key, message) \
                 or self.union_widths(sql_key, message):
+            return True
+        if re.search(r"Function \w+ does not support (VARCHAR|VARIANT)\S* argument type", message) and self.dates_only(sql_key):
             return True
         named = _FROM_COLUMN.search(message)
         bad = _BAD_CAST.search(message)

@@ -1469,7 +1469,9 @@ def strict_dates(tree: exp.Expression, conn, params=None) -> bool:  # noqa: ANN0
         named = _SNOWFLAKE_TYPE.get(kind) or ("NUMBER(38,0)" if "INT" in kind else kind.replace("DECIMAL", "NUMBER"))
         if kind == "STRING_LITERAL":
             named = f"VARCHAR({len(arg.name)})"
-        raise ProgrammingError(msg=f"SQL compilation error:\nFunction {fn} does not support {named} argument type",
+        shown = arg.sql(dialect="snowflake")
+        raise ProgrammingError(msg=f"SQL compilation error:\nFunction {fn} does not support {named} argument type"
+                                   f"\n(the argument: {shown if len(shown) <= 200 else shown[:200] + ' ...'})",
                                errno=2016, sqlstate="22000")
     return loosened
 
