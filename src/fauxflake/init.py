@@ -1063,6 +1063,10 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     col, parent = parent, parent.parent
                     if not (isinstance(parent, exp.JSONExtract) and parent.this is col):
                         use.paths.setdefault(hit[1], {})
+                elif isinstance(parent, (exp.Contains, exp.StartsWith, exp.EndsWith)) and parent.this is col:
+                    if within_pattern(parent) and not isinstance(parent.parent, exp.Not):
+                        use.patterns.setdefault(hit[1], set()).add(within_pattern(parent))  # contains(area, 'All')
+                        use.texts.add(hit[1])
                 elif isinstance(parent, (exp.EQ, exp.NEQ, exp.Like, exp.ILike, exp.In)):
                     if isinstance(parent, (exp.Like, exp.ILike)) and parent.this is col and isinstance(parent.expression, exp.Any) \
                             and not isinstance(parent.parent, exp.Not) and _like_patterns(parent):
@@ -1967,8 +1971,25 @@ def asked_shapes(use: "SourceUse", col: str) -> set[str]:
 
 
 def like_shape(pattern: str) -> str:
-    """A template whose values match the LIKE pattern: `%.pool%.near` -> `{hex}.pool{hex}.near`."""
-    return pattern.replace("\\", "").replace("%", "{hex}").replace("_", "x")
+    """A template whose values match the LIKE pattern: `%.pool%.near` -> `{hex}.pool{hex}.near`. `_` (any one
+    character) is written as an underscore, which is what the pattern nearly always means by it."""
+    out, i = "", 0
+    while i < len(pattern):
+        if pattern[i] == "\\" and i + 1 < len(pattern):
+            out, i = out + pattern[i + 1], i + 2
+            continue
+        out, i = out + ("{hex}" if pattern[i] == "%" else pattern[i]), i + 1
+    return out
+
+
+def within_pattern(test: exp.Expression) -> str | None:
+    """`contains(name, 'All')`, `startswith(name, 'tap-')`, `endswith(name, '.near')` as the LIKE pattern they are."""
+    said = test.expression
+    if not isinstance(test, (exp.Contains, exp.StartsWith, exp.EndsWith)) or not isinstance(said, exp.Literal) or not said.is_string \
+            or not re.search(r"[A-Za-z0-9]", said.name) or len(said.name) > 60 or "{" in said.name:
+        return None
+    text = said.name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"{'' if isinstance(test, exp.StartsWith) else '%'}{text}{'' if isinstance(test, exp.EndsWith) else '%'}"
 
 
 def history_window(dates: list[tuple[str, date]], default: date = date(2025, 1, 1), days: int = 60) -> tuple[date, int | None]:

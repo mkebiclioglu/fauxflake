@@ -399,7 +399,7 @@ def test_pieces_of_a_split_text_that_rows_are_kept_by_are_generated():
     }
     request = build_spec(manifest, "A")[0]["tables"]["RAW.S.LOG"]["columns"]["REQUEST"]
     assert request["gen"] == "template"
-    assert request["templates"] == ["POST {hex}/api/v1/ack {hex}", "POST {hex}/api/v1/sendxpush {hex}", "{hex} {hex} {hex}"]  # `_` in LIKE stands for any one character
+    assert request["templates"] == ["POST {hex}/api/v1/ack {hex}", "POST {hex}/api/v1/send_push {hex}", "{hex} {hex} {hex}"]  # `_` in LIKE stands for any one character
 
 
 def test_an_id_asked_for_by_name_through_a_foreign_key_exists_in_the_table_it_refers_to(emu, tmp_path):
@@ -921,7 +921,7 @@ def test_a_reference_to_a_column_that_is_not_the_key_holds_its_values():
 def test_values_that_contain_something_also_begin_the_way_that_is_asked():
     from fauxflake.init import like_shapes
 
-    assert like_shapes({"http%", "%utm_content=partner%"}) == ["http{hex}", "http{hex}utmxcontent=partner{hex}"]
+    assert like_shapes({"http%", "%utm_content=partner%"}) == ["http{hex}", "http{hex}utm_content=partner{hex}"]
     assert like_shapes({"%a%", "%.com"}) == ["{hex}.com", "{hex}a{hex}"]
 
 
