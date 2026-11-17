@@ -58,6 +58,8 @@ class SourceUse:
         self.ips: set[str] = set()  # text columns handed to PARSE_IP
         self.bounds: dict[str, set[float]] = {}  # column -> numbers the SQL compares it with
         self.text_bounds: dict[str, set[int]] = {}  # text column -> numbers written as text it is ranged by (`between '4000' and '4999'`)
+        # column -> texts and LIKE patterns asked of the columns it is lined up with in a UNION
+        self.united: dict[str, dict[str, set[str]]] = {"literals": {}, "patterns": {}}
         self.equals: dict[str, set[int]] = {}  # column -> whole numbers the SQL asks for by name (`project_id = 278964`, `in (1, 2)`)
         self.scales: dict[tuple[str, str], int] = {}  # (column, path in its document) -> digits of an epoch number below the second
         self.splits: dict[str, dict] = {}  # text column -> {"seps": {"/": {0: "BIGINT"}}, "digits": False} from split()[i]::type
@@ -1451,6 +1453,15 @@ def flattened_objects(paths: dict[str, str | None]) -> dict[str, str | None]:
     return out
 
 
+def asked_texts(use: "SourceUse", col: str) -> set[str]:
+    """The texts asked of a column, by name or of a column it is lined up with in a UNION."""
+    return use.literals.get(col, set()) | use.united["literals"].get(col, set())
+
+
+def asked_shapes(use: "SourceUse", col: str) -> set[str]:
+    return use.patterns.get(col, set()) | use.united["patterns"].get(col, set())
+
+
 def like_shape(pattern: str) -> str:
     """A template whose values match the LIKE pattern: `%.pool%.near` -> `{hex}.pool{hex}.near`."""
     return pattern.replace("\\", "").replace("%", "{hex}").replace("_", "x")
@@ -1725,6 +1736,13 @@ def analyse(manifest: dict, database: str) -> Analysis:
             if any(c in u.texts for u, c in members):
                 for u, c in members:
                     u.texts.add(c)
+            # (`stage_name` of the snapshots united with `stage_name` of the live table, then joined to the list of
+            # stages: both hold the names the SQL asks for, not only the branch written first)
+            # (kept apart from what is asked of the column itself: ids named in one branch are not ids of the other)
+            for kind in ("literals", "patterns"):
+                asked = set().union(*(getattr(u, kind).get(c, set()) | u.united[kind].get(c, set()) for u, c in members))
+                for u, c in members if asked else ():
+                    u.united[kind].setdefault(c, set()).update(asked - getattr(u, kind).get(c, set()))
             hint = next((u.columns.get(c) for u, c in members if u.columns.get(c)), None)
             for u, c in members:
                 if hint and not u.columns.get(c):
@@ -1849,21 +1867,21 @@ def analyse(manifest: dict, database: str) -> Analysis:
             elif (name, col) in accepted:
                 values = accepted[(name, col)]
                 out[col] = {"gen": "categorical", "values": {v: round(1 / len(values), 4) for v in values}}
-            elif 0 < len(use.literals.get(col, ())) <= 30 and not hint_is_number(hint) and col not in use.patterns \
+            elif 0 < len(asked_texts(use, col)) <= 30 and not hint_is_number(hint) and not asked_shapes(use, col) \
                     and not (hint or "").upper().startswith(("BOOL", "DATE", "TIMESTAMP")) \
                     and not (col in use.json_text or use.paths.get(col)):
                 # (a document compared with '[{}]' is still a document; `isdeleted::boolean` compared with 'true' is a
                 # boolean; `closedate::date` compared with '2020-02-01' is a date)
                 # `where status = 'open'` should select something: use the values the SQL names
-                named = sorted(use.literals[col] | set(sorted(use.examples.get(col, ()))[:12]))
+                named = sorted(asked_texts(use, col) | set(sorted(use.examples.get(col, ()))[:12]))
                 share = round(0.8 / len(named), 4)
                 out[col] = {"gen": "categorical", "values": {**{v: share for v in named}, f"other_{col.lower()}": 0.2}}
-            elif not hint_is_number(hint) and (col in use.patterns or col in use.examples or (use.literals.get(col) and not (
+            elif not hint_is_number(hint) and (asked_shapes(use, col) or col in use.examples or (asked_texts(use, col) and not (
                     (hint or "").upper().startswith(("BOOL", "DATE", "TIMESTAMP")) or col in use.json_text or use.paths.get(col)))):
                 # `where name like 'tap-%'` should keep some rows: make values that fit each pattern, beside the
                 # values asked for by name (`name in ('1,000 CI Minutes', ...)`, however many there are)
-                shapes = sorted(like_shape(p) for p in use.patterns.get(col, ())) + sorted(use.examples.get(col, ()))[:24]
-                named = sorted(v for v in use.literals.get(col, ()) if "{" not in v)[:80]
+                shapes = sorted(like_shape(p) for p in asked_shapes(use, col)) + sorted(use.examples.get(col, ()))[:24]
+                named = sorted(v for v in asked_texts(use, col) if "{" not in v)[:80]
                 out[col] = {"gen": "template", "templates": [*shapes, *named, f"{col.lower()}_{{hex}}"]}
             elif col in use.part_shapes and not hint_is_number(hint):
                 out[col] = {"gen": "template", "templates": part_templates(use.part_shapes[col], (use.splits.get(col) or {}).get("seps", {}))}
@@ -2153,8 +2171,25 @@ def analyse(manifest: dict, database: str) -> Analysis:
     for (child, col), (parent, pcol) in fks.items():
         if child in tables and parent in tables and tables[parent]["columns"].get(pcol, {}).get("gen") not in ("sequence", "hash_id") \
                 and tables[child]["columns"].get(col, {}).get("gen") == "fk":  # (a key of its own table stays one)
-            notes.append(f"{child}.{col}: references {parent}.{pcol}, which is not that table's key; generated as a plain column.")
-            tables[child]["columns"][col] = guess(col, None)
+            # (a `relationships` test to a column that is not the key: stage names tested against the list of stages)
+            held = tables[parent]["columns"].get(pcol) or {}
+            label = pcol.lower()
+            if held.get("gen") == "categorical":
+                tables[child]["columns"][col] = {"gen": "categorical", "values": dict(held["values"]),
+                                                 **({"type": held["type"]} if held.get("type") else {})}
+            elif held == {"gen": "template", "template": f"{label}_{{hex}}"}:
+                # nothing known of either: the parent holds each value once, the child takes its values from them
+                tables[parent]["columns"][pcol] = {"gen": "template", "template": f"{label}_{{n}}"}
+                tables[child]["columns"][col] = {"gen": "pool", "pool": label, "size": 200}
+            elif held.get("gen") in ("pool", "dist") and not held.get("unique"):
+                tables[child]["columns"][col] = dict(held)
+            elif held.get("gen") == "template" and re.fullmatch(r"\w+_\{n\}", str(held.get("template") or "")) and not held.get("templates"):
+                tables[child]["columns"][col] = {"gen": "pool", "pool": str(held["template"])[: -len("_{n}")], "size": 200}
+            else:
+                tables[child]["columns"][col] = guess(col, None)
+                notes.append(f"{child}.{col}: references {parent}.{pcol}, which is not that table's key; generated as a plain column.")
+                continue
+            notes.append(f"{child}.{col}: references {parent}.{pcol}, which is not that table's key; it holds the same values.")
     # INFORMATION_SCHEMA is the warehouse describing itself: the emulator answers it, nothing to generate
     tables = {name: t for name, t in tables.items() if name.split(".")[1] != "INFORMATION_SCHEMA"}
     # a source that names what the project itself builds (a seed or a model, declared as a source so

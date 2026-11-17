@@ -889,3 +889,30 @@ def test_text_ranges_and_named_values_beside_patterns():
     assert use.text_bounds == {"ACCOUNT_NUMBER": {4000, 4999}}
     assert use.equals == {"NAMESPACE_ID": {4347861}}
     assert use.literals["PLAN"] == {"1,000 CI Minutes"} and use.patterns["PLAN"]
+
+
+def test_a_reference_to_a_column_that_is_not_the_key_holds_its_values():
+    from fauxflake.init import build_spec
+
+    def model(name, sql, **more):
+        return {"resource_type": "model", "name": name, "unique_id": f"model.p.{name}", "compiled_code": sql, "database": "A", "schema": "S",
+                "relation_name": f"A.S.{name}", "depends_on": {"nodes": more.pop("deps", [])}, "package_name": "p",
+                "original_file_path": f"models/{name}.sql", "config": {"materialized": "table"}, **more}
+
+    def source(name):
+        return {"resource_type": "source", "name": name, "unique_id": f"source.p.raw.{name}", "database": "RAW", "schema": "S",
+                "identifier": name, "relation_name": f"RAW.S.{name}", "source_name": "raw", "package_name": "p", "columns": {}}
+
+    manifest = {"nodes": {
+        "model.p.opps": model("opps", "select id, stagename as stage_name from RAW.S.OPPS", deps=["source.p.raw.OPPS"]),
+        "model.p.stages": model("stages", "select id as stage_id, masterlabel as primary_label from RAW.S.STAGES "
+                                          "where masterlabel in ('1-Discovery', '8-Closed Lost')", deps=["source.p.raw.STAGES"]),
+        "test.p.rel": {"resource_type": "test", "name": "rel", "unique_id": "test.p.rel", "package_name": "p", "column_name": "stage_name",
+                       "attached_node": "model.p.opps", "depends_on": {"nodes": ["model.p.stages", "model.p.opps"]},
+                       "test_metadata": {"name": "relationships", "kwargs": {"column_name": "stage_name", "to": "ref('stages')",
+                                                                              "field": "primary_label"}},
+                       "refs": [{"name": "stages"}, {"name": "opps"}]}},
+        "sources": {"source.p.raw.OPPS": source("OPPS"), "source.p.raw.STAGES": source("STAGES")}}
+    spec, _notes = build_spec(manifest, "A")[:2]
+    child = spec["tables"]["RAW.S.OPPS"]["columns"]["STAGENAME"]
+    assert child["gen"] == "categorical" and {"1-Discovery", "8-Closed Lost"} <= set(child["values"])

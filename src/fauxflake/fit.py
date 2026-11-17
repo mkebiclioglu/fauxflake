@@ -1137,6 +1137,8 @@ class Fitter:
 
     def repair(self) -> None:
         """Keep the spec loadable whatever was learned: a reference needs a parent with a key."""
+        if os.environ.get("FAUXFLAKE_FIT_WATCH"):
+            self._watch(self.__dict__.get("_last_watched") or self._watched(), "something other than an error's lesson (seen at repair)")
         keyed = {t for t, spec in self.tables.items()
                  if any(d.get("gen") in ("sequence", "hash_id") for d in (spec.get("columns") or {}).values())}
         for table, spec in self.tables.items():
@@ -2527,20 +2529,24 @@ class Fitter:
 
     def learn(self, sql_key: str, message: str) -> bool:
         """Apply whatever one error message teaches. True when the spec changed."""
-        watch = os.environ.get("FAUXFLAKE_FIT_WATCH")  # for working on the fitter: TABLE.COLUMN, whose changes are written down
-        if not watch:
-            done = self._learn(sql_key, message)
-            if done and _MADE_UP_NUMBER.search(message):
-                self.numbers_upstream(sql_key)
-            return done
-        table, column = watch.upper().rsplit(".", 1)
-        before = copy.deepcopy((self.tables.get(table, {}).get("columns") or {}).get(column))
+        before = self._watched()  # for working on the fitter: FAUXFLAKE_FIT_WATCH=TABLE.COLUMN,... whose changes are written down
         done = self._learn(sql_key, message)
-        after = (self.tables.get(table, {}).get("columns") or {}).get(column)
-        if after != before:
-            with open(os.environ.get("FAUXFLAKE_FIT_DEBUG", "fit") + ".watch.txt", "a") as out:
-                out.write(f"{watch}: {before} -> {after}\n  by {sql_key}: {message[:600]}\n  learned: {self.learned[-3:]}\n")
+        if done and _MADE_UP_NUMBER.search(message):
+            self.numbers_upstream(sql_key)
+        self._watch(before, f"{sql_key}: {message[:600]}")
         return done
+
+    def _watched(self) -> dict[str, dict | None]:
+        spots = [w for w in os.environ.get("FAUXFLAKE_FIT_WATCH", "").upper().split(",") if "." in w]
+        return {w: copy.deepcopy((self.tables.get(w.rsplit(".", 1)[0], {}).get("columns") or {}).get(w.rsplit(".", 1)[1])) for w in spots}
+
+    def _watch(self, before: dict[str, dict | None], by: str) -> None:
+        for spot, held in before.items():
+            now = (self.tables.get(spot.rsplit(".", 1)[0], {}).get("columns") or {}).get(spot.rsplit(".", 1)[1])
+            if now != held:
+                with open(os.environ.get("FAUXFLAKE_FIT_DEBUG", "fit") + ".watch.txt", "a") as out:
+                    out.write(f"{spot}: {held} -> {now}\n  by {by}\n  learned: {self.learned[-3:]}\n")
+        self.__dict__["_last_watched"] = self._watched()
 
     def _learn(self, sql_key: str, message: str) -> bool:
         if self.text_into_a_document(sql_key, message):
@@ -3474,9 +3480,9 @@ class Fitter:
         except Exception:  # noqa: BLE001 - the first reading stands
             return analysis
         fresh = _Readings(fresh, analysis)
-        watch = os.environ.get("FAUXFLAKE_FIT_WATCH")  # for working on the fitter: what this reading says of TABLE.COLUMN
-        if watch:
-            table, column = watch.upper().rsplit(".", 1)
+        for watch in [w for w in os.environ.get("FAUXFLAKE_FIT_WATCH", "").upper().split(",") if "." in w]:
+            # for working on the fitter: what this reading says of TABLE.COLUMN
+            table, column = watch.rsplit(".", 1)
             said = (fresh.spec["tables"].get(table, {}).get("columns") or {}).get(column)
             held = (self.tables.get(table, {}).get("columns") or {}).get(column)
             stem = os.environ.get("FAUXFLAKE_FIT_DEBUG", "fit")
