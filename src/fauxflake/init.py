@@ -72,6 +72,13 @@ class SourceUse:
         self.periods: dict[str, str] = {}
         self.path_prefix: dict[str, dict[str, str]] = {}  # variant column -> path -> text stripped off before the rest is parsed
         self.truncs: dict[str, str] = {}  # time column -> the unit a model cuts it to before matching on it (`date_trunc('hour', at)`)
+        # (the thing, the time): rows kept as the latest of each thing each day (`qualify row_number() over
+        # (partition by server_id, cast(timestamp as date) order by timestamp desc) = 1`): readings, taken day after day
+        # (column, "empty" | "null", rule): `case when name = 'Calls' and array_size(skus) > 0` next to `case when
+        # array_size(skus) = 0`: the model has no place for a list that is not empty under another name, so the
+        # list is empty (or the column null) wherever the rule, written in the table's own columns, does not hold
+        self.implied: list[tuple[str, str, str]] = []
+        self.readings: set[tuple[str, str]] = set()
         self.series: set[frozenset[str]] = set()  # columns a join matches on together (`on a.id = b.id and a.hour = b.hour`)
         self.read_bounds: dict[str, set[float]] = {}  # number column -> what the models that read the table itself compare it with
         self.windows: dict[str, set[float]] = {}  # number column -> the range the model that reads the table itself keeps (`between a and b`)
@@ -376,6 +383,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 elif node.name.upper() in passthrough:
                     direct[alias.upper()] = passthrough[node.name.upper()]
                     added[alias.upper()] = computed.get(node.name.upper(), set())
+                    explicit[alias.upper()] = {k: v for k, v in lineage.get(node.name.upper(), {}).items()
+                                               if k not in ("*", _PATHS) and not k.startswith("\0")}
                 elif models and _table_id(node) in models and "*" in models[_table_id(node)]:
                     # a model that is `select * from source`: reading it is reading the source
                     through, computed_there = models[_table_id(node)]["*"]
@@ -396,6 +405,9 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 if name in passthrough:
                     direct[alias_name] = passthrough[name]
                     added[alias_name] = computed.get(name, set())
+                    # (`o.id as sfid, o.*` in the CTE: its sfid is the source's id, whatever alias the CTE is read by)
+                    explicit[alias_name] = {k: v for k, v in lineage.get(name, {}).items()
+                                            if k not in ("*", _PATHS) and not k.startswith("\0")}
                 elif name in lineage:
                     renames[alias_name] = lineage[name]
                 elif id(getattr(node, "expression", None)) in outputs_of:
@@ -964,6 +976,10 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                         there = resolve(other) if isinstance(other, exp.Column) else None
                         if there and there[0] != hit[0]:
                             joins.append((hit, there))
+                        elif there and there[1] != hit[1] and col.table and other.table and col.table.upper() != other.table.upper():
+                            # `on a.sfid = b.renewed_by_opportunity_id__c`, both read from the opportunities: one row
+                            # names another row of its own table
+                            joins.append((hit, there))
                         if not there and a_calendar_day(other):
                             use.whole_days.add(hit[1])
                         if not there and isinstance(other, exp.SplitPart) and getattr(other.args.get("delimiter"), "name", "") == "@" \
@@ -1208,6 +1224,74 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 if one and two and len(one) == len(two):
                     joins.extend((a, b) for a, b in zip(one, two) if a and b and a != b and a[0] != b[0])
 
+        kept = select.args.get("qualify")
+        for test in (kept.find_all(exp.EQ) if kept is not None else []):
+            window, one = (test.this, test.expression) if isinstance(test.this, exp.Window) else (test.expression, test.this)
+            if not (isinstance(window, exp.Window) and isinstance(window.this, exp.RowNumber) and isinstance(one, exp.Literal)
+                    and one.name == "1" and len(window.args.get("partition_by") or []) == 2):
+                continue
+            thing = moment = None
+            for part in window.args["partition_by"]:
+                daily = False
+                for _ in range(6):
+                    if isinstance(part, exp.Column) and written(part) is not None:
+                        part = written(part)
+                    elif isinstance(part, (exp.TsOrDsToDate, exp.Date)) or (
+                            isinstance(part, (exp.Cast, exp.TryCast)) and part.to.is_type(exp.DataType.Type.DATE)) or (
+                            isinstance(part, (exp.DateTrunc, exp.TimestampTrunc)) and str(part.args.get("unit") or "").upper().strip("'") == "DAY"):
+                        part, daily = part.this, True
+                    elif isinstance(part, (exp.Cast, exp.TryCast, exp.Paren)):
+                        part = part.this
+                    else:
+                        break
+                hit = resolve(part) if isinstance(part, exp.Column) and not isinstance(part.this, exp.Star) else None
+                if hit and daily:
+                    moment = hit
+                elif hit:
+                    thing = hit
+            if thing and moment and thing[0] == moment[0] and thing[0] in sources and thing[1] != moment[1]:
+                sources[thing[0]].readings.add((thing[1], moment[1]))
+
+        def state(atom):  # noqa: ANN001, ANN202
+            """(the value tested, "empty" | "null", whether the test says it has something) for `array_size(x) > 0`,
+            `array_size(x) = 0`, `x is not null`, `x is null`."""
+            while isinstance(atom, exp.Paren):
+                atom = atom.this
+            if isinstance(atom, exp.Not) and isinstance(atom.this, exp.Is) and isinstance(atom.this.expression, exp.Null):
+                return atom.this.this, "null", True
+            if isinstance(atom, exp.Is) and isinstance(atom.expression, exp.Null):
+                return atom.this, "null", False
+            if isinstance(atom, (exp.GT, exp.EQ, exp.GTE)) and isinstance(atom.this, exp.ArraySize) and isinstance(atom.expression, exp.Literal):
+                if isinstance(atom, exp.GT) and atom.expression.name == "0" or isinstance(atom, exp.GTE) and atom.expression.name == "1":
+                    return atom.this.this, "empty", True
+                if isinstance(atom, exp.EQ) and atom.expression.name == "0":
+                    return atom.this.this, "empty", False
+            return None
+
+        asked = [c.this for case in select.find_all(exp.Case) for c in case.args.get("ifs") or []]
+        asked += [node.this for node in select.find_all(exp.CountIf, exp.If)]
+        asked = [c for c in asked if c is not None and c.find_ancestor(exp.Select) is select]
+        without = {(got[0].sql(), got[1]) for got in map(state, asked) if got and not got[2]}
+        for condition in asked if without else []:
+            parts = list(condition.flatten()) if isinstance(condition, exp.And) else []
+            for part in parts:
+                got = state(part)
+                if not got or not got[2] or (got[0].sql(), got[1]) not in without:
+                    continue
+                # where the list has something, the rest of the condition holds: said by leaving the other case out
+                rest = [p for p in parts if p is not part]
+                try:
+                    held = inline(got[0])
+                    rule = inline(exp.and_(*[p.copy() for p in rest])) if rest else None
+                except Exception:  # noqa: BLE001
+                    held = rule = None
+                names = {c.name.upper() for c in held[1].find_all(exp.Column)} if held else set()
+                if rule and len(names) == 1 and held[0] == rule[0] and held[0] in sources \
+                        and not names & {c.name.upper() for c in rule[1].find_all(exp.Column)}:
+                    found = (names.pop(), got[1], rule[1].sql(dialect="snowflake"))
+                    if found not in sources[held[0]].implied:
+                        sources[held[0]].implied.append(found)
+
         outputs: dict[str, tuple[str, str]] = {}
         stars = [p for p in select.expressions if isinstance(p, exp.Star) or (isinstance(p, exp.Column) and isinstance(p.this, exp.Star))]
         positional[id(select)] = by_position = []
@@ -1348,10 +1432,13 @@ def _share_join_values(tables: dict[str, dict], joins: list, notes: list[str], l
         return (fields, m[2]) if fields is not None and m[2] in fields else None
 
     group_of: dict[tuple[str, str, str], set] = {}
+    own = set()  # pairs of columns of one table that a model matches with each other (`on a.id = b.parent_id`)
     for a, b in joins:
         a, b = place(a), place(b)
         if holder(a) is None or holder(b) is None:
             continue
+        if a[0] == b[0] and not a[2] and not b[2]:
+            own.add((a, b))
         merged = group_of.get(a, {a}) | group_of.get(b, {b})
         for m in merged:
             group_of[m] = merged
@@ -1374,14 +1461,16 @@ def _share_join_values(tables: dict[str, dict], joins: list, notes: list[str], l
                 if gen[m]["gen"] != gen[parent]["gen"]:
                     gen[m]["gen"] = gen[parent]["gen"]
             for m in members:
-                if gen[m]["gen"] not in _FREE or (m[0] == parent[0] and not m[2]):
+                if gen[m]["gen"] not in _FREE or (m[0] == parent[0] and not m[2] and (m, parent) not in own and (parent, m) not in own):
                     continue
                 if m[2]:  # inside a document: one of the parent's first rows, which every day's load has
                     put(m, {"gen": "fk", "ref": parent[0], "first": 50})
                 elif m[0] != parent[0]:
                     put(m, {"gen": "fk", "ref": parent[0], "skew": 1.5})
                 else:
-                    continue
+                    # a row that names another row of its own table (the opportunity that renewed it, a parent):
+                    # half the rows name none, as the first of a chain does
+                    put(m, {"gen": "fk", "ref": parent[0], "skew": 1.5, "null_rate": float(gen[m].get("null_rate") or 0.5)})
                 notes.append(f"{name(m)}: joined to {parent[0]}.{parent[1]} in a model, generated as a reference to it.")
             continue
         free = [m for m in members if gen[m]["gen"] in _FREE]
@@ -2433,6 +2522,24 @@ def analyse(manifest: dict, database: str) -> Analysis:
         # holds one row per period for each of a few entities, as a meter or a daily balance does: generated so, and
         # whatever is joined to the entity draws from the same few
         columns = tables.get(name, {}).get("columns") or {}
+        for thing, moment in sorted(use.readings):
+            # the latest row of each server each day is what the models keep: the table holds readings, the same few
+            # things reporting day after day. A key that gives every row a thing of its own would leave each with
+            # one day of history; it names a few, each in its turn, and what refers to it refers to those
+            held, when = columns.get(thing) or {}, columns.get(moment) or {}
+            if held.get("gen") in _KEYS and not held.get("template") and when.get("gen") in ("event_time", "time_offset") \
+                    and not when.get("format") and not when.get("epoch") and not when.get("unique") and not tables[name].get("grain"):
+                held["of"] = 20
+                tables[name]["grain"] = [moment, thing]
+                for other, gen in columns.items():
+                    # what a reading says about the thing in words (its installation, its address) is the same in
+                    # every reading of it; what it counts changes from day to day
+                    if other != thing and gen.get("gen") == "template" and gen.get("template") == f"{other.lower()}_{{hex}}" \
+                            and not gen.get("templates") and not gen.get("follows") and not gen.get("unique"):
+                        gen["follows"] = thing
+                notes.append(f"{name}: models keep the latest row of each {thing.lower()} each day; generated as readings, "
+                             f"one row a day for each of 20 {thing.lower()}s (`of` on the key).")
+                break
         for together_here in sorted(use.series, key=sorted):
             for c in together_here:  # cut to the hour by the models that match on it: on the hour here
                 if columns.get(c, {}).get("gen") in ("event_time", "time_offset") and not columns[c].get("trunc") and use.truncs.get(c) \
@@ -2591,6 +2698,29 @@ def analyse(manifest: dict, database: str) -> Analysis:
         for gen in table["columns"].values():
             if gen.get("gen") == "object" and gen.get("fields"):
                 created_comes_first(gen["fields"])
+    for name, use in uses.items():
+        for col, kind, said in use.implied:
+            try:
+                rule = sqlglot.parse_one(said, read="snowflake")
+            except Exception:  # noqa: BLE001
+                continue
+            rule = rule.transform(lambda n: exp.Var(this=f"__col_{n.name.upper()}__") if isinstance(n, exp.Column) else n)
+            rule = re.sub(r"__col_(\w+?)__", r"{{\1}}", rule.sql(dialect="duckdb"))
+            # the tables lined up with this one in a UNION (the same event, one table per kind) hold the same rule
+            same = {(name, col)} | {(m[0], m[1]) for group in links if any((m[0], m[1]) == (name, col) for m in group) for m in group}
+            # (and the other tables of its schema with the same columns: one table per kind of event, read as one)
+            same |= {(other, col) for other in tables if other.rsplit(".", 1)[0] == name.rsplit(".", 1)[0]}
+            for table, column in sorted(same):
+                columns = tables.get(table, {}).get("columns") or {}
+                held = columns.get(column) or {}
+                key = "empty_unless" if kind == "empty" else "null_unless"
+                if (kind == "empty") != (held.get("gen") == "array") or held.get("gen") in _KEYS or held.get(key) \
+                        or not rule_binds(rule, column, columns):
+                    continue
+                held[key] = rule
+                held.pop("null_rate", None) if kind == "empty" else None
+                notes.append(f"{table}.{column}: the models have a case for it having something only together with another "
+                             f"condition; it is {'empty' if kind == 'empty' else 'null'} in the rows where that does not hold (`{key}`).")
     for (name, col), rule in gated:
         columns = tables.get(name, {}).get("columns") or {}
         if col in columns and columns[col].get("gen") not in _KEYS and rule_binds(rule, col, columns):

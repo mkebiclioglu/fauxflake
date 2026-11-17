@@ -3461,6 +3461,8 @@ class Fitter:
             analysis = self.read_again(manifest, analysis, keep=fresh and not failed)
             redo = {r["unique_id"] for r in failed if r["unique_id"].startswith(("model.", "snapshot."))}
             expected = self.spec.setdefault("dbt", {}).setdefault("expected_failures", [])
+            self.failing_now = {nodes[r["unique_id"]]["name"] for r in failed
+                                if r["unique_id"] in nodes and nodes[r["unique_id"]]["resource_type"] == "test"}
             accepted = 0
             again: set[str] = set()  # models to build in the next round, with everything downstream
             behind_sources: set[str] = set()  # and what reads a source one of whose tests failed
@@ -3480,6 +3482,8 @@ class Fitter:
                         src = manifest.get("sources", {}).get(dep)
                         if src:
                             behind_sources.add(f"source:{src['source_name']}.{src['name']}+")
+                    if r["status"] == "fail" and self.trial_blamed(node["name"]):
+                        continue
                     # a failing test either teaches the spec something, or states a fact about production
                     # data that invented data does not share: that one goes on the list of expected failures
                     if r["status"] == "error":  # the test's own SQL failed: the same lessons as for a model
@@ -3993,6 +3997,67 @@ class Fitter:
                     self.dirty = True
                     self.learned.append(f"{late[0]}.{late[1]}: test {node['name']} says it is never before {early[1]}; generated after it.")
                     return True
+        return self.try_succession(node)
+
+    def try_succession(self, node: dict) -> bool:
+        """A test that compares what two models hold (the raw events of one system with a blend of two) and that
+        no rule read off its SQL explains. Projects blend a system with the one that replaced it, and state that
+        nothing is lost: true when one stops where the other starts, false when both run side by side with
+        unrelated numbers. That is tried, in both orders: the tables behind only one of the models in use for the
+        first half of the history, the others from then on. What does not make the test pass is taken back."""
+        trials = self.__dict__.setdefault("trials", {})
+        name = node["name"]
+        trial = trials.get(name)
+        if trial and trial.get("applied"):
+            self._end_trial(name, trial, "the test still fails")
+        if trial is None:
+            trial = trials[name] = {"left": [], "applied": None}
+            timed = lambda t: any(d.get("gen") in ("event_time", "time_offset", "loaded_at")  # noqa: E731
+                                  for d in (self.tables[t].get("columns") or {}).values())
+            refs = [d for d in (node.get("depends_on") or {}).get("nodes") or [] if d.startswith(("model.", "snapshot."))]
+            behind = [{t for t in self.sources_of(ref) if timed(t)} for ref in refs]
+            every = set().union(*behind) if behind else set()
+            narrow = sorted((b for b in behind if b and b < every), key=lambda b: (len(b), sorted(b)))
+            free = all(not self.tables[t].get("from_day") and self.tables[t].get("until_day") is None
+                       and not self.tables[t].get("grain") for t in every)
+            if narrow and len(every) <= 8 and free:
+                one, other = sorted(narrow[0]), sorted(every - narrow[0])
+                trial["left"] = [(one, other), (other, one)]
+        if not trial["left"]:
+            return False
+        early, late = trial["left"].pop(0)
+        half = max(2, int((self.__dict__.get("spec") or {}).get("history") or 60) // 2)
+        for table in early:
+            self.tables[table]["until_day"] = half
+        for table in late:
+            self.tables[table]["from_day"] = half
+        trial.update(applied=(early, late), failing=set(self.__dict__.get("failing_now") or ()), round=self.__dict__.get("n_round") or 0)
+        self.retyped.update([*early, *late])
+        self.dirty = True
+        self.learned.append(f"test {name}: compares models built from {', '.join(early)} and from {', '.join(late)}; trying the "
+                            f"first in use until day {half} of the history and the second from then on (`until_day`, `from_day`).")
+        return True
+
+    def _end_trial(self, name: str, trial: dict, why: str) -> None:
+        early, late = trial["applied"]
+        for table in early:
+            self.tables[table].pop("until_day", None)
+        for table in late:
+            self.tables[table].pop("from_day", None)
+        trial["applied"] = None
+        self.retyped.update([*early, *late])
+        self.dirty = True
+        self.learned.append(f"test {name}: {why}; {', '.join(early)} and {', '.join(late)} cover the whole history again.")
+
+    def trial_blamed(self, name: str) -> bool:
+        """A test that passed until something was tried for another test, and fails in the round after: what was
+        tried is taken back, and the test is looked at again once the data is what it was."""
+        for other, trial in (self.__dict__.get("trials") or {}).items():
+            if trial.get("applied") and other != name and name not in trial.get("failing", ()) \
+                    and (self.__dict__.get("n_round") or 0) == (trial.get("round") or 0) + 1:
+                self._end_trial(other, trial, f"test {name} fails with it")
+                trial["left"] = []
+                return True
         return False
 
     def learn_from_test(self, node: dict, analysis) -> bool:  # noqa: ANN001
@@ -4079,7 +4144,14 @@ class Fitter:
                 if held:
                     # the values it shares with a seed or another table (what a join meets on): each once, in the first rows
                     fresh["named"] = list(dict.fromkeys(held))[:500]
-                if gen == fresh or (gen.get("gen") == "template" and gen.get("named")):
+                # in a table of readings, what no two rows of a model share is said of the thing the readings are
+                # about (a server's installation id), not of each reading: one per thing
+                about = next((c for c, d in columns.items() if d.get("gen") in ("sequence", "hash_id") and d.get("of")), None)
+                if about and about != col:
+                    fresh["follows"] = about
+                    if gen.get("gen") == "template" and gen.get("named"):
+                        fresh["named"] = list(gen["named"])
+                if gen == fresh or (gen.get("gen") == "template" and gen.get("named") and gen.get("follows") == fresh.get("follows")):
                     return False
                 columns[col] = fresh
             self.learned.append(f"{table}.{col}: a `unique` test failed, now generated without repeats.")

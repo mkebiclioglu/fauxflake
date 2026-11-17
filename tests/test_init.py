@@ -1133,3 +1133,67 @@ def test_a_coalesce_in_one_branch_of_a_union_is_lined_up_with_the_other_branch()
         select id, version_full from a union select id, version_full from b""", uses, {}, links, [], [])
     assert {(m[0], m[1]) for group in links for m in group if any(x[1] == "SERVER_VERSION" for x in group)} == {
         ("RAW.A.SCORE", "SERVER_VERSION"), ("RAW.B.SCORE", "SERVERVERSION"), ("RAW.B.SCORE", "SERVER_VERSION")}
+
+
+def test_rows_kept_as_the_latest_of_each_thing_each_day_are_readings():
+    uses, *_ = _scan({"a.b.latest": """
+        select user_id as server_id, cast(timestamp as date) as server_date, version
+        from raw.t.server
+        qualify row_number() over (partition by server_id, server_date order by timestamp desc) = 1"""}, ["RAW.T.SERVER"])
+    assert uses["RAW.T.SERVER"].readings == {("USER_ID", "TIMESTAMP")}
+
+
+def test_a_row_that_names_another_row_of_its_own_table_refers_to_it():
+    from fauxflake.init import build_spec
+
+    manifest = {
+        "sources": {"source.p.s.opportunity": {
+            "database": "RAW", "schema": "S", "name": "opportunity", "identifier": "opportunity",
+            "columns": {c: {"data_type": t} for c, t in {"id": "VARCHAR", "renewed_by_opportunity_id__c": "NUMBER",
+                                                         "amount": "NUMBER"}.items()}}},
+        "nodes": {
+            "model.p.m": {"resource_type": "model", "depends_on": {"nodes": ["source.p.s.opportunity"]}, "relation_name": "A.B.M",
+                          "compiled_code": """
+                with opportunity as (select distinct o.id as sfid, o.* from raw.s.opportunity o)
+                select a.sfid, sum(b.amount) as renewed
+                from opportunity a left join opportunity b on a.sfid = b.renewed_by_opportunity_id__c
+                group by 1"""},
+            "test.p.u": {"resource_type": "test", "attached_node": "model.p.m", "depends_on": {"nodes": ["model.p.m"]},
+                         "column_name": "sfid", "test_metadata": {"name": "unique", "kwargs": {"column_name": "sfid"}}},
+        },
+    }
+    spec, _notes = build_spec(manifest, "A")
+    columns = spec["tables"]["RAW.S.OPPORTUNITY"]["columns"]
+    assert columns["ID"]["gen"] in ("hash_id", "sequence")
+    assert columns["RENEWED_BY_OPPORTUNITY_ID__C"]["gen"] == "fk" and columns["RENEWED_BY_OPPORTUNITY_ID__C"]["ref"] == "RAW.S.OPPORTUNITY"
+
+
+def test_a_case_and_its_complement_say_when_a_list_has_something():
+    from fauxflake.init import build_spec
+
+    def source(name):
+        return {"database": "RAW", "schema": "CALLS", "name": name, "identifier": name,
+                "columns": {c: {"data_type": t} for c, t in {"id": "VARCHAR", "user_id": "VARCHAR", "context_feature_name": "VARCHAR",
+                                                             "context_feature_skus": "ARRAY"}.items()}}
+
+    manifest = {
+        "sources": {"source.p.c.started": source("started"), "source.p.c.ended": source("ended")},
+        "nodes": {
+            "model.p.stg": {"resource_type": "model", "depends_on": {"nodes": ["source.p.c.started"]}, "relation_name": "A.B.STG",
+                            "compiled_code": """
+                select id as event_id, user_id, coalesce(context_feature_name, 'Calls') as feature_name,
+                       parse_json(coalesce(context_feature_skus, '[]'))::array as feature_skus
+                from raw.calls.started"""},
+            "model.p.daily": {"resource_type": "model", "depends_on": {"nodes": ["model.p.stg"]}, "relation_name": "A.B.DAILY",
+                              "compiled_code": """
+                select user_id,
+                       count(distinct case when feature_name = 'Calls' and array_size(feature_skus) > 0 then event_id end) as known,
+                       count(distinct case when array_size(feature_skus) = 0 then event_id end) as unknown,
+                       count(distinct event_id) as total
+                from a.b.stg group by 1"""},
+        },
+    }
+    spec, _notes = build_spec(manifest, "A")
+    for table in ("RAW.CALLS.STARTED", "RAW.CALLS.ENDED"):  # (the other table of the schema has the same columns)
+        skus = spec["tables"][table]["columns"]["CONTEXT_FEATURE_SKUS"]
+        assert skus["gen"] == "array" and "{{CONTEXT_FEATURE_NAME}}" in skus["empty_unless"] and not skus.get("null_rate")

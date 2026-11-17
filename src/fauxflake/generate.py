@@ -114,6 +114,7 @@ class TableSQL:
         return f"(case when day between date '{self.sc.start}' and date '{self.sc.end}' then {bad} else {normal} end)"
 
     base = "g"  # what a column's randomness is keyed on: the row, or another column's value (`follows`)
+    turn = None  # while a column follows the thing a table of readings is about: that thing's number
 
     def salt(self, name: str) -> str:
         if self.base in ("g", "(g - 1)"):  # the row, or (for a value that repeats the row before) the one before it
@@ -162,14 +163,7 @@ class TableSQL:
     def grain(self) -> dict[str, int]:
         """The columns of the table's `grain` that take their values in turn (listed values, or a pool's), with how
         many each has: unique together with the period (the day, or the hour when the time column is cut to hours)."""
-        out = {}
-        for c in self.t.raw.get("grain") or []:
-            d = self.t.columns.get(c, {})
-            if d.get("gen") == "categorical" and d.get("values"):
-                out[c] = len(d["values"])
-            elif d.get("gen") == "pool":
-                out[c] = int(d.get("size", 200))
-        return out
+        return self.t.grain_sizes()
 
     def grain_time(self) -> tuple[str, str] | None:
         """The time column of the grain and its period (hour or day): the rows of a day fill its periods in turn."""
@@ -352,11 +346,16 @@ class TableSQL:
         instead of the row, so an id and its attributes stay consistent across rows."""
         other = d.get("follows")
         if other and self.base == "g":
+            sizes = self.grain()
+            if self.t.columns[other].get("of") and other in sizes:
+                # what it follows is the thing a table of readings is about: the things come in turn, and this
+                # is the number of the row's own (the first ones take the values the column has by name)
+                self.turn = f"((_n // {math.prod(list(sizes.values())[:list(sizes).index(other)])}) % {sizes[other]})::bigint"
             self.base = f"({self.expr(other, self.t.columns[other])})"
             try:
                 return self._expr(col, d)
             finally:
-                self.base = "g"
+                self.base, self.turn = "g", None
         return self._expr(col, d)
 
     def _expr(self, col: str, d: dict) -> str:
@@ -364,6 +363,11 @@ class TableSQL:
         if gen == "hash_id" and d.get("domain") and "." in col:
             # an id inside a document: one per element, in a range of its own that `link` values point into
             expr = f"md5(concat({lit(f'{self.spec.seed}:{d['domain']}:')}, {self.base}))"
+        elif gen in ("sequence", "hash_id") and d.get("of") and col in self.grain() and self.base == "g" and "." not in col:
+            # a table of readings: the same few things report period after period, each in its turn
+            sizes = self.grain()
+            stride = math.prod(list(sizes.values())[:list(sizes).index(col)])
+            expr = self.key_expr(self.t, f"((_n // {stride}) % {sizes[col]})::bigint")
         elif gen in ("sequence", "hash_id"):
             expr = self.key_expr(self.t, "g")
         elif gen == "link":
@@ -406,7 +410,9 @@ class TableSQL:
             parent = self.spec.tables[d["ref"].upper()]
             skew = float(d.get("skew", 1.0))
             idx = f"floor(pow({self.u(col)}, {skew!r}) * greatest(_pc_{col}, 1))::bigint"
-            if d.get("first"):  # inside a document: one of the parent's first rows
+            if parent.key[1].get("of"):  # readings of a few things: one of them
+                idx = f"floor({self.u(col)} * {int(parent.key[1]['of'])})::bigint"
+            elif d.get("first"):  # inside a document: one of the parent's first rows
                 idx = f"floor({self.u(col)} * {int(d['first'])})::bigint"
             elif d.get("per_parent") and self.base == "g":
                 # at most so many rows for one parent (`having count(*) > 2` is a test): rows share parents in turn
@@ -486,10 +492,11 @@ class TableSQL:
                 expr = f"case ({self._expr(str(d['begins_with']), lead)})::varchar {arms} else {one_of(shapes)} end"
             else:
                 expr = one_of(shapes)
-            if d.get("named") and self.base == "g" and "." not in col:
+            if d.get("named") and (self.base == "g" or self.turn) and "." not in col:
                 # values another table or a seed holds, in a column no two rows share: the first rows have them
+                # (the first things, where the column says something about the thing a row is a reading of)
                 arms = " ".join(f"when {i} then {lit(str(v))}" for i, v in enumerate(d["named"]))
-                expr = f"(case g {arms} else {expr} end)"
+                expr = f"(case {self.turn or 'g'} {arms} else {expr} end)"
         elif gen == "time_offset":
             expr = f"_ev + {ms(piecewise(self.u(col), d['p'], d['seconds']))}"
             if self.in_order() and min(d["seconds"]) >= 0 and max(d["seconds"]) <= 7 * 86400:
@@ -557,6 +564,10 @@ class TableSQL:
             rate = self.during(repr(self.sc.null_rate), rate)
         if rate != "0.0":
             expr = f"case when {self.u(col + ':null')} < {rate} then NULL else {expr} end"
+        if d.get("empty_unless") and gen == "array" and self.base == "g" and "." not in col:
+            # a list that has something only where a rule about the row holds: empty in the other rows
+            rule = re.sub(r"\{\{(\w+)\}\}", lambda m: f"({self.expr(m[1], self.t.columns[m[1]])})", str(d["empty_unless"]))
+            expr = f"case when ({rule}) then {expr} else '[]'::JSON end"
         if d.get("null_unless") and self.base == "g" and "." not in col:
             # a rule about the row holds wherever the column has a value: no value in the rows it does not hold for
             rule = re.sub(r"\{\{(\w+)\}\}", lambda m: f"({self.expr(m[1], self.t.columns[m[1]])})", str(d["null_unless"]))

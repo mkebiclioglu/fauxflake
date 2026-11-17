@@ -391,3 +391,77 @@ def test_a_column_is_empty_where_the_rule_about_its_rows_does_not_hold_and_email
         assert 0 < cut < rows and wrong == 0
         assert cur.execute("""select count(*), count_if("CONTACT" like 'email\\__%@fauxmail.net' escape '\\')
                               from "RAW"."T"."RELEASES" """).fetchone() == (rows, rows)
+
+
+def test_a_table_of_readings_holds_a_row_a_day_for_each_of_a_few_things(tmp_path):
+    from datetime import datetime
+
+    from fauxflake.emulator import serve
+    from fauxflake.generate import Warehouse
+    from fauxflake.spec import Spec
+
+    spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "tables": {
+        "RAW.T.SERVER": {"volume": {"rows_per_day": 2}, "grain": ["TIMESTAMP", "USER_ID"], "columns": {
+            "USER_ID": {"gen": "hash_id", "of": 5, "named": ["93myk"]},
+            "INSTALLATION": {"gen": "template", "template": "installation_{hex}", "follows": "USER_ID", "named": ["u85ky", "qe3n8"]},
+            "TIMESTAMP": {"gen": "event_time"}, "RECEIVED_AT": {"gen": "loaded_at"}}},
+        "RAW.T.EVENT": {"volume": {"rows_per_day": 300}, "columns": {
+            "ID": {"gen": "sequence"}, "SERVER": {"gen": "fk", "ref": "RAW.T.SERVER", "skew": 1.5},
+            "TIMESTAMP": {"gen": "event_time"}}}}}, tmp_path / "x.yml")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 11))
+        cur = emu.cursor()
+        # every server reports every day, however few rows a day the scale leaves the table
+        assert cur.execute("""select count(distinct "USER_ID"), count(distinct "TIMESTAMP"::date), count(*),
+                                     count(distinct concat("USER_ID", "TIMESTAMP"::date)), count_if("USER_ID" = '93myk')
+                              from "RAW"."T"."SERVER" where "TIMESTAMP" < '2025-01-10'""").fetchone() == (5, 9, 45, 45, 9)
+        # what is said of a server is the same in each of its readings, and the first servers have the named values
+        assert cur.execute("""select count(distinct "INSTALLATION"), count(distinct concat("USER_ID", "INSTALLATION")),
+                                     count(distinct case when "INSTALLATION" in ('u85ky', 'qe3n8') then "USER_ID" end),
+                                     min(case when "USER_ID" = '93myk' then "INSTALLATION" end)
+                              from "RAW"."T"."SERVER" where "TIMESTAMP" < '2025-01-10'""").fetchone() == (5, 5, 2, "u85ky")
+        # and an event of a server on a day finds that server's reading of the day
+        assert cur.execute("""select count(*), count(s."USER_ID") from "RAW"."T"."EVENT" e left join "RAW"."T"."SERVER" s
+                              on s."USER_ID" = e."SERVER" and s."TIMESTAMP"::date = e."TIMESTAMP"::date
+                              where e."TIMESTAMP" < '2025-01-10'""").fetchone()[0] > 1000
+        assert cur.execute("""select count(*) from "RAW"."T"."EVENT" e left join "RAW"."T"."SERVER" s
+                              on s."USER_ID" = e."SERVER" and s."TIMESTAMP"::date = e."TIMESTAMP"::date
+                              where e."TIMESTAMP" < '2025-01-10' and s."USER_ID" is null""").fetchone()[0] == 0
+
+
+def test_a_table_another_took_over_from_has_rows_only_while_it_was_in_use():
+    from datetime import date
+
+    from fauxflake.spec import Spec
+
+    spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "history": 60, "least_rows": 100, "tables": {
+        "RAW.T.OLD": {"volume": {"rows_per_day": 3}, "until_day": 30, "columns": {"ID": {"gen": "sequence"}}},
+        "RAW.T.NEW": {"volume": {"rows_per_day": 3}, "from_day": 30, "columns": {"ID": {"gen": "sequence"}}}}}, ".")
+    old = spec.tables["RAW.T.OLD"].calendar(date(2025, 1, 1), date(2025, 3, 1), 1, 1.0, least=spec.least)
+    new = spec.tables["RAW.T.NEW"].calendar(date(2025, 1, 1), date(2025, 3, 1), 1, 1.0, least=spec.least)
+    assert all((n > 0) == (day < date(2025, 1, 31)) for day, _, n in old) and sum(n for _, _, n in old) >= 100
+    assert all((n > 0) == (day >= date(2025, 1, 31)) for day, _, n in new) and sum(n for _, _, n in new) >= 90
+    # the days a table has are the same days however far the clock has got
+    earlier = spec.tables["RAW.T.NEW"].calendar(date(2025, 1, 1), date(2025, 2, 10), 1, 1.0, least=spec.least)
+    assert earlier == new[:len(earlier)]
+
+
+def test_a_list_is_empty_where_the_rule_about_its_rows_does_not_hold(tmp_path):
+    from datetime import datetime
+
+    from fauxflake.emulator import serve
+    from fauxflake.generate import Warehouse
+    from fauxflake.spec import Spec
+
+    spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "tables": {"RAW.T.CALLS": {
+        "volume": {"rows_per_day": 300}, "columns": {
+            "ID": {"gen": "sequence"},
+            "NAME": {"gen": "categorical", "values": {"Calls": 0.8, "other_name": 0.2}},
+            "SKUS": {"gen": "array", "values": ["professional", "enterprise"],
+                     "empty_unless": "(COALESCE(({{NAME}}), 'Calls')) = 'Calls'"}}}}}, tmp_path / "x.yml")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 3))
+        rows, known, unknown, lost = emu.cursor().execute(
+            """select count(*), count_if("NAME" = 'Calls' and json_array_length("SKUS") > 0), count_if(json_array_length("SKUS") = 0),
+                      count_if("NAME" <> 'Calls' and json_array_length("SKUS") > 0) from "RAW"."T"."CALLS" """).fetchone()
+        assert known > 0 and unknown > 0 and lost == 0 and known + unknown == rows
