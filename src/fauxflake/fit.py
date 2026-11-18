@@ -3587,6 +3587,16 @@ class Fitter:
                 # nothing left to learn from a partial round. Before the full build that has the last word, the models
                 # that built with no rows are asked what the data lacks: what that teaches is rebuilt in part as well,
                 # and one full build confirms everything at the end, not one after each look
+                if expected and not getattr(self, "_second_look", False):
+                    # (and the tests listed along the way are looked at again with all that was learned since)
+                    self._second_look = True
+                    by_name = {n["name"]: n for n in nodes.values() if n.get("resource_type") == "test"}
+                    taught = [name for name in list(expected) if name in by_name and (
+                        self.learn_from_test(by_name[name], analysis)
+                        or self.learn_from_singular(by_name[name], analysis, self._compiled(project, by_name[name])))]
+                    if taught:
+                        expected[:] = [name for name in expected if name not in taught]
+                        self.log(f"  a second look at the listed tests: {len(taught)} can be taught to the spec")
                 looks = self.__dict__.setdefault("_row_looks", 0)
                 if not failed and looks < 2 and not os.environ.get("FAUXFLAKE_FIT_NO_ROWS_LOOK"):
                     self._row_looks, looked = looks + 1, True
