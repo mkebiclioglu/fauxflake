@@ -877,6 +877,9 @@ class Fitter:
                 column = column_here
                 if held.get("gen") == "template" and held.get("templates"):
                     continue
+                if held.get("gen") == "template" and delimiter and set(str(held.get("template", "")).split(delimiter)) == {"{n}"} \
+                        and str(held["template"]).count("{n}") >= max(count, 2):
+                    continue  # (already numbers, and as many as this model reads: another model reads more of them)
                 if column in columns and columns[column] != fresh and columns[column].get("template") != fresh["template"] \
                         and columns[column].get("gen") in (*_FREE, "sequence", "dist", "hash_id"):
                     if columns[column].get("gen") in ("sequence", "hash_id"):
@@ -3585,7 +3588,9 @@ class Fitter:
                      "learned": self.learned[before:], "statements": dict(emulator.FAILED_STATEMENTS)}, indent=1))
                 emulator.FAILED_STATEMENTS.clear()
             # the same lessons about the same failures as an earlier round of the same kind: going round in circles
-            state = (fresh, frozenset(r["unique_id"] for r in failed), tuple(sorted(self.learned[before:])))
+            # (whether the round was a full one or not: a full build that fails and learns as a partial one did before
+            # it is the same circle)
+            state = (frozenset(r["unique_id"] for r in failed), tuple(sorted(self.learned[before:])))
             rounds_seen = self.__dict__.setdefault("_rounds_seen", set())
             looked = False  # whether this round has already asked the empty models what the data lacks
             nothing_new = (len(self.learned) == before or (state in rounds_seen and bool(failed))) and not accepted

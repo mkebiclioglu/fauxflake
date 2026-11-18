@@ -615,7 +615,9 @@ class TableSQL:
                 f"(day::timestamp + to_hours(((_n // {math.prod(self.grain().values())}) % 24)::integer))"
         if d.get("trunc") and gen in ("event_time", "time_offset", "updated_at") and not d.get("format") and not d.get("epoch"):
             expr = f"date_trunc({lit(str(d['trunc']))}, {expr})"  # reported per hour (or day): on the boundary
-        if d.get("length") and "." not in col:
+        parent_key = self.spec.tables[str(d["ref"]).upper()].key[1] if gen == "fk" and str(d.get("ref", "")).upper() in self.spec.tables else {}
+        texts = gen in ("hash_id", "template") or (gen == "pool" and not d.get("numeric")) or (gen == "fk" and parent_key.get("gen") == "hash_id")
+        if d.get("length") and "." not in col and texts:  # (a number stays the number it is: only ids that are text are rewritten)
             # an id of a given length (`length(server_id) = 26`): the value rewritten, the same way wherever it is
             # written, so what matched still matches and what differed still differs
             text = f"({expr})::varchar"
