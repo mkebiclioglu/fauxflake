@@ -336,6 +336,13 @@ MACROS = [
           when regexp_full_match(x::varchar, '\\s*[+-]?[0-9]*\\.?[0-9]*[eE]\\s*') then case
             when regexp_matches(x::varchar, '[0-9]') then regexp_replace(trim(x::varchar), '\\.?[eE]$', '') else '0' end
           when regexp_full_match(x::varchar, '\\s*[+-]?\\.\\s*') then '0' end""",
+    # TIME(x): the time of day; a zoned timestamp is read in the session's zone (the emulator's is UTC)
+    f"""create or replace macro {_NS}_sf_time(x) as case
+          when typeof(x) like 'TIMESTAMP%' then cast(try_cast(x as timestamp) as time)
+          else cast(x::varchar as time) end""",
+    # CONDITIONAL_CHANGE_EVENT: how often the value changed from one row to the next (NULLs passed over), so far
+    f"""create or replace macro {_NS}_sf_changes_in(l) as len(list_filter(range(1, len(l)), lambda i: l[i + 1] <> l[i]))""",
+    f"""create or replace macro {_NS}_sf_change_event(l) as {_NS}_sf_changes_in(list_filter(l, lambda e: e is not null))""",
     f"""create or replace macro {_NS}_sf_int(x) as case
           when {_NS}_sf_num_text(x) is not null then cast(round({_NS}_sf_num_text(x)::decimal(38, 9)) as bigint)
           when typeof(x) in ('DOUBLE', 'FLOAT') then cast(round(try_cast(x::varchar as double)) as bigint)
@@ -891,7 +898,19 @@ def _fix(node: exp.Expression) -> exp.Expression:
     if isinstance(node, exp.Anonymous) and isinstance(node.this, str) and node.name.lower() in _RENAMED:
         return _fn(_RENAMED[node.name.lower()], *node.expressions)  # (a function sqlglot has no class for)
     if isinstance(node, exp.Time) and node.this is not None and not node.args.get("zone"):
-        return exp.cast(node.this, "time")  # TIME(ts): the time of day it holds (sqlglot reads a zone into it)
+        if isinstance(node.this, exp.Literal) and node.this.is_string:
+            return exp.cast(node.this, "time")  # TIME('10:20:30')
+        return _fn("_sf_time", node.this)  # TIME(ts): the time of day it holds (sqlglot reads a zone into it)
+    if isinstance(node, exp.Window) and isinstance(node.this, exp.Anonymous) and isinstance(node.this.this, str) \
+            and node.this.name.upper() in ("CONDITIONAL_TRUE_EVENT", "CONDITIONAL_CHANGE_EVENT") and node.this.expressions:
+        # so far in the window's order: how many rows met the condition / how often the value changed
+        arg = node.this.expressions[0].copy()
+        so_far = exp.WindowSpec(kind="ROWS", start="UNBOUNDED", start_side="PRECEDING", end="CURRENT ROW")
+        window = lambda f: exp.Window(this=f, partition_by=[p.copy() for p in node.args.get("partition_by") or []],  # noqa: E731
+                                      order=node.args["order"].copy() if node.args.get("order") else None, spec=so_far)
+        if node.this.name.upper() == "CONDITIONAL_TRUE_EVENT":
+            return window(exp.Sum(this=exp.Case(ifs=[exp.If(this=arg, true=exp.Literal.number(1))], default=exp.Literal.number(0))))
+        return _fn("_sf_change_event", window(exp.Anonymous(this="LIST", expressions=[arg])))
     if isinstance(node, exp.Anonymous) and isinstance(node.this, str) and node.name.lower() == "map_construct" \
             and len(node.expressions) % 2 == 0:
         pairs = [x for k, v in zip(node.expressions[::2], node.expressions[1::2]) for x in (exp.cast(k.copy(), "varchar"), v.copy())]

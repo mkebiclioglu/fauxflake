@@ -635,9 +635,9 @@
 - {id: fn_sum_real_2, sql: "select SUM_REAL(column1) from values (2.5::float), (0.5::float), (2.5::float)", gap: "not in the emulator"}
 - {id: fn_tan, sql: "select TAN(2.5::float)"}
 - {id: fn_tanh, sql: "select TANH(2.5::float)"}
-- {id: fn_time, sql: "select TIME('2024-03-15 10:20:30'::timestamp_ltz)", gap: "not in the emulator"}
+- {id: fn_time, sql: "select TIME('2024-03-15 10:20:30'::timestamp_ltz)"}
 - {id: fn_time_2, sql: "select TIME('2024-03-15 10:20:30'::timestamp_ntz)"}
-- {id: fn_time_3, sql: "select TIME('2024-03-15 10:20:30 +0000'::timestamp_tz)", gap: "not in the emulator"}
+- {id: fn_time_3, sql: "select TIME('2024-03-15 10:20:30 +0000'::timestamp_tz)"}
 - {id: fn_timestampfromparts, sql: "select TIMESTAMPFROMPARTS('2024-03-15'::date, '10:20:30'::time)"}
 - {id: fn_timestampntzfromparts, sql: "select TIMESTAMPNTZFROMPARTS('2024-03-15'::date, '10:20:30'::time)"}
 - {id: fn_timestamp_from_parts, sql: "select TIMESTAMP_FROM_PARTS('2024-03-15'::date, '10:20:30'::time)"}
@@ -693,7 +693,7 @@
 - {id: hw_to_numeric, sql: "select to_numeric('12.345', 10, 2), to_number('12.5'), to_decimal('7'), try_to_numeric('x'), try_to_decimal('1.25', 5, 1), to_double('1.5'), try_to_double('x'), try_to_boolean('yes'), try_to_boolean('x')"}
 - {id: hw_try_timestamps, sql: "select try_to_timestamp('2024-03-15 10:20:30'), try_to_timestamp('nope'), try_to_timestamp_ntz('2024-03-15'), try_to_time('10:20:30'), try_to_time('x'), try_to_date('2024-03-15'), try_to_date('15/03/2024', 'DD/MM/YYYY')"}
 - {id: hw_try_to_binary, sql: "select try_to_binary('616263', 'hex') = to_binary('616263', 'hex'), try_to_binary('zz', 'hex') is null"}
-- {id: hw_conditional_change, gap: "CONDITIONAL_CHANGE_EVENT is not in the emulator", sql: "select column1, conditional_change_event(column2) over (order by column1), conditional_true_event(column2 > 1) over (order by column1) from values (1, 1), (2, 1), (3, 2), (4, 2), (5, 3) order by 1"}
+- {id: hw_conditional_change, sql: "select column1, conditional_change_event(column2) over (order by column1), conditional_true_event(column2 > 1) over (order by column1) from values (1, 1), (2, 1), (3, 2), (4, 2), (5, 3) order by 1"}
 - {id: hw_higher_order, sql: "select filter(array_construct(1, 2, 3, 4), x -> x > 2), transform(array_construct(1, 2, 3), x -> x * 2), reduce(array_construct(1, 2, 3), 0, (acc, x) -> acc + x)"}
 - {id: hw_array_misc, sql: "select array_sort(array_construct(3, 1, 2)), array_min(array_construct(3, 1, 2)), array_max(array_construct(3, 1, 2)), array_flatten(array_construct(array_construct(1), array_construct(2, 3))), array_except(array_construct(1, 2, 3), array_construct(2)), array_intersection(array_construct(1, 2), array_construct(2, 3)), array_remove(array_construct(1, 2, 1), 1::variant), array_position(2::variant, array_construct(1, 2)), array_prepend(array_construct(2), 1), array_append(array_construct(1), 2), array_cat(array_construct(1), array_construct(2)), array_compact(array_construct(1, null, 2)), array_generate_range(0, 3), arrays_overlap(array_construct(1, 2), array_construct(2))"}
 - {id: hw_array_union_agg, sql: "select array_sort(array_union_agg(column1)) from (select array_construct(1, 2) as column1 union all select array_construct(2, 3))"}
