@@ -237,7 +237,8 @@ def profile(spec_path, connection, days, sample_pct, k_anonymity, max_categories
 @click.option("--schema", default="FAUXFLAKE_PARITY", show_default=True,
               help="Schema dbt builds into on both engines (some projects name theirs in SQL, for UDFs say).")
 @click.option("--report", default=None, help="Write every difference to this JSON file.")
-def parity(spec_path, project_dir, scale, history, db_path, keep, connection, days, schema, report):
+@click.option("--select", "-s", "select", multiple=True, help="Build and compare only these (dbt selector syntax).")
+def parity(spec_path, project_dir, scale, history, db_path, keep, connection, days, schema, report, select):
     """Build on the emulator and on real Snowflake from identical synthetic data, and compare."""
     db_path = _warehouse_dir(project_dir, db_path, keep)
     import snowflake.connector
@@ -259,7 +260,8 @@ def parity(spec_path, project_dir, scale, history, db_path, keep, connection, da
         wh = Warehouse(emu, spec, scale, freeze_clock=False)
         local = DbtProject(project_dir, emulator_output(emu.port, database))
         remote = DbtProject(project_dir, snowflake_output(connection, database), name="snowflake")
-        rows, found = run(conn, wh, local, remote, _start(spec, history), days, remote_schema=schema, log=click.echo)
+        rows, found = run(conn, wh, local, remote, _start(spec, history), days, remote_schema=schema, log=click.echo,
+                          select=list(select) or None)
     click.echo("")
     for d in found:
         click.echo(f"DIFF {d.kind:<20} {d.node}\n     {d.detail[:400]}")

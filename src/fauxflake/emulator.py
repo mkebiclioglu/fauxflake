@@ -529,10 +529,36 @@ def run_guarded(cursor, work, limit: float | None = None) -> None:  # noqa: ANN0
         raise outcome["error"]
 
 
+_TO_TIMESTAMP = """
+CREATE OR REPLACE MACRO ${catalog}._fs_to_timestamp(val, scale) AS (
+    CASE
+        -- a number is seconds since 1970 (or the unit `scale` says), its fraction kept
+        WHEN typeof(val) LIKE 'DECIMAL%' OR typeof(val) IN ('TINYINT', 'SMALLINT', 'INTEGER', 'BIGINT', 'HUGEINT', 'UTINYINT',
+                                                            'USMALLINT', 'UINTEGER', 'UBIGINT', 'DOUBLE', 'FLOAT')
+            THEN make_timestamp(round(try_cast(val AS DECIMAL(38, 9)) * power(10, 6 - scale)::DECIMAL(38, 9))::BIGINT)
+        -- text of digits: seconds, milliseconds, microseconds or nanoseconds, by its size (unless `scale` says)
+        WHEN regexp_full_match(trim(val::VARCHAR), '-?[0-9]+')
+            THEN make_timestamp((CASE
+                WHEN scale <> 0 THEN try_cast(trim(val::VARCHAR) AS HUGEINT) * power(10, 6 - scale)::DECIMAL(38, 9)
+                WHEN abs(try_cast(trim(val::VARCHAR) AS HUGEINT)) < 31536000000 THEN try_cast(trim(val::VARCHAR) AS HUGEINT) * 1000000
+                WHEN abs(try_cast(trim(val::VARCHAR) AS HUGEINT)) < 31536000000000 THEN try_cast(trim(val::VARCHAR) AS HUGEINT) * 1000
+                WHEN abs(try_cast(trim(val::VARCHAR) AS HUGEINT)) < 31536000000000000 THEN try_cast(trim(val::VARCHAR) AS HUGEINT)
+                ELSE try_cast(trim(val::VARCHAR) AS HUGEINT) // 1000 END)::BIGINT)
+        ELSE CAST(val AS TIMESTAMP)
+    END
+);
+"""
+
+
 def _patch_fakesnow() -> None:
     global _patched
     if _patched:
         return
+    from string import Template as _Template
+
+    import fakesnow.macros as _macros
+
+    _macros.FS_TO_TIMESTAMP = _Template(_TO_TIMESTAMP)  # (fakesnow's casts a number to BIGINT first: 0.023 s became 0)
     # generated SQL can nest thousands deep (a pivot over many values, a long OR chain): give the
     # parser and the rewrites room, in the threads started from here on
     sys.setrecursionlimit(max(sys.getrecursionlimit(), 50_000))

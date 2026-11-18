@@ -756,3 +756,24 @@
 - {id: mixed_kinds_26, sql: "select case when n > 1 then v else n end from (select '7' as v, 2 as n)"}
 - {id: mixed_kinds_27, sql: "select 'x' as v union all select 5"}
 - {id: mixed_kinds_28, sql: "select '5' as v union all select 5"}
+
+# TO_TIMESTAMP of numbers and of text holding digits (measured on Snowflake).
+- {id: epoch_1, sql: "select to_timestamp(1735689600)"}
+- {id: epoch_2, sql: "select to_timestamp(1735689600123)"}
+- {id: epoch_3, sql: "select to_timestamp(1735689600123456)"}
+- {id: epoch_4, sql: "select to_timestamp(1735689600123456789)"}
+- {id: epoch_5, sql: "select to_timestamp(1735689600123.5)"}
+- {id: epoch_6, sql: "select to_timestamp('1735689600123')"}
+- {id: epoch_7, sql: "select to_timestamp('1735689600')"}
+- {id: epoch_8, sql: "select to_timestamp(createdat / 1000) from (select 23 as createdat)"}
+- {id: epoch_9, sql: "select to_timestamp(1.5)"}
+- {id: epoch_10, sql: "select to_timestamp(-5)"}
+- {id: epoch_11, sql: "select to_timestamp(31535999999)"}
+- {id: epoch_12, sql: "select to_timestamp(31536000000)"}
+- {id: epoch_13, sql: "select to_timestamp(1735689600, 3)"}
+- {id: epoch_14, sql: "select to_timestamp(1735689600123, 3)"}
+- {id: epoch_15, sql: "select to_timestamp_ntz(1.5::float)", gap: "a FLOAT is a compile error in Snowflake"}
+- {id: epoch_16, sql: "select to_timestamp('2024-03-01 10:00:00.5')"}
+- {id: epoch_17, sql: "select '2024-03-01'::timestamp"}
+- {id: epoch_18, sql: "select createdat::timestamp from (select 23 as createdat)"}
+- {id: epoch_19, sql: "select to_timestamp(createdat * 100000000000) from (select 23 as createdat)"}

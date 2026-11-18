@@ -859,9 +859,7 @@ def _fix(node: exp.Expression) -> exp.Expression:
         node.set("this", _fn("_sf_text", node.this))  # a VARIANT column matches by its text, without JSON quotes
     if isinstance(node, exp.TryCast) and node.to.is_type("timestamp", "timestampntz") and node.args.get("requires_string"):
         return _fn("_sf_try_timestamp", node.this)
-    if isinstance(node, exp.UnixToTime) and isinstance(node.this, exp.Literal) and node.this.is_string \
-            and _NUMERIC_TEXT.match(node.this.name):
-        node.set("this", exp.Literal.number(node.this.name.strip()))  # TO_TIMESTAMP('1735689600') is an epoch
+    # (TO_TIMESTAMP('1735689600123'): text of digits, read by its size as seconds or milliseconds, in _fs_to_timestamp)
     if isinstance(node, exp.Anonymous) and node.name.upper() == "TO_DATE" and len(node.expressions) == 1 \
             and isinstance(node.expressions[0], exp.Literal) and re.fullmatch(r"\d{8,}", node.expressions[0].name):
         return exp.cast(exp.UnixToTime(this=exp.Literal.number(node.expressions[0].name)), "date")

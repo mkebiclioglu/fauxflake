@@ -94,7 +94,7 @@ class Parity:
 
     @property
     def ok(self) -> bool:
-        return self.only_emulator == 0 and self.only_snowflake == 0 and not self.note
+        return self.only_emulator == 0 and self.only_snowflake == 0 and (not self.note or self.note.startswith("differ in"))
 
 
 def _comparable(column: str, kind: str, source: str) -> str:
@@ -154,6 +154,7 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
             theirs = _fetch(conn, f'select * from {node["database"]}.{remote_schema or node["schema"]}.{name}')
             mine = f'{node["database"]}.{schema or node["schema"]}.{name}'
             types = {c.upper(): ty for c, ty, *_ in duck.execute(f"describe {mine}").fetchall()}
+            note = ""
             if theirs is None:  # zero rows
                 theirs_n, a, b = 0, duck.execute(f"select count(*) from {mine}").fetchone()[0], 0
             else:
@@ -171,13 +172,26 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
                     cols = ", ".join(f'"{c}"::varchar as "{c}"' if c in documents else f'"{c}"' for c in types)
                     duck.register("_mine", _canonical_columns(duck.execute(f"select {cols} from {mine}").to_arrow_table(), documents))
                     source = "_mine"
-                a, b = duck.execute(f"""
-                    with t as (select {', '.join(_comparable(c, ty, 'theirs') for c, ty in types.items())} from _theirs),
-                         m as (select {', '.join(_comparable(c, ty, 'mine') for c, ty in types.items())} from {source})
+                both = (f"with t as (select {', '.join(_comparable(c, ty, 'theirs') for c, ty in types.items())} from _theirs), "
+                        f"m as (select {', '.join(_comparable(c, ty, 'mine') for c, ty in types.items())} from {source}) ")
+                a, b = duck.execute(both + """
                     select (select count(*) from (select * from m except all select * from t)),
                            (select count(*) from (select * from t except all select * from m))""").fetchone()
+                note = ""
+                if a or b:
+                    # which columns hold other values, each compared on its own (rows need not line up): one sample each
+                    differing = []
+                    for c in types:
+                        q = f'"{c}"'
+                        got = duck.execute(both + f"""
+                            select (select any_value({q}::varchar) from (select {q} from m except all select {q} from t)),
+                                   (select any_value({q}::varchar) from (select {q} from t except all select {q} from m)),
+                                   (select count(*) from (select {q} from m except all select {q} from t))""").fetchone()
+                        if got[2]:
+                            differing.append(f"{c}: emulator {str(got[0])[:60]!r} snowflake {str(got[1])[:60]!r}")
+                    note = "differ in " + "; ".join(differing[:6]) if differing else ""
             mine_n = duck.execute(f"select count(*) from {mine}").fetchone()[0]
-            out.append(Parity(node["name"], mine_n, theirs_n, a, b))
+            out.append(Parity(node["name"], mine_n, theirs_n, a, b, note if theirs is not None and (a or b) else ""))
         except Exception as e:  # noqa: BLE001
             out.append(Parity(node["name"], 0, 0, 0, 0, f"{type(e).__name__}: {str(e)[:160]}"))
     return out
@@ -227,7 +241,7 @@ def differences(local: dict, remote: dict, rows: list[Parity]) -> list[Differenc
 
 
 def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datetime, days: int,
-        remote_schema: str = "FAUXFLAKE_PARITY", log=print) -> tuple[list[Parity], list[Difference]]:
+        remote_schema: str = "FAUXFLAKE_PARITY", log=print, select: list[str] | None = None) -> tuple[list[Parity], list[Difference]]:
     """The same sources on both engines, the same project built on both (every node, also after one fails), then
     what each did compared: which nodes failed on one side only, which tests answered differently, which models hold
     other rows. Day by day for incremental models."""
@@ -245,9 +259,10 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
         os.environ["FAUXFLAKE_TESTS_DO_NOT_BLOCK"] = "1"  # (a failing test keeps nothing else from being built and compared)
         try:
             # the same schema name on both sides: some models embed their own relation names
-            local.invoke(["build", *full], schema=remote_schema, quiet=True)
+            chosen = ["--select", *select] if select else []
+            local.invoke(["build", *full, *chosen], schema=remote_schema, quiet=True)
             mine = outcomes(local)
-            remote.invoke(["build", *full], schema=remote_schema, quiet=True)
+            remote.invoke(["build", *full, *chosen], schema=remote_schema, quiet=True)
             theirs = outcomes(remote)
         finally:
             os.environ.pop("FAUXFLAKE_TESTS_DO_NOT_BLOCK", None)
