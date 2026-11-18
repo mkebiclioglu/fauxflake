@@ -251,7 +251,7 @@ def parity(spec_path, project_dir, scale, history, db_path, keep, connection, da
     spec = Spec.load(spec_path)
     database = spec.dbt.get("database", "ANALYTICS")
     conn = snowflake.connector.connect(connection_name=connection)
-    with serve() as emu:
+    with serve(db_path=db_path) as emu:
         # (Snowflake's CURRENT_DATE is today, in its session's time zone: so is the emulator's here, or every date
         # spine would end on another day)
         from . import emulator as _emulator

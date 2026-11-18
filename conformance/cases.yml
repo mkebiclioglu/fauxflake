@@ -777,3 +777,44 @@
 - {id: epoch_17, sql: "select '2024-03-01'::timestamp"}
 - {id: epoch_18, sql: "select createdat::timestamp from (select 23 as createdat)"}
 - {id: epoch_19, sql: "select to_timestamp(createdat * 100000000000) from (select 23 as createdat)"}
+
+# ::array of a value that is not a list; text read as a NUMBER with a bare exponent mark (measured on Snowflake).
+- {id: cast_array_1, sql: "select parse_json('[125]')::array"}
+- {id: cast_array_2, sql: "select parse_json(coalesce(parse_json('[125]'), '[]'))::array"}
+- {id: cast_array_3, sql: "select parse_json(coalesce(v, '[]'))::array from (select parse_json('[125]') as v)"}
+- {id: cast_array_4, sql: "select parse_json(coalesce(v, '[]'))::array from (select '[125]' as v)"}
+- {id: cast_array_5, sql: "select parse_json(coalesce(v, '[]'))::array from (select null::variant as v)"}
+- {id: cast_array_6, sql: "select parse_json(v) from (select parse_json('[125]') as v)"}
+- {id: cast_array_7, sql: "select parse_json(v)::array from (select parse_json('{}') as v)"}
+- {id: cast_array_8, sql: "select parse_json(coalesce(v, '[]'))::array from (select parse_json('{}') as v)"}
+- {id: cast_array_9, sql: "select try_to_decimal(split_part(v, '.', 1)) from (select '52420402537.10.2' as v)"}
+- {id: cast_array_10, sql: "select try_to_decimal(split_part(v, '.', 1)) from (select '52420402537' as v)"}
+- {id: cast_array_11, sql: "select try_to_decimal('52420402537')"}
+- {id: number_text_1, sql: "select try_to_decimal('12e')"}
+- {id: number_text_2, sql: "select try_to_decimal('12E')"}
+- {id: number_text_3, sql: "select try_to_decimal('12e+')"}
+- {id: number_text_4, sql: "select try_to_decimal('12e-')"}
+- {id: number_text_5, sql: "select try_to_decimal('12.e')"}
+- {id: number_text_6, sql: "select try_to_decimal('.5e')"}
+- {id: number_text_7, sql: "select try_to_decimal('e')"}
+- {id: number_text_8, sql: "select try_to_decimal('12ee')"}
+- {id: number_text_9, sql: "select try_to_number('12e', 10, 2)"}
+- {id: number_text_10, sql: "select try_to_double('12e')"}
+- {id: number_text_11, sql: "select try_cast('12e' as number)"}
+- {id: number_text_12, sql: "select try_cast('12e' as double)"}
+- {id: number_text_13, sql: "select to_number('12e')"}
+- {id: number_text_14, sql: "select '12e'::number"}
+- {id: number_text_15, sql: "select try_to_decimal('12d')"}
+- {id: number_text_16, sql: "select try_to_decimal('+12e')"}
+- {id: number_text_17, sql: "select try_to_decimal('1.5e2')"}
+- {id: number_text_18, sql: "select try_to_decimal('12 e')"}
+- {id: number_text_b_1, sql: "select try_to_decimal('')"}
+- {id: number_text_b_2, sql: "select try_to_decimal('.')"}
+- {id: number_text_b_3, sql: "select try_to_decimal('+')"}
+- {id: number_text_b_4, sql: "select try_to_decimal('+e')"}
+- {id: number_text_b_5, sql: "select try_to_decimal('.e')"}
+- {id: number_text_b_6, sql: "select try_to_decimal(' 12e ')"}
+- {id: number_text_b_7, sql: "select try_to_decimal('-.e')"}
+- {id: number_text_b_8, sql: "select try_cast('12e' as int)"}
+- {id: number_text_b_9, sql: "select try_to_decimal('12e', 10, 2)"}
+- {id: number_text_b_10, sql: "select '12e'::decimal(10,2)"}

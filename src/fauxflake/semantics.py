@@ -329,7 +329,15 @@ MACROS = [
         "'iv', upper(md5(k::varchar)), 'tag', upper(md5(v::varchar)))"
         for args in ("v, k", "v, k, iv", "v, k, iv, aad", "v, k, iv, aad, mode")),
     # A float cast to an integer rounds half away from zero (2.5 -> 3). DuckDB rounds half to even.
+    # Snowflake reads text as a NUMBER with a bare exponent mark ('12e' is 12, '.e' and '.' are 0); DOUBLE does not.
+    # The text DuckDB can read instead, or NULL when it reads the text as it is
+    f"""create or replace macro {_NS}_sf_num_text(x) as case
+          when typeof(x) <> 'VARCHAR' then null
+          when regexp_full_match(x::varchar, '\\s*[+-]?[0-9]*\\.?[0-9]*[eE]\\s*') then case
+            when regexp_matches(x::varchar, '[0-9]') then regexp_replace(trim(x::varchar), '\\.?[eE]$', '') else '0' end
+          when regexp_full_match(x::varchar, '\\s*[+-]?\\.\\s*') then '0' end""",
     f"""create or replace macro {_NS}_sf_int(x) as case
+          when {_NS}_sf_num_text(x) is not null then cast(round({_NS}_sf_num_text(x)::decimal(38, 9)) as bigint)
           when typeof(x) in ('DOUBLE', 'FLOAT') then cast(round(try_cast(x::varchar as double)) as bigint)
           else cast(x as bigint) end""",
     f"""create or replace macro {_NS}_sf_to_array(x) as case
@@ -796,6 +804,9 @@ def _fix(node: exp.Expression) -> exp.Expression:
         node.set("this", exp.cast(node.this, "varchar"))  # NULLIF(v:x, '') compares the value, not JSON text
     if isinstance(node, exp.ToArray):
         return _fn("_sf_to_array", node.this)
+    if isinstance(node, exp.Cast) and node.to.this == exp.DataType.Type.ARRAY and not node.to.expressions \
+            and not isinstance(node.this, (exp.Array, exp.Null)):
+        return _fn("_sf_to_array", node.this)  # x::array wraps a value that is not a list, as TO_ARRAY does
     if isinstance(node, exp.Uniform):
         # UNIFORM(lo, hi, RANDOM()): written out here so it also works inside CTEs and views
         gen = node.args.get("gen")
@@ -1241,9 +1252,30 @@ def balance_chains(transformed: exp.Expression) -> exp.Expression:
     return transformed
 
 
+_NOT_TEXT = (exp.Binary, exp.AggFunc, exp.Null, exp.Neg, exp.Abs, exp.Round, exp.Floor, exp.Ceil)
+
+
+def _number_texts(transformed: exp.Expression) -> None:
+    """A cast of text to an integer or decimal also reads what Snowflake reads as a number and DuckDB does not."""
+    for cast in list(transformed.find_all(exp.Cast, exp.TryCast)):
+        if not cast.to.is_type("decimal", "bigint", "int", "smallint", "tinyint", "hugeint"):
+            continue
+        arg = cast.this
+        if isinstance(arg, _NOT_TEXT) or (isinstance(arg, exp.Literal) and not arg.is_string) \
+                or (isinstance(arg, exp.Cast) and not arg.to.is_type("varchar", "text")) or _is(arg, "_sf_num_text") \
+                or any(_is(c, "_sf_num_text") for c in (cast.parent.find_all(exp.Anonymous) if isinstance(cast.parent, exp.If) else [])):
+            continue
+        if isinstance(arg, exp.Literal) and not re.fullmatch(r"\s*[+-]?[0-9]*\.?[0-9]*[eE]?\s*", arg.name):
+            continue  # text that is not a number of this kind: as it is
+        fixed = _fn("_sf_num_text", arg.copy())
+        cast.replace(exp.Case(ifs=[exp.If(this=exp.Not(this=exp.Is(this=fixed.copy(), expression=exp.Null())),
+                                          true=cast.__class__(this=fixed, to=cast.to.copy()))], default=cast.copy()))
+
+
 def finish(transformed: exp.Expression) -> exp.Expression:
     """Fix-ups on the DuckDB side of the translation."""
     transformed = balance_chains(transformed)
+    _number_texts(transformed)
     for agg in list(transformed.find_all(exp.ArrayAgg)):
         # ARRAY_AGG(OBJECT_CONSTRUCT(*)) is written for DuckDB with a filter that leaves out NULLs and
         # repeats the argument. An object of every column is never NULL, and DuckDB will not expand a
