@@ -7,6 +7,8 @@ days pass on both, and every model is compared row for row.
 
 from __future__ import annotations
 
+import contextlib
+
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -142,7 +144,7 @@ def _canonical_columns(table, columns: list[str]):
 
 
 def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_schema: str | None = None,
-            only: set[str] | None = None) -> list[Parity]:
+            only: set[str] | None = None, clock: tuple | None = None) -> list[Parity]:
     """Each model on the emulator against the same model on Snowflake, row for row. Without
     `schema`, each model is read from the schema dbt built it in (the same on both sides)."""
     duck, out = emu.cursor(), []
@@ -180,16 +182,28 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
                 note = ""
                 if a or b:
                     # which columns hold other values, each compared on its own (rows need not line up): one sample each
-                    differing = []
+                    differing, clocks = [], []
                     for c in types:
                         q = f'"{c}"'
                         got = duck.execute(both + f"""
                             select (select any_value({q}::varchar) from (select {q} from m except all select {q} from t)),
                                    (select any_value({q}::varchar) from (select {q} from t except all select {q} from m)),
                                    (select count(*) from (select {q} from m except all select {q} from t))""").fetchone()
-                        if got[2]:
+                        if got[2] and _is_clock(duck, both, c, types[c], clock):
+                            clocks.append(c)
+                        elif got[2]:
                             differing.append(f"{c}: emulator {str(got[0])[:60]!r} snowflake {str(got[1])[:60]!r}")
                     note = "differ in " + "; ".join(differing[:6]) if differing else ""
+                    if clocks:  # the rows compared without them
+                        rest = {c: ty for c, ty in types.items() if c not in clocks}
+                        if rest:
+                            both = (f"with t as (select {', '.join(_comparable(c, ty, 'theirs') for c, ty in rest.items())} from _theirs), "
+                                    f"m as (select {', '.join(_comparable(c, ty, 'mine') for c, ty in rest.items())} from {source}) ")
+                            a, b = duck.execute(both + """
+                                select (select count(*) from (select * from m except all select * from t)),
+                                       (select count(*) from (select * from t except all select * from m))""").fetchone()
+                        else:
+                            a = b = 0
             mine_n = duck.execute(f"select count(*) from {mine}").fetchone()[0]
             out.append(Parity(node["name"], mine_n, theirs_n, a, b, note if theirs is not None and (a or b) else ""))
         except Exception as e:  # noqa: BLE001
@@ -240,6 +254,56 @@ def differences(local: dict, remote: dict, rows: list[Parity]) -> list[Differenc
     return out
 
 
+@contextlib.contextmanager
+def remote_session():
+    """dbt on Snowflake as the emulator runs: every model on the connection's warehouse (a model's
+    `snowflake_warehouse` names one of its own account), and the clock in UTC (the emulator's zone)."""
+    import snowflake.connector
+    from dbt.adapters.snowflake.impl import SnowflakeAdapter
+
+    hook, connect = SnowflakeAdapter.pre_model_hook, snowflake.connector.connect
+
+    def in_utc(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        kwargs["session_parameters"] = {**(kwargs.get("session_parameters") or {}), "TIMEZONE": "UTC"}
+        return connect(*args, **kwargs)
+
+    SnowflakeAdapter.pre_model_hook = lambda self, config: None
+    snowflake.connector.connect = in_utc
+    try:
+        yield
+    finally:
+        SnowflakeAdapter.pre_model_hook, snowflake.connector.connect = hook, connect
+
+
+def _instant(v):  # noqa: ANN001, ANN202
+    """A timestamp or date as a naive UTC datetime."""
+    from datetime import date, timezone
+
+    if isinstance(v, datetime):
+        return v.astimezone(timezone.utc).replace(tzinfo=None) if v.tzinfo else v
+    if isinstance(v, date):
+        return datetime(v.year, v.month, v.day)
+    return None
+
+
+def _is_clock(duck, both: str, column: str, kind: str, clock) -> bool:  # noqa: ANN001
+    """The column holds when the build ran: the emulator's frozen clock on its side, a time within the
+    Snowflake build on the other (CURRENT_TIMESTAMP() and the like differ by the hour of the build, not by engine)."""
+    if clock is None or not kind.startswith(("TIMESTAMP", "DATE")):
+        return False
+    frozen, start, end = clock
+    q = f'"{column}"'
+    lo_m, hi_m, lo_t, hi_t = (_instant(v) for v in duck.execute(
+        both + f"select (select min({q}) from m), (select max({q}) from m), (select min({q}) from t), (select max({q}) from t)").fetchone())
+    if None in (lo_m, hi_m, lo_t, hi_t):
+        return False
+    slack = timedelta(seconds=2)
+    if kind == "DATE":
+        days = {frozen.date(), start.date(), end.date()}
+        return lo_m.date() == hi_m.date() == frozen.date() and lo_t.date() in days and hi_t.date() in days
+    return frozen - slack <= lo_m <= hi_m <= frozen + slack and start - slack <= lo_t <= hi_t <= end + slack
+
+
 def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datetime, days: int,
         remote_schema: str = "FAUXFLAKE_PARITY", log=print, select: list[str] | None = None) -> tuple[list[Parity], list[Difference]]:
     """The same sources on both engines, the same project built on both (every node, also after one fails), then
@@ -262,12 +326,18 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
             chosen = ["--select", *select] if select else []
             local.invoke(["build", *full, *chosen], schema=remote_schema, quiet=True)
             mine = outcomes(local)
-            remote.invoke(["build", *full, *chosen], schema=remote_schema, quiet=True)
+            began = conn.cursor().execute("select sysdate()").fetchone()[0]
+            with remote_session():
+                remote.invoke(["build", *full, *chosen], schema=remote_schema, quiet=True)
+            ended = conn.cursor().execute("select sysdate()").fetchone()[0]
             theirs = outcomes(remote)
         finally:
             os.environ.pop("FAUXFLAKE_TESTS_DO_NOT_BLOCK", None)
         log(f"{now:%Y-%m-%d}  built on both engines")
         built = {uid for uid in mine if mine[uid][0] == "success" and theirs.get(uid, ("",))[0] == "success"}
-        rows = compare(conn, wh.emu, local, only=built)  # (each model where dbt put it: the same schema on both sides)
+        from . import emulator
+
+        clock = (emulator.FROZEN_NOW, began, ended) if emulator.FROZEN_NOW else None
+        rows = compare(conn, wh.emu, local, only=built, clock=clock)  # (each model where dbt put it: the same schema on both sides)
         found = differences(mine, theirs, rows)
     return rows, found

@@ -1,0 +1,21 @@
+from datetime import datetime
+
+import duckdb
+
+from fauxflake.parity import _is_clock
+
+
+def test_a_column_holding_when_each_build_ran_is_the_clock_not_a_difference():
+    duck = duckdb.connect()
+    frozen, began, ended = datetime(2026, 11, 18, 16, 0, 0), datetime(2026, 11, 18, 16, 5, 0), datetime(2026, 11, 18, 16, 9, 0)
+    duck.execute("create table mine as select timestamptz '2026-11-18 16:00:00+00' as at, date '2026-11-18' as d, "
+                 "timestamp '2026-11-18 16:00:00' as other")
+    duck.execute("create table theirs as select timestamptz '2026-11-18 16:07:31+00' as at, date '2026-11-18' as d, "
+                 "timestamp '2026-11-18 16:00:00' as other union all select timestamptz '2026-11-18 16:08:00+00', "
+                 "date '2026-11-18', timestamp '2026-01-01'")
+    both = "with m as (select * from mine), t as (select * from theirs) "
+    clock = (frozen, began, ended)
+    assert _is_clock(duck, both, "at", "TIMESTAMP WITH TIME ZONE", clock)
+    assert _is_clock(duck, both, "d", "DATE", clock)
+    assert not _is_clock(duck, both, "other", "TIMESTAMP", clock)  # a value from the data, far from either build
+    assert not _is_clock(duck, both, "at", "TIMESTAMP WITH TIME ZONE", None)

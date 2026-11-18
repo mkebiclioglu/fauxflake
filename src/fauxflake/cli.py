@@ -256,7 +256,8 @@ def parity(spec_path, project_dir, scale, history, db_path, keep, connection, da
         # spine would end on another day)
         from . import emulator as _emulator
 
-        _emulator.FROZEN_NOW = conn.cursor().execute("select current_timestamp()::timestamp_ntz").fetchone()[0]
+        conn.cursor().execute("alter session set timezone = 'UTC'")  # (the emulator's zone; dbt's sessions too)
+        _emulator.FROZEN_NOW = conn.cursor().execute("select sysdate()").fetchone()[0]
         wh = Warehouse(emu, spec, scale, freeze_clock=False)
         local = DbtProject(project_dir, emulator_output(emu.port, database))
         remote = DbtProject(project_dir, snowflake_output(connection, database), name="snowflake")
