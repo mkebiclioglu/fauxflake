@@ -1000,3 +1000,18 @@ def test_only_the_tables_the_spec_changed_and_those_that_refer_to_them_are_gener
     tables["RAW.T.C"]["volume"]["rows_per_day"] = 20
     assert f._changed_since_generated(Spec, 0.001, 60) is None  # how many rows a table has moves every table
     assert f._changed_since_generated(Spec, 0.01, 60) is None  # another scale
+
+
+def test_a_lesson_about_a_column_keeps_the_rules_about_its_rows():
+    rule = "HASH(({{USER_ID}})::VARCHAR) % 2 = 1"
+    tables = {"RAW.T.SERVER": {"columns": {"USER_ID": {"gen": "hash_id"},
+                                           "INSTALLATION": {"gen": "template", "template": "installation_{hex}", "null_unless": rule}}}}
+    f = fitter(tables=tables)
+    test = {"name": "unique_server_installation", "attached_node": "model.p.server", "column_name": "installation",
+            "test_metadata": {"name": "unique", "kwargs": {}}, "depends_on": {"nodes": ["model.p.server"]}}
+    places = _Places({("model.p.server", "INSTALLATION"): ("RAW.T.SERVER", "INSTALLATION", "")})
+    tables["RAW.T.SERVER"]["columns"]["INSTALLATION"]["gen"] = "categorical"
+    tables["RAW.T.SERVER"]["columns"]["INSTALLATION"]["values"] = {"a": 0.5, "b": 0.5}
+    tables["RAW.T.SERVER"]["columns"]["INSTALLATION"].pop("template")
+    assert f.learn_from_test(test, places)
+    assert tables["RAW.T.SERVER"]["columns"]["INSTALLATION"]["null_unless"] == rule

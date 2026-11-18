@@ -4332,7 +4332,26 @@ class Fitter:
                 return True
         return False
 
+    _ROW_RULES = ("null_unless", "empty_unless", "length", "spares")
+
     def learn_from_test(self, node: dict, analysis) -> bool:  # noqa: ANN001
+        """A failing generic test states a fact about the data the spec did not know. What a lesson puts in a column's
+        place keeps the rules the column had about its rows (when it has a value, how long an id is): those say
+        nothing of how the value is made, and another test relies on them."""
+        rules = {(name, col): {k: gen[k] for k in self._ROW_RULES if k in gen}
+                 for name, table in self.tables.items() for col, gen in (table.get("columns") or {}).items()
+                 if any(k in gen for k in self._ROW_RULES)}
+        changed = self._learn_from_test(node, analysis)
+        for (name, col), kept in rules.items() if changed else ():
+            gen = (self.tables.get(name, {}).get("columns") or {}).get(col)
+            if gen is not None:
+                for key, value in kept.items():
+                    if key == "empty_unless" and gen.get("gen") != "array":
+                        continue
+                    gen.setdefault(key, value)
+        return changed
+
+    def _learn_from_test(self, node: dict, analysis) -> bool:  # noqa: ANN001
         """A failing generic test states a fact about the data the spec did not know."""
         meta = node.get("test_metadata")
         tested = node.get("attached_node") or next(iter(reversed(node.get("depends_on", {}).get("nodes") or [])), None)
