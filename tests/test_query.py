@@ -77,3 +77,21 @@ def test_nullif_and_in_with_an_empty_string_take_a_variant_column_by_its_value()
         cur.execute("""create or replace table D.S.T as select parse_json('{"a":"x"}'):a as j, parse_json('""') as e, 'k' as t, '' as u""")
         assert cur.execute("select nullif(j, ''), nullif(e, ''), nullif(t, ''), nullif(u, '') from D.S.T").fetchall() == [('"x"', None, "k", None)]
         assert cur.execute("select j in ('', 'x'), e in ('', 'x'), t in ('', 'q') from D.S.T").fetchall() == [(True, True, False)]
+
+
+def test_a_statement_is_stopped_while_there_is_still_room_on_the_disk(monkeypatch):
+    import pytest
+    from snowflake.connector.errors import ProgrammingError
+
+    from fauxflake.emulator import serve
+
+    monkeypatch.setenv("FAUXFLAKE_MIN_FREE_GB", "100000000")  # (no disk has this much free: every long statement stops)
+    with serve() as emu:
+        conn = emu._fs.connect(database="D", schema="S")
+        cur = conn.cursor()
+        cur.execute("create database if not exists D")
+        cur.execute("create schema if not exists D.S")
+        assert cur.execute("select 1").fetchall() == [(1,)]  # a quick statement is not looked at
+        with pytest.raises(ProgrammingError, match="the disk is nearly full"):
+            cur.execute("select count(*) from range(3000000) a, range(3000000) b where a.range + b.range = -1")
+        assert cur.execute("select 2").fetchall() == [(2,)]  # and the session carries on

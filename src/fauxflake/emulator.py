@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import shutil
+import tempfile
 import socket
 import sys
 import threading
@@ -488,7 +489,19 @@ def run_guarded(cursor, work, limit: float | None = None) -> None:  # noqa: ANN0
 
     worker = threading.Thread(target=target, name="fauxflake-statement", daemon=True)
     worker.start()
-    worker.join(limit)
+    # (a statement that multiplies rows can also fill the disk well inside its time: it is stopped while there is
+    # still room to work in, whatever it is writing)
+    began, full = time.monotonic(), False
+    while worker.is_alive() and time.monotonic() - began < limit:
+        worker.join(min(2.0, max(0.05, limit - (time.monotonic() - began))))
+        if worker.is_alive() and time.monotonic() - began > 5:
+            try:
+                where = getattr(CURRENT, "db_path", None) or tempfile.gettempdir()
+                full = shutil.disk_usage(where).free < float(os.environ.get("FAUXFLAKE_MIN_FREE_GB", "3")) * 2**30
+            except Exception:  # noqa: BLE001
+                full = False
+            if full:
+                break
     if worker.is_alive():
         duck = cursor._duck_conn
         duck.interrupt()
@@ -499,6 +512,11 @@ def run_guarded(cursor, work, limit: float | None = None) -> None:  # noqa: ANN0
             if conn.database and conn.schema:
                 fresh.execute(f"SET schema='{conn.database}.{conn.schema}'")
             conn._duck_conn = cursor._duck_conn = fresh
+        if full:
+            raise ProgrammingError(
+                msg=f"fauxflake emulator: statement stopped after {time.monotonic() - began:.0f}s: the disk is nearly full "
+                    "(FAUXFLAKE_MIN_FREE_GB). On generated data this is usually a join or a date spine that explodes; "
+                    "look at the values the model reads.", errno=604, sqlstate="57014")
         raise ProgrammingError(
             msg=f"fauxflake emulator: statement stopped after {limit:.0f}s (FAUXFLAKE_STATEMENT_TIMEOUT). On generated data "
                 "this is usually a join or a date spine that explodes; look at the values the model reads.",
