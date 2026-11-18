@@ -3324,7 +3324,7 @@ class Fitter:
             self.push_pending()
             roots = sum(1 for m in failures.values() if not m.startswith("upstream failed"))
             self.log(f"  pass {n_pass}: {len(order) - len(failures)}/{len(order)} models run ({roots} fail on their own), "
-                     f"{len(self.learned) - before} thing(s) learned")
+                     f"{len(self.learned) - before} thing(s) learned ({time.time() - started:.0f}s for {done} model(s))")
             if os.environ.get("FAUXFLAKE_FIT_DEBUG"):  # for working on the fitter: what each pass learned and what failed
                 with open(os.environ["FAUXFLAKE_FIT_DEBUG"] + ".passes.txt", "a") as out:
                     out.write(f"pass {n_pass}: learned {self.learned[before:][:40]}\n  failing on their own: "
