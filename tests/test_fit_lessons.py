@@ -989,7 +989,8 @@ def test_only_the_tables_the_spec_changed_and_those_that_refer_to_them_are_gener
             def execute(_):
                 return type("R", (), {"fetchall": lambda self: [("RAW", "T", "A"), ("RAW", "T", "B"), ("RAW", "T", "C")]})()
 
-    tables = {"RAW.T.A": {"volume": {"rows_per_day": 10}, "columns": {"ID": {"gen": "sequence"}, "X": {"gen": "template", "template": "x_{hex}"}}},
+    tables = {"RAW.T.A": {"volume": {"rows_per_day": 10}, "columns": {"ID": {"gen": "sequence"}, "X": {"gen": "template", "template": "x_{hex}"},
+                                                                         "F": {"gen": "categorical", "type": "BOOLEAN", "values": {True: 0.5, False: 0.5, None: 0.0}}}},
               "RAW.T.B": {"volume": {"rows_per_day": 10}, "columns": {"A_ID": {"gen": "fk", "ref": "RAW.T.A"}}},
               "RAW.T.C": {"volume": {"rows_per_day": 10}, "columns": {"N": {"gen": "sequence"}}}}
     f = fitter(tables=tables, spec={"seed": 1, "start": "2025-01-01", "tables": tables}, emu=Emu())

@@ -334,12 +334,12 @@ class Fitter:
 
         raw = self.spec
         everything = json.dumps([{k: v for k, v in raw.items() if k not in ("tables", "dbt", "existing", "udfs")},
-                                 {name: calendar_of(t) for name, t in sorted(self.tables.items())}], sort_keys=True, default=str)
+                                 {name: calendar_of(t) for name, t in sorted(self.tables.items())}], default=str)
         prints = {}
         for name, table in self.tables.items():
-            text = json.dumps(table, sort_keys=True, default=str)
+            text = json.dumps(table, default=str)
             parents = sorted({m.upper() for m in re.findall(r'"ref": "([^"]+)"', text)} - {name})
-            prints[name] = hash((text, tuple(json.dumps(self.tables.get(p), sort_keys=True, default=str) for p in parents)))
+            prints[name] = hash((text, tuple(json.dumps(self.tables.get(p), default=str) for p in parents)))
         key = (id(self.emu), scale, history, everything)
         held, self._generated = self.__dict__.get("_generated"), (key, prints)
         if held is None or held[0] != key:
