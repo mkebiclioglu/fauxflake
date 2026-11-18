@@ -780,7 +780,9 @@ class Warehouse:
                 continue
             cal = t.calendar(self.spec.start, until.date(), self.spec.seed, self.scale, self.scenario, self.spec.thin, self.spec.least)
             self.cur.execute(f"create or replace temp table cal_{t.ident} (day date, cum bigint, n bigint)")
-            self.cur.executemany(f"insert into cal_{t.ident} values (?, ?, ?)", cal)
+            if cal:  # (one statement for all the days: a row at a time took most of the time on a long history)
+                self.cur.execute(f"insert into cal_{t.ident} select unnest(?::date[]), unnest(?::bigint[]), unnest(?::bigint[])",
+                                 [[c[0] for c in cal], [c[1] for c in cal], [c[2] for c in cal]])
             cals[t.name] = cal
         return cals
 
