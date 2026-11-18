@@ -828,3 +828,14 @@
 - {id: union_text_6, sql: "select x from (select null as x union all select v from (select 'abc' as v)) order by 1"}
 - {id: union_text_7, sql: "select x from (select 1 as x union select v from (select '1' as v)) order by 1"}
 - {id: union_text_8, sql: "select x from (select 1 as x, 'a' as y union all select v, w from (select '2' as v, 3 as w)) order by 1"}
+
+# ARRAY_AGG over a window and ARRAY_UNIQUE_AGG of only NULLs: an empty array (measured on Snowflake).
+- {id: array_agg_nulls_1, sql: "select array_unique_agg(v) over (partition by k) from (select 1 k, null::varchar v)"}
+- {id: array_agg_nulls_2, sql: "select array_unique_agg(v) from (select 1 k, null::varchar v)"}
+- {id: array_agg_nulls_3, sql: "select array_agg(v) over (partition by k) from (select 1 k, null::varchar v)"}
+- {id: array_agg_nulls_4, sql: "select array_agg(v) from (select 1 k, null::varchar v)"}
+- {id: array_agg_nulls_5, sql: "select array_agg(v) from (select 1 k, null::varchar v where false)"}
+- {id: array_agg_nulls_6, sql: "select array_unique_agg(v) from (select 1 k, null::varchar v where false)"}
+- {id: array_agg_nulls_7, sql: "select array_unique_agg(v) over (partition by k) from (select 1 k, 'a' v union all select 1, 'a' union all select 1, null)"}
+- {id: array_agg_nulls_8, sql: "select array_agg(distinct v) from (select 1 k, null::varchar v)"}
+- {id: array_agg_nulls_9, sql: "select array_agg(v) within group (order by v) over (partition by k) from (select 1 k, null::varchar v)"}

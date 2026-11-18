@@ -179,6 +179,81 @@
    ]
   ]
  },
+ "array_agg_nulls_1": {
+  "rows": [
+   [
+    []
+   ]
+  ]
+ },
+ "array_agg_nulls_2": {
+  "rows": [
+   [
+    []
+   ]
+  ]
+ },
+ "array_agg_nulls_3": {
+  "rows": [
+   [
+    []
+   ]
+  ]
+ },
+ "array_agg_nulls_4": {
+  "rows": [
+   [
+    []
+   ]
+  ]
+ },
+ "array_agg_nulls_5": {
+  "rows": [
+   [
+    []
+   ]
+  ]
+ },
+ "array_agg_nulls_6": {
+  "rows": [
+   [
+    []
+   ]
+  ]
+ },
+ "array_agg_nulls_7": {
+  "rows": [
+   [
+    [
+     "a"
+    ]
+   ],
+   [
+    [
+     "a"
+    ]
+   ],
+   [
+    [
+     "a"
+    ]
+   ]
+  ]
+ },
+ "array_agg_nulls_8": {
+  "rows": [
+   [
+    []
+   ]
+  ]
+ },
+ "array_agg_nulls_9": {
+  "rows": [
+   [
+    []
+   ]
+  ]
+ },
  "array_agg_skips_nulls": {
   "error": "000979 (42601): SQL compilation error:"
  },

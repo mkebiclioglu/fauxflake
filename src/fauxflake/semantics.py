@@ -751,6 +751,14 @@ def _fix(node: exp.Expression) -> exp.Expression:
         if not isinstance(node.parent, (exp.Window, exp.WithinGroup)):
             empty = "{}" if isinstance(node, exp.ObjectAgg) else "[]"  # no rows give an empty value, not NULL
             return exp.Coalesce(this=node, expressions=[exp.ParseJSON(this=exp.Literal.string(empty))])
+    if isinstance(node, exp.Window) and (isinstance(node.this, exp.ArrayAgg) or (
+            isinstance(node.this, exp.WithinGroup) and isinstance(node.this.this, exp.ArrayAgg))) \
+            and not isinstance(node.parent, exp.Coalesce):
+        return exp.Coalesce(this=node, expressions=[exp.ParseJSON(this=exp.Literal.string("[]"))])  # also over a window
+    if (isinstance(node, exp.ArrayUniqueAgg) and not isinstance(node.parent, exp.Window)) or (
+            isinstance(node, exp.Window) and isinstance(node.this, exp.ArrayUniqueAgg)):
+        if not isinstance(node.parent, exp.Coalesce):
+            return exp.Coalesce(this=node, expressions=[exp.Array(expressions=[])])  # only NULLs: an empty array
     if isinstance(node, exp.Lateral) and isinstance(node.this, exp.SplitToTable):
         node.set("this", _split_to_table(node.this))
         return node
