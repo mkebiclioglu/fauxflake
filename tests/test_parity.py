@@ -45,3 +45,33 @@ def test_arrays_that_differ_only_in_order_and_where_such_order_comes_from():
     assert _canonical('["b","a"]', unordered=True) == _canonical('["a", "b"]', unordered=True)
     assert _unordered_aggregate("select array_unique_agg(v) over (partition by k) from t") == "ARRAY_UNIQUE_AGG without an order"
     assert _unordered_aggregate("select array_agg(v) within group (order by v) from t") is None
+
+
+def test_models_are_compared_row_for_row_with_documents_by_content():
+    import snowflake.connector
+
+    from fauxflake.emulator import serve
+    from fauxflake.parity import compare
+
+    class Project:  # the two models, as dbt lists them
+        def models(self):
+            return [{"unique_id": f"model.p.{n}", "name": n, "database": "D", "schema": s}
+                    for n, s in (("same", "MINE"), ("other", "MINE"), ("empty", "MINE"))]
+
+    with serve() as emu:
+        conn = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S"))
+        cur = conn.cursor()
+        cur.execute("create database if not exists D")
+        for schema in ("MINE", "THEIRS"):
+            cur.execute(f"create schema if not exists D.{schema}")
+        # the same rows, the document written with its keys in another order and 1.0 for 1; one row differs in `other`
+        cur.execute("""create or replace table D.MINE.SAME as select 1 as n, 'a' as s, parse_json('{"b": 1, "a": [2, 1]}') as v""")
+        cur.execute("""create or replace table D.THEIRS.SAME as select 1 as n, 'a' as s, parse_json('{"a": [2, 1], "b": 1.0}') as v""")
+        cur.execute("""create or replace table D.MINE.OTHER as select * from values (1, parse_json('[1, 2]')), (2, parse_json('[3]')) as t(n, v)""")
+        cur.execute("""create or replace table D.THEIRS.OTHER as select * from values (1, parse_json('[2, 1]')), (3, parse_json('[3]')) as t(n, v)""")
+        cur.execute("create or replace table D.MINE.EMPTY as select 1 as n where false")
+        cur.execute("create or replace table D.THEIRS.EMPTY as select 1 as n where false")
+        got = {r.model: r for r in compare(conn, emu, Project(), schema="MINE", remote_schema="THEIRS")}
+        assert got["same"].ok and got["same"].snowflake_rows == 1, got["same"]
+        assert (got["other"].only_emulator, got["other"].only_snowflake) == (2, 2) and "N:" in got["other"].note, got["other"]
+        assert got["empty"].ok and got["empty"].snowflake_rows == 0

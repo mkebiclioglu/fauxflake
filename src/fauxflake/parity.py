@@ -73,16 +73,32 @@ def seed(conn, wh: Warehouse, after: datetime | None = None, log=print, workers:
                 log(line)
 
 
-def _fetch(conn, sql: str):
-    """Query Snowflake into an Arrow table (None when empty), without needing pandas."""
+def _fetch_into(conn, sql: str, duck, types: dict[str, str]) -> tuple[list[str], int]:  # noqa: ANN001
+    """Query Snowflake into the DuckDB table `_theirs`, a batch at a time (a spine of millions of rows does not
+    fit in memory as Python values; DuckDB spills to disk). The columns take the emulator's types where it has
+    the column (documents as text). Returns Snowflake's column names and the number of rows."""
     import pyarrow as pa
 
     cur = conn.cursor()
-    rows = cur.execute(sql).fetchall()
-    if not rows:
-        return None
+    cur.execute(sql)
     names = [d[0] for d in cur.description]
-    return pa.table({n: [r[i] for r in rows] for i, n in enumerate(names)})
+    duck.execute("drop table if exists _theirs")
+    kinds = {n: ("VARCHAR" if types.get(n.upper()) == "JSON" else types.get(n.upper(), "VARCHAR")) for n in names}
+    duck.execute("create temp table _theirs (" + ", ".join(f'"{n}" {kinds[n]}' for n in names) + ")")
+    try:
+        batches = cur.fetch_arrow_batches()
+    except Exception:  # noqa: BLE001 - a result that does not come as Arrow: rows, a chunk at a time
+        def chunks():
+            while rows := cur.fetchmany(100_000):
+                yield pa.table({n: [None if r[i] is None else r[i] for r in rows] for i, n in enumerate(names)})
+        batches = chunks()
+    count = 0
+    for batch in batches:
+        duck.register("_batch", batch)
+        duck.execute("insert into _theirs by name select * from _batch")
+        duck.unregister("_batch")
+        count += batch.num_rows
+    return names, count
 
 
 @dataclass
@@ -102,12 +118,12 @@ class Parity:
             not self.note or self.note.startswith(("differ in", "both engines fail to read")))
 
 
-def _comparable(column: str, kind: str, source: str) -> str:
+def _comparable(column: str, kind: str, source: str, unordered: bool = False) -> str:
     """One column in a form both engines agree on: Snowflake's values arrive as Python objects
     (pretty-printed JSON text, floats that differ in the last bit)."""
     quoted = f'"{column}"'
-    if kind == "JSON":
-        return f"{quoted}::varchar as {quoted}"  # canonical text: see _canonical_columns
+    if kind == "JSON":  # canonical text (see _canonical), on both sides
+        return f"{'_fx_canon_u' if unordered else '_fx_canon'}({quoted}::varchar) as {quoted}"
     if kind in ("DOUBLE", "FLOAT"):
         return f"format('{{:.10g}}', {quoted}::double) as {quoted}"
     return f"{quoted}::{kind} as {quoted}" if source == "theirs" else quoted
@@ -136,16 +152,17 @@ def _canonical(text: str | None, unordered: bool = False) -> str | None:
         return text
 
 
-def _canonical_columns(table, columns: list[str], unordered: bool = False):
-    """The Arrow table with its JSON columns rewritten as canonical text."""
+def _canonical_functions(duck) -> None:  # noqa: ANN001
+    """`_fx_canon(text)` and `_fx_canon_u(text)` (arrays sorted too) in DuckDB, a batch of values at a time."""
     import pyarrow as pa
 
-    lookup = {name.upper(): name for name in table.column_names}
-    for col in columns:
-        name = lookup[col]
-        values = [_canonical(None if v is None else str(v), unordered) for v in table.column(name).to_pylist()]
-        table = table.set_column(table.column_names.index(name), name, pa.array(values, pa.string()))
-    return table
+    def made(unordered: bool):  # noqa: ANN202 - (DuckDB wants a function of exactly one argument)
+        return lambda values: pa.array([_canonical(v, unordered) for v in values.to_pylist()], pa.string())
+
+    for name, unordered in (("_fx_canon", False), ("_fx_canon_u", True)):
+        if duck.execute("select count(*) from duckdb_functions() where function_name = ?", [name]).fetchall()[0][0]:
+            continue
+        duck.create_function(name, made(unordered), ["VARCHAR"], "VARCHAR", type="arrow")
 
 
 def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_schema: str | None = None,
@@ -153,56 +170,52 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
     """Each model on the emulator against the same model on Snowflake, row for row. Without
     `schema`, each model is read from the schema dbt built it in (the same on both sides)."""
     duck, out = emu.cursor(), []
+    _canonical_functions(duck)
+
+    def pair(kinds: dict[str, str], unordered: bool = False) -> str:  # (the two sides, as CTEs t and m)
+        return (f"with t as (select {', '.join(_comparable(c, ty, 'theirs', unordered) for c, ty in kinds.items())} from _theirs), "
+                f"m as (select {', '.join(_comparable(c, ty, 'mine', unordered) for c, ty in kinds.items())} from {mine}) ")
+
+    counted = "select (select count(*) from (select * from m except all select * from t)), " \
+              "(select count(*) from (select * from t except all select * from m))"
     for node in sorted(local.models(), key=lambda n: n["name"]):
         if only is not None and node["unique_id"] not in only:
             continue
         name = node.get("alias") or node["name"]
         mine = f'{node["database"]}.{schema or node["schema"]}.{name}'
         try:
-            theirs = _fetch(conn, f'select * from {node["database"]}.{remote_schema or node["schema"]}.{name}')
+            types = {c.upper(): ty for c, ty, *_ in duck.execute(f"describe {mine}").fetchall()}
+        except Exception:  # noqa: BLE001 - the emulator cannot read it (a view over something that fails)
+            types = {}
+        try:
+            names, theirs_n = _fetch_into(conn, f'select * from {node["database"]}.{remote_schema or node["schema"]}.{name}', duck, types)
         except Exception as e:  # noqa: BLE001 - a view that fails when read (its data): does the emulator's fail too?
             try:
-                duck.execute(f"select * from {mine}").fetchall()
+                duck.execute(f"select count(*) from {mine}").fetchall()
             except Exception:  # noqa: BLE001
                 out.append(Parity(node["name"], 0, 0, 0, 0, f"both engines fail to read it: {str(e)[:160]}"))
             else:
                 out.append(Parity(node["name"], 0, 0, 0, 0, f"Snowflake fails to read it: {type(e).__name__}: {str(e)[:160]}"))
             continue
         try:
-            types = {c.upper(): ty for c, ty, *_ in duck.execute(f"describe {mine}").fetchall()}
+            if not types:
+                types = {c.upper(): ty for c, ty, *_ in duck.execute(f"describe {mine}").fetchall()}
             note, order_only = "", False
-            if theirs is None:  # zero rows
-                theirs_n, a, b = 0, duck.execute(f"select count(*) from {mine}").fetchone()[0], 0
+            if not theirs_n:  # zero rows
+                a, b = duck.execute(f"select count(*) from {mine}").fetchone()[0], 0
             else:
-                duck.register("_theirs", theirs)
                 # compare in the emulator's types, so NUMBER(38,0) vs BIGINT is not a difference
-                missing = set(types) ^ {c.upper() for c in theirs.column_names}
+                missing = set(types) ^ {c.upper() for c in names}
                 if missing:
-                    out.append(Parity(node["name"], 0, theirs.num_rows, 0, 0, f"columns differ: {sorted(missing)}"))
+                    out.append(Parity(node["name"], 0, theirs_n, 0, 0, f"columns differ: {sorted(missing)}"))
                     continue
-                theirs_n = theirs.num_rows
-                source = mine
+                # (JSON is compared by content: key order and 1 vs 1.0 are not differences)
                 documents = [c for c, ty in types.items() if ty == "JSON"]
-                if documents:  # compare JSON by content: key order and 1 vs 1.0 are not differences
-                    duck.register("_theirs", _canonical_columns(theirs, documents))
-                    cols = ", ".join(f'"{c}"::varchar as "{c}"' if c in documents else f'"{c}"' for c in types)
-                    duck.register("_mine", _canonical_columns(duck.execute(f"select {cols} from {mine}").to_arrow_table(), documents))
-                    source = "_mine"
-                both = (f"with t as (select {', '.join(_comparable(c, ty, 'theirs') for c, ty in types.items())} from _theirs), "
-                        f"m as (select {', '.join(_comparable(c, ty, 'mine') for c, ty in types.items())} from {source}) ")
-                a, b = duck.execute(both + """
-                    select (select count(*) from (select * from m except all select * from t)),
-                           (select count(*) from (select * from t except all select * from m))""").fetchone()
+                both = pair(types)
+                a, b = duck.execute(both + counted).fetchone()
                 note = ""
                 if (a or b) and documents:  # the same rows once array elements are sorted: only the order differs
-                    plain = duck.execute(f"select {cols} from {mine}").to_arrow_table()
-                    duck.register("_theirs", _canonical_columns(theirs, documents, unordered=True))
-                    duck.register("_mine", _canonical_columns(plain, documents, unordered=True))
-                    a2, b2 = duck.execute(both + """
-                        select (select count(*) from (select * from m except all select * from t)),
-                               (select count(*) from (select * from t except all select * from m))""").fetchone()
-                    duck.register("_theirs", _canonical_columns(theirs, documents))
-                    duck.register("_mine", _canonical_columns(plain, documents))
+                    a2, b2 = duck.execute(pair(types, unordered=True) + counted).fetchone()
                     if not a2 and not b2:
                         order_only = True
                 if a or b:
@@ -221,16 +234,9 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
                     note = "differ in " + "; ".join(differing[:6]) if differing else ""
                     if clocks:  # the rows compared without them
                         rest = {c: ty for c, ty in types.items() if c not in clocks}
-                        if rest:
-                            both = (f"with t as (select {', '.join(_comparable(c, ty, 'theirs') for c, ty in rest.items())} from _theirs), "
-                                    f"m as (select {', '.join(_comparable(c, ty, 'mine') for c, ty in rest.items())} from {source}) ")
-                            a, b = duck.execute(both + """
-                                select (select count(*) from (select * from m except all select * from t)),
-                                       (select count(*) from (select * from t except all select * from m))""").fetchone()
-                        else:
-                            a = b = 0
+                        a, b = duck.execute(pair(rest) + counted).fetchone() if rest else (0, 0)
             mine_n = duck.execute(f"select count(*) from {mine}").fetchone()[0]
-            out.append(Parity(node["name"], mine_n, theirs_n, a, b, note if theirs is not None and (a or b) else "", order_only=order_only))
+            out.append(Parity(node["name"], mine_n, theirs_n, a, b, note if theirs_n and (a or b) else "", order_only=order_only))
         except Exception as e:  # noqa: BLE001
             out.append(Parity(node["name"], 0, 0, 0, 0, f"{type(e).__name__}: {str(e)[:160]}"))
     return out
