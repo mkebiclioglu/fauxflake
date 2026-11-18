@@ -188,6 +188,29 @@ difference in the output comes from the code change:
 
 The output is Markdown, ready to post on the pull request.
 
+### parity: the same project on the emulator and on Snowflake
+
+```
+$ fauxflake parity --connection prod_readonly_ci --schema ANALYTICS_CI
+...
+DIFF rows          fct_subscriptions
+     emulator=1366 snowflake=1366 only_emulator=12 only_snowflake=12 differ in QUANTITY: emulator '12' snowflake '12.00000'
+DIFF undetermined  int_active_days
+     the order of rows is not determined: 71 tied group(s) in MAX(is_active) OVER (PARTITION BY user_id ORDER BY day ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)
+
+233/259 models built on both engines hold the same rows; 1 difference(s); 9 model(s) whose rows the data does not determine
+```
+
+The generated sources are loaded into a schema of your Snowflake account, the project is built on
+both engines (every node, also after one fails), and every model is compared row for row. Each
+difference names the columns that differ, with a value from each side. Columns that only hold
+when the build ran (`current_timestamp()`) are compared as the clock. A model whose result
+depends on the order of rows that tie (`ROW_NUMBER()`, `LAG`, a `ROWS` frame, `ARRAY_AGG` without
+`WITHIN GROUP`) gives other rows on any engine, Snowflake included; it is reported as
+`undetermined`, with the window, rather than as a difference. `--select` narrows the run;
+`--report diff.json` keeps every difference. It costs credits: run it when you change engines
+or upgrade, not on every pull request.
+
 ### simulate: let time pass
 
 ```
@@ -265,7 +288,8 @@ When the emulator does not know a statement it fails at once with a message that
 Everything here was run; the commands are in this repo.
 
 **1. Answers recorded from Snowflake.** [`conformance/cases.yml`](conformance/cases.yml) holds
-309 small queries. `fauxflake conformance --connection <name>` runs them on real Snowflake
+805 small queries, among them one call of each signature of Snowflake's built-in functions;
+38 are marked as known gaps (`BINARY` arguments to text functions, XML, sketch internals). `fauxflake conformance --connection <name>` runs them on real Snowflake
 and stores the answers; CI replays them against the emulator with no Snowflake access. A case
 that stops matching fails CI.
 
