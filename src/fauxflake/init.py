@@ -1829,6 +1829,10 @@ def guess(column: str, hint: str | None) -> dict:
         digits = re.search(r"\((\d+)\s*,\s*0\)", h)
         top = min(1000, 10 ** int(digits.group(1)) - 1) if digits else 1000
         return {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1 if top > 1 else 0, top]}
+    if not h and c in ("DBT_VALID_FROM", "DBT_UPDATED_AT"):
+        return {"gen": "time_offset", **WEEK}  # the columns a dbt snapshot writes: a snapshot kept as a source
+    if not h and c == "DBT_VALID_TO":
+        return {"gen": "time_offset", "p": [0, 0.5, 1], "seconds": [8 * 86400, 30 * 86400, 365 * 86400], "null_rate": 0.8}
     c = re.sub(r"__P?C$", "", c)  # Salesforce's suffix for a custom field: the name before it says what it holds
     if h == "BOOLEAN" or (not h and (re.match(r"^(IS|HAS|WAS)_", c) or c in _FLAGS)):
         # most rows are not deleted, archived or test data, and most are active: a filter on either flag keeps
