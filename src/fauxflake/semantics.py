@@ -1957,6 +1957,74 @@ def coerce_union_literals(transformed: exp.Expression, conn) -> exp.Expression: 
     return transformed
 
 
+_NUMERIC_KINDS = ("TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT",
+                  "DOUBLE", "FLOAT", "DECIMAL")
+
+
+def mixed_kinds(transformed: exp.Expression, conn) -> exp.Expression:  # noqa: ANN001
+    """`coalesce(licensed_seats, quantity)` with the one text and the other a number: Snowflake takes the number's
+    type, and text that is not a number is an error. DuckDB takes text, and the value goes on as it is. The same for
+    a date or a timestamp beside text (the text is read as one), and the other way round for a boolean beside text
+    (Snowflake keeps the text). Asked of DuckDB one SELECT at a time; text literals are left alone, as DuckDB already
+    reads them as the other type (and a branch that is never taken must not fail)."""
+    by_select: dict[int, tuple[exp.Select, list[list[exp.Expression]]]] = {}
+    for node in transformed.find_all(exp.Coalesce, exp.Case, exp.If, exp.Greatest, exp.Least):
+        select = node.find_ancestor(exp.Select)
+        if isinstance(node, exp.Case):
+            args = [i.args.get("true") for i in node.args.get("ifs") or []] + [node.args.get("default")]
+        elif isinstance(node, exp.If):
+            if isinstance(node.parent, exp.Case):
+                continue
+            args = [node.args.get("true"), node.args.get("false")]
+        else:
+            args = [node.this, *node.expressions]
+        args = [a for a in args if a is not None and not isinstance(a, exp.Null)]
+        if any(isinstance(a, exp.Literal) and a.is_string for a in args) and any(isinstance(a, exp.Boolean) for a in args):
+            for a in args:  # coalesce('x', false): text, as in Snowflake (DuckDB would read 'x' as a boolean)
+                if isinstance(a, exp.Boolean):
+                    a.replace(exp.Literal.string("true" if a.this else "false"))
+            continue
+        if select is None or select.args.get("from_") is None or len(args) < 2 or not any(a.find(exp.Column) for a in args):
+            continue
+        by_select.setdefault(id(select), (select, []))[1].append(args)
+    for select, calls in by_select.values():
+        flat = [a for args in calls for a in args]
+        probe = exp.Select(expressions=[exp.alias_(a.copy(), f"_k{i}") for i, a in enumerate(flat)])
+        probe.set("from_", select.args["from_"].copy())
+        if select.args.get("joins"):
+            probe.set("joins", [j.copy() for j in select.args["joins"]])
+        try:
+            kinds = [str(row[1]).upper() for row in conn.execute("describe " + _cte_prefix(select) + probe.sql(dialect="duckdb")).fetchall()]
+        except Exception:  # noqa: BLE001, S112 - binds only in its place: left as it is
+            continue
+        if len(kinds) != len(flat):
+            continue
+        at = 0
+        for args in calls:
+            mine, at = kinds[at:at + len(args)], at + len(args)
+            if "VARCHAR" not in mine or "JSON" in mine:
+                continue
+            numbers = [k for k in mine if k.startswith(_NUMERIC_KINDS)]
+            times = [k for k in mine if k.startswith("TIMESTAMP")]
+            if numbers:
+                target = "DOUBLE" if any(k.startswith(("DOUBLE", "FLOAT")) for k in numbers) else "DECIMAL(38, 5)"
+            elif times:
+                target = times[0]
+            elif "DATE" in mine:
+                target = "DATE"
+            elif "BOOLEAN" in mine:
+                for arg, kind in zip(args, mine):
+                    if kind == "BOOLEAN" and not isinstance(arg, exp.Boolean):
+                        arg.replace(exp.cast(arg.copy(), "varchar"))
+                continue
+            else:
+                continue
+            for arg, kind in zip(args, mine):
+                if kind == "VARCHAR" and not (isinstance(arg, exp.Literal) and arg.is_string):
+                    arg.replace(exp.cast(arg.copy(), target))
+    return transformed
+
+
 def text_beside_variant(transformed: exp.Expression, conn) -> exp.Expression | None:  # noqa: ANN001
     """`select * from a union all select * from b` where a column is a VARIANT in one branch and text in
     another: Snowflake keeps the text as a VARIANT string. DuckDB parses it as JSON and stops at the first

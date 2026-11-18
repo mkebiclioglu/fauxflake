@@ -5371,6 +5371,169 @@
    ]
   ]
  },
+ "mixed_kinds_1": {
+  "rows": [
+   [
+    "5"
+   ]
+  ]
+ },
+ "mixed_kinds_10": {
+  "rows": [
+   [
+    "5"
+   ]
+  ]
+ },
+ "mixed_kinds_11": {
+  "error": "100038 (22018): Numeric value 'x' is not recognized"
+ },
+ "mixed_kinds_12": {
+  "rows": [
+   [
+    "10"
+   ]
+  ]
+ },
+ "mixed_kinds_13": {
+  "rows": [
+   [
+    "a"
+   ]
+  ]
+ },
+ "mixed_kinds_14": {
+  "error": "100038 (22018): Numeric value 'x' is not recognized"
+ },
+ "mixed_kinds_15": {
+  "rows": [
+   [
+    "7"
+   ]
+  ]
+ },
+ "mixed_kinds_16": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "mixed_kinds_17": {
+  "rows": [
+   [
+    true
+   ]
+  ]
+ },
+ "mixed_kinds_18": {
+  "error": "100038 (22018): Numeric value 'x' is not recognized"
+ },
+ "mixed_kinds_19": {
+  "rows": [
+   [
+    "6"
+   ]
+  ]
+ },
+ "mixed_kinds_2": {
+  "rows": [
+   [
+    "2024-01-01"
+   ]
+  ]
+ },
+ "mixed_kinds_20": {
+  "error": "100038 (22018): Numeric value 'x' is not recognized"
+ },
+ "mixed_kinds_21": {
+  "rows": [
+   [
+    true
+   ]
+  ]
+ },
+ "mixed_kinds_22": {
+  "rows": [
+   [
+    true
+   ]
+  ]
+ },
+ "mixed_kinds_23": {
+  "error": "100038 (22018): Numeric value 'x' is not recognized"
+ },
+ "mixed_kinds_24": {
+  "error": "100038 (22018): Numeric value 'x' is not recognized"
+ },
+ "mixed_kinds_25": {
+  "rows": [
+   [
+    "5"
+   ]
+  ]
+ },
+ "mixed_kinds_26": {
+  "rows": [
+   [
+    "7"
+   ]
+  ]
+ },
+ "mixed_kinds_27": {
+  "error": "100038 (22018): Numeric value 'x' is not recognized"
+ },
+ "mixed_kinds_28": {
+  "rows": [
+   [
+    "5"
+   ],
+   [
+    "5"
+   ]
+  ]
+ },
+ "mixed_kinds_3": {
+  "rows": [
+   [
+    "2024-01-02"
+   ]
+  ]
+ },
+ "mixed_kinds_4": {
+  "error": "100040 (22007): Date 'x' is not recognized"
+ },
+ "mixed_kinds_5": {
+  "rows": [
+   [
+    "2024-01-02 10:00:00.000"
+   ]
+  ]
+ },
+ "mixed_kinds_6": {
+  "rows": [
+   [
+    "true"
+   ]
+  ]
+ },
+ "mixed_kinds_7": {
+  "rows": [
+   [
+    "x"
+   ]
+  ]
+ },
+ "mixed_kinds_8": {
+  "error": "001038 (22023): SQL compilation error:"
+ },
+ "mixed_kinds_9": {
+  "rows": [
+   [
+    "5"
+   ]
+  ]
+ },
  "month_spine": {
   "rows": [
    [

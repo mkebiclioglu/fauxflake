@@ -726,3 +726,33 @@
 - {id: try_input_16, sql: "select try_cast(5 as varchar)"}
 - {id: try_input_17, sql: "select try_cast('2024-01-01'::timestamp as date)"}
 - {id: try_input_18, sql: "select try_cast(5 as number)"}
+
+# What an expression mixing text with a number, a date, a timestamp or a boolean gives (measured on Snowflake).
+- {id: mixed_kinds_1, sql: "select coalesce('5', 5)"}
+- {id: mixed_kinds_2, sql: "select coalesce(null::varchar, '2024-01-01'::date)"}
+- {id: mixed_kinds_3, sql: "select coalesce('2024-01-02', '2024-01-01'::date)"}
+- {id: mixed_kinds_4, sql: "select coalesce('x', '2024-01-01'::date)"}
+- {id: mixed_kinds_5, sql: "select coalesce('2024-01-02 10:00', '2024-01-01'::timestamp)"}
+- {id: mixed_kinds_6, sql: "select coalesce('true', false)"}
+- {id: mixed_kinds_7, sql: "select coalesce('x', false)"}
+- {id: mixed_kinds_8, sql: "select coalesce(5, '2024-01-01'::date)"}
+- {id: mixed_kinds_9, sql: "select iff(false, 'x', 5)"}
+- {id: mixed_kinds_10, sql: "select case when false then 'x' else 5 end"}
+- {id: mixed_kinds_11, sql: "select decode(1, 1, 'x', 5)"}
+- {id: mixed_kinds_12, sql: "select greatest('10', 9)"}
+- {id: mixed_kinds_13, sql: "select least('a', 'b')"}
+- {id: mixed_kinds_14, sql: "select nvl2(1, 'x', 5)"}
+- {id: mixed_kinds_15, sql: "select ifnull('7', 5)"}
+- {id: mixed_kinds_16, sql: "select nullif('5', 5)"}
+- {id: mixed_kinds_17, sql: "select '5' = 5"}
+- {id: mixed_kinds_18, sql: "select 'x' = 5"}
+- {id: mixed_kinds_19, sql: "select '5' + 1"}
+- {id: mixed_kinds_20, sql: "select 'x' + 1"}
+- {id: mixed_kinds_21, sql: "select '5' > 4"}
+- {id: mixed_kinds_22, sql: "select 5 in ('5', 'x')"}
+- {id: mixed_kinds_23, sql: "select 'x' in (5)"}
+- {id: mixed_kinds_24, sql: "select coalesce(v, 5) from (select 'x' as v)"}
+- {id: mixed_kinds_25, sql: "select coalesce(v, n) from (select null::varchar as v, 5 as n)"}
+- {id: mixed_kinds_26, sql: "select case when n > 1 then v else n end from (select '7' as v, 2 as n)"}
+- {id: mixed_kinds_27, sql: "select 'x' as v union all select 5"}
+- {id: mixed_kinds_28, sql: "select '5' as v union all select 5"}
