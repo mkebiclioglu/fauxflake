@@ -3972,20 +3972,26 @@ class Fitter:
         for table, spec in fresh.spec["tables"].items():
             # rules about the rows that the built SQL states (a list empty, a column null, unless something holds of the
             # row): they say when a column has a value, whatever generates the value
-            mine = self.tables.get(table, {}).get("columns") or {}
             for col, gen in spec["columns"].items():
-                held = mine.get(col)
                 for rule in ("empty_unless", "null_unless"):
-                    if held is None or not gen.get(rule) or held.get(rule) or (table, col, rule) in gave:
+                    if not gen.get(rule):
                         continue
-                    if rule == "empty_unless" and held.get("gen") != "array":
-                        continue
-                    if init.rule_binds(str(gen[rule]), col, mine):
-                        held[rule] = gave[(table, col, rule)] = gen[rule]
-                        if rule == "empty_unless":
-                            held.pop("null_rate", None)
-                        changed += 1
-                        self.retyped.add(table)
+                    # (a list empty unless...: said of one table of a schema that holds one table per kind of event,
+                    # it holds in the others with the same columns, which the reading may not have taken for lists yet)
+                    for other in [table, *(t for t in self.tables if rule == "empty_unless" and t != table
+                                           and t.rsplit(".", 1)[0] == table.rsplit(".", 1)[0])]:
+                        mine = self.tables.get(other, {}).get("columns") or {}
+                        held = mine.get(col)
+                        if held is None or held.get(rule) or (other, col, rule) in gave or held.get("gen") in ("sequence", "hash_id"):
+                            continue
+                        if rule == "empty_unless" and held.get("gen") != "array":
+                            continue
+                        if init.rule_binds(str(gen[rule]), col, mine):
+                            held[rule] = gave[(other, col, rule)] = gen[rule]
+                            if rule == "empty_unless":
+                                held.pop("null_rate", None)
+                            changed += 1
+                            self.retyped.add(other)
         if changed:
             self.dirty = True
             self.learned.append(f"read the project again with the SQL the build compiled: {changed} column(s) and field(s) "
