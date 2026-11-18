@@ -95,3 +95,14 @@ def test_a_statement_is_stopped_while_there_is_still_room_on_the_disk(monkeypatc
         with pytest.raises(ProgrammingError, match="the disk is nearly full"):
             cur.execute("select count(*) from range(3000000) a, range(3000000) b where a.range + b.range = -1")
         assert cur.execute("select 2").fetchall() == [(2,)]  # and the session carries on
+
+
+def test_a_result_beyond_a_signed_64_bit_integer_comes_back_as_a_number():
+    import snowflake.connector
+
+    from fauxflake.emulator import serve
+
+    with serve() as emu:
+        conn = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S"))
+        assert conn.cursor().execute("select md5_number_lower64('abc'), md5_number_upper64('abc')").fetchall() == [
+            (15462616177412505458, 10376663631224000432)]

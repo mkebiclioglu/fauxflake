@@ -1161,6 +1161,7 @@ def engine() -> Iterator[Emulator]:
 
     _patch_fakesnow()
     fs = FakeSnow(nop_regexes=NOPS)
+    semantics.python_functions(fs.duck_conn)
     for macro in semantics.MACROS:
         fs.duck_conn.execute(macro)
     semantics.reserved_words(fs.duck_conn)
@@ -1209,6 +1210,7 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
         for stale in [*Path(db_path).glob("*.db"), *Path(db_path).glob("*.db.wal"), *Path(db_path).glob(objects.FUNCTIONS_FILE)]:
             stale.unlink()  # every run starts from an empty warehouse
     fs = FakeSnow(db_path=db_path, nop_regexes=NOPS)
+    semantics.python_functions(fs.duck_conn)
     for macro in semantics.MACROS:
         fs.duck_conn.execute(macro)
     semantics.reserved_words(fs.duck_conn)

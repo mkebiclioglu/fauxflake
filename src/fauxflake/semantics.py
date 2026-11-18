@@ -17,6 +17,22 @@ from . import catalog
 _NS = "_fs_global.main."
 _SCALE = r"coalesce(try_cast(nullif(regexp_extract(typeof(a), ',(\d+)\)', 1), '') as integer), 0)"
 
+def python_functions(duck) -> None:  # noqa: ANN001
+    """What DuckDB has no function for and SQL cannot say: registered once, before the macros that call them."""
+    import hashlib
+
+    def sha2(text: str | None, bits: int | None) -> str | None:
+        if text is None or bits not in (224, 256, 384, 512):
+            return None
+        return hashlib.new(f"sha{bits}", text.encode()).hexdigest()
+
+    try:
+        duck.create_function("_fxpy_sha2", sha2, ["VARCHAR", "INTEGER"], "VARCHAR", null_handling="special")
+    except Exception:  # noqa: BLE001, S110 - registered already on this connection
+        pass
+    duck.execute(f"create or replace macro {_NS}_fx_sha2(x, n) as _fxpy_sha2(x, n)")
+
+
 MACROS = [
     # NUMBER / NUMBER keeps max(s, min(s + 6, 12)) decimals and raises on zero.
     # DuckDB returns a full-precision double, and NULL on zero. The failing cast raises without
@@ -81,6 +97,17 @@ MACROS = [
     f"""create or replace macro {_NS}_sf_array_size
           (x json) as case when json_type(x) = 'ARRAY' then json_array_length(x) end,
           (x) as len(x)""",
+    f"""create or replace macro {_NS}_sf_arrays_to_object(k, v) as
+          to_json(map(from_json(k::json, '["VARCHAR"]'), from_json(v::json, '["JSON"]')))""",
+    f"""create or replace macro {_NS}_sf_arrays_zip
+          (a, b) as to_json(list_transform(range(greatest(json_array_length(a::json), json_array_length(b::json))::bigint), lambda i:
+             json_object('$1', a::json -> i::integer, '$2', b::json -> i::integer))),
+          (a, b, c) as to_json(list_transform(range(greatest(json_array_length(a::json), json_array_length(b::json), json_array_length(c::json))::bigint), lambda i:
+             json_object('$1', a::json -> i::integer, '$2', b::json -> i::integer, '$3', c::json -> i::integer)))""",
+    f"create or replace macro {_NS}_sf_try_base64_binary(x) as try(from_base64(x::varchar))",
+    f"create or replace macro {_NS}_sf_md5_lower64(x) as ('0x' || right(md5(x::varchar), 16))::ubigint::decimal(38, 0)",
+    f"create or replace macro {_NS}_sf_md5_upper64(x) as ('0x' || left(md5(x::varchar), 16))::ubigint::decimal(38, 0)",
+    f"create or replace macro {_NS}_sf_array_union_agg(x) as to_json(list_distinct(flatten(list(from_json(x::json, '[\"JSON\"]')))))",
     f"create or replace macro {_NS}_sf_negate(x) as -x",
     f"create or replace macro {_NS}_sf_bitcount(x) as bit_count(x::bigint)",
     f"create or replace macro {_NS}_sf_getbit(x, p) as (x::bigint >> p::integer) & 1",
@@ -239,8 +266,15 @@ MACROS = [
       for name, kind in {"date": "date", "time": "time", "timestamp_ntz": "timestamp", "timestamp_ltz": "timestamp", "timestamp_tz": "timestamp"}.items()],
     *[f"create or replace macro {_NS}_sf_as_{name}(v) as try_cast((v::json ->> '$') as {kind})"
       for name, kind in {"date": "date", "time": "time", "timestamp_ntz": "timestamp", "timestamp_ltz": "timestamp", "timestamp_tz": "timestamp"}.items()],
-    *[f"create or replace macro {_NS}_sf_as_{name}(v) as case when json_type(v::varchar) in ('UBIGINT', 'BIGINT', 'DOUBLE') then v::double end"
+    *[f"""create or replace macro {_NS}_sf_as_{name}
+            (v) as case when json_type(v::varchar) in ('UBIGINT', 'BIGINT', 'DOUBLE') then v::double end,
+            (v, p) as case when json_type(v::varchar) in ('UBIGINT', 'BIGINT', 'DOUBLE') then round(v::double, 0) end,
+            (v, p, s) as case when json_type(v::varchar) in ('UBIGINT', 'BIGINT', 'DOUBLE') then round(v::double, s::integer) end"""
       for name in ("double", "real", "number", "decimal")],
+    f"""create or replace macro {_NS}_sf_sha2
+          (x) as sha256(x::varchar),
+          (x, n) as case when n = 256 then sha256(x::varchar) else {_NS}_fx_sha2(x::varchar, n::integer) end""",
+    f"create or replace macro {_NS}_sf_sha2_binary(x) as unhex(sha256(x::varchar))",
     f"create or replace macro {_NS}_sf_as_boolean(v) as case when json_type(v::varchar) = 'BOOLEAN' then v::boolean end",
     f"create or replace macro {_NS}_sf_as_object(v) as case when json_type(v::varchar) = 'OBJECT' then v::json end",
     f"create or replace macro {_NS}_sf_as_array(v) as case when json_type(v::varchar) = 'ARRAY' then v::json end",
@@ -317,6 +351,10 @@ _RENAMED = {  # Snowflake function -> macro, same arguments
     **{f"as_{k}": f"_sf_as_{k}" for k in ("date", "time", "timestamp_ntz", "timestamp_ltz", "timestamp_tz", "double", "real",
                                           "number", "decimal", "boolean", "object", "array")}, "upper": "_sf_upper", "ucase": "_sf_upper",
     "as_integer": "_sf_as_integer", "as_varchar": "_sf_as_varchar", "as_char": "_sf_as_varchar",
+    "arrays_to_object": "_sf_arrays_to_object", "arrays_zip": "_sf_arrays_zip", "try_base64_decode_binary": "_sf_try_base64_binary",
+    "md5_number_lower64": "_sf_md5_lower64", "md5_number_upper64": "_sf_md5_upper64",
+    "m_d5_number_lower64": "_sf_md5_lower64", "m_d5_number_upper64": "_sf_md5_upper64",
+    "sha2_hex": "_sf_sha2", "sha2_binary": "_sf_sha2_binary", "array_union_agg": "_sf_array_union_agg",
     "negate": "_sf_negate", "bitcount": "_sf_bitcount", "getbit": "_sf_getbit", "array_repeat": "_sf_array_repeat",
     "binary_as_string": "_sf_binary_as_string", "string_as_binary": "_sf_string_as_binary", "jaccard_similarity": "_sf_jaccard",
     "approximate_count_distinct": "_sf_approx_count", "hll": "_sf_approx_count", "soundex_p123": "_sf_soundex",
@@ -780,6 +818,8 @@ def _fix(node: exp.Expression) -> exp.Expression:
         renamed = next((_RENAMED[n.lower()] for n in type(node).sql_names() if n.lower() in _RENAMED), None)
         if renamed:
             return _fn(renamed, *_func_args(node))
+    if isinstance(node, exp.SHA2) and isinstance(node.args.get("length"), exp.Literal) and node.args["length"].name not in ("256", ""):
+        return _fn("_sf_sha2", node.this, node.args["length"])  # sha2(x, 512): DuckDB has 256 only
     if isinstance(node, exp.Anonymous) and isinstance(node.this, str) and node.name.lower() in _RENAMED:
         return _fn(_RENAMED[node.name.lower()], *node.expressions)  # (a function sqlglot has no class for)
     if isinstance(node, exp.Anonymous) and isinstance(node.this, str) and node.name.lower() == "like_any" and len(node.expressions) >= 2:
@@ -1344,8 +1384,9 @@ def rewrite(node: exp.Expression) -> exp.Expression:
 
 
 _AS_BIGINT = {"TINYINT", "SMALLINT", "UTINYINT", "USMALLINT", "UINTEGER"}
-_SUPPORTED = {"BIGINT", "BLOB", "BOOLEAN", "DATE", "DOUBLE", "HUGEINT", "INTEGER", "JSON", "TIME", "TIMESTAMP",
-              "TIMESTAMP WITH TIME ZONE", "TIMESTAMP_NS", "UBIGINT", "VARCHAR", '"NULL"'}
+_SUPPORTED = {"BIGINT", "BLOB", "BOOLEAN", "DATE", "DOUBLE", "INTEGER", "JSON", "TIME", "TIMESTAMP",
+              "TIMESTAMP WITH TIME ZONE", "TIMESTAMP_NS", "VARCHAR", '"NULL"'}
+_AS_NUMBER = {"UBIGINT", "HUGEINT", "UHUGEINT"}  # beyond a signed 64-bit integer: Snowflake's NUMBER(38,0)
 
 
 def coerce_result(cursor) -> None:  # noqa: ANN001
@@ -1364,6 +1405,8 @@ def coerce_result(cursor) -> None:  # noqa: ANN001
             casts.append(f"to_json(_c{i})::JSON as {alias}")
         elif kind in _AS_BIGINT:
             casts.append(f"_c{i}::BIGINT as {alias}")
+        elif kind in _AS_NUMBER:
+            casts.append(f"_c{i}::DECIMAL(38, 0) as {alias}")
         elif kind == "FLOAT":
             casts.append(f"_c{i}::DOUBLE as {alias}")
         else:
