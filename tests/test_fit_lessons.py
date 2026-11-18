@@ -51,6 +51,17 @@ def test_columns_compared_with_text_are_text():
     assert Fitter._columns_used(fallback, "literal", "none") == ["KIND"]
 
 
+def test_a_number_is_not_followed_into_what_gives_back_text():
+    from fauxflake.fit import _number_flow
+
+    flow = lambda sql: [c.name for c in _number_flow(parse(sql).expressions[0].this)]  # noqa: E731
+    # `coalesce(nullif(id, ''), ip_address) as id`: an id that can be empty, so text, whatever another model's `id` is
+    assert flow("select coalesce(nullif(id, ''), ip_address) as id") == []
+    assert flow("select case when x then name else 'unknown' end as n") == []
+    assert flow("select coalesce(amount, '0') * rate as a") == ["amount", "rate"]
+    assert flow("select sum(nullif(amount, '')::float) as a") == ["amount"]  # (still a number, held as text)
+
+
 def test_every_column_a_model_reads_from_a_table_is_found_at_once():
     tree = parse("""
         with m as (select user_id, max(ts) as mx from "RAW".a.cfg group by 1)

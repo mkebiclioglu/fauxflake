@@ -135,6 +135,23 @@ def _value_flow(node: exp.Expression | None, depth: int = 0) -> list[exp.Column]
     return []
 
 
+def _said_text(node: exp.Expression | None) -> bool:
+    """Text by how it is written: a text literal, or `nullif(x, '')` (a value that can be empty)."""
+    while isinstance(node, exp.Paren):
+        node = node.this
+    if isinstance(node, exp.Nullif):
+        node = node.expression
+    return isinstance(node, exp.Literal) and node.is_string and not re.fullmatch(r"\s*-?\d+(\.\d+)?\s*", node.name)
+
+
+def _given_back(node: exp.Expression) -> list[exp.Expression]:
+    if isinstance(node, exp.Coalesce):
+        return [node.this, *node.expressions]
+    if isinstance(node, exp.If):
+        return [v for v in (node.args.get("true"), node.args.get("false")) if v is not None]
+    return [v for v in [b.args.get("true") for b in node.args.get("ifs") or []] + [node.args.get("default")] if v is not None]
+
+
 def _number_flow(node: exp.Expression, depth: int = 0) -> list[exp.Column]:
     """The columns whose values make up a number written as `node`: the operands of a product or a quotient, what
     COALESCE, IFF and CASE give back (not what they test), the argument of SUM, MAX, ROUND and their kind. Not the
@@ -143,6 +160,8 @@ def _number_flow(node: exp.Expression, depth: int = 0) -> list[exp.Column]:
         return []
     if isinstance(node, exp.Column):
         return [node]
+    if isinstance(node, (exp.Coalesce, exp.If, exp.Case)) and any(_said_text(v) for v in _given_back(node)):
+        return []  # `coalesce(nullif(id, ''), ip_address)`: what it gives back is text
     if isinstance(node, (exp.Mul, exp.Div)):
         return _number_flow(node.this, depth + 1) + _number_flow(node.expression, depth + 1)
     if isinstance(node, exp.Coalesce):
