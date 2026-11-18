@@ -64,3 +64,16 @@ def test_a_statement_adjusted_once_is_adjusted_the_same_way_while_the_types_it_r
         assert asked(lambda: cur.execute(query).fetchall()) == 0  # not asked again
         cur.execute("create or replace table D.S.T as select 1 as a, '1' as v")
         assert asked(lambda: cur.execute(query).fetchall()) == 1  # the types changed: asked again
+
+
+def test_nullif_and_in_with_an_empty_string_take_a_variant_column_by_its_value():
+    from fauxflake.emulator import serve
+
+    with serve() as emu:
+        conn = emu._fs.connect(database="D", schema="S")
+        cur = conn.cursor()
+        cur.execute("create database if not exists D")
+        cur.execute("create schema if not exists D.S")
+        cur.execute("""create or replace table D.S.T as select parse_json('{"a":"x"}'):a as j, parse_json('""') as e, 'k' as t, '' as u""")
+        assert cur.execute("select nullif(j, ''), nullif(e, ''), nullif(t, ''), nullif(u, '') from D.S.T").fetchall() == [('"x"', None, "k", None)]
+        assert cur.execute("select j in ('', 'x'), e in ('', 'x'), t in ('', 'q') from D.S.T").fetchall() == [(True, True, False)]

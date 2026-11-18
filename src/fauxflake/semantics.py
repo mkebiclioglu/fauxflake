@@ -740,6 +740,13 @@ def _fix(node: exp.Expression) -> exp.Expression:
         if (isinstance(left, exp.Column) or isinstance(right, exp.Column)) and not skip and not asof:
             same = _fn("_sf_eq", node.this, node.expression)
             return same if isinstance(node, exp.EQ) else exp.Not(this=same)
+    if isinstance(node, exp.Nullif) and isinstance(node.this, exp.Column) and isinstance(node.expression, exp.Literal) \
+            and node.expression.is_string and node.find_ancestor(exp.Select) is not None:
+        # nullif(col, ''): a VARIANT column is compared by its value (DuckDB would read the '' as a JSON document)
+        return exp.Case(ifs=[exp.If(this=_fn("_sf_eq", node.this.copy(), node.expression.copy()), true=exp.Null())], default=node.this.copy())
+    if isinstance(node, exp.In) and isinstance(node.this, exp.Column) and node.expressions and not node.args.get("query") \
+            and all(isinstance(e, exp.Literal) and e.is_string for e in node.expressions) and any(e.name == "" for e in node.expressions):
+        node.set("this", _fn("_sf_text", node.this))  # col in ('', 'x'): by its text, whatever the column holds
     if isinstance(node, _COMPARISONS) or isinstance(node, exp.In):
         other = node.expression if isinstance(node, _COMPARISONS) else (node.expressions[0] if node.expressions else None)
         if isinstance(node.this, _VARIANT_ACCESS) and isinstance(other, exp.Literal) and other.is_string:
