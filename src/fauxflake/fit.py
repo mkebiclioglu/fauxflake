@@ -3969,6 +3969,23 @@ class Fitter:
                         held["gen"] = "hash_id"
                     changed += 1
                     self.retyped.add(table)
+        for table, spec in fresh.spec["tables"].items():
+            # rules about the rows that the built SQL states (a list empty, a column null, unless something holds of the
+            # row): they say when a column has a value, whatever generates the value
+            mine = self.tables.get(table, {}).get("columns") or {}
+            for col, gen in spec["columns"].items():
+                held = mine.get(col)
+                for rule in ("empty_unless", "null_unless"):
+                    if held is None or not gen.get(rule) or held.get(rule) or (table, col, rule) in gave:
+                        continue
+                    if rule == "empty_unless" and held.get("gen") != "array":
+                        continue
+                    if init.rule_binds(str(gen[rule]), col, mine):
+                        held[rule] = gave[(table, col, rule)] = gen[rule]
+                        if rule == "empty_unless":
+                            held.pop("null_rate", None)
+                        changed += 1
+                        self.retyped.add(table)
         if changed:
             self.dirty = True
             self.learned.append(f"read the project again with the SQL the build compiled: {changed} column(s) and field(s) "
