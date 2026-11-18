@@ -93,6 +93,7 @@ class Parity:
     only_emulator: int
     only_snowflake: int
     note: str = ""
+    undetermined: str = ""  # why the rows are not determined by the data (ties in an ordered window), when they are not
 
     @property
     def ok(self) -> bool:
@@ -238,7 +239,7 @@ def outcomes(project: DbtProject) -> dict[str, tuple[str, str, object]]:
 @dataclass
 class Difference:
     node: str
-    kind: str  # emulator_only_error | snowflake_only_error | test_result | rows
+    kind: str  # emulator_only_error | snowflake_only_error | test_result | rows | undetermined
     detail: str
 
 
@@ -258,10 +259,88 @@ def differences(local: dict, remote: dict, rows: list[Parity]) -> list[Differenc
         elif uid.startswith("test.") and not broke(mine) and (mine[0], mine[2]) != (theirs[0], theirs[2]):
             out.append(Difference(uid, "test_result", f"emulator {mine[0]} ({mine[2]}), snowflake {theirs[0]} ({theirs[2]})"))
     for r in rows:
-        if not r.ok:
+        if not r.ok and r.undetermined:
+            out.append(Difference(r.model, "undetermined", r.undetermined))
+        elif not r.ok:
             out.append(Difference(r.model, "rows", f"emulator={r.emulator_rows} snowflake={r.snowflake_rows} "
                                                     f"only_emulator={r.only_emulator} only_snowflake={r.only_snowflake} {r.note}"))
     return out
+
+
+def _ties(conn, sql: str) -> str | None:  # noqa: ANN001
+    """A window in the model whose result hangs on the order of rows that tie on its PARTITION BY and ORDER BY
+    (ROW_NUMBER, LAG, FIRST_VALUE, a ROWS frame...): on such data any engine may give other rows, each run.
+    Counted on Snowflake. None when every such window has distinct keys (or none can be asked about)."""
+    import sqlglot
+    from sqlglot import exp
+
+    try:
+        tree = sqlglot.parse_one(sql, read="snowflake")
+    except Exception:  # noqa: BLE001
+        return None
+    sensitive = (exp.RowNumber, exp.FirstValue, exp.LastValue, exp.NthValue, exp.Lag, exp.Lead)
+    for win in tree.find_all(exp.Window):
+        order, spec = win.args.get("order"), win.args.get("spec")
+        if order is None or not (isinstance(win.this, sensitive) or (spec is not None and str(spec.args.get("kind", "")).lower() == "rows")):
+            continue
+        select = win.find_ancestor(exp.Select)
+        if select is None or select.args.get("group") or select.args.get("from_") is None:
+            continue
+        keys = [p.copy() for p in win.args.get("partition_by") or []] + [o.this.copy() for o in order.expressions]
+        probe = exp.Select(expressions=[exp.alias_(k, f"_t{i}") for i, k in enumerate(keys)])
+        for arg in ("from_", "joins", "where"):
+            if select.args.get(arg) is not None:
+                value = select.args[arg]
+                probe.set(arg, [j.copy() for j in value] if isinstance(value, list) else value.copy())
+        withs, scope = [], select
+        while scope is not None:
+            if scope.args.get("with_") is not None:
+                withs.append(scope.args["with_"])
+            scope = scope.parent
+        ctes = [c.sql(dialect="snowflake") for w in reversed(withs) for c in w.expressions]
+        names = ", ".join(f"_t{i}" for i in range(len(keys)))
+        query = (("with " + ", ".join(ctes) + " ") if ctes else "") + \
+            f"select count(*) from (select 1 from ({probe.sql(dialect='snowflake')}) group by {names} having count(*) > 1)"
+        try:
+            (tied,) = conn.cursor().execute(query).fetchone()
+        except Exception:  # noqa: BLE001, S112 - a window that only binds in its place: not asked
+            continue
+        if tied:
+            return f"{tied} tied group(s) in {' '.join(win.sql(dialect='snowflake').split())[:160]}"
+    return None
+
+
+def undetermined(conn, remote: DbtProject, rows: list[Parity]) -> None:  # noqa: ANN001
+    """Mark each differing model whose rows the data does not determine, or that is built on one that is."""
+    nodes = {n["name"]: n for n in remote.models()}
+    by_id = {n["unique_id"]: n for n in nodes.values()}
+    found: dict[str, str] = {}
+    for r in rows:
+        if not r.ok and r.model in nodes:
+            why = _ties(conn, nodes[r.model].get("compiled_code") or "")
+            if why:
+                found[nodes[r.model]["unique_id"]] = why
+
+    def upstream(uid: str, seen: set[str]) -> str | None:
+        for parent in by_id.get(uid, {}).get("depends_on", {}).get("nodes", []):
+            if parent in seen:
+                continue
+            seen.add(parent)
+            if parent in found:
+                return parent
+            hit = upstream(parent, seen)
+            if hit:
+                return hit
+        return None
+
+    for r in rows:
+        if r.ok or r.model not in nodes:
+            continue
+        uid = nodes[r.model]["unique_id"]
+        if uid in found:
+            r.undetermined = "the order of rows is not determined: " + found[uid]
+        elif (parent := upstream(uid, set())) is not None:
+            r.undetermined = f"built on {by_id[parent]['name']}, whose order of rows is not determined"
 
 
 @contextlib.contextmanager
@@ -348,6 +427,7 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
         from . import emulator
 
         clock = (emulator.FROZEN_NOW, began, ended) if emulator.FROZEN_NOW else None
-        rows = compare(conn, wh.emu, local, only=built, clock=clock)  # (each model where dbt put it: the same schema on both sides)
+        rows = compare(conn, wh.emu, local, only=built, clock=clock)
+        undetermined(conn, remote, rows)  # (each model where dbt put it: the same schema on both sides)
         found = differences(mine, theirs, rows)
     return rows, found

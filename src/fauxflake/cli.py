@@ -267,11 +267,15 @@ def parity(spec_path, project_dir, scale, history, db_path, keep, connection, da
     for d in found:
         click.echo(f"DIFF {d.kind:<20} {d.node}\n     {d.detail[:400]}")
     same = sum(1 for r in rows if r.ok)
-    click.echo(f"\n{same}/{len(rows)} models built on both engines hold the same rows; {len(found)} difference(s)")
+    loose = [d for d in found if d.kind == "undetermined"]
+    found_real = [d for d in found if d.kind != "undetermined"]
+    click.echo(f"\n{same}/{len(rows)} models built on both engines hold the same rows; {len(found_real)} difference(s)"
+               + (f"; {len(loose)} model(s) whose rows the data does not determine (ties in an ordered window: "
+                  "no engine gives the same rows twice)" if loose else ""))
     if report:
         import json as _json
         Path(report).write_text(_json.dumps({"rows": [r.__dict__ for r in rows], "differences": [d.__dict__ for d in found]}, indent=1))
-    sys.exit(0 if not found else 1)
+    sys.exit(0 if not found_real else 1)
 
 
 @main.command()
