@@ -36,3 +36,12 @@ def test_a_window_whose_order_has_ties_is_found():
         assert _ties(conn, tied).startswith("1 tied group(s)")
         assert _ties(conn, "select row_number() over (partition by u order by d, s) from D.S.T") is None  # distinct keys
         assert _ties(conn, "select rank() over (partition by u order by d) from D.S.T") is None  # ties do not matter to RANK
+
+
+def test_arrays_that_differ_only_in_order_and_where_such_order_comes_from():
+    from fauxflake.parity import _canonical, _unordered_aggregate
+
+    assert _canonical('["b","a"]') != _canonical('["a","b"]')
+    assert _canonical('["b","a"]', unordered=True) == _canonical('["a", "b"]', unordered=True)
+    assert _unordered_aggregate("select array_unique_agg(v) over (partition by k) from t") == "ARRAY_UNIQUE_AGG without an order"
+    assert _unordered_aggregate("select array_agg(v) within group (order by v) from t") is None

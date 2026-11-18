@@ -94,6 +94,7 @@ class Parity:
     only_snowflake: int
     note: str = ""
     undetermined: str = ""  # why the rows are not determined by the data (ties in an ordered window), when they are not
+    order_only: bool = False  # the rows are the same once the elements of each array are sorted
 
     @property
     def ok(self) -> bool:
@@ -112,8 +113,9 @@ def _comparable(column: str, kind: str, source: str) -> str:
     return f"{quoted}::{kind} as {quoted}" if source == "theirs" else quoted
 
 
-def _canonical(text: str | None) -> str | None:
-    """JSON as both engines would agree on it: Snowflake stores object keys sorted and prints 1.0."""
+def _canonical(text: str | None, unordered: bool = False) -> str | None:
+    """JSON as both engines would agree on it: Snowflake stores object keys sorted and prints 1.0.
+    `unordered`: arrays with their elements sorted too."""
     import json
 
     def tidy(v):
@@ -122,7 +124,8 @@ def _canonical(text: str | None) -> str | None:
         if isinstance(v, dict):
             return {k: tidy(x) for k, x in v.items()}
         if isinstance(v, list):
-            return [tidy(x) for x in v]
+            items = [tidy(x) for x in v]
+            return sorted(items, key=lambda x: json.dumps(x, sort_keys=True)) if unordered else items
         return v
 
     if text is None:
@@ -133,14 +136,14 @@ def _canonical(text: str | None) -> str | None:
         return text
 
 
-def _canonical_columns(table, columns: list[str]):
+def _canonical_columns(table, columns: list[str], unordered: bool = False):
     """The Arrow table with its JSON columns rewritten as canonical text."""
     import pyarrow as pa
 
     lookup = {name.upper(): name for name in table.column_names}
     for col in columns:
         name = lookup[col]
-        values = [_canonical(None if v is None else str(v)) for v in table.column(name).to_pylist()]
+        values = [_canonical(None if v is None else str(v), unordered) for v in table.column(name).to_pylist()]
         table = table.set_column(table.column_names.index(name), name, pa.array(values, pa.string()))
     return table
 
@@ -167,7 +170,7 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
             continue
         try:
             types = {c.upper(): ty for c, ty, *_ in duck.execute(f"describe {mine}").fetchall()}
-            note = ""
+            note, order_only = "", False
             if theirs is None:  # zero rows
                 theirs_n, a, b = 0, duck.execute(f"select count(*) from {mine}").fetchone()[0], 0
             else:
@@ -191,6 +194,17 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
                     select (select count(*) from (select * from m except all select * from t)),
                            (select count(*) from (select * from t except all select * from m))""").fetchone()
                 note = ""
+                if (a or b) and documents:  # the same rows once array elements are sorted: only the order differs
+                    plain = duck.execute(f"select {cols} from {mine}").to_arrow_table()
+                    duck.register("_theirs", _canonical_columns(theirs, documents, unordered=True))
+                    duck.register("_mine", _canonical_columns(plain, documents, unordered=True))
+                    a2, b2 = duck.execute(both + """
+                        select (select count(*) from (select * from m except all select * from t)),
+                               (select count(*) from (select * from t except all select * from m))""").fetchone()
+                    duck.register("_theirs", _canonical_columns(theirs, documents))
+                    duck.register("_mine", _canonical_columns(plain, documents))
+                    if not a2 and not b2:
+                        order_only = True
                 if a or b:
                     # which columns hold other values, each compared on its own (rows need not line up): one sample each
                     differing, clocks = [], []
@@ -216,7 +230,7 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
                         else:
                             a = b = 0
             mine_n = duck.execute(f"select count(*) from {mine}").fetchone()[0]
-            out.append(Parity(node["name"], mine_n, theirs_n, a, b, note if theirs is not None and (a or b) else ""))
+            out.append(Parity(node["name"], mine_n, theirs_n, a, b, note if theirs is not None and (a or b) else "", order_only=order_only))
         except Exception as e:  # noqa: BLE001
             out.append(Parity(node["name"], 0, 0, 0, 0, f"{type(e).__name__}: {str(e)[:160]}"))
     return out
@@ -310,6 +324,21 @@ def _ties(conn, sql: str) -> str | None:  # noqa: ANN001
     return None
 
 
+def _unordered_aggregate(sql: str) -> str | None:
+    """ARRAY_AGG / ARRAY_UNIQUE_AGG / LISTAGG without WITHIN GROUP (ORDER BY ...): the order of what it gathers is not defined."""
+    import sqlglot
+    from sqlglot import exp
+
+    try:
+        tree = sqlglot.parse_one(sql, read="snowflake")
+    except Exception:  # noqa: BLE001
+        return None
+    for agg in tree.find_all(exp.ArrayAgg, exp.ArrayUniqueAgg, exp.GroupConcat):
+        if not isinstance(agg.parent, exp.WithinGroup) and not agg.find(exp.Order):
+            return {exp.ArrayAgg: "ARRAY_AGG", exp.ArrayUniqueAgg: "ARRAY_UNIQUE_AGG"}.get(type(agg), "LISTAGG") + " without an order"
+    return None
+
+
 def undetermined(conn, remote: DbtProject, rows: list[Parity]) -> None:  # noqa: ANN001
     """Mark each differing model whose rows the data does not determine, or that is built on one that is."""
     nodes = {n["name"]: n for n in remote.models()}
@@ -320,6 +349,17 @@ def undetermined(conn, remote: DbtProject, rows: list[Parity]) -> None:  # noqa:
             why = _ties(conn, nodes[r.model].get("compiled_code") or "")
             if why:
                 found[nodes[r.model]["unique_id"]] = why
+    unordered = {uid: why for uid, n in by_id.items() if (why := _unordered_aggregate(n.get("compiled_code") or ""))}
+
+    def unordered_upstream(uid: str, seen: set[str]) -> str | None:
+        if uid in unordered:
+            return uid
+        for parent in by_id.get(uid, {}).get("depends_on", {}).get("nodes", []):
+            if parent not in seen:
+                seen.add(parent)
+                if (hit := unordered_upstream(parent, seen)) is not None:
+                    return hit
+        return None
 
     def upstream(uid: str, seen: set[str]) -> str | None:
         for parent in by_id.get(uid, {}).get("depends_on", {}).get("nodes", []):
@@ -337,7 +377,10 @@ def undetermined(conn, remote: DbtProject, rows: list[Parity]) -> None:  # noqa:
         if r.ok or r.model not in nodes:
             continue
         uid = nodes[r.model]["unique_id"]
-        if uid in found:
+        if r.order_only and (source := unordered_upstream(uid, set())) is not None:
+            r.undetermined = (f"the same rows with array elements in another order; {by_id[source]['name']} uses "
+                              f"{unordered[source]}, which gives no order")
+        elif uid in found:
             r.undetermined = "the order of rows is not determined: " + found[uid]
         elif (parent := upstream(uid, set())) is not None:
             r.undetermined = f"built on {by_id[parent]['name']}, whose order of rows is not determined"
