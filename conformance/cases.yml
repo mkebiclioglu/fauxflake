@@ -726,6 +726,16 @@
 - {id: try_input_16, sql: "select try_cast(5 as varchar)"}
 - {id: try_input_17, sql: "select try_cast('2024-01-01'::timestamp as date)"}
 - {id: try_input_18, sql: "select try_cast(5 as number)"}
+# TRY_CAST takes a value of exactly the target type: a whole-number column (NUMBER(38,0)) as INTEGER, but not a literal (NUMBER(1,0))
+- {id: try_whole_1, sql: "select try_cast(n as integer) from (select 123456789012::number(38,0) n)"}
+- {id: try_whole_2, sql: "select try_cast(5::bigint as number)"}
+- {id: try_whole_3, sql: "select try_cast(5::number(38,0) as number(10,0))"}
+- {id: try_whole_4, sql: "select try_cast(5::number(10,2) as integer)"}
+- {id: try_whole_5, sql: "select try_to_number(5::number(38,0))"}
+- {id: try_whole_6, sql: "select try_to_number(5::number(38,0), 10, 0)"}
+- {id: try_whole_7, sql: "select try_cast(5.5::float as integer)"}
+- {id: try_whole_8, sql: "select try_cast(5 as integer)"}
+- {id: try_whole_9, sql: "select try_to_decimal(n) from (select 7::integer n)"}
 
 # What an expression mixing text with a number, a date, a timestamp or a boolean gives (measured on Snowflake).
 - {id: mixed_kinds_1, sql: "select coalesce('5', 5)"}

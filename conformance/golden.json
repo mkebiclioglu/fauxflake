@@ -7719,6 +7719,49 @@
    ]
   ]
  },
+ "try_whole_1": {
+  "rows": [
+   [
+    "123456789012"
+   ]
+  ]
+ },
+ "try_whole_2": {
+  "rows": [
+   [
+    "5"
+   ]
+  ]
+ },
+ "try_whole_3": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "try_whole_4": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "try_whole_5": {
+  "rows": [
+   [
+    "5"
+   ]
+  ]
+ },
+ "try_whole_6": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "try_whole_7": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "try_whole_8": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "try_whole_9": {
+  "rows": [
+   [
+    "7"
+   ]
+  ]
+ },
  "typeof_variant": {
   "rows": [
    [

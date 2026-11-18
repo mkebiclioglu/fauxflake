@@ -111,7 +111,8 @@ MACROS = [
     f"""create or replace macro {_NS}_sf_try_input(x, target) as case
           when typeof(x) in ('VARCHAR', '"NULL"') or (target = 'DATE' and typeof(x) = 'DATE')
             or (target = 'BOOLEAN' and typeof(x) = 'BOOLEAN') or (target = 'DOUBLE' and typeof(x) in ('DOUBLE', 'FLOAT'))
-            or (target = 'BLOB' and typeof(x) = 'BLOB') then x
+            or (target = 'BLOB' and typeof(x) = 'BLOB')
+            or (target = 'WHOLE' and typeof(x) in ('BIGINT', 'HUGEINT', 'SMALLINT', 'DECIMAL(38,0)')) then x
           else error('Function TRY_CAST cannot be used with arguments of type ' || typeof(x)) end""",
     f"create or replace macro {_NS}_sf_negate(x) as -x",
     f"create or replace macro {_NS}_sf_bitcount(x) as case when typeof(x) = 'BLOB' then bit_count(x::bit) else bit_count(x::bigint) end",
@@ -587,16 +588,32 @@ def _collation(spec: str) -> str | None:
 _TRY_SAME = {"DATE": ("DATE",), "BOOLEAN": ("BOOLEAN",), "DOUBLE": ("DOUBLE", "FLOAT"), "BLOB": ("BLOB",)}
 
 
+def _whole(to: exp.DataType) -> bool:
+    """NUMBER(38,0) by any of its names (INTEGER, BIGINT, NUMBER, DECIMAL(38, 0)): what a whole-number column already is.
+    TRY_CAST takes a value of exactly the target type, so of these only whole numbers pass (measured on Snowflake)."""
+    T = exp.DataType.Type
+    if to.this in (T.INT, T.BIGINT, T.SMALLINT, T.TINYINT):
+        return True
+    if to.this in (T.DECIMAL, T.BIGDECIMAL):
+        sizes = [p.name for p in to.expressions]
+        return sizes in ([], ["38"], ["38", "0"])
+    return False
+
+
 def _try_target(node: exp.Expression) -> str | None:
     """The DuckDB type a TRY_CAST or TRY_TO_ function of Snowflake converts to, or None for anything else."""
     if isinstance(node, exp.TryCast) and node.args.get("requires_string"):
         kind = node.to.this
+        if _whole(node.to):
+            return "WHOLE"
         return {exp.DataType.Type.DATE: "DATE", exp.DataType.Type.BOOLEAN: "BOOLEAN", exp.DataType.Type.DOUBLE: "DOUBLE",
                 exp.DataType.Type.FLOAT: "DOUBLE", exp.DataType.Type.BINARY: "BLOB", exp.DataType.Type.VARBINARY: "BLOB"}.get(kind, "OTHER")
     if not node.args.get("safe"):
         return None
     if isinstance(node, exp.ToNumber):
-        return "OTHER"
+        precision, scale = node.args.get("precision"), node.args.get("scale")
+        plain = node.args.get("format") is None and (precision is None or precision.name == "38") and (scale is None or scale.name == "0")
+        return "WHOLE" if plain else "OTHER"
     if isinstance(node, exp.TsOrDsToDate):
         return "DATE"
     if isinstance(node, exp.ToBoolean):
@@ -611,7 +628,7 @@ def _try_target(node: exp.Expression) -> str | None:
 def _try_anonymous_target(node: exp.Expression) -> str | None:
     if isinstance(node, exp.Anonymous) and isinstance(node.this, str) and re.fullmatch(
             r"TRY_TO_(TIMESTAMP(_NTZ|_LTZ|_TZ)?|TIME|NUMBER|NUMERIC|DECIMAL)", node.name.upper()):
-        return "OTHER"
+        return "WHOLE" if re.fullmatch(r"TRY_TO_(NUMBER|NUMERIC|DECIMAL)", node.name.upper()) and len(node.expressions) == 1 else "OTHER"
     return None
 
 
