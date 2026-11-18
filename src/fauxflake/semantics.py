@@ -79,8 +79,17 @@ MACROS = [
     f"""create or replace macro {_NS}_sf_width_bucket(x, lo, hi, n) as case
           when x < lo then 0 when x >= hi then n + 1 else floor((x - lo) * n / (hi - lo))::bigint + 1 end""",
     f"""create or replace macro {_NS}_sf_array_size
-          (x json) as json_array_length(x),
+          (x json) as case when json_type(x) = 'ARRAY' then json_array_length(x) end,
           (x) as len(x)""",
+    f"create or replace macro {_NS}_sf_negate(x) as -x",
+    f"create or replace macro {_NS}_sf_bitcount(x) as bit_count(x::bigint)",
+    f"create or replace macro {_NS}_sf_getbit(x, p) as (x::bigint >> p::integer) & 1",
+    f"create or replace macro {_NS}_sf_array_repeat(x, n) as to_json(list_transform(range(n::bigint), lambda i: x))",
+    f"create or replace macro {_NS}_sf_binary_as_string(b) as decode(b::blob)",
+    f"create or replace macro {_NS}_sf_string_as_binary(s) as encode(s::varchar)",
+    f"create or replace macro {_NS}_sf_jaccard(a, b) as jaccard(a::varchar, b::varchar)",
+    f"create or replace macro {_NS}_sf_approx_count(x) as approx_count_distinct(x)",
+    f"create or replace macro {_NS}_sf_try_hex_binary(s) as try(unhex(s::varchar))",
     f"create or replace macro {_NS}_sf_current_account_name() as 'FAUXFLAKE'",
     # the text behind the base64, as UTF-8; a VARIANT string is read without its JSON quotes
     f"create or replace macro {_NS}_sf_try_base64(x) as try(decode(from_base64({_NS}_sf_text(x))))",
@@ -110,7 +119,7 @@ MACROS = [
     f"""create or replace macro {_NS}_sf_soundex(s) as case
           when s is null then null
           when regexp_replace(upper(s), '[^A-Z]', '', 'g') = '' then ''
-          else left(regexp_replace(upper(s), '[^A-Z]', '', 'g'), 1) || left(replace(
+          else left(regexp_replace(s, '[^A-Za-z]', '', 'g'), 1) || left(replace(
             case when left(regexp_replace(upper(s), '[^A-Z]', '', 'g'), 1) in ('H', 'W')
                  then {_NS}_sf_soundex_squeeze({_NS}_sf_soundex_codes(s))
                  else substr({_NS}_sf_soundex_squeeze({_NS}_sf_soundex_codes(s)), 2) end, '0', '') || '000', 3) end""",
@@ -308,6 +317,10 @@ _RENAMED = {  # Snowflake function -> macro, same arguments
     **{f"as_{k}": f"_sf_as_{k}" for k in ("date", "time", "timestamp_ntz", "timestamp_ltz", "timestamp_tz", "double", "real",
                                           "number", "decimal", "boolean", "object", "array")}, "upper": "_sf_upper", "ucase": "_sf_upper",
     "as_integer": "_sf_as_integer", "as_varchar": "_sf_as_varchar", "as_char": "_sf_as_varchar",
+    "negate": "_sf_negate", "bitcount": "_sf_bitcount", "getbit": "_sf_getbit", "array_repeat": "_sf_array_repeat",
+    "binary_as_string": "_sf_binary_as_string", "string_as_binary": "_sf_string_as_binary", "jaccard_similarity": "_sf_jaccard",
+    "approximate_count_distinct": "_sf_approx_count", "hll": "_sf_approx_count", "soundex_p123": "_sf_soundex",
+    "try_hex_decode_binary": "_sf_try_hex_binary", "is_date_value": "_sf_is_date",
     **{f"is_{k}": f"_sf_is_{k}" for k in ("object", "array", "integer", "varchar", "char", "boolean", "decimal", "double", "real")},
 }
 _DATE_TOKENS = re.compile(r"YYYY|YY|MM|DD|HH|MI|SS|MON|DY|AM|PM", re.IGNORECASE)
@@ -767,6 +780,12 @@ def _fix(node: exp.Expression) -> exp.Expression:
         renamed = next((_RENAMED[n.lower()] for n in type(node).sql_names() if n.lower() in _RENAMED), None)
         if renamed:
             return _fn(renamed, *_func_args(node))
+    if isinstance(node, exp.Anonymous) and isinstance(node.this, str) and node.name.lower() in _RENAMED:
+        return _fn(_RENAMED[node.name.lower()], *node.expressions)  # (a function sqlglot has no class for)
+    if isinstance(node, exp.Anonymous) and isinstance(node.this, str) and node.name.lower() == "like_any" and len(node.expressions) >= 2:
+        subject, *patterns = node.expressions  # like_any(s, p1, p2): like one of them
+        tests = [exp.Like(this=subject.copy(), expression=p.copy()) for p in patterns]
+        return exp.paren(tests[0] if len(tests) == 1 else exp.or_(*tests))
     if isinstance(node, (exp.TimeToStr, exp.StrToTime, exp.StrToDate)) and isinstance(node.args.get("format"), exp.Literal):
         fmt = node.args["format"]
         fmt.set("this", fmt.name.replace("Mon", "%b").replace("Dy", "%a"))
