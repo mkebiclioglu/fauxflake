@@ -1401,3 +1401,12 @@ def test_what_is_read_no_further_back_than_a_mark_lies_within_that_of_the_top_of
     }
     held = build_spec(manifest, "A")[0]["tables"]["RAW.S.SHARDS"]["columns"]["BLOCK"]
     assert held["v"] == [9980000, 10000000] and held["p"] == [0, 1], held
+
+
+def test_a_text_of_numbers_in_one_union_branch_is_the_same_kind_of_text_in_the_others():
+    from fauxflake.init import _share_union_values
+
+    tables = {"RAW.V.USAGE": {"columns": {"VERSION": {"gen": "template", "templates": ["{n}.{n}", "{n}.{n}-pre"]}}},
+              "RAW.V.PINGS": {"columns": {"RESULTS": {"gen": "object", "fields": {"version": {"gen": "template", "template": "version_{hex}"}}}}}}
+    _share_union_values(tables, [{("RAW.V.USAGE", "VERSION"), ("RAW.V.PINGS", "RESULTS", "version")}])
+    assert tables["RAW.V.PINGS"]["columns"]["RESULTS"]["fields"]["version"] == {"gen": "template", "templates": ["{n}.{n}", "{n}.{n}-pre"]}

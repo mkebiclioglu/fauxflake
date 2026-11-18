@@ -854,6 +854,14 @@ class Fitter:
             fresh = {"gen": "template", "template": delimiter.join(["{n}"] * max(count, 2))}
             for table in self.sources_of(uid):
                 columns = self.tables[table].get("columns") or {}
+                # (the same value read out of a document by that name, in another branch of what the model reads)
+                for held in columns.values():
+                    field = (held.get("fields") or {}).get(column.lower()) if held.get("gen") == "object" else None
+                    if field is not None and field == {"gen": "template", "template": f"{column.lower()}_{{hex}}"}:
+                        held["fields"][column.lower()] = dict(fresh)
+                        self.retyped.add(table)
+                        self.learned.append(f"{table}: field {column.lower()}: its pieces are read as numbers; generated as {fresh['template']!r}.")
+                        changed = True
                 if column not in columns:  # (read under another name upstream)
                     renamed = [n for n in self.origins(uid, column, strict=True) if n in columns]
                     if not renamed:

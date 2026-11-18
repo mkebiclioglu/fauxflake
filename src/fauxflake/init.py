@@ -1739,10 +1739,17 @@ def _share_union_values(tables: dict[str, dict], links: list) -> None:
             gens = {m: held[m][0][held[m][1]] for m in members if held[m]}
             named = next((g for g in gens.values() if g.get("gen") == "template" and "{n}" in str(g.get("template")) and "templates" not in g), None)
             pooled = next((g for g in gens.values() if g.get("gen") == "pool"), None)
+            # (`12.3`, `12.3-pre`: a text of numbers in one branch is the same kind of text in the others)
+            numbered = next((g for g in gens.values() if g.get("gen") == "template" and g.get("templates")
+                             and all("{n}" in str(t) for t in g["templates"]) and not g.get("parts")), None)
             for m, gen in gens.items():
                 if gen.get("gen") != "template" or "templates" in gen or "parts" in gen or gen.get("format"):
                     continue
                 where, key = held[m]
+                label = re.sub(r"~\w+|\[\]", "", m[2]).split(".")[-1].lower() if m[2] else m[1].lower()
+                if numbered and not named and not pooled and gen.get("template") == f"{label}_{{hex}}" and not gen.get("follows"):
+                    where[key] = {"gen": "template", "templates": list(numbered["templates"])}
+                    continue
                 if named and gen is not named and "{n}" not in str(gen.get("template")) and of_an_id(m, gen):
                     where[key] = {"gen": "template", "template": named["template"], **({"follows": gen["follows"]} if gen.get("follows") else {})}
                 elif pooled and not named:
