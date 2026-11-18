@@ -114,7 +114,7 @@ MACROS = [
             or (target = 'BLOB' and typeof(x) = 'BLOB') then x
           else error('Function TRY_CAST cannot be used with arguments of type ' || typeof(x)) end""",
     f"create or replace macro {_NS}_sf_negate(x) as -x",
-    f"create or replace macro {_NS}_sf_bitcount(x) as bit_count(x::bigint)",
+    f"create or replace macro {_NS}_sf_bitcount(x) as case when typeof(x) = 'BLOB' then bit_count(x::bit) else bit_count(x::bigint) end",
     f"create or replace macro {_NS}_sf_getbit(x, p) as (x::bigint >> p::integer) & 1",
     f"create or replace macro {_NS}_sf_array_repeat(x, n) as to_json(list_transform(range(n::bigint), lambda i: x))",
     f"create or replace macro {_NS}_sf_binary_as_string(b) as decode(b::blob)",
@@ -124,6 +124,8 @@ MACROS = [
     f"""create or replace macro {_NS}_sf_try_hex_binary(s) as case
           when length(s::varchar) % 2 = 0 and regexp_full_match(s::varchar, '[0-9A-Fa-f]*') then unhex(s::varchar) end""",
     f"create or replace macro {_NS}_sf_is_binary(v) as case when v is not null then false end",
+    f"create or replace macro {_NS}_sf_as_binary(v) as case when v is not null then null::blob end",  # (no VARIANT here holds bytes)
+    f"create or replace macro {_NS}_sf_bitmap_position(bucket, bit) as (bucket - 1) * 32768 + bit + 1",
     f"create or replace macro {_NS}_sf_try_validate_utf8(s) as s",
     f"create or replace macro {_NS}_sf_current_account_name() as 'FAUXFLAKE'",
     # the text behind the base64, as UTF-8; a VARIANT string is read without its JSON quotes
@@ -382,7 +384,8 @@ _RENAMED = {  # Snowflake function -> macro, same arguments
     "binary_as_string": "_sf_binary_as_string", "string_as_binary": "_sf_string_as_binary", "jaccard_similarity": "_sf_jaccard",
     "approximate_count_distinct": "_sf_approx_count", "hll": "_sf_approx_count", "soundex_p123": "_sf_soundex",
     "try_hex_decode_binary": "_sf_try_hex_binary", "is_date_value": "_sf_is_date",
-    "is_binary": "_sf_is_binary", "is_vector": "_sf_is_binary", "try_validate_utf8": "_sf_try_validate_utf8",
+    "is_binary": "_sf_is_binary", "is_vector": "_sf_is_binary", "as_binary": "_sf_as_binary",
+    "bitmap_absolute_position": "_sf_bitmap_position", "try_validate_utf8": "_sf_try_validate_utf8",
     **{f"is_{k}": f"_sf_is_{k}" for k in ("object", "array", "integer", "varchar", "char", "boolean", "decimal", "double", "real")},
 }
 _DATE_TOKENS = re.compile(r"YYYY|YY|MM|DD|HH|MI|SS|MON|DY|AM|PM", re.IGNORECASE)
@@ -897,6 +900,8 @@ def _fix(node: exp.Expression) -> exp.Expression:
         return _fn("_sf_sha2", node.this, node.args["length"])  # sha2(x, 512): DuckDB has 256 only
     if isinstance(node, exp.Anonymous) and isinstance(node.this, str) and node.name.lower() in _RENAMED:
         return _fn(_RENAMED[node.name.lower()], *node.expressions)  # (a function sqlglot has no class for)
+    if isinstance(node, exp.Anonymous) and node.name.upper() == "ARRAY_CONSTRUCT_STRUCTURED":
+        return exp.Array(expressions=list(node.expressions))  # (the same values; only the declared type differs)
     if isinstance(node, exp.Time) and node.this is not None and not node.args.get("zone"):
         if isinstance(node.this, exp.Literal) and node.this.is_string:
             return exp.cast(node.this, "time")  # TIME('10:20:30')
@@ -1711,6 +1716,73 @@ def _convert(node: exp.Expression, to: str) -> None:
     node.replace(exp.cast(node.copy(), to))
 
 
+# Snowflake's string functions also take BINARY values, byte by byte. DuckDB's take text only: the bytes are
+# worked on as hex digits, two to a byte, and turned back into bytes where the answer is a BINARY
+_BINARY_CALLS = {"reverse": exp.Reverse, "lpad": exp.Pad, "rpad": exp.Pad, "concat_ws": exp.ConcatWs, "contains": exp.Contains,
+                 "starts_with": exp.StartsWith, "ends_with": exp.EndsWith, "~": exp.BitwiseNot, "bit_length": exp.BitLength}
+
+
+def _covers(text: str, sql: str, pos: int) -> bool:
+    start = text.find(sql)
+    while start >= 0:
+        if start <= pos < start + len(sql):
+            return True
+        start = text.find(sql, start + 1)
+    return False
+
+
+def shifted_bytes(transformed: exp.Expression, conn, message: str) -> exp.Expression | None:  # noqa: ANN001
+    """`BITSHIFTLEFT(to_binary('616263', 'hex'), 7)`: Snowflake shifts the bits of the bytes and keeps their number.
+    DuckDB reads the operand as a whole number and cannot. The shifts of BINARY operands are made on BIT strings."""
+    if "Unimplemented type for cast (BLOB ->" not in message:
+        return None
+    tree, changed = transformed.copy(), False
+    for node in list(tree.find_all(exp.BitwiseLeftShift, exp.BitwiseRightShift)):
+        operand = node.this.this if isinstance(node.this, exp.Cast) else node.this
+        select = node.find_ancestor(exp.Select)
+        probe = exp.Select(expressions=[exp.alias_(operand.copy(), "_k")])
+        if select is not None and select.args.get("from_") is not None:
+            probe.set("from_", select.args["from_"].copy())
+            if select.args.get("joins"):
+                probe.set("joins", [j.copy() for j in select.args["joins"]])
+        try:
+            kind = conn.execute("describe " + (_cte_prefix(select) if select is not None else "") + probe.sql(dialect="duckdb")).fetchall()[0][1]
+        except Exception:  # noqa: BLE001 - an operand that only binds in its place
+            continue
+        if kind == "BLOB":
+            node.replace(exp.cast(node.__class__(this=exp.cast(operand.copy(), "bit"), expression=node.expression.copy()), "blob"))
+            changed = True
+    return tree if changed else None
+
+
+def _binary_call(tree: exp.Expression, text: str, name: str, pos: int) -> bool:
+    hexed = lambda e: exp.func("hex", e.copy())  # noqa: E731
+    unhex = lambda e: exp.func("unhex", e)  # noqa: E731
+    found = [n for n in tree.find_all(_BINARY_CALLS[name]) if _covers(text, n.sql(dialect="duckdb"), pos)]
+    if not found:
+        return False
+    node = min(found, key=lambda n: len(n.sql(dialect="duckdb")))  # (the innermost)
+    if name == "reverse":
+        made = unhex(exp.func("array_to_string", exp.func("list_reverse", exp.func("regexp_extract_all", hexed(node.this), exp.Literal.string(".."))),
+                                  exp.Literal.string("")))
+    elif name in ("lpad", "rpad"):
+        fill = node.args.get("fill_pattern")
+        made = unhex(exp.func(name, hexed(node.this), exp.Mul(this=exp.paren(node.expression.copy()), expression=exp.Literal.number(2)),
+                              *([hexed(fill)] if fill is not None else [])))
+    elif name == "concat_ws":
+        made = unhex(exp.ConcatWs(expressions=[hexed(e) for e in node.expressions]))
+    elif name == "contains":  # (on a byte boundary)
+        made = exp.func("regexp_matches", hexed(node.this), exp.DPipe(this=exp.Literal.string("^(..)*?"), expression=hexed(node.expression)))
+    elif name in ("starts_with", "ends_with"):
+        made = node.__class__(this=hexed(node.this), expression=hexed(node.expression))
+    elif name == "~":
+        made = exp.cast(exp.BitwiseNot(this=exp.cast(node.this.copy(), "bit")), "blob")
+    else:  # bit_length
+        made = exp.Mul(this=exp.func("octet_length", node.this.copy()), expression=exp.Literal.number(8))
+    node.replace(made)
+    return True
+
+
 _TEXT_CALLS = {"substring", "substr", "left", "right"}
 
 
@@ -1752,6 +1824,8 @@ def _repair(tree: exp.Expression, text: str, details: dict) -> bool:
             if done:
                 return True
         return False
+    if "BLOB" in types and name.lower() in _BINARY_CALLS:
+        return _binary_call(tree, text, name.lower(), pos)
     if "VARCHAR" not in types:
         return False
     if name in _OPERATORS_BY_SIGN:

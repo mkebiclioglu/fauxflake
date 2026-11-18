@@ -1019,6 +1019,7 @@ def _patch_fakesnow() -> None:
                                                                                  lambda sql: _outside_transaction(self, sql)))
                 if "Malformed JSON" in e else None,
                 "zones": lambda e: semantics.dates_in_time_zones(transformed, self._duck_conn) if "TIMESTAMPTZ_NS" in e else None,
+                "bytes": lambda e: semantics.shifted_bytes(transformed, self._duck_conn, e),
                 "types": lambda e: semantics.repair_types(transformed, self._duck_conn, params)
                 if "No function matches" in e or "Could not choose a best candidate" in e else None,
             }

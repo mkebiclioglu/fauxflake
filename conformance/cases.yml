@@ -345,7 +345,7 @@
 - {id: fn_array_compact, sql: "select ARRAY_COMPACT(array_construct(3, 1, 2))"}
 - {id: fn_array_construct, sql: "select ARRAY_CONSTRUCT(7)"}
 - {id: fn_array_construct_compact, sql: "select ARRAY_CONSTRUCT_COMPACT(7)"}
-- {id: fn_array_construct_structured, sql: "select ARRAY_CONSTRUCT_STRUCTURED(7)", gap: "not in the emulator"}
+- {id: fn_array_construct_structured, sql: "select ARRAY_CONSTRUCT_STRUCTURED(7)"}
 - {id: fn_array_contains, sql: "select ARRAY_CONTAINS(parse_json('{\"a\": 1, \"b\": [1, 2]}'), array_construct(3, 1, 2))"}
 - {id: fn_array_contains_2, sql: "select ARRAY_CONTAINS(7, array_construct(3, 1, 2))"}
 - {id: fn_array_distinct, sql: "select ARRAY_DISTINCT(array_construct(3, 1, 2))"}
@@ -370,7 +370,7 @@
 - {id: fn_ascii, sql: "select ASCII('abc')"}
 - {id: fn_asinh, sql: "select ASINH(2.5::float)"}
 - {id: fn_as_array, sql: "select AS_ARRAY(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
-- {id: fn_as_binary, sql: "select AS_BINARY(parse_json('{\"a\": 1, \"b\": [1, 2]}'))", gap: "not in the emulator"}
+- {id: fn_as_binary, sql: "select AS_BINARY(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
 - {id: fn_as_boolean, sql: "select AS_BOOLEAN(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
 - {id: fn_as_char, sql: "select AS_CHAR(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
 - {id: fn_as_date, sql: "select AS_DATE(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
@@ -389,20 +389,20 @@
 - {id: fn_bitandagg, sql: "select BITANDAGG(column1) from values (7), (2), (7)"}
 - {id: fn_bitand_agg, sql: "select BITAND_AGG(column1) from values (7), (2), (7)"}
 - {id: fn_bitcount, sql: "select BITCOUNT(7)"}
-- {id: fn_bitcount_2, sql: "select BITCOUNT(to_binary('616263', 'hex'))", gap: "not in the emulator"}
-- {id: fn_bitmap_absolute_position, sql: "select BITMAP_ABSOLUTE_POSITION(7, 2)", gap: "not in the emulator"}
+- {id: fn_bitcount_2, sql: "select BITCOUNT(to_binary('616263', 'hex'))"}
+- {id: fn_bitmap_absolute_position, sql: "select BITMAP_ABSOLUTE_POSITION(7, 2)"}
 - {id: fn_bitmap_bit_position, sql: "select BITMAP_BIT_POSITION(7)"}
 - {id: fn_bitmap_bucket_number, sql: "select BITMAP_BUCKET_NUMBER(7)"}
 - {id: fn_bitmap_construct_agg, sql: "select BITMAP_CONSTRUCT_AGG(column1) from values (7), (2), (7)"}
 - {id: fn_bitnot, sql: "select BITNOT(7)"}
-- {id: fn_bitnot_2, sql: "select BITNOT(to_binary('616263', 'hex'))", gap: "not in the emulator"}
+- {id: fn_bitnot_2, sql: "select BITNOT(to_binary('616263', 'hex'))"}
 - {id: fn_bitor, sql: "select BITOR(7, 2)"}
 - {id: fn_bitoragg, sql: "select BITORAGG(column1) from values (7), (2), (7)"}
 - {id: fn_bitor_agg, sql: "select BITOR_AGG(column1) from values (7), (2), (7)"}
 - {id: fn_bitshiftleft, sql: "select BITSHIFTLEFT(7, 2)"}
-- {id: fn_bitshiftleft_2, sql: "select BITSHIFTLEFT(to_binary('616263', 'hex'), 7)", gap: "not in the emulator"}
+- {id: fn_bitshiftleft_2, sql: "select BITSHIFTLEFT(to_binary('616263', 'hex'), 7)"}
 - {id: fn_bitshiftright, sql: "select BITSHIFTRIGHT(7, 2)"}
-- {id: fn_bitshiftright_2, sql: "select BITSHIFTRIGHT(to_binary('616263', 'hex'), 7)", gap: "not in the emulator"}
+- {id: fn_bitshiftright_2, sql: "select BITSHIFTRIGHT(to_binary('616263', 'hex'), 7)"}
 - {id: fn_bitxor, sql: "select BITXOR(7, 2)"}
 - {id: fn_bitxoragg, sql: "select BITXORAGG(column1) from values (7), (2), (7)"}
 - {id: fn_bitxor_agg, sql: "select BITXOR_AGG(column1) from values (7), (2), (7)"}
@@ -410,16 +410,16 @@
 - {id: fn_bit_andagg, sql: "select BIT_ANDAGG(column1) from values (7), (2), (7)"}
 - {id: fn_bit_and_agg, sql: "select BIT_AND_AGG(column1) from values (7), (2), (7)"}
 - {id: fn_bit_length, sql: "select BIT_LENGTH('abc')"}
-- {id: fn_bit_length_2, sql: "select BIT_LENGTH(to_binary('616263', 'hex'))", gap: "not in the emulator"}
+- {id: fn_bit_length_2, sql: "select BIT_LENGTH(to_binary('616263', 'hex'))"}
 - {id: fn_bit_not, sql: "select BIT_NOT(7)"}
-- {id: fn_bit_not_2, sql: "select BIT_NOT(to_binary('616263', 'hex'))", gap: "not in the emulator"}
+- {id: fn_bit_not_2, sql: "select BIT_NOT(to_binary('616263', 'hex'))"}
 - {id: fn_bit_or, sql: "select BIT_OR(7, 2)"}
 - {id: fn_bit_oragg, sql: "select BIT_ORAGG(column1) from values (7), (2), (7)"}
 - {id: fn_bit_or_agg, sql: "select BIT_OR_AGG(column1) from values (7), (2), (7)"}
 - {id: fn_bit_shiftleft, sql: "select BIT_SHIFTLEFT(7, 2)"}
-- {id: fn_bit_shiftleft_2, sql: "select BIT_SHIFTLEFT(to_binary('616263', 'hex'), 7)", gap: "not in the emulator"}
+- {id: fn_bit_shiftleft_2, sql: "select BIT_SHIFTLEFT(to_binary('616263', 'hex'), 7)"}
 - {id: fn_bit_shiftright, sql: "select BIT_SHIFTRIGHT(7, 2)"}
-- {id: fn_bit_shiftright_2, sql: "select BIT_SHIFTRIGHT(to_binary('616263', 'hex'), 7)", gap: "not in the emulator"}
+- {id: fn_bit_shiftright_2, sql: "select BIT_SHIFTRIGHT(to_binary('616263', 'hex'), 7)"}
 - {id: fn_bit_xor, sql: "select BIT_XOR(7, 2)"}
 - {id: fn_bit_xoragg, sql: "select BIT_XORAGG(column1) from values (7), (2), (7)"}
 - {id: fn_bit_xor_agg, sql: "select BIT_XOR_AGG(column1) from values (7), (2), (7)"}
@@ -441,9 +441,9 @@
 - {id: fn_concat, sql: "select CONCAT('abc')"}
 - {id: fn_concat_2, sql: "select CONCAT(to_binary('616263', 'hex'))"}
 - {id: fn_concat_ws, sql: "select CONCAT_WS('abc', 'b')"}
-- {id: fn_concat_ws_2, sql: "select CONCAT_WS(to_binary('616263', 'hex'), to_binary('62', 'hex'))", gap: "not in the emulator"}
+- {id: fn_concat_ws_2, sql: "select CONCAT_WS(to_binary('616263', 'hex'), to_binary('62', 'hex'))"}
 - {id: fn_contains, sql: "select CONTAINS('abc', 'b')"}
-- {id: fn_contains_2, sql: "select CONTAINS(to_binary('616263', 'hex'), to_binary('62', 'hex'))", gap: "not in the emulator"}
+- {id: fn_contains_2, sql: "select CONTAINS(to_binary('616263', 'hex'), to_binary('62', 'hex'))"}
 - {id: fn_corr, sql: "select CORR(column1, column2) from values (2.5::float, 0.5::float), (0.5::float, 2.5::float), (2.5::float, 0.5::float)"}
 - {id: fn_corr_2, sql: "select CORR(column1, column2) from values (2.5, 0.5), (0.5, 2.5), (2.5, 0.5)"}
 - {id: fn_cos, sql: "select COS(2.5::float)"}
@@ -469,7 +469,7 @@
 - {id: fn_div0null, sql: "select DIV0NULL(7, 2)"}
 - {id: fn_div0null_2, sql: "select DIV0NULL(2.5::float, 0.5::float)"}
 - {id: fn_endswith, sql: "select ENDSWITH('abc', 'b')"}
-- {id: fn_endswith_2, sql: "select ENDSWITH(to_binary('616263', 'hex'), to_binary('62', 'hex'))", gap: "not in the emulator"}
+- {id: fn_endswith_2, sql: "select ENDSWITH(to_binary('616263', 'hex'), to_binary('62', 'hex'))"}
 - {id: fn_equal_null, sql: "select EQUAL_NULL(7, 2)"}
 - {id: fn_exp, sql: "select EXP(2.5::float)"}
 - {id: fn_exp_2, sql: "select EXP(2.5)"}
@@ -528,7 +528,7 @@
 - {id: fn_log, sql: "select LOG(2.5::float, 0.5::float)"}
 - {id: fn_log_2, sql: "select LOG(2.5, 0.5)"}
 - {id: fn_lower, sql: "select LOWER('abc')"}
-- {id: fn_lpad, sql: "select LPAD(to_binary('616263', 'hex'), 7, to_binary('62', 'hex'))", gap: "not in the emulator"}
+- {id: fn_lpad, sql: "select LPAD(to_binary('616263', 'hex'), 7, to_binary('62', 'hex'))"}
 - {id: fn_map_construct, sql: "select MAP_CONSTRUCT(7, 2)"}
 - {id: fn_max, sql: "select MAX(column1) from values (7), (2), (7)"}
 - {id: fn_max_by, sql: "select MAX_BY(column1, column2) from values (7, 2), (2, 7), (7, 2)"}
@@ -590,9 +590,9 @@
 - {id: fn_regr_valy_2, sql: "select REGR_VALY(2.5, 0.5)"}
 - {id: fn_repeat, sql: "select REPEAT('abc', 7)"}
 - {id: fn_reverse, sql: "select REVERSE('abc')"}
-- {id: fn_reverse_2, sql: "select REVERSE(to_binary('616263', 'hex'))", gap: "not in the emulator"}
+- {id: fn_reverse_2, sql: "select REVERSE(to_binary('616263', 'hex'))"}
 - {id: fn_right, sql: "select RIGHT('abc', 7)"}
-- {id: fn_rpad, sql: "select RPAD(to_binary('616263', 'hex'), 7, to_binary('62', 'hex'))", gap: "not in the emulator"}
+- {id: fn_rpad, sql: "select RPAD(to_binary('616263', 'hex'), 7, to_binary('62', 'hex'))"}
 - {id: fn_rtrimmed_length, sql: "select RTRIMMED_LENGTH('abc')"}
 - {id: fn_sha1, sql: "select SHA1('abc')"}
 - {id: fn_sha1_2, sql: "select SHA1(to_binary('616263', 'hex'))"}
@@ -619,7 +619,7 @@
 - {id: fn_square, sql: "select SQUARE(2.5::float)"}
 - {id: fn_square_2, sql: "select SQUARE(2.5)"}
 - {id: fn_startswith, sql: "select STARTSWITH('abc', 'b')"}
-- {id: fn_startswith_2, sql: "select STARTSWITH(to_binary('616263', 'hex'), to_binary('62', 'hex'))", gap: "not in the emulator"}
+- {id: fn_startswith_2, sql: "select STARTSWITH(to_binary('616263', 'hex'), to_binary('62', 'hex'))"}
 - {id: fn_stddev, sql: "select STDDEV(column1) from values (7), (2), (7)"}
 - {id: fn_stddev_2, sql: "select STDDEV(column1) from values (2.5::float), (0.5::float), (2.5::float)"}
 - {id: fn_stddev_pop, sql: "select STDDEV_POP(column1) from values (7), (2), (7)"}
