@@ -106,3 +106,25 @@ def test_a_result_beyond_a_signed_64_bit_integer_comes_back_as_a_number():
         conn = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S"))
         assert conn.cursor().execute("select md5_number_lower64('abc'), md5_number_upper64('abc')").fetchall() == [
             (15462616177412505458, 10376663631224000432)]
+
+
+def test_a_fault_of_the_emulator_is_reported_at_once_instead_of_retried(monkeypatch):
+    import time
+
+    import pytest
+    import snowflake.connector
+    from snowflake.connector.errors import ProgrammingError
+
+    import fakesnow.server
+    from fauxflake.emulator import serve
+
+    def broken(*a, **k):
+        raise AssertionError("Timezone X not yet supported")
+
+    with serve() as emu:
+        cur = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S")).cursor()
+        monkeypatch.setattr(fakesnow.server, "to_sf", broken)
+        started = time.monotonic()
+        with pytest.raises(ProgrammingError, match="internal error"):
+            cur.execute("select 1").fetchall()
+        assert time.monotonic() - started < 20

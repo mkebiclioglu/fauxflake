@@ -709,6 +709,16 @@ def _patch_fakesnow() -> None:
         future = in_flight[key] = loop.create_future()
         try:
             response = await handle(request)
+        except server.ServerError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            # a fault of the emulator itself (encoding a result, say): answered as a failed statement, so the client
+            # reports it at once instead of retrying the request for minutes on an HTTP 500
+            response = JSONResponse({"data": {"errorCode": "009997", "sqlState": "XX000"}, "code": "009997",
+                                     "message": f"fauxflake emulator: internal error: {type(e).__name__}: {e}"[:2000],
+                                     "success": False})
+            future.set_result(response)
+            return response
         except BaseException as e:
             future.set_exception(e)
             future.exception()  # marked as retrieved: a repeat may never come
