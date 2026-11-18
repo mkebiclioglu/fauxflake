@@ -81,6 +81,7 @@ class SourceUse:
         # list is empty (or the column null) wherever the rule, written in the table's own columns, does not hold
         self.implied: list[tuple[str, str, str]] = []
         self.readings: set[tuple[str, str]] = set()
+        self.one_each: set[str] = set()  # columns a dbt snapshot of the table takes as its unique key: one row for each value
         # (the thing, the start, the end): rows looked up by a thing and a moment inside their period (`on a.namespace_id =
         # h.namespace_id and a.created_at >= h.valid_from and a.created_at < coalesce(h.valid_to, '2099-01-01')`):
         # the history of each thing, whose periods never overlap
@@ -2293,6 +2294,8 @@ def analyse(manifest: dict, database: str) -> Analysis:
             for name in [*keys, *listed]:
                 if isinstance(name, str) and re.fullmatch(r"\w+", name):
                     source.add(name)
+            if len(keys) == 1 and isinstance(keys[0], str) and re.fullmatch(r"\w+", keys[0]):
+                source.one_each.add(keys[0].upper())  # (the snapshot is of one row for each: the key names it alone)
             if isinstance(config.get("updated_at"), str) and re.fullmatch(r"\w+", config["updated_at"]):
                 source.add(config["updated_at"], "TIMESTAMP")
         if node.get("relation_name"):
@@ -2895,6 +2898,8 @@ def analyse(manifest: dict, database: str) -> Analysis:
                 notes.append(f"{name}.{one}{'.' + one_path if one_path else ''}: models keep the latest row of each and look it up by "
                              f"{by_path or by}; each belongs to one {(by_path or by).lower()} (`follows`).")
         for thing, moment in sorted(use.readings):
+            if thing in use.one_each:
+                continue  # (a snapshot takes the table to have one row for each: users, not their daily reports)
             # the latest row of each server each day is what the models keep: the table holds readings, the same few
             # things reporting day after day. A key that gives every row a thing of its own would leave each with
             # one day of history; it names a few, each in its turn, and what refers to it refers to those

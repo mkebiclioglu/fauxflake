@@ -1427,3 +1427,22 @@ def test_the_value_of_a_history_of_changes_goes_by_the_field_it_is_about():
     held = build_spec(manifest, "A")[0]["tables"]["RAW.S.HISTORY"]["columns"]["OLDVALUE"]
     assert held["gen"] == "by" and held["of"] == "FIELD" and set(held["cases"]) == {"amount", "closedate"}, held
     assert held["cases"]["closedate"]["format"] == "%Y-%m-%d" and held["cases"]["amount"]["gen"] == "dist"
+
+
+def test_a_table_a_snapshot_takes_one_row_of_for_each_key_is_not_a_table_of_readings():
+    from fauxflake.init import build_spec
+
+    def manifest(snapshot: bool) -> dict:
+        nodes = {"model.p.daily": {"resource_type": "model", "name": "daily", "depends_on": {"nodes": []}, "relation_name": "A.B.DAILY", "compiled_code": """
+            select id, modified::date as day, name from raw.s.users
+            qualify row_number() over (partition by id, modified::date order by modified desc) = 1"""}}
+        if snapshot:
+            nodes["snapshot.p.users_snapshot"] = {"resource_type": "snapshot", "name": "users_snapshot", "depends_on": {"nodes": []},
+                                                  "relation_name": "A.S.USERS_SNAPSHOT", "config": {"unique_key": "id", "updated_at": "modified"},
+                                                  "compiled_code": "select * from raw.s.users"}
+        return {"sources": {"source.p.s.users": {"database": "RAW", "schema": "S", "name": "users", "identifier": "users", "columns": {
+            "id": {"data_type": "VARCHAR"}, "modified": {"data_type": "TIMESTAMP"}, "name": {"data_type": "VARCHAR"}}}}, "nodes": nodes}
+
+    assert build_spec(manifest(False), "A")[0]["tables"]["RAW.S.USERS"].get("grain")  # readings, as far as the models say
+    table = build_spec(manifest(True), "A")[0]["tables"]["RAW.S.USERS"]
+    assert not table.get("grain") and not table["columns"]["ID"].get("of")

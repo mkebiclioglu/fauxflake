@@ -491,13 +491,17 @@ def run_guarded(cursor, work, limit: float | None = None) -> None:  # noqa: ANN0
     worker.start()
     # (a statement that multiplies rows can also fill the disk well inside its time: it is stopped while there is
     # still room to work in, whatever it is writing)
-    began, full = time.monotonic(), False
+    began, full, room = time.monotonic(), False, None
     while worker.is_alive() and time.monotonic() - began < limit:
         worker.join(min(2.0, max(0.05, limit - (time.monotonic() - began))))
         if worker.is_alive() and time.monotonic() - began > 5:
             try:
                 where = getattr(CURRENT, "db_path", None) or tempfile.gettempdir()
-                full = shutil.disk_usage(where).free < float(os.environ.get("FAUXFLAKE_MIN_FREE_GB", "3")) * 2**30
+                free = shutil.disk_usage(where).free
+                room = free if room is None else room  # (what was free when the statement was first looked at)
+                # (short of room, and this statement is what is taking it: one that merely runs on a full disk goes on)
+                full = free < float(os.environ.get("FAUXFLAKE_MIN_FREE_GB", "3")) * 2**30 and (
+                    room - free > 2**29 or free < 2**29 or "FAUXFLAKE_MIN_FREE_GB" in os.environ)
             except Exception:  # noqa: BLE001
                 full = False
             if full:
