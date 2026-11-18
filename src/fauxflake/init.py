@@ -87,6 +87,7 @@ class SourceUse:
         # the history of each thing, whose periods never overlap
         self.histories: set[tuple[str, str, str]] = set()
         self.lengths: dict[str, int] = {}  # text column -> how long the models take its values to be (`length(server_id) <> 26`: invalid)
+        self.try_text: dict[str, str] = {}  # column -> what a TRY_ function reads it as (`try_to_timestamp(col)`): text holding that
         # number column -> how far behind the newest value the models still read (`block >= (select max(block) from
         # what was loaded) - 20000`): what a run takes in lies within that of the newest
         self.lookbacks: dict[str, float] = {}
@@ -294,6 +295,30 @@ def _parsed_as(node: exp.Expression) -> str | None:
             and re.fullmatch(r"(TRY_)?TO_TIMESTAMP(_NTZ|_LTZ|_TZ)?", reader.name.upper()):
         return "TIMESTAMP"
     return None
+
+
+def _try_reads(node: exp.Expression) -> str | None:
+    """What a TRY_ function the value is handed to as it is reads it as: TIMESTAMP, DATE, TIME, NUMBER or DOUBLE.
+    In Snowflake those functions take text only (a few also their own type): the column holds text."""
+    top = node
+    while isinstance(top.parent, exp.Paren):
+        top = top.parent
+    reader = top.parent
+    first = reader.expressions[0] if isinstance(reader, exp.Anonymous) and reader.expressions else getattr(reader, "this", None)
+    if first is not top:
+        return None
+    if isinstance(reader, exp.Anonymous) and re.fullmatch(r"TRY_TO_(TIMESTAMP(_NTZ|_LTZ|_TZ)?)", reader.name.upper()):
+        return "TIMESTAMP"
+    if isinstance(reader, exp.Anonymous) and re.fullmatch(r"TRY_TO_(NUMBER|NUMERIC|DECIMAL)", reader.name.upper()):
+        return "NUMBER"
+    if not reader.args.get("safe") and not (isinstance(reader, exp.TryCast) and reader.args.get("requires_string")):
+        return None
+    if isinstance(reader, exp.TryCast):
+        to = reader.to
+        return "DATE" if to.is_type("date") else "TIME" if to.is_type("time") else "TIMESTAMP" if to.is_type(*exp.DataType.TEMPORAL_TYPES) \
+            else "DOUBLE" if to.is_type("double", "float") else "NUMBER" if to.is_type(*exp.DataType.NUMERIC_TYPES) else None
+    return {exp.TsOrDsToDate: "DATE", exp.TsOrDsToTime: "TIME", exp.StrToTime: "TIMESTAMP", exp.ToNumber: "NUMBER",
+            exp.ToDouble: "DOUBLE"}.get(type(reader))
 
 
 def _split_use(use: "SourceUse", column: str, call: exp.Expression) -> bool:
@@ -994,6 +1019,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     use.columns[hit[1]] = _parsed_as(col)  # try_to_timestamp(cast(issued as varchar)): a point in time
                 if _epoch_scale(col):
                     use.scales[(hit[1], "")] = _epoch_scale(col)
+                if _try_reads(col):
+                    use.try_text.setdefault(hit[1], _try_reads(col))  # try_to_timestamp(col): the column holds text
                 if isinstance(parent, (exp.Sum, exp.Avg, exp.Add, exp.Sub, exp.Mul, exp.Div)):
                     use.numbers.add(hit[1])
                 if joins is not None:
@@ -2718,6 +2745,24 @@ def analyse(manifest: dict, database: str) -> Analysis:
             if col in out and by in out and not out[col].get("follows") and out[by].get("follows") != col \
                     and out[col]["gen"] in ("dist", "template", "categorical", "time_offset", "pool"):
                 out[col]["follows"] = by
+        for col, kind in use.try_text.items():
+            # `try_to_timestamp(col)`: in Snowflake the column holds text (a TRY_ function takes nothing else); what the
+            # text says is a point in time or a number, written the way such text usually is
+            gen = out.get(col)
+            if gen is None or gen.get("format") or str(gen.get("type", "")).upper() in ("VARCHAR", "TEXT", "STRING"):
+                continue
+            if kind in ("TIMESTAMP", "DATE", "TIME"):
+                fmt = {"TIMESTAMP": "%Y-%m-%d %H:%M:%S", "DATE": "%Y-%m-%d", "TIME": "%H:%M:%S"}[kind]
+                if gen.get("gen") in ("time_offset", "event_time", "updated_at", "loaded_at") and not gen.get("epoch"):
+                    out[col] = {"gen": "time_offset", "format": fmt, **{k: v for k, v in gen.items() if k in ("p", "seconds", "null_rate")}}
+                    out[col].setdefault("p", WEEK["p"])
+                    out[col].setdefault("seconds", WEEK["seconds"])
+                elif gen.get("gen") == "template" and gen.get("template") == f"{col.lower()}_{{hex}}" and not gen.get("templates"):
+                    out[col] = {"gen": "time_offset", "format": fmt, **WEEK}
+            elif kind in ("NUMBER", "DOUBLE") and gen.get("gen") == "dist":
+                out[col] = {**gen, "type": "VARCHAR"}
+            elif kind in ("NUMBER", "DOUBLE") and gen.get("gen") == "template" and gen.get("template") == f"{col.lower()}_{{hex}}":
+                out[col] = {"gen": "dist", "type": "VARCHAR", "p": [0, 1], "v": [1, 1000]}
         periods_have_length(out)
         tables[name] = {
             "volume": {"rows_per_day": 100_000, "weekly": [1, 1, 1, 1, 1, 1, 1]},  # placeholder: 100 rows a day at the default scale
@@ -3491,7 +3536,11 @@ def _fit(project, path: Path, database: str, emu, manifest: dict, analysis: Anal
         if len(failures) > before * 0.9 and (len(fitter.learned) == known or before - len(failures) < 3):
             break  # compiling again changes little now: the build takes it from here
     fitter.drop_models(manifest)
-    summary = {} if os.environ.get("FAUXFLAKE_FIT_NO_BUILD") else fitter.learn_from_build(project, analysis)
+    # the data is the user's to describe: a build round fixes what keeps models from building (types, missing
+    # columns), and the tests that fail on the data as it is are reported. FAUXFLAKE_FIT_TESTS=1 also learns from them
+    fitter.models_only = not os.environ.get("FAUXFLAKE_FIT_TESTS")
+    summary = {} if os.environ.get("FAUXFLAKE_FIT_NO_BUILD") else fitter.learn_from_build(
+        project, analysis, rounds=30 if os.environ.get("FAUXFLAKE_FIT_TESTS") else 8)
     # a function the project creates itself (in a hook) needs no placeholder
     state = emu._fs.results_cache.get(objects._KEY)
     created = set(state.functions) if state else set()

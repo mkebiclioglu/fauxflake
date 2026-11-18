@@ -1446,3 +1446,19 @@ def test_a_table_a_snapshot_takes_one_row_of_for_each_key_is_not_a_table_of_read
     assert build_spec(manifest(False), "A")[0]["tables"]["RAW.S.USERS"].get("grain")  # readings, as far as the models say
     table = build_spec(manifest(True), "A")[0]["tables"]["RAW.S.USERS"]
     assert not table.get("grain") and not table["columns"]["ID"].get("of")
+
+
+def test_a_column_a_try_function_reads_holds_text():
+    from fauxflake.init import build_spec
+
+    manifest = {
+        "sources": {"source.p.s.events": {"database": "RAW", "schema": "S", "name": "events", "identifier": "events", "columns": {
+            "original_timestamp": {"data_type": "VARCHAR"}, "amount": {"data_type": "VARCHAR"}, "day": {"data_type": "VARCHAR"}}}},
+        "nodes": {"model.p.m": {"resource_type": "model", "name": "m", "depends_on": {"nodes": []}, "relation_name": "A.B.M",
+                                "compiled_code": "select try_to_timestamp_ntz(original_timestamp) as at, try_to_number(amount) as n, "
+                                                 "try_to_date(day) as d from raw.s.events"}},
+    }
+    columns = build_spec(manifest, "A")[0]["tables"]["RAW.S.EVENTS"]["columns"]
+    assert columns["ORIGINAL_TIMESTAMP"]["format"] == "%Y-%m-%d %H:%M:%S", columns
+    assert columns["DAY"].get("format") == "%Y-%m-%d" or columns["DAY"].get("type", "").upper() == "VARCHAR", columns
+    assert columns["AMOUNT"].get("type") == "VARCHAR", columns

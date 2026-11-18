@@ -10,7 +10,8 @@ from fauxflake.cli import main
 PROJECT = Path(__file__).parent / "projects" / "fit_me"
 
 
-def test_init_learns_the_spec_by_running_the_project(tmp_path):
+def test_init_learns_the_spec_by_running_the_project(tmp_path, monkeypatch):
+    monkeypatch.setenv("FAUXFLAKE_FIT_TESTS", "1")  # (what the tests say of the data is learned too, on request)
     spec_path = tmp_path / "fauxflake.yml"
     runner = CliRunner()
     out = runner.invoke(main, ["init", "--project-dir", str(PROJECT), "--spec", str(spec_path)])
@@ -60,3 +61,13 @@ def test_fit_updates_a_spec_without_losing_edits(tmp_path):
     after = yaml.safe_load(spec_path.read_text())["tables"]["RAW.APP.EVENTS"]
     assert after["columns"]["REGION_CODE"]["v"] == [40, 60, 70] and after["volume"]["rows_per_day"] == 123
     assert "RAW.APP.EVENTS.REGION_CODE" in out.output
+
+
+def test_init_fixes_what_keeps_models_from_building_and_reports_failing_tests(tmp_path):
+    spec_path = tmp_path / "fauxflake.yml"
+    out = CliRunner().invoke(main, ["init", "--project-dir", str(PROJECT), "--spec", str(spec_path)])
+    assert out.exit_code == 0, out.output
+    spec = yaml.safe_load(spec_path.read_text())
+    assert "6/6 models" in out.output  # every model builds
+    assert "expected_failures" not in (spec.get("dbt") or {})  # a test that fails on the data is the user's to look at
+    assert "no_small_totals" in out.output

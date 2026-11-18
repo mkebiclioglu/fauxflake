@@ -3382,6 +3382,8 @@ class Fitter:
 
     # --- loop 2: the real dbt build
 
+    models_only = False  # a build round fixes models that fail, and nothing about what tests say of the data
+
     def learn_from_build(self, project, analysis, rounds: int = 30) -> dict:  # noqa: ANN001
         """Run `dbt build`, read the results, fix what the spec can fix. Returns the last summary."""
         summary: dict = {}
@@ -3512,6 +3514,8 @@ class Fitter:
                 if node is None:
                     continue
                 message = r.get("message") or ""
+                if node["resource_type"] == "test" and self.models_only:
+                    continue  # (what the data should be like is the user's to say in the spec: a failing test is reported, not taught)
                 if node["resource_type"] == "test":
                     # (whatever comes of it: dbt skipped what is downstream of the model it tests, which the next round builds)
                     tested = nodes.get(node.get("attached_node") or "") or next(
@@ -3607,7 +3611,7 @@ class Fitter:
                 # nothing left to learn from a partial round. Before the full build that has the last word, the models
                 # that built with no rows are asked what the data lacks: what that teaches is rebuilt in part as well,
                 # and one full build confirms everything at the end, not one after each look
-                if expected and not getattr(self, "_second_look", False):
+                if expected and not getattr(self, "_second_look", False) and not self.models_only:
                     # (and the tests listed along the way are looked at again with all that was learned since)
                     self._second_look = True
                     by_name = {n["name"]: n for n in nodes.values() if n.get("resource_type") == "test"}
@@ -3618,7 +3622,7 @@ class Fitter:
                         expected[:] = [name for name in expected if name not in taught]
                         self.log(f"  a second look at the listed tests: {len(taught)} can be taught to the spec")
                 looks = self.__dict__.setdefault("_row_looks", 0)
-                if not failed and looks < 2 and not os.environ.get("FAUXFLAKE_FIT_NO_ROWS_LOOK"):
+                if not failed and looks < 2 and not os.environ.get("FAUXFLAKE_FIT_NO_ROWS_LOOK") and not self.models_only:
                     self._row_looks, looked = looks + 1, True
                     taught = self.learn_from_empties(nodes)
                     if taught:
@@ -3631,7 +3635,7 @@ class Fitter:
                 # before stopping: the tests listed along the way were judged with what was known then. With all that
                 # was read and learned since, some can be taught to the spec after all; those come off the list and
                 # the build runs once more
-                if expected and not getattr(self, "_second_look", False) and n_round < rounds:
+                if expected and not getattr(self, "_second_look", False) and n_round < rounds and not self.models_only:
                     self._second_look = True
                     by_name = {n["name"]: n for n in nodes.values() if n.get("resource_type") == "test"}
                     taught = [name for name in list(expected) if name in by_name and (
@@ -3644,7 +3648,8 @@ class Fitter:
                         continue
                 # and the models that built, but with no rows: where the rows stop may be something the data can meet
                 looks = self.__dict__.setdefault("_row_looks", 0)
-                if not failed and looks < 2 and n_round < rounds and not looked and not os.environ.get("FAUXFLAKE_FIT_NO_ROWS_LOOK"):
+                if not failed and looks < 2 and n_round < rounds and not looked and not self.models_only \
+                        and not os.environ.get("FAUXFLAKE_FIT_NO_ROWS_LOOK"):
                     self._row_looks = looks + 1
                     taught = self.learn_from_empties(nodes)
                     if taught:
