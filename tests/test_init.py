@@ -1493,3 +1493,13 @@ def test_a_number_lined_up_with_a_made_up_text_in_a_union_makes_the_text_a_numbe
     _share_union_values(tables, [{("A.S.ONE", "DURATION"), ("A.S.TWO", "DURATION"), ("A.S.THREE", "DURATION")}])
     assert tables["A.S.TWO"]["columns"]["DURATION"] == {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000]}
     assert tables["A.S.THREE"]["columns"]["DURATION"]["gen"] == "template"  # a text with a shape of its own stays
+
+
+def test_a_placeholder_number_lined_up_with_a_reference_in_a_union_holds_the_keys():
+    from fauxflake.init import _share_union_values
+
+    ref = {"gen": "fk", "ref": "A.S.ACCOUNT", "skew": 1.5}
+    tables = {"A.S.NOW": {"columns": {"ACCOUNT_ID": dict(ref)}},
+              "A.S.BEFORE": {"columns": {"ACCOUNT_ID": {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000]}}}}
+    _share_union_values(tables, [{("A.S.NOW", "ACCOUNT_ID"), ("A.S.BEFORE", "ACCOUNT_ID")}])
+    assert tables["A.S.BEFORE"]["columns"]["ACCOUNT_ID"] == ref

@@ -1857,6 +1857,12 @@ def _share_union_values(tables: dict[str, dict], links: list) -> None:
             if gen.get("gen") == "template" and gen.get("template") == f"{label}_{{hex}}" and len(gen) == 2:
                 where, key = held[m]
                 where[key] = {k: v for k, v in number.items() if k in ("gen", "type", "p", "v")}
+        # the other way round: a placeholder number lined up with a reference to another table's keys holds those keys
+        key = next((g for g in gens.values() if g.get("gen") == "fk"), None)
+        for m, gen in gens.items() if key else ():
+            if gen.get("gen") == "dist" and gen.get("p") == [0, 1] and gen.get("v") == [1, 1000] and set(gen) <= {"gen", "type", "p", "v"}:
+                where, at = held[m]
+                where[at] = dict(key)
 
 
 _FLAGS = {"ISDELETED", "ISWON", "ISCLOSED", "ISACTIVE", "ISCONVERTED", "ISARCHIVED", "ISPRIVATE"}
