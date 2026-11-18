@@ -418,7 +418,7 @@ def _func_args(node: exp.Func) -> list[exp.Expression]:
     return out
 
 
-_NUMBER_FORMAT = re.compile(r"^(FM)?(\$)?([09,]+)(?:\.([09]+))?$", re.IGNORECASE)
+_NUMBER_FORMAT = re.compile(r"^(FM)?(S)?(\$)?([09,]+)(?:\.([09]+))?$", re.IGNORECASE)
 
 
 def _number_format(value: exp.Expression, model: str) -> exp.Expression | None:
@@ -428,7 +428,7 @@ def _number_format(value: exp.Expression, model: str) -> exp.Expression | None:
     m = _NUMBER_FORMAT.match(model.strip())
     if not m:
         return None
-    fill, dollar, whole, frac = m.groups()
+    fill, signed, dollar, whole, frac = m.groups()
     decimals = len(frac or "")
     digits = whole.replace(",", "")
     spec = ("," if "," in whole else "") + f".{decimals}f"
@@ -438,9 +438,9 @@ def _number_format(value: exp.Expression, model: str) -> exp.Expression | None:
     text = f"format('{{:{spec}}}', abs({v}))"
     if dollar:
         text = f"concat('$', {text})"
-    text = f"(case when {v} < 0 then '-' else '' end || {text})"
-    if not fill:  # Snowflake right-aligns in the model's width, plus one position for the sign
-        text = f"lpad({text}, {len(model.strip()) + 1}, ' ')"
+    text = f"(case when {v} < 0 then '-' else '{'+' if signed else ''}' end || {text})"
+    if not fill:  # Snowflake right-aligns in the model's width, plus one position for the sign (S is that position)
+        text = f"lpad({text}, {len(model.strip()) + (0 if signed else 1)}, ' ')"
     return sqlglot.parse_one(text, read="duckdb")
 
 
