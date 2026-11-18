@@ -89,6 +89,10 @@ class SourceUse:
         # number column -> how far behind the newest value the models still read (`block >= (select max(block) from
         # what was loaded) - 20000`): what a run takes in lies within that of the newest
         self.lookbacks: dict[str, float] = {}
+        # (the column that names a field, the column that holds its value, {field: "date" | "number"}): `pivot(max(old_value)
+        # for field in ('amount', 'closedate'))` with `closedate::date`, `amount::float` further down: a history of
+        # changes, where what the value column holds depends on the field the row is about
+        self.pivoted: list[tuple[str, str, dict[str, str]]] = []
         self.kept_ranges: dict[str, tuple[float, float]] = {}  # number column -> a range some model keeps (`between a and b`)
         # ((column, path), (column, path)): rows kept as the latest of each of the first, then looked up by the
         # second (`partition by dns` ... `on x.installation_id = l.installation_id`): the first belongs to one of the second
@@ -1308,6 +1312,41 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 for got in behind(inner) or ():
                     if len(got) == 2 and got[0] in sources:
                         sources[got[0]].lengths.setdefault(got[1], int(number.name))
+
+        for turned in select.find_all(exp.Pivot):
+            listed = (turned.args.get("fields") or [None])[0]
+            held = turned.expressions[0].this if turned.expressions and isinstance(turned.expressions[0], exp.AggFunc) else None
+            if turned.args.get("unpivot") or turned.find_ancestor(exp.Select) is not select or not isinstance(listed, exp.In) \
+                    or not isinstance(listed.this, exp.Column) or not isinstance(held, exp.Column):
+                continue
+            # (`coalesce(old_value, 'true null') as old_value` upstream: the column it takes first)
+            def the_one(col):  # noqa: ANN001, ANN202
+                """The one source column a column stands for, also through `lower(field) as opportunity_field` upstream."""
+                hit = resolve(col) or next(iter(behind(col) or ()), None)
+                told = None if hit else upstream(_EXPR, col)
+                if told:
+                    try:
+                        inside = {c.name.upper() for c in sqlglot.parse_one(told[1], read="snowflake").find_all(exp.Column)}
+                    except Exception:  # noqa: BLE001
+                        inside = set()
+                    hit = (told[0], inside.pop()) if len(inside) == 1 else None
+                return tuple(hit[:2]) if hit else None
+
+            field, value = the_one(listed.this), the_one(held)
+            written_out = [e.this if isinstance(e, (exp.Alias, exp.PivotAlias)) else e for e in listed.expressions]
+            names = {e.name.upper(): e.name for e in written_out if isinstance(e, exp.Literal) and e.is_string}
+            if not (field and value and field[0] == value[0] and field[0] in sources and field[1] != value[1] and names):
+                continue
+            kinds: dict[str, str] = {}
+            for cast in tree.find_all(exp.Cast, exp.TryCast):  # (anywhere in the model: the casts come after the pivot)
+                inner = cast.this.unnest()
+                if isinstance(inner, exp.Column) and inner.name.upper() in names:
+                    if cast.to.is_type("date", "timestamp", "timestampntz", "timestamptz", "timestampltz", "datetime"):
+                        kinds.setdefault(names[inner.name.upper()], "date")
+                    elif cast.to.is_type("float", "double", "decimal", "int", "bigint", "number"):
+                        kinds.setdefault(names[inner.name.upper()], "number")
+            if kinds:
+                sources[field[0]].pivoted.append((field[1], value[1], kinds))
 
         # `where block >= (select max(block) from loaded) - 20000`: a run reads what is within 20000 of the newest
         for test in select.find_all(exp.GTE, exp.GT):
@@ -2785,6 +2824,19 @@ def analyse(manifest: dict, database: str) -> Analysis:
             held[column] = {"gen": "row_of", "group": seed, "values": [row[i] for row in rows]}
         joined.append(f"{table} ({', '.join(columns)}): joined together to the seed {seed}, generated as the rows it lists.")
     _share_join_values(tables, joins, joined, lookups)
+    for name, use in uses.items():
+        columns = tables.get(name, {}).get("columns") or {}
+        for field, value, kinds in use.pivoted:
+            # a history of changes: the old value of a date is a date, of an amount a number (`by` the field column)
+            held = columns.get(value)
+            if field not in columns or held is None or held.get("gen") in (*_KEYS, "fk", "by", "object", "array"):
+                continue
+            cases = {f: ({"gen": "time_offset", "format": "%Y-%m-%d", **WEEK} if kind == "date" else
+                         {"gen": "dist", "type": "BIGINT", "p": [0, 0.5, 1], "v": [0, 1000, 100000]}) for f, kind in sorted(kinds.items())}
+            columns[value] = {"gen": "by", "of": field, "cases": cases, "else": {k: v for k, v in held.items() if k != "null_rate"},
+                              **({"null_rate": held["null_rate"]} if held.get("null_rate") else {})}
+            notes.append(f"{name}.{value}: models turn it into one column for each {field.lower()} and read some as dates or numbers; "
+                         f"what it holds goes by the {field.lower()} of the row (`by`).")
     for name, use in uses.items():
         columns = tables.get(name, {}).get("columns") or {}
         for thing, start, end in sorted(use.histories):

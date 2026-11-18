@@ -597,3 +597,26 @@ def test_a_table_generated_again_on_its_own_still_finds_the_rows_it_refers_to(tm
         again.advance_to(datetime(2025, 1, 3), only={"RAW.T.ORDERS"})
         assert emu.cursor().execute("""select count(*), count(a."ID"), count(o."NOTE") from "RAW"."T"."ORDERS" o
                                        left join "RAW"."T"."ACCOUNTS" a on a."ID" = o."ACCOUNT" """).fetchone() == (400, 400, 400)
+
+
+def test_a_value_that_goes_by_another_column_holds_what_each_case_says(tmp_path):
+    from datetime import datetime
+
+    from fauxflake.emulator import serve
+    from fauxflake.generate import Warehouse
+    from fauxflake.spec import Spec
+
+    spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "tables": {"RAW.T.HISTORY": {"volume": {"rows_per_day": 300}, "columns": {
+        "ID": {"gen": "sequence"},
+        "FIELD": {"gen": "categorical", "values": {"amount": 0.3, "closedate": 0.3, "stagename": 0.4}},
+        "OLDVALUE": {"gen": "by", "of": "FIELD", "else": {"gen": "template", "template": "oldvalue_{hex}"}, "cases": {
+            "amount": {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [0, 1000]},
+            "closedate": {"gen": "time_offset", "format": "%Y-%m-%d", "p": [0, 1], "seconds": [0, 86400]}}}}}}}, tmp_path / "x.yml")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 3))
+        cur = emu.cursor()
+        assert cur.execute("""select count(*), count(try_cast("OLDVALUE" as bigint)) from "RAW"."T"."HISTORY" where "FIELD" = 'amount' """).fetchone()[0] > 50
+        rows, dates, amounts, texts = cur.execute("""select count(*), count_if("FIELD" = 'closedate' and try_cast("OLDVALUE" as date) is not null),
+            count_if("FIELD" = 'amount' and try_cast("OLDVALUE" as bigint) is not null), count_if("FIELD" = 'stagename' and "OLDVALUE" like 'oldvalue\\_%' escape '\\')
+            from "RAW"."T"."HISTORY" """).fetchone()
+        assert rows == dates + amounts + texts and min(dates, amounts, texts) > 50

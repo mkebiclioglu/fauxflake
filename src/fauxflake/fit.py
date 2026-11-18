@@ -955,8 +955,8 @@ class Fitter:
                 self.tables.get(str(gen.get("ref", "")).upper(), {}).get("columns") or {}).values())
             if as_text and hint != "TEXT" and not fmt and (reads is None or kind in reads) and not (numeric and hashed):
                 continue  # already holds numbers, dates or booleans as text: a cast reads them (a reference to hashes does not)
-            if kind in ("lifecycle", "loaded_at"):
-                continue
+            if kind in ("lifecycle", "loaded_at", "by"):
+                continue  # (`by`: the value goes by another column, each case with a kind of its own)
             if kind in ("object", "array") and (gen.get("fields") or kind == "array") and hint not in ("VARIANT", "ARRAY", "TEXT"):
                 continue  # a document the models read fields of: the value that failed is one of its fields
             if hint == "VARIANT" and kind not in _FREE:

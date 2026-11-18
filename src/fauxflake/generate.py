@@ -604,6 +604,16 @@ class TableSQL:
                     expr = self._expr(str(d["of"]), other)
                 finally:
                     self.base = "g"
+        elif gen == "by":
+            # what the value is goes by another column of the row (the old value of a date field is a date): text
+            other = self.t.columns.get(str(d.get("of"))) if "." not in col else None
+            rest = f"({self._expr(col, d['else'])})::varchar"
+            if other is None:
+                expr = rest
+            else:
+                arms = " ".join(f"when {lit(str(name))} then ({self._expr(f'{col}:{name}', case)})::varchar"
+                                for name, case in (d.get("cases") or {}).items())
+                expr = f"(case ({self.expr(str(d['of']), other)})::varchar {arms} else {rest} end)"
         elif gen == "constant":
             expr = lit(d.get("value"))
         else:

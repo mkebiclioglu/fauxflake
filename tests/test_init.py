@@ -1410,3 +1410,20 @@ def test_a_text_of_numbers_in_one_union_branch_is_the_same_kind_of_text_in_the_o
               "RAW.V.PINGS": {"columns": {"RESULTS": {"gen": "object", "fields": {"version": {"gen": "template", "template": "version_{hex}"}}}}}}
     _share_union_values(tables, [{("RAW.V.USAGE", "VERSION"), ("RAW.V.PINGS", "RESULTS", "version")}])
     assert tables["RAW.V.PINGS"]["columns"]["RESULTS"]["fields"]["version"] == {"gen": "template", "templates": ["{n}.{n}", "{n}.{n}-pre"]}
+
+
+def test_the_value_of_a_history_of_changes_goes_by_the_field_it_is_about():
+    from fauxflake.init import build_spec
+
+    manifest = {
+        "sources": {"source.p.s.history": {"database": "RAW", "schema": "S", "name": "history", "identifier": "history", "columns": {
+            c: {"data_type": "VARCHAR"} for c in ("opportunityid", "field", "oldvalue")}}},
+        "nodes": {"model.p.m": {"resource_type": "model", "name": "m", "depends_on": {"nodes": []}, "relation_name": "A.B.M", "compiled_code": """
+            with base as (select opportunityid as id, field as opportunity_field, oldvalue as old_value from raw.s.history
+                          where field in ('amount', 'closedate', 'stagename')),
+                 turned as (select * from base pivot(max(old_value) for opportunity_field in ('amount', 'closedate', 'stagename')))
+            select id, closedate::date as close_date, amount::float as amount, stagename from turned"""}},
+    }
+    held = build_spec(manifest, "A")[0]["tables"]["RAW.S.HISTORY"]["columns"]["OLDVALUE"]
+    assert held["gen"] == "by" and held["of"] == "FIELD" and set(held["cases"]) == {"amount", "closedate"}, held
+    assert held["cases"]["closedate"]["format"] == "%Y-%m-%d" and held["cases"]["amount"]["gen"] == "dist"
