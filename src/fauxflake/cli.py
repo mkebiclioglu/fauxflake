@@ -251,7 +251,11 @@ def parity(spec_path, project_dir, scale, history, db_path, keep, connection, da
     database = spec.dbt.get("database", "ANALYTICS")
     conn = snowflake.connector.connect(connection_name=connection)
     with serve() as emu:
-        wh = Warehouse(emu, spec, scale)
+        # (Snowflake's CURRENT_DATE is today, in its session's time zone: so is the emulator's here, or every date
+        # spine would end on another day)
+        zone = conn.cursor().execute("show parameters like 'TIMEZONE' in session").fetchall()[0][1]
+        emu.duck.execute(f"set global TimeZone = '{zone}'")
+        wh = Warehouse(emu, spec, scale, freeze_clock=False)
         local = DbtProject(project_dir, emulator_output(emu.port, database))
         remote = DbtProject(project_dir, snowflake_output(connection, database), name="snowflake")
         rows, found = run(conn, wh, local, remote, _start(spec, history), days, remote_schema=schema, log=click.echo)
