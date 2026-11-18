@@ -27,35 +27,48 @@ def _snowflake_type(kind: str) -> str:
     return TYPES.get(kind, kind.replace("DECIMAL", "NUMBER"))
 
 
-def seed(conn, wh: Warehouse, after: datetime | None = None, log=print) -> None:
-    """Copy the emulator's source tables (or the rows loaded since `after`) into Snowflake."""
-    cur = conn.cursor()
+def seed(conn, wh: Warehouse, after: datetime | None = None, log=print, workers: int = 8) -> None:
+    """Copy the emulator's source tables (or the rows loaded since `after`) into Snowflake. Each table is written
+    to a Parquet file here, one after the other (DuckDB is one connection), and loaded into Snowflake by a few
+    threads at once (PUT and COPY wait on the network, not on this machine)."""
+    from concurrent.futures import ThreadPoolExecutor
+
     with tempfile.TemporaryDirectory() as tmp:
+        work = []
         for t in wh.spec.ordered():
             db, schema, table = t.name.split(".")
             loaded = t.role("loaded_at")
-            if t.raw.get("mode") == "upsert" or not loaded:
-                after = None  # rows change in place, so the table is replaced rather than appended to
-            where = f"where {loaded} > '{after}'" if after else ""
-            path = Path(tmp) / f"{table}.parquet"
+            since = None if t.raw.get("mode") == "upsert" or not loaded else after  # (rows that change in place: replaced)
+            where = f"where {loaded} > '{since}'" if since else ""
+            path = Path(tmp) / f"{db}.{schema}.{table}.parquet"
             n = wh.cur.execute(f"copy (select * from {t.name} {where}) to '{path}' (format parquet)").fetchone()[0]
             described = [(c, _snowflake_type(ty)) for c, ty, *_ in wh.cur.execute(f"describe {t.name}").fetchall()]
-            if after is None:
-                cols = ", ".join(f'"{c}" {ty}' for c, ty in described)
-                try:
-                    cur.execute(f"create database if not exists {db}")
-                except Exception:  # noqa: BLE001, S110 - a role that may not create databases: the schema says so if it is missing
-                    pass
-                cur.execute(f"create schema if not exists {db}.{schema}")
-                cur.execute(f"create or replace table {t.name} ({cols})")
-            if n == 0:
-                continue
-            cur.execute(f"put file://{path} @{db}.{schema}.%{table} auto_compress=false overwrite=true")
-            # (a document travels as text and is parsed on arrival: loaded by name it would stay a string)
-            picked = ", ".join(f'parse_json($1:"{c}"::varchar)' if ty == "VARIANT" else f'$1:"{c}"::{ty}' for c, ty in described)
-            cur.execute(f"copy into {t.name} from (select {picked} from @{db}.{schema}.%{table}) "
-                        "file_format=(type=parquet use_logical_type=true) purge=true")
-            log(f"  seeded {t.name}: {n:,} rows")
+            work.append((t.name, db, schema, table, path, n, described, since is None))
+        cur = conn.cursor()
+        for db, schema in sorted({(w[1], w[2]) for w in work if w[7]}):
+            try:
+                cur.execute(f"create database if not exists {db}")
+            except Exception:  # noqa: BLE001, S110 - a role that may not create databases: the schema says so if it is missing
+                pass
+            cur.execute(f"create schema if not exists {db}.{schema}")
+
+        def load(item) -> str:  # noqa: ANN001
+            name, db, schema, table, path, n, described, fresh = item
+            c = conn.cursor()
+            if fresh:
+                c.execute(f"create or replace table {name} ({', '.join(f'{chr(34)}{col}{chr(34)} {ty}' for col, ty in described)})")
+            if n:
+                c.execute(f"put file://{path} @{db}.{schema}.%{table} auto_compress=false overwrite=true")
+                # (a document travels as text and is parsed on arrival: loaded by name it would stay a string)
+                picked = ", ".join(f'parse_json($1:"{col}"::varchar)' if ty == "VARIANT" else f'$1:"{col}"::{ty}' for col, ty in described)
+                c.execute(f"copy into {name} from (select {picked} from @{db}.{schema}.%{table}) "
+                          "file_format=(type=parquet use_logical_type=true) purge=true")
+            c.close()
+            return f"  seeded {name}: {n:,} rows"
+
+        with ThreadPoolExecutor(workers) as pool:
+            for line in pool.map(load, work):
+                log(line)
 
 
 def _fetch(conn, sql: str):

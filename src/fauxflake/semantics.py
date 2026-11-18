@@ -121,7 +121,10 @@ MACROS = [
     f"create or replace macro {_NS}_sf_string_as_binary(s) as encode(s::varchar)",
     f"create or replace macro {_NS}_sf_jaccard(a, b) as jaccard(a::varchar, b::varchar)",
     f"create or replace macro {_NS}_sf_approx_count(x) as approx_count_distinct(x)",
-    f"create or replace macro {_NS}_sf_try_hex_binary(s) as try(unhex(s::varchar))",
+    f"""create or replace macro {_NS}_sf_try_hex_binary(s) as case
+          when length(s::varchar) % 2 = 0 and regexp_full_match(s::varchar, '[0-9A-Fa-f]*') then unhex(s::varchar) end""",
+    f"create or replace macro {_NS}_sf_is_binary(v) as case when v is not null then false end",
+    f"create or replace macro {_NS}_sf_try_validate_utf8(s) as s",
     f"create or replace macro {_NS}_sf_current_account_name() as 'FAUXFLAKE'",
     # the text behind the base64, as UTF-8; a VARIANT string is read without its JSON quotes
     f"create or replace macro {_NS}_sf_try_base64(x) as try(decode(from_base64({_NS}_sf_text(x))))",
@@ -364,6 +367,7 @@ _RENAMED = {  # Snowflake function -> macro, same arguments
     "binary_as_string": "_sf_binary_as_string", "string_as_binary": "_sf_string_as_binary", "jaccard_similarity": "_sf_jaccard",
     "approximate_count_distinct": "_sf_approx_count", "hll": "_sf_approx_count", "soundex_p123": "_sf_soundex",
     "try_hex_decode_binary": "_sf_try_hex_binary", "is_date_value": "_sf_is_date",
+    "is_binary": "_sf_is_binary", "is_vector": "_sf_is_binary", "try_validate_utf8": "_sf_try_validate_utf8",
     **{f"is_{k}": f"_sf_is_{k}" for k in ("object", "array", "integer", "varchar", "char", "boolean", "decimal", "double", "real")},
 }
 _DATE_TOKENS = re.compile(r"YYYY|YY|MM|DD|HH|MI|SS|MON|DY|AM|PM", re.IGNORECASE)
@@ -869,6 +873,12 @@ def _fix(node: exp.Expression) -> exp.Expression:
         return _fn("_sf_sha2", node.this, node.args["length"])  # sha2(x, 512): DuckDB has 256 only
     if isinstance(node, exp.Anonymous) and isinstance(node.this, str) and node.name.lower() in _RENAMED:
         return _fn(_RENAMED[node.name.lower()], *node.expressions)  # (a function sqlglot has no class for)
+    if isinstance(node, exp.Time) and node.this is not None and not node.args.get("zone"):
+        return exp.cast(node.this, "time")  # TIME(ts): the time of day it holds (sqlglot reads a zone into it)
+    if isinstance(node, exp.Anonymous) and isinstance(node.this, str) and node.name.lower() == "map_construct" \
+            and len(node.expressions) % 2 == 0:
+        pairs = [x for k, v in zip(node.expressions[::2], node.expressions[1::2]) for x in (exp.cast(k.copy(), "varchar"), v.copy())]
+        return exp.Anonymous(this="json_object", expressions=pairs)  # a MAP reads back as the object it lists
     if isinstance(node, exp.Anonymous) and isinstance(node.this, str) and node.name.lower() == "like_any" and len(node.expressions) >= 2:
         subject, *patterns = node.expressions  # like_any(s, p1, p2): like one of them
         tests = [exp.Like(this=subject.copy(), expression=p.copy()) for p in patterns]

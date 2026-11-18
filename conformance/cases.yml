@@ -494,7 +494,7 @@
 - {id: fn_ifnull, sql: "select IFNULL(7, 2)"}
 - {id: fn_insert, sql: "select INSERT('abc', 7, 2, 'b')"}
 - {id: fn_is_array, sql: "select IS_ARRAY(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
-- {id: fn_is_binary, sql: "select IS_BINARY(parse_json('{\"a\": 1, \"b\": [1, 2]}'))", gap: "not in the emulator"}
+- {id: fn_is_binary, sql: "select IS_BINARY(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
 - {id: fn_is_boolean, sql: "select IS_BOOLEAN(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
 - {id: fn_is_char, sql: "select IS_CHAR(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
 - {id: fn_is_date, sql: "select IS_DATE(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
@@ -510,7 +510,7 @@
 - {id: fn_is_timestamp_ntz, sql: "select IS_TIMESTAMP_NTZ(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
 - {id: fn_is_timestamp_tz, sql: "select IS_TIMESTAMP_TZ(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
 - {id: fn_is_varchar, sql: "select IS_VARCHAR(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
-- {id: fn_is_vector, sql: "select IS_VECTOR(parse_json('{\"a\": 1, \"b\": [1, 2]}'))", gap: "not in the emulator"}
+- {id: fn_is_vector, sql: "select IS_VECTOR(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
 - {id: fn_jaccard_similarity, sql: "select JACCARD_SIMILARITY('abc', 'b')"}
 - {id: fn_jarowinkler_similarity, sql: "select JAROWINKLER_SIMILARITY('abc', 'b')"}
 - {id: fn_kurtosis, sql: "select KURTOSIS(column1) from values (7), (2), (7)"}
@@ -529,7 +529,7 @@
 - {id: fn_log_2, sql: "select LOG(2.5, 0.5)"}
 - {id: fn_lower, sql: "select LOWER('abc')"}
 - {id: fn_lpad, sql: "select LPAD(to_binary('616263', 'hex'), 7, to_binary('62', 'hex'))", gap: "not in the emulator"}
-- {id: fn_map_construct, sql: "select MAP_CONSTRUCT(7, 2)", gap: "not in the emulator"}
+- {id: fn_map_construct, sql: "select MAP_CONSTRUCT(7, 2)"}
 - {id: fn_max, sql: "select MAX(column1) from values (7), (2), (7)"}
 - {id: fn_max_by, sql: "select MAX_BY(column1, column2) from values (7, 2), (2, 7), (7, 2)"}
 - {id: fn_md5, sql: "select MD5('abc')"}
@@ -636,7 +636,7 @@
 - {id: fn_tan, sql: "select TAN(2.5::float)"}
 - {id: fn_tanh, sql: "select TANH(2.5::float)"}
 - {id: fn_time, sql: "select TIME('2024-03-15 10:20:30'::timestamp_ltz)", gap: "not in the emulator"}
-- {id: fn_time_2, sql: "select TIME('2024-03-15 10:20:30'::timestamp_ntz)", gap: "not in the emulator"}
+- {id: fn_time_2, sql: "select TIME('2024-03-15 10:20:30'::timestamp_ntz)"}
 - {id: fn_time_3, sql: "select TIME('2024-03-15 10:20:30 +0000'::timestamp_tz)", gap: "not in the emulator"}
 - {id: fn_timestampfromparts, sql: "select TIMESTAMPFROMPARTS('2024-03-15'::date, '10:20:30'::time)"}
 - {id: fn_timestampntzfromparts, sql: "select TIMESTAMPNTZFROMPARTS('2024-03-15'::date, '10:20:30'::time)"}
@@ -646,10 +646,10 @@
 - {id: fn_to_json, sql: "select TO_JSON(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
 - {id: fn_to_xml, sql: "select TO_XML(parse_json('{\"a\": 1, \"b\": [1, 2]}'))", gap: "not in the emulator"}
 - {id: fn_translate, sql: "select TRANSLATE('abc', 'b', 'b')"}
-- {id: fn_try_hex_decode_binary, sql: "select TRY_HEX_DECODE_BINARY('abc')", gap: "not in the emulator"}
+- {id: fn_try_hex_decode_binary, sql: "select TRY_HEX_DECODE_BINARY('abc')"}
 - {id: fn_try_hex_decode_string, sql: "select TRY_HEX_DECODE_STRING('abc')"}
 - {id: fn_try_parse_json, sql: "select TRY_PARSE_JSON('abc')"}
-- {id: fn_try_validate_utf8, sql: "select TRY_VALIDATE_UTF8('abc')", gap: "not in the emulator"}
+- {id: fn_try_validate_utf8, sql: "select TRY_VALIDATE_UTF8('abc')"}
 - {id: fn_typeof, sql: "select TYPEOF(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
 - {id: fn_unicode, sql: "select UNICODE('abc')"}
 - {id: fn_upper, sql: "select UPPER('abc')"}
