@@ -3044,15 +3044,19 @@ def analyse(manifest: dict, database: str) -> Analysis:
         # the things are dealt in two halves by what they are called: one half has the one fact, the other half the other
         shared = {(t, e) for t, _, e in sides}
         group = next((g for g in ({m[:2] for m in g} for g in [*links, *({a, b} for a, b in joins)]) if shared <= g), None)
-        linked = lambda a, b: a == b or any(a in {m[:2] for m in g} and b in {m[:2] for m in g} for g in links)  # noqa: E731
+        lined_up: dict[tuple[str, str], set[int]] = {}  # column -> the UNIONs (by number) it is lined up in
+        for number, g in enumerate(links):
+            for m in g:
+                lined_up.setdefault(m[:2], set()).add(number)
+        linked = lambda a, b: a == b or bool(lined_up.get(a, set()) & lined_up.get(b, set()))  # noqa: E731
         if group is None and not all(tables.get(t, {}).get("columns", {}).get(e, {}).get("gen") in (*_KEYS, "fk") for t, e in shared):
             continue
         for half, (table, facts, thing) in enumerate(sides):
             places = [(table, fact, thing) for fact in facts]
             for other, columns in ((n, t.get("columns") or {}) for n, t in tables.items() if n != table):
                 # (a table lined up with it in a UNION says the same of the same things)
-                places += [(other, c, e) for fact in facts for c in columns for e in columns
-                           if linked((table, fact), (other, c)) and (other, c) != (table, fact) and linked((table, thing), (other, e)) and c != e]
+                entities = [e for e in columns if linked((table, thing), (other, e))]
+                places += [(other, c, e) for fact in facts for c in columns if linked((table, fact), (other, c)) for e in entities if c != e]
             for name, fact, entity in places:
                 columns = tables.get(name, {}).get("columns") or {}
                 rule = f"HASH(({{{{{entity}}}}})::VARCHAR) % 2 = {half}"

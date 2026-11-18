@@ -3351,8 +3351,20 @@ class Fitter:
         redo: set[str] = set()  # models that failed in the round before
         for n_round in range(1, rounds + 1):
             self.n_round = n_round
+            took = {"start": time.monotonic()}
+            if os.environ.get("FAUXFLAKE_FIT_PROFILE"):  # for working on the fitter: where this thread's time goes, round by round
+                import cProfile
+
+                if self.__dict__.get("_profile") is not None:
+                    self._profile.disable()
+                    self._profile.dump_stats(f"{os.environ['FAUXFLAKE_FIT_PROFILE']}.round{n_round - 1}.prof")
+                self._profile = cProfile.Profile()
+                self._profile.enable()
+            if n_round > 1 and self.__dict__.get("_round_logged"):
+                self.log(f"    (and {took['start'] - self._round_logged:.0f}s on what the round taught, before the next)")
             # at the scale and history `fauxflake build` uses, so that what is reported here is what a build gives
             self.generate(scale=0.001, history=int(self.spec.get("history") or 60))
+            took["generated"] = time.monotonic()
             before = len(self.learned)
             self.retyped = set()
             results_path = project.target_path / "run_results.json"
@@ -3414,10 +3426,12 @@ class Fitter:
                             pass
             results_path.unlink(missing_ok=True)
             os.environ["FAUXFLAKE_TESTS_DO_NOT_BLOCK"] = "1"  # (every failing test in one round; see DbtProject.invoke)
+            took["ready"] = time.monotonic()
             try:
                 project.invoke(["build", *selected], silent=True)
             finally:
                 os.environ.pop("FAUXFLAKE_TESTS_DO_NOT_BLOCK", None)
+            took["built"] = time.monotonic()
             if not results_path.exists():
                 self.log(f"  dbt build did not run: {project.last_error[:600] or 'no results were written'}")
                 return {"error": project.last_error or "dbt build wrote no results"}
@@ -3526,6 +3540,10 @@ class Fitter:
                                                     if status in ("error", "fail")]}
             self.log(f"  build {n_round}{'' if fresh else ' (what changed)'}: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
                      + f"; {len(self.learned) - before} thing(s) learned")
+            self._round_logged = time.monotonic()
+            self.log(f"    ({self._round_logged - took['start']:.0f}s: {took['generated'] - took['start']:.0f}s generating data, "
+                     f"{took['ready'] - took['generated']:.0f}s setting up, {took['built'] - took['ready']:.0f}s in dbt, "
+                     f"{self._round_logged - took['built']:.0f}s reading the results)")
             if os.environ.get("FAUXFLAKE_FIT_DEBUG"):
                 Path(os.environ["FAUXFLAKE_FIT_DEBUG"] + f".build{n_round}.json").write_text(json.dumps(
                     {"failed": {r["unique_id"]: (r.get("message") or "")[:2000] for r in failed},
@@ -3535,13 +3553,23 @@ class Fitter:
             # the same lessons about the same failures as an earlier round of the same kind: going round in circles
             state = (fresh, frozenset(r["unique_id"] for r in failed), tuple(sorted(self.learned[before:])))
             rounds_seen = self.__dict__.setdefault("_rounds_seen", set())
+            looked = False  # whether this round has already asked the empty models what the data lacks
             nothing_new = (len(self.learned) == before or (state in rounds_seen and bool(failed))) and not accepted
             rounds_seen.add(state)
             if (not failed or nothing_new) and not fresh and n_round < rounds:
-                # nothing left to learn from a partial round: a full build on a fresh warehouse has the last word
-                fresh, selected = True, []
-                self.log("  nothing more to fix in what was rebuilt; a full build on a fresh warehouse to confirm")
-                continue
+                # nothing left to learn from a partial round. Before the full build that has the last word, the models
+                # that built with no rows are asked what the data lacks: what that teaches is rebuilt in part as well,
+                # and one full build confirms everything at the end, not one after each look
+                looks = self.__dict__.setdefault("_row_looks", 0)
+                if not failed and looks < 2 and not os.environ.get("FAUXFLAKE_FIT_NO_ROWS_LOOK"):
+                    self._row_looks, looked = looks + 1, True
+                    taught = self.learn_from_empties(nodes)
+                    if taught:
+                        self.log(f"  {taught} model(s) that came out empty said what the data lacks; building what reads it again")
+                if len(self.learned) == before or failed:
+                    fresh, selected = True, []
+                    self.log("  nothing more to fix in what was rebuilt; a full build on a fresh warehouse to confirm")
+                    continue
             if not failed or nothing_new:
                 # before stopping: the tests listed along the way were judged with what was known then. With all that
                 # was read and learned since, some can be taught to the spec after all; those come off the list and
@@ -3559,7 +3587,7 @@ class Fitter:
                         continue
                 # and the models that built, but with no rows: where the rows stop may be something the data can meet
                 looks = self.__dict__.setdefault("_row_looks", 0)
-                if not failed and looks < 2 and n_round < rounds and not os.environ.get("FAUXFLAKE_FIT_NO_ROWS_LOOK"):
+                if not failed and looks < 2 and n_round < rounds and not looked and not os.environ.get("FAUXFLAKE_FIT_NO_ROWS_LOOK"):
                     self._row_looks = looks + 1
                     taught = self.learn_from_empties(nodes)
                     if taught:
