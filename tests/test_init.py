@@ -1482,3 +1482,14 @@ def test_text_parsed_with_a_format_is_written_in_that_format_also_inside_a_docum
     # what strftime writes with it is what Snowflake reads with the model's format
     written = duckdb.connect().execute(f"select strftime(timestamp '2024-01-02 03:04:05.123456', '{inside['format']}')").fetchone()[0]
     assert written == "2024-01-02T03:04:05.123456000+0000"
+
+
+def test_a_number_lined_up_with_a_made_up_text_in_a_union_makes_the_text_a_number():
+    from fauxflake.init import _share_union_values
+
+    tables = {"A.S.ONE": {"columns": {"DURATION": {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000]}}},
+              "A.S.TWO": {"columns": {"DURATION": {"gen": "template", "template": "duration_{hex}"}}},
+              "A.S.THREE": {"columns": {"DURATION": {"gen": "template", "template": "x-{hex}"}}}}
+    _share_union_values(tables, [{("A.S.ONE", "DURATION"), ("A.S.TWO", "DURATION"), ("A.S.THREE", "DURATION")}])
+    assert tables["A.S.TWO"]["columns"]["DURATION"] == {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000]}
+    assert tables["A.S.THREE"]["columns"]["DURATION"]["gen"] == "template"  # a text with a shape of its own stays

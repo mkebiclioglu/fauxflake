@@ -1844,6 +1844,19 @@ def _share_union_values(tables: dict[str, dict], links: list) -> None:
                     where[key] = {"gen": "template", "template": named["template"], **({"follows": gen["follows"]} if gen.get("follows") else {})}
                 elif pooled and not named:
                     where[key] = dict(pooled)
+    # a number lined up with a made-up text (`count_{hex}`): Snowflake gives the UNION's column the number's type,
+    # and the text is an error there. The text was only a placeholder: it becomes the same kind of number
+    for group in links:
+        members = [(m[0], m[1], m[2] if len(m) > 2 else "") for m in group]
+        held = {m: holder(m) for m in members}
+        gens = {m: held[m][0][held[m][1]] for m in members if held[m]}
+        number = next((g for g in gens.values() if g.get("gen") == "dist" and str(g.get("type", "")).upper().startswith(
+            ("BIGINT", "INT", "DECIMAL", "NUMBER", "DOUBLE", "FLOAT"))), None)
+        for m, gen in gens.items() if number else ():
+            label = re.sub(r"~\w+|\[\]", "", m[2]).split(".")[-1].lower() if m[2] else m[1].lower()
+            if gen.get("gen") == "template" and gen.get("template") == f"{label}_{{hex}}" and len(gen) == 2:
+                where, key = held[m]
+                where[key] = {k: v for k, v in number.items() if k in ("gen", "type", "p", "v")}
 
 
 _FLAGS = {"ISDELETED", "ISWON", "ISCLOSED", "ISACTIVE", "ISCONVERTED", "ISARCHIVED", "ISPRIVATE"}
