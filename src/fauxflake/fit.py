@@ -3646,7 +3646,12 @@ class Fitter:
                     again.add(nodes[owner]["name"])
             others = len(self.learned) - before - len(self.retyped)  # lessons about something else than a source's values
             changed = sorted({*changed, *behind_sources})
-            if not (again or behind_sources) or len(again) + len(changed) > 300 or (others > 0 and not changed and not again):
+            broke = any(status == "error" and kind in ("model", "snapshot", "seed") for kind, status, _ in outcome.values())
+            if again and broke and len(again) <= 300 and len(again) + len(changed) > 300:
+                # models still fail, and the lessons touched most of the sources: what failed and what waits on it is
+                # built first, to find the next errors; the rest is seen again by the full build that confirms
+                selected = ["--select", *[f"{name}+" for name in sorted(again)]]
+            elif not (again or behind_sources) or len(again) + len(changed) > 300 or (others > 0 and not changed and not again):
                 selected = []
             else:
                 selected = ["--select", *[f"{name}+" for name in sorted(again)], *sorted(changed)]
