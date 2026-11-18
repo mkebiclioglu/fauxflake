@@ -15,6 +15,7 @@ import yaml
 
 
 def emulator_output(port: int, database: str, threads: int = 4) -> dict:
+    threads = int(os.environ.get("FAUXFLAKE_THREADS") or threads)
     return {
         "type": "snowflake", "account": "fauxflake", "user": "ci", "password": "ci",
         "host": "127.0.0.1", "port": port, "protocol": "http",

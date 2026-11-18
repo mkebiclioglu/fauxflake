@@ -31,3 +31,36 @@ def test_query_reads_a_kept_warehouse(tmp_path):
     assert one.exit_code == 0 and "generated" not in one.output, one.output
     missing = runner.invoke(main, ["query", "--db-path", str(tmp_path / "nothing"), "select 1"])
     assert missing.exit_code != 0 and "no warehouse" in missing.output
+
+
+def test_a_statement_adjusted_once_is_adjusted_the_same_way_while_the_types_it_reads_stay(monkeypatch):
+    from fauxflake import emulator, semantics
+    from fauxflake.emulator import serve
+
+    calls = []
+    real = semantics.resolve_equalities
+
+    def slow(tree, conn):
+        calls.append(1)
+        import time
+        time.sleep(0.3)
+        return real(tree, conn)
+
+    monkeypatch.setattr(semantics, "resolve_equalities", slow)
+    emulator.ADJUSTED.clear()
+    with serve() as emu:
+        conn = emu._fs.connect(database="D", schema="S")
+        cur = conn.cursor()
+        cur.execute("create database if not exists D")
+        cur.execute("create schema if not exists D.S")
+        cur.execute("""create or replace table D.S.T as select 1 as a, parse_json('"1"') as v""")
+        query = "select t.a from D.S.T t join D.S.T u on t.a::varchar = u.v"
+        def asked(run) -> int:
+            before = len(calls)
+            run()
+            return len(calls) - before
+
+        assert asked(lambda: cur.execute(query).fetchall()) == 1
+        assert asked(lambda: cur.execute(query).fetchall()) == 0  # not asked again
+        cur.execute("create or replace table D.S.T as select 1 as a, '1' as v")
+        assert asked(lambda: cur.execute(query).fetchall()) == 1  # the types changed: asked again

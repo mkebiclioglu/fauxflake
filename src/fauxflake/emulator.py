@@ -453,6 +453,21 @@ def _built(cursor, fq: str) -> None:  # noqa: ANN001
                                       f' add column if not exists "{column}" {kind}')
 
 
+ADJUSTED: dict[str, tuple[str, exp.Expression]] = {}  # a statement as written -> (the types it read, how it was adjusted)
+
+
+def _types_read(cursor, tree: exp.Expression) -> str:  # noqa: ANN001
+    """The columns and types of every relation a statement names, as one text: what its adjustments depend on."""
+    names = sorted({t.name.upper() for t in tree.find_all(exp.Table) if t.name})
+    if not names:
+        return ""
+    listed = ", ".join("'" + n.replace("'", "''") + "'" for n in names)
+    rows = cursor._duck_conn.execute(
+        "select database_name, schema_name, table_name, column_name, data_type from duckdb_columns() "
+        f"where upper(table_name) in ({listed}) order by all").fetchall()
+    return str(hash(tuple(rows)))
+
+
 def run_guarded(cursor, work, limit: float | None = None) -> None:  # noqa: ANN001
     """Run one statement with a time limit, as STATEMENT_TIMEOUT_IN_SECONDS does on Snowflake.
 
@@ -509,6 +524,20 @@ def _patch_fakesnow() -> None:
     original = FakeSnowflakeCursor.execute
 
     def execute(self, command, *args, **kwargs):  # noqa: ANN001
+        if os.environ.get("FAUXFLAKE_EMULATOR_TIMING"):  # for working on the emulator: where a statement's time goes
+            self._fx_clock = {"start": time.monotonic(), "transform": 0.0, "transforms": 0, "run": 0.0, "runs": 0, "adjust": 0.0}
+            try:
+                return timed_execute(self, command, *args, **kwargs)
+            finally:
+                c = self._fx_clock
+                total = time.monotonic() - c["start"]
+                if total >= float(os.environ["FAUXFLAKE_EMULATOR_TIMING"]):
+                    print(f"fauxflake timing: {total:.1f}s ({c['transforms']} rewrites {c['transform']:.1f}s, adjustments {c['adjust']:.1f}s, "
+                          f"{c['runs']} runs {c['run']:.1f}s) " + ", ".join(f"{k} {v:.1f}s" for k, v in c.items() if k not in (
+                              "start", "transform", "transforms", "run", "runs", "adjust")) + f" {' '.join(str(command).split())[:90]}", file=sys.stderr)
+        return timed_execute(self, command, *args, **kwargs)
+
+    def timed_execute(self, command, *args, **kwargs):  # noqa: ANN001
         try:
             self._fauxflake_outer = semantics.outer_flattens(command)
             self._fauxflake_recursive = semantics.outer_flattens(command, "recursive")
@@ -725,6 +754,15 @@ def _patch_fakesnow() -> None:
     original_transform = FakeSnowflakeCursor._transform
 
     def _transform(self, expression, params):  # noqa: ANN001
+        clock, began = getattr(self, "_fx_clock", None), time.monotonic()
+        try:
+            return _transform_once(self, expression, params)
+        finally:
+            if clock is not None:
+                clock["transform"] += time.monotonic() - began
+                clock["transforms"] += 1
+
+    def _transform_once(self, expression, params):  # noqa: ANN001
         expression = objects.apply_policies(objects.tag_scans(objects.result_scans(expression, self), self), self)
         if getattr(self, "_fauxflake_qualify", False) and self._conn.database:
             expression = semantics.qualify_schemas(expression, self._conn.database)
@@ -883,11 +921,31 @@ def _patch_fakesnow() -> None:
 
         def attempt() -> None:
             nonlocal transformed
-            for adjust in (semantics.coerce_union_literals, semantics.resolve_equalities, semantics.shared_aliases):
-                try:
-                    transformed = adjust(transformed, self._duck_conn)
-                except Exception:  # noqa: BLE001, S110 - an optional adjustment: the statement runs as written
-                    pass
+            clock, began = getattr(self, "_fx_clock", None), time.monotonic()
+            # the adjustments ask DuckDB for the types a statement binds to, which on a model of many CTEs takes as
+            # long as running it. The same statement over relations of the same types (the next round of a fitting,
+            # the build after the one that prepared it) is adjusted the same way: that answer is kept
+            written = transformed.sql(dialect="duckdb") if isinstance(transformed, exp.Expression) else None
+            kept = ADJUSTED.get(written) if written is not None else None
+            types = _types_read(self, transformed) if kept is not None else None
+            if kept is not None and kept[0] == types:
+                transformed = kept[1].copy()
+            else:
+                for adjust in (semantics.coerce_union_literals, semantics.resolve_equalities, semantics.shared_aliases):
+                    one = time.monotonic()
+                    try:
+                        transformed = adjust(transformed, self._duck_conn)
+                    except Exception:  # noqa: BLE001, S110 - an optional adjustment: the statement runs as written
+                        pass
+                    if clock is not None:
+                        clock[adjust.__name__] = clock.get(adjust.__name__, 0.0) + time.monotonic() - one
+                if written is not None and time.monotonic() - began > 0.25 and len(ADJUSTED) < 5000:
+                    try:
+                        ADJUSTED[written] = (_types_read(self, transformed), transformed.copy())
+                    except Exception:  # noqa: BLE001, S110
+                        pass
+            if clock is not None:
+                clock["adjust"] += time.monotonic() - began
             _heal(self)  # a probe that failed inside a transaction aborted it
             remedies = {
                 "times": lambda e: semantics.numbers_as_times(transformed, e) or semantics.offsets_as_written(transformed, e),
@@ -904,10 +962,15 @@ def _patch_fakesnow() -> None:
             }
             used: collections.Counter = collections.Counter()
             while True:
+                ran = time.monotonic()
                 try:
                     run(transformed)
                     return
                 except (ProgrammingError, duckdb.Error) as e:
+                    if clock is not None:
+                        clock["run"] += time.monotonic() - ran
+                        clock["runs"] += 1
+                        ran = None
                     # one repair can uncover the next (an implicit conversion, then an alias named like a table)
                     for name, remedy in remedies.items():
                         if used[name] >= 2:
