@@ -55,6 +55,7 @@ class SourceUse:
         self.arrays: set[str] = set()  # variant columns that are flattened or indexed
         self.array_values: dict[str, set[str]] = {}  # list column -> the values the SQL asks whether it contains
         self.formats: dict[str, str] = {}  # text column -> strftime format it is parsed with
+        self.path_formats: dict[str, dict[str, str]] = {}  # variant column -> {"a.b": strftime format the text there is parsed with}
         self.json_text: set[str] = set()  # text columns holding JSON (passed to PARSE_JSON)
         self.texts: set[str] = set()  # columns compared with string literals
         self.ips: set[str] = set()  # text columns handed to PARSE_IP
@@ -294,6 +295,26 @@ def _parsed_as(node: exp.Expression) -> str | None:
     if isinstance(reader, exp.Anonymous) and reader.expressions and reader.expressions[0] is top and len(reader.expressions) == 1 \
             and re.fullmatch(r"(TRY_)?TO_TIMESTAMP(_NTZ|_LTZ|_TZ)?", reader.name.upper()):
         return "TIMESTAMP"
+    return None
+
+
+def _strftime(fmt: str) -> str:
+    """A format sqlglot read from Snowflake's (`YYYY-MM-DD"T"HH24:MI:SS.FFTZHTZM`) as one DuckDB's strftime writes:
+    nanoseconds as microseconds and three zeros, the zone as UTC's (the generated times are UTC)."""
+    digits = {"nine": "%f000", "six": "%f", "three": "%g", None: "%f"}
+    return re.sub(r"%f(?:_(nine|six|three))?", lambda m: digits[m.group(1)], fmt).replace("%z", "+0000").replace("%Z", "UTC")
+
+
+def _parsed_with_format(node: exp.Expression) -> str | None:
+    """The format a value (possibly cast to text first) is parsed with: to_timestamp(v:at::varchar, 'YYYY-MM-DD')."""
+    top = node
+    while isinstance(top.parent, (exp.Cast, exp.TryCast, exp.Paren)) and (
+            isinstance(top.parent, exp.Paren) or top.parent.to.is_type(*exp.DataType.TEXT_TYPES)):
+        top = top.parent
+    reader = top.parent
+    if isinstance(reader, (exp.StrToTime, exp.StrToDate, exp.TsOrDsToDate)) and reader.this is top \
+            and isinstance(reader.args.get("format"), exp.Literal):
+        return _strftime(reader.args["format"].name)
     return None
 
 
@@ -1137,6 +1158,8 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                     hint = _parsed_as(parent) or hint
                     if keys and _epoch_scale(parent):
                         use.scales[(hit[1], ".".join(keys))] = _epoch_scale(parent)
+                    if keys and _parsed_with_format(parent):  # to_timestamp(v:at::varchar, 'YYYY-MM-DD"T"...'): text in that format
+                        use.path_formats.setdefault(hit[1], {})[".".join(keys)] = _parsed_with_format(parent)
                     if keys:
                         known = use.paths.setdefault(hit[1], {})
                         previous = known.get(".".join(keys))
@@ -1162,7 +1185,7 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                                 use.array_values.setdefault(hit[1], set()).add(one.name)
                 elif isinstance(parent, (exp.StrToTime, exp.StrToDate, exp.TsOrDsToDate)) and parent.this is col \
                         and isinstance(parent.args.get("format"), exp.Literal):
-                    use.formats[hit[1]] = parent.args["format"].name  # a text column holding dates
+                    use.formats[hit[1]] = _strftime(parent.args["format"].name)  # a text column holding dates
 
         def upstream(prefix: str, col: exp.Column):  # noqa: ANN202
             name, table = prefix + col.name.upper(), col.table.upper()
@@ -2652,6 +2675,9 @@ def analyse(manifest: dict, database: str) -> Analysis:
                     marks = [t[: -len("{hex}")] for t in known if t.endswith("{hex}") and re.fullmatch(r"[^\w\s{}]+", t[: -len("{hex}")])]
                     made = [mark + text for mark in marks[:2] for text in made] or made
                     out[col]["fields"][path] = {"gen": "template", "templates": list(dict.fromkeys([*made, *known]))}
+                for path, fmt in use.path_formats.get(col, {}).items():
+                    if path in out[col]["fields"]:
+                        out[col]["fields"][path] = {"gen": "time_offset", "format": fmt, **WEEK}
                 for path, mark in use.path_prefix.get(col, {}).items():
                     if any(field.startswith(path + "~json") for field in out[col]["fields"]):
                         out[col]["fields"][path + "~prefix"] = {"gen": "constant", "value": mark}

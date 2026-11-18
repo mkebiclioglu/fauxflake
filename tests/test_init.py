@@ -1462,3 +1462,23 @@ def test_a_column_a_try_function_reads_holds_text():
     assert columns["ORIGINAL_TIMESTAMP"]["format"] == "%Y-%m-%d %H:%M:%S", columns
     assert columns["DAY"].get("format") == "%Y-%m-%d" or columns["DAY"].get("type", "").upper() == "VARCHAR", columns
     assert columns["AMOUNT"].get("type") == "VARCHAR", columns
+
+
+def test_text_parsed_with_a_format_is_written_in_that_format_also_inside_a_document():
+    import duckdb
+
+    from fauxflake.init import build_spec
+
+    manifest = {
+        "sources": {"source.p.s.issues": {"database": "RAW", "schema": "S", "name": "issues", "identifier": "issues", "columns": {
+            "fields": {"data_type": "VARIANT"}, "created": {"data_type": "VARCHAR"}}}},
+        "nodes": {"model.p.m": {"resource_type": "model", "name": "m", "depends_on": {"nodes": []}, "relation_name": "A.B.M",
+                                "compiled_code": """select to_timestamp_tz(fields:resolutiondate::varchar, 'YYYY-MM-DD"T"HH24:MI:SS.FFTZHTZM') as r,
+                                                           to_timestamp(created, 'YYYY-MM-DD HH24:MI:SS.FF3') as c from raw.s.issues"""}},
+    }
+    columns = build_spec(manifest, "A")[0]["tables"]["RAW.S.ISSUES"]["columns"]
+    inside = columns["FIELDS"]["fields"]["resolutiondate"]
+    assert inside["format"] == "%Y-%m-%dT%H:%M:%S.%f000+0000" and columns["CREATED"]["format"] == "%Y-%m-%d %H:%M:%S.%g", columns
+    # what strftime writes with it is what Snowflake reads with the model's format
+    written = duckdb.connect().execute(f"select strftime(timestamp '2024-01-02 03:04:05.123456', '{inside['format']}')").fetchone()[0]
+    assert written == "2024-01-02T03:04:05.123456000+0000"
