@@ -2001,6 +2001,43 @@ _NUMERIC_KINDS = ("TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "UTINYI
                   "DOUBLE", "FLOAT", "DECIMAL")
 
 
+def _kinds_past_aliases(select: exp.Select, calls: list, conn) -> tuple[list, list[str]]:  # noqa: ANN001
+    """The kinds of the arguments that read aliases of their own SELECT, the aliases asked along. Only aliases made
+    of columns, not of other aliases (a chain of them would be written out many times over)."""
+    source = exp.Select(expressions=[exp.Star()])
+    source.set("from_", select.args["from_"].copy())
+    if select.args.get("joins"):
+        source.set("joins", [j.copy() for j in select.args["joins"]])
+    try:  # a name that is a column of what the SELECT reads is that column, also where an alias has the name
+        columns = {str(row[0]).upper() for row in conn.execute("describe " + _cte_prefix(select) + source.sql(dialect="duckdb")).fetchall()}
+    except Exception:  # noqa: BLE001
+        return [], []
+    aliases = {e.alias.upper(): e for e in select.expressions if isinstance(e, exp.Alias) and e.alias.upper() not in columns}
+
+    def reads(e: exp.Expression) -> set[str]:
+        return {c.name.upper() for c in e.find_all(exp.Column) if not c.table and c.name.upper() in aliases}
+
+    kept, needed = [], {}
+    for args in calls:
+        named = set().union(*(reads(a) for a in args))
+        if any(reads(aliases[n].this) for n in named):
+            continue
+        kept.append(args)
+        needed.update({n: aliases[n] for n in named})
+    flat = [a for args in kept for a in args]
+    if not flat:
+        return [], []
+    probe = exp.Select(expressions=[e.copy() for e in needed.values()] + [exp.alias_(a.copy(), f"_k{i}") for i, a in enumerate(flat)])
+    probe.set("from_", select.args["from_"].copy())
+    if select.args.get("joins"):
+        probe.set("joins", [j.copy() for j in select.args["joins"]])
+    try:
+        rows = conn.execute("describe " + _cte_prefix(select) + probe.sql(dialect="duckdb")).fetchall()
+    except Exception:  # noqa: BLE001 - binds only in its place: left as it is
+        return [], []
+    return kept, [str(row[1]).upper() for row in rows][len(needed):]
+
+
 def mixed_kinds(transformed: exp.Expression, conn) -> exp.Expression:  # noqa: ANN001
     """`coalesce(licensed_seats, quantity)` with the one text and the other a number: Snowflake takes the number's
     type, and text that is not a number is an error. DuckDB takes text, and the value goes on as it is. The same for
@@ -2035,8 +2072,9 @@ def mixed_kinds(transformed: exp.Expression, conn) -> exp.Expression:  # noqa: A
             probe.set("joins", [j.copy() for j in select.args["joins"]])
         try:
             kinds = [str(row[1]).upper() for row in conn.execute("describe " + _cte_prefix(select) + probe.sql(dialect="duckdb")).fetchall()]
-        except Exception:  # noqa: BLE001, S112 - binds only in its place: left as it is
-            continue
+        except Exception:  # noqa: BLE001 - an argument may read an alias of the same SELECT
+            calls, kinds = _kinds_past_aliases(select, calls, conn)
+            flat = [a for args in calls for a in args]
         if len(kinds) != len(flat):
             continue
         at = 0

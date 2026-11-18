@@ -128,3 +128,18 @@ def test_a_fault_of_the_emulator_is_reported_at_once_instead_of_retried(monkeypa
         with pytest.raises(ProgrammingError, match="internal error"):
             cur.execute("select 1").fetchall()
         assert time.monotonic() - started < 20
+
+
+def test_text_beside_a_number_takes_the_number_also_when_the_select_reads_its_own_alias():
+    import snowflake.connector
+
+    from fauxflake.emulator import serve
+
+    with serve() as emu:
+        cur = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S")).cursor()
+        cur.execute("create database if not exists D")
+        cur.execute("create schema if not exists D.S")
+        cur.execute("create or replace table D.S.T as select '7' as quantity, 3 as seats, '2024-01-02' as started")
+        got = cur.execute("""select started::date as began, case when began is not null then seats else quantity end as n,
+                                    coalesce(seats, quantity) as m from D.S.T""").fetchall()
+        assert [type(v).__name__ for v in got[0][1:]] == ["Decimal", "Decimal"], got
