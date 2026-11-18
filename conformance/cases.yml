@@ -818,3 +818,13 @@
 - {id: number_text_b_8, sql: "select try_cast('12e' as int)"}
 - {id: number_text_b_9, sql: "select try_to_decimal('12e', 10, 2)"}
 - {id: number_text_b_10, sql: "select '12e'::decimal(10,2)"}
+
+# UNION of text beside a number, a date or a boolean: the column takes the other type (measured on Snowflake).
+- {id: union_text_1, sql: "select x from (select 1 as x union all select v from (select '2' as v)) order by 1"}
+- {id: union_text_2, sql: "select x from (select 1 as x union all select v from (select 'abc' as v)) order by 1"}
+- {id: union_text_3, sql: "select x from (select v as x from (select '2' as v) union all select 1.5) order by 1"}
+- {id: union_text_4, sql: "select x from (select current_date() - 1 as x union all select v from (select '2024-01-02' as v)) order by 1"}
+- {id: union_text_5, sql: "select x from (select true as x union all select v from (select 'abc' as v)) order by 1"}
+- {id: union_text_6, sql: "select x from (select null as x union all select v from (select 'abc' as v)) order by 1"}
+- {id: union_text_7, sql: "select x from (select 1 as x union select v from (select '1' as v)) order by 1"}
+- {id: union_text_8, sql: "select x from (select 1 as x, 'a' as y union all select v, w from (select '2' as v, 3 as w)) order by 1"}

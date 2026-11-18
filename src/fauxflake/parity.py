@@ -96,7 +96,8 @@ class Parity:
 
     @property
     def ok(self) -> bool:
-        return self.only_emulator == 0 and self.only_snowflake == 0 and (not self.note or self.note.startswith("differ in"))
+        return self.only_emulator == 0 and self.only_snowflake == 0 and (
+            not self.note or self.note.startswith(("differ in", "both engines fail to read")))
 
 
 def _comparable(column: str, kind: str, source: str) -> str:
@@ -152,9 +153,18 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
         if only is not None and node["unique_id"] not in only:
             continue
         name = node.get("alias") or node["name"]
+        mine = f'{node["database"]}.{schema or node["schema"]}.{name}'
         try:
             theirs = _fetch(conn, f'select * from {node["database"]}.{remote_schema or node["schema"]}.{name}')
-            mine = f'{node["database"]}.{schema or node["schema"]}.{name}'
+        except Exception as e:  # noqa: BLE001 - a view that fails when read (its data): does the emulator's fail too?
+            try:
+                duck.execute(f"select * from {mine}").fetchall()
+            except Exception:  # noqa: BLE001
+                out.append(Parity(node["name"], 0, 0, 0, 0, f"both engines fail to read it: {str(e)[:160]}"))
+            else:
+                out.append(Parity(node["name"], 0, 0, 0, 0, f"Snowflake fails to read it: {type(e).__name__}: {str(e)[:160]}"))
+            continue
+        try:
             types = {c.upper(): ty for c, ty, *_ in duck.execute(f"describe {mine}").fetchall()}
             note = ""
             if theirs is None:  # zero rows

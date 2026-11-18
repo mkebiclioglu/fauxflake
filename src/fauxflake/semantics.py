@@ -1997,6 +1997,44 @@ def coerce_union_literals(transformed: exp.Expression, conn) -> exp.Expression: 
     return transformed
 
 
+def union_text_kinds(transformed: exp.Expression, conn) -> exp.Expression:  # noqa: ANN001
+    """`select n from a union all select t from b` with `n` a number and `t` text: Snowflake gives the column the
+    number's own type (also a date's, a timestamp's, a boolean's) and text that is not one is an error. DuckDB makes
+    the column text. Common with `dbt_utils.star` over two tables whose columns are in other orders."""
+    if not transformed.find(exp.SetOperation):
+        return transformed
+    for union in list(transformed.find_all(exp.SetOperation)):
+        if isinstance(union.parent, exp.SetOperation) or (isinstance(union.parent, exp.Subquery) and isinstance(union.parent.parent, exp.SetOperation)):
+            continue
+        branches = [b for b in _branches(union) if isinstance(b, exp.Select)]
+        if len(branches) < 2 or len(branches) != len(_branches(union)) or len({len(b.expressions) for b in branches}) != 1 \
+                or any(isinstance(p, exp.Star) or (isinstance(p, exp.Column) and isinstance(p.this, exp.Star)) for b in branches for p in b.expressions):
+            continue
+        prefix = _cte_prefix(union)
+        try:
+            described = [[str(r[1]).upper() for r in conn.execute("describe " + prefix + b.sql(dialect="duckdb")).fetchall()] for b in branches]
+        except Exception:  # noqa: BLE001, S112 - a branch that only binds in its context: left as it is
+            continue
+        if len({len(d) for d in described}) != 1 or len(described[0]) != len(branches[0].expressions):
+            continue
+        for i in range(len(described[0])):
+            kinds = [d[i] for d in described]
+            if "VARCHAR" not in kinds or "JSON" in kinds:
+                continue
+            typed = [k for k in kinds if k.startswith((*_NUMERIC_KINDS, "DECIMAL", "DOUBLE", "FLOAT", "TIMESTAMP", "DATE", "BOOLEAN"))]
+            if not typed:
+                continue
+            target = "DOUBLE" if any(k.startswith(("DOUBLE", "FLOAT")) for k in typed) else typed[0]
+            for branch, kind in zip(branches, kinds):
+                proj = branch.expressions[i]
+                value = proj.unalias()
+                if kind != "VARCHAR" or isinstance(value, (exp.Null, exp.Literal)):
+                    continue  # (a text literal: coerce_union_literals)
+                cast = exp.cast(value.copy(), exp.DataType.build(target, dialect="duckdb"))
+                proj.replace(exp.alias_(cast, proj.alias_or_name, quoted=True) if proj.alias_or_name else cast)
+    return transformed
+
+
 _NUMERIC_KINDS = ("TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT",
                   "DOUBLE", "FLOAT", "DECIMAL")
 

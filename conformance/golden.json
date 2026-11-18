@@ -7665,6 +7665,69 @@
    ]
   ]
  },
+ "union_text_1": {
+  "rows": [
+   [
+    "1"
+   ],
+   [
+    "2"
+   ]
+  ]
+ },
+ "union_text_2": {
+  "error": "100038 (22018): Numeric value 'abc' is not recognized"
+ },
+ "union_text_3": {
+  "rows": [
+   [
+    "1.5"
+   ],
+   [
+    "2"
+   ]
+  ]
+ },
+ "union_text_4": {
+  "rows": [
+   [
+    "2024-01-02"
+   ],
+   [
+    "2026-11-17"
+   ]
+  ]
+ },
+ "union_text_5": {
+  "error": "100037 (22018): Boolean value 'abc' is not recognized"
+ },
+ "union_text_6": {
+  "rows": [
+   [
+    "abc"
+   ],
+   [
+    null
+   ]
+  ]
+ },
+ "union_text_7": {
+  "rows": [
+   [
+    "1"
+   ]
+  ]
+ },
+ "union_text_8": {
+  "rows": [
+   [
+    "1"
+   ],
+   [
+    "2"
+   ]
+  ]
+ },
  "union_text_literal_takes_the_other_type": {
   "rows": [
    [
