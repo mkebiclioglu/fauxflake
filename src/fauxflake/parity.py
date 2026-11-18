@@ -15,8 +15,16 @@ from pathlib import Path
 from .dbt import DbtProject
 from .generate import Warehouse
 
-TYPES = {"BIGINT": "NUMBER(38,0)", "INTEGER": "NUMBER(38,0)", "DOUBLE": "FLOAT", "VARCHAR": "VARCHAR",
-         "TIMESTAMP": "TIMESTAMP_NTZ", "DATE": "DATE", "BOOLEAN": "BOOLEAN"}
+TYPES = {"BIGINT": "NUMBER(38,0)", "INTEGER": "NUMBER(38,0)", "HUGEINT": "NUMBER(38,0)", "UBIGINT": "NUMBER(38,0)",
+         "SMALLINT": "NUMBER(38,0)", "TINYINT": "NUMBER(38,0)", "DOUBLE": "FLOAT", "FLOAT": "FLOAT", "VARCHAR": "VARCHAR",
+         "TIMESTAMP": "TIMESTAMP_NTZ", "TIMESTAMP_NS": "TIMESTAMP_NTZ", "TIMESTAMP WITH TIME ZONE": "TIMESTAMP_TZ",
+         "DATE": "DATE", "TIME": "TIME", "BOOLEAN": "BOOLEAN", "JSON": "VARIANT", "BLOB": "BINARY"}
+
+
+def _snowflake_type(kind: str) -> str:
+    if kind.endswith("[]") or kind.startswith(("STRUCT", "MAP")):
+        return "VARIANT"
+    return TYPES.get(kind, kind.replace("DECIMAL", "NUMBER"))
 
 
 def seed(conn, wh: Warehouse, after: datetime | None = None, log=print) -> None:
@@ -31,16 +39,22 @@ def seed(conn, wh: Warehouse, after: datetime | None = None, log=print) -> None:
             where = f"where {loaded} > '{after}'" if after else ""
             path = Path(tmp) / f"{table}.parquet"
             n = wh.cur.execute(f"copy (select * from {t.name} {where}) to '{path}' (format parquet)").fetchone()[0]
+            described = [(c, _snowflake_type(ty)) for c, ty, *_ in wh.cur.execute(f"describe {t.name}").fetchall()]
             if after is None:
-                cols = ", ".join(
-                    f'"{c}" {TYPES.get(ty, ty.replace("DECIMAL", "NUMBER"))}'
-                    for c, ty, *_ in wh.cur.execute(f"describe {t.name}").fetchall())
+                cols = ", ".join(f'"{c}" {ty}' for c, ty in described)
+                try:
+                    cur.execute(f"create database if not exists {db}")
+                except Exception:  # noqa: BLE001, S110 - a role that may not create databases: the schema says so if it is missing
+                    pass
                 cur.execute(f"create schema if not exists {db}.{schema}")
                 cur.execute(f"create or replace table {t.name} ({cols})")
+            if n == 0:
+                continue
             cur.execute(f"put file://{path} @{db}.{schema}.%{table} auto_compress=false overwrite=true")
-            cur.execute(f"copy into {t.name} from @{db}.{schema}.%{table} "
-                        "file_format=(type=parquet use_logical_type=true) "
-                        "match_by_column_name=case_insensitive purge=true")
+            # (a document travels as text and is parsed on arrival: loaded by name it would stay a string)
+            picked = ", ".join(f'parse_json($1:"{c}"::varchar)' if ty == "VARIANT" else f'$1:"{c}"::{ty}' for c, ty in described)
+            cur.execute(f"copy into {t.name} from (select {picked} from @{db}.{schema}.%{table}) "
+                        "file_format=(type=parquet use_logical_type=true) purge=true")
             log(f"  seeded {t.name}: {n:,} rows")
 
 
