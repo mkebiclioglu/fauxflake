@@ -326,3 +326,348 @@
 - {id: substring_of_number_with_regexp_instr, sql: "select substring(form_fields, regexp_instr(form_fields, '3'), length(form_fields)) as s, left(n, 2) as l, right(n, 2) as r from (select 1234.5::float as form_fields, 98765 as n)"}
 - {id: arithmetic_on_text_inside_aggregate, sql: "select sum(case when s = 'Open' then (a + b) * p * .01 else 0 end) as w, sum(case when not s = 'Open' then a * p * .01 else 0 end) as r from (select 'Open' as s, 10.50::number(18,2) as a, 2.25::number(18,2) as b, '50' as p union all select 'Won', 4.00, 1.00, '25')"}
 - {id: select_star_without_from, sql: "with source as (select 1 as a), renamed as (select a from source) select *, 1 as x"}
+
+# One call of each built-in function Snowflake lists (SHOW FUNCTIONS), with arguments made from its signature.
+# Recorded 2026-11-18. A `gap:` is a function the emulator does not have yet, or answers differently.
+- {id: fn_abs, sql: "select ABS(7)"}
+- {id: fn_abs_2, sql: "select ABS(2.5::float)"}
+- {id: fn_abs_3, sql: "select ABS(2.5)"}
+- {id: fn_acosh, sql: "select ACOSH(2.5::float)"}
+- {id: fn_any_value, sql: "select ANY_VALUE(column1) from values (7), (2), (7)"}
+- {id: fn_approximate_count_distinct, sql: "select APPROXIMATE_COUNT_DISTINCT(column1) from values (7), (2), (7)", gap: "not in the emulator"}
+- {id: fn_approx_count_distinct, sql: "select APPROX_COUNT_DISTINCT(column1) from values (7), (2), (7)"}
+- {id: fn_approx_percentile_accumulate, sql: "select APPROX_PERCENTILE_ACCUMULATE(column1) from values (2.5::float), (0.5::float), (2.5::float)", gap: "not in the emulator"}
+- {id: fn_arrayagg, sql: "select ARRAYAGG(column1) from values (7), (2), (7)"}
+- {id: fn_arrays_overlap, sql: "select ARRAYS_OVERLAP(array_construct(3, 1, 2), array_construct(2, 9))"}
+- {id: fn_array_agg, sql: "select ARRAY_AGG(column1) from values (7), (2), (7)"}
+- {id: fn_array_append, sql: "select ARRAY_APPEND(array_construct(3, 1, 2), 7)"}
+- {id: fn_array_cat, sql: "select ARRAY_CAT(array_construct(3, 1, 2), array_construct(2, 9))"}
+- {id: fn_array_compact, sql: "select ARRAY_COMPACT(array_construct(3, 1, 2))"}
+- {id: fn_array_construct, sql: "select ARRAY_CONSTRUCT(7)"}
+- {id: fn_array_construct_compact, sql: "select ARRAY_CONSTRUCT_COMPACT(7)"}
+- {id: fn_array_construct_structured, sql: "select ARRAY_CONSTRUCT_STRUCTURED(7)", gap: "not in the emulator"}
+- {id: fn_array_contains, sql: "select ARRAY_CONTAINS(parse_json('{\"a\": 1, \"b\": [1, 2]}'), array_construct(3, 1, 2))"}
+- {id: fn_array_contains_2, sql: "select ARRAY_CONTAINS(7, array_construct(3, 1, 2))"}
+- {id: fn_array_distinct, sql: "select ARRAY_DISTINCT(array_construct(3, 1, 2))"}
+- {id: fn_array_except, sql: "select ARRAY_EXCEPT(array_construct(3, 1, 2), array_construct(2, 9))"}
+- {id: fn_array_insert, sql: "select ARRAY_INSERT(array_construct(3, 1, 2), 7, 7)", gap: "answers differently"}
+- {id: fn_array_intersection, sql: "select ARRAY_INTERSECTION(array_construct(3, 1, 2), array_construct(2, 9))"}
+- {id: fn_array_max, sql: "select ARRAY_MAX(array_construct(3, 1, 2))"}
+- {id: fn_array_min, sql: "select ARRAY_MIN(array_construct(3, 1, 2))"}
+- {id: fn_array_position, sql: "select ARRAY_POSITION(parse_json('{\"a\": 1, \"b\": [1, 2]}'), array_construct(3, 1, 2))"}
+- {id: fn_array_position_2, sql: "select ARRAY_POSITION(7, array_construct(3, 1, 2))"}
+- {id: fn_array_prepend, sql: "select ARRAY_PREPEND(array_construct(3, 1, 2), 7)"}
+- {id: fn_array_remove, sql: "select ARRAY_REMOVE(array_construct(3, 1, 2), parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_array_remove_2, sql: "select ARRAY_REMOVE(array_construct(3, 1, 2), 7)"}
+- {id: fn_array_remove_at, sql: "select ARRAY_REMOVE_AT(array_construct(3, 1, 2), 7)"}
+- {id: fn_array_repeat, sql: "select ARRAY_REPEAT(7, 7)", gap: "not in the emulator"}
+- {id: fn_array_reverse, sql: "select ARRAY_REVERSE(array_construct(3, 1, 2))"}
+- {id: fn_array_size, sql: "select ARRAY_SIZE(array_construct(3, 1, 2))"}
+- {id: fn_array_size_2, sql: "select ARRAY_SIZE(parse_json('{\"a\": 1, \"b\": [1, 2]}'))", gap: "answers differently"}
+- {id: fn_array_slice, sql: "select ARRAY_SLICE(array_construct(3, 1, 2), 7, 2)"}
+- {id: fn_array_to_string, sql: "select ARRAY_TO_STRING(array_construct(3, 1, 2), 'abc')"}
+- {id: fn_array_unique_agg, sql: "select ARRAY_UNIQUE_AGG(column1) from values (7), (2), (7)"}
+- {id: fn_ascii, sql: "select ASCII('abc')"}
+- {id: fn_asinh, sql: "select ASINH(2.5::float)"}
+- {id: fn_as_array, sql: "select AS_ARRAY(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_as_binary, sql: "select AS_BINARY(parse_json('{\"a\": 1, \"b\": [1, 2]}'))", gap: "not in the emulator"}
+- {id: fn_as_boolean, sql: "select AS_BOOLEAN(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_as_char, sql: "select AS_CHAR(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_as_date, sql: "select AS_DATE(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_as_double, sql: "select AS_DOUBLE(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_as_object, sql: "select AS_OBJECT(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_as_real, sql: "select AS_REAL(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_as_time, sql: "select AS_TIME(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_as_varchar, sql: "select AS_VARCHAR(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_atan, sql: "select ATAN(2.5::float)"}
+- {id: fn_atan2, sql: "select ATAN2(2.5::float, 0.5::float)"}
+- {id: fn_avg, sql: "select AVG(column1) from values (7), (2), (7)"}
+- {id: fn_avg_2, sql: "select AVG(column1) from values (2.5::float), (0.5::float), (2.5::float)"}
+- {id: fn_avg_3, sql: "select AVG(column1) from values (2.5), (0.5), (2.5)"}
+- {id: fn_binary_as_string, sql: "select BINARY_AS_STRING(to_binary('616263', 'hex'))", gap: "not in the emulator"}
+- {id: fn_bitand, sql: "select BITAND(7, 2)"}
+- {id: fn_bitandagg, sql: "select BITANDAGG(column1) from values (7), (2), (7)"}
+- {id: fn_bitand_agg, sql: "select BITAND_AGG(column1) from values (7), (2), (7)"}
+- {id: fn_bitcount, sql: "select BITCOUNT(7)", gap: "not in the emulator"}
+- {id: fn_bitcount_2, sql: "select BITCOUNT(to_binary('616263', 'hex'))", gap: "not in the emulator"}
+- {id: fn_bitmap_absolute_position, sql: "select BITMAP_ABSOLUTE_POSITION(7, 2)", gap: "not in the emulator"}
+- {id: fn_bitmap_bit_position, sql: "select BITMAP_BIT_POSITION(7)"}
+- {id: fn_bitmap_bucket_number, sql: "select BITMAP_BUCKET_NUMBER(7)"}
+- {id: fn_bitmap_construct_agg, sql: "select BITMAP_CONSTRUCT_AGG(column1) from values (7), (2), (7)"}
+- {id: fn_bitnot, sql: "select BITNOT(7)"}
+- {id: fn_bitnot_2, sql: "select BITNOT(to_binary('616263', 'hex'))", gap: "not in the emulator"}
+- {id: fn_bitor, sql: "select BITOR(7, 2)"}
+- {id: fn_bitoragg, sql: "select BITORAGG(column1) from values (7), (2), (7)"}
+- {id: fn_bitor_agg, sql: "select BITOR_AGG(column1) from values (7), (2), (7)"}
+- {id: fn_bitshiftleft, sql: "select BITSHIFTLEFT(7, 2)"}
+- {id: fn_bitshiftleft_2, sql: "select BITSHIFTLEFT(to_binary('616263', 'hex'), 7)", gap: "not in the emulator"}
+- {id: fn_bitshiftright, sql: "select BITSHIFTRIGHT(7, 2)"}
+- {id: fn_bitshiftright_2, sql: "select BITSHIFTRIGHT(to_binary('616263', 'hex'), 7)", gap: "not in the emulator"}
+- {id: fn_bitxor, sql: "select BITXOR(7, 2)"}
+- {id: fn_bitxoragg, sql: "select BITXORAGG(column1) from values (7), (2), (7)"}
+- {id: fn_bitxor_agg, sql: "select BITXOR_AGG(column1) from values (7), (2), (7)"}
+- {id: fn_bit_and, sql: "select BIT_AND(7, 2)"}
+- {id: fn_bit_andagg, sql: "select BIT_ANDAGG(column1) from values (7), (2), (7)"}
+- {id: fn_bit_and_agg, sql: "select BIT_AND_AGG(column1) from values (7), (2), (7)"}
+- {id: fn_bit_length, sql: "select BIT_LENGTH('abc')"}
+- {id: fn_bit_length_2, sql: "select BIT_LENGTH(to_binary('616263', 'hex'))", gap: "not in the emulator"}
+- {id: fn_bit_not, sql: "select BIT_NOT(7)"}
+- {id: fn_bit_not_2, sql: "select BIT_NOT(to_binary('616263', 'hex'))", gap: "not in the emulator"}
+- {id: fn_bit_or, sql: "select BIT_OR(7, 2)"}
+- {id: fn_bit_oragg, sql: "select BIT_ORAGG(column1) from values (7), (2), (7)"}
+- {id: fn_bit_or_agg, sql: "select BIT_OR_AGG(column1) from values (7), (2), (7)"}
+- {id: fn_bit_shiftleft, sql: "select BIT_SHIFTLEFT(7, 2)"}
+- {id: fn_bit_shiftleft_2, sql: "select BIT_SHIFTLEFT(to_binary('616263', 'hex'), 7)", gap: "not in the emulator"}
+- {id: fn_bit_shiftright, sql: "select BIT_SHIFTRIGHT(7, 2)"}
+- {id: fn_bit_shiftright_2, sql: "select BIT_SHIFTRIGHT(to_binary('616263', 'hex'), 7)", gap: "not in the emulator"}
+- {id: fn_bit_xor, sql: "select BIT_XOR(7, 2)"}
+- {id: fn_bit_xoragg, sql: "select BIT_XORAGG(column1) from values (7), (2), (7)"}
+- {id: fn_bit_xor_agg, sql: "select BIT_XOR_AGG(column1) from values (7), (2), (7)"}
+- {id: fn_booland, sql: "select BOOLAND(7, 2)"}
+- {id: fn_booland_agg, sql: "select BOOLAND_AGG(column1) from values (7), (2), (7)"}
+- {id: fn_boolnot, sql: "select BOOLNOT(7)"}
+- {id: fn_boolor, sql: "select BOOLOR(7, 2)"}
+- {id: fn_boolor_agg, sql: "select BOOLOR_AGG(column1) from values (7), (2), (7)"}
+- {id: fn_boolxor, sql: "select BOOLXOR(7, 2)"}
+- {id: fn_boolxor_agg, sql: "select BOOLXOR_AGG(column1) from values (7), (2), (7)"}
+- {id: fn_cbrt, sql: "select CBRT(2.5::float)"}
+- {id: fn_cbrt_2, sql: "select CBRT(2.5)"}
+- {id: fn_char, sql: "select CHAR(7)"}
+- {id: fn_check_json, sql: "select CHECK_JSON('abc')", gap: "answers differently"}
+- {id: fn_check_xml, sql: "select CHECK_XML('abc')", gap: "not in the emulator"}
+- {id: fn_check_xml_2, sql: "select CHECK_XML('abc', true)", gap: "not in the emulator"}
+- {id: fn_chr, sql: "select CHR(7)"}
+- {id: fn_coalesce, sql: "select COALESCE(7, 2)"}
+- {id: fn_concat, sql: "select CONCAT('abc')"}
+- {id: fn_concat_2, sql: "select CONCAT(to_binary('616263', 'hex'))"}
+- {id: fn_concat_ws, sql: "select CONCAT_WS('abc', 'b')"}
+- {id: fn_concat_ws_2, sql: "select CONCAT_WS(to_binary('616263', 'hex'), to_binary('62', 'hex'))", gap: "not in the emulator"}
+- {id: fn_contains, sql: "select CONTAINS('abc', 'b')"}
+- {id: fn_contains_2, sql: "select CONTAINS(to_binary('616263', 'hex'), to_binary('62', 'hex'))", gap: "not in the emulator"}
+- {id: fn_corr, sql: "select CORR(column1, column2) from values (2.5::float, 0.5::float), (0.5::float, 2.5::float), (2.5::float, 0.5::float)"}
+- {id: fn_corr_2, sql: "select CORR(column1, column2) from values (2.5, 0.5), (0.5, 2.5), (2.5, 0.5)"}
+- {id: fn_cos, sql: "select COS(2.5::float)"}
+- {id: fn_cosh, sql: "select COSH(2.5::float)"}
+- {id: fn_cot, sql: "select COT(2.5::float)"}
+- {id: fn_count, sql: "select COUNT(column1) from values (7), (2), (7)"}
+- {id: fn_count_if, sql: "select COUNT_IF(column1) from values (true), (false), (true)"}
+- {id: fn_covar_pop, sql: "select COVAR_POP(column1, column2) from values (2.5::float, 0.5::float), (0.5::float, 2.5::float), (2.5::float, 0.5::float)"}
+- {id: fn_covar_pop_2, sql: "select COVAR_POP(column1, column2) from values (2.5, 0.5), (0.5, 2.5), (2.5, 0.5)"}
+- {id: fn_covar_samp, sql: "select COVAR_SAMP(column1, column2) from values (2.5::float, 0.5::float), (0.5::float, 2.5::float), (2.5::float, 0.5::float)"}
+- {id: fn_covar_samp_2, sql: "select COVAR_SAMP(column1, column2) from values (2.5, 0.5), (0.5, 2.5), (2.5, 0.5)"}
+- {id: fn_date, sql: "select DATE('2024-03-15 10:20:30'::timestamp_ltz)"}
+- {id: fn_date_2, sql: "select DATE('2024-03-15 10:20:30'::timestamp_ntz)"}
+- {id: fn_date_3, sql: "select DATE('2024-03-15 10:20:30 +0000'::timestamp_tz)"}
+- {id: fn_datefromparts, sql: "select DATEFROMPARTS(7, 2, 2)"}
+- {id: fn_date_from_parts, sql: "select DATE_FROM_PARTS(7, 2, 2)"}
+- {id: fn_dayname, sql: "select DAYNAME('2024-03-15'::date)"}
+- {id: fn_decode, sql: "select DECODE(7, 2, 2)"}
+- {id: fn_degrees, sql: "select DEGREES(2.5::float)"}
+- {id: fn_div0, sql: "select DIV0(7, 2)"}
+- {id: fn_div0_2, sql: "select DIV0(2.5::float, 0.5::float)"}
+- {id: fn_div0_3, sql: "select DIV0(2.5, 0.5)"}
+- {id: fn_div0null, sql: "select DIV0NULL(7, 2)"}
+- {id: fn_div0null_2, sql: "select DIV0NULL(2.5::float, 0.5::float)"}
+- {id: fn_endswith, sql: "select ENDSWITH('abc', 'b')"}
+- {id: fn_endswith_2, sql: "select ENDSWITH(to_binary('616263', 'hex'), to_binary('62', 'hex'))", gap: "not in the emulator"}
+- {id: fn_equal_null, sql: "select EQUAL_NULL(7, 2)"}
+- {id: fn_exp, sql: "select EXP(2.5::float)"}
+- {id: fn_exp_2, sql: "select EXP(2.5)"}
+- {id: fn_factorial, sql: "select FACTORIAL(7)"}
+- {id: fn_fuzzy_subsequence_score, sql: "select FUZZY_SUBSEQUENCE_SCORE('abc', 'b')", gap: "not in the emulator"}
+- {id: fn_get, sql: "select GET(parse_json('{\"a\": 1, \"b\": [1, 2]}'), 'abc')"}
+- {id: fn_get_2, sql: "select GET(parse_json('{\"a\": 1, \"b\": [1, 2]}'), 7)"}
+- {id: fn_get_3, sql: "select GET(object_construct('a', 1, 'b', 'x'), 'abc')"}
+- {id: fn_get_4, sql: "select GET(array_construct(3, 1, 2), 7)"}
+- {id: fn_getbit, sql: "select GETBIT(7, 2)", gap: "not in the emulator"}
+- {id: fn_get_ignore_case, sql: "select GET_IGNORE_CASE(parse_json('{\"a\": 1, \"b\": [1, 2]}'), 'abc')"}
+- {id: fn_get_ignore_case_2, sql: "select GET_IGNORE_CASE(object_construct('a', 1, 'b', 'x'), 'abc')"}
+- {id: fn_get_path, sql: "select GET_PATH(parse_json('{\"a\": 1, \"b\": [1, 2]}'), 'abc')"}
+- {id: fn_get_path_2, sql: "select GET_PATH(object_construct('a', 1, 'b', 'x'), 'abc')"}
+- {id: fn_get_path_3, sql: "select GET_PATH(array_construct(3, 1, 2), 'abc')"}
+- {id: fn_greatest, sql: "select GREATEST(7)"}
+- {id: fn_greatest_ignore_nulls, sql: "select GREATEST_IGNORE_NULLS(7)"}
+- {id: fn_hll, sql: "select HLL(column1) from values (7), (2), (7)", gap: "not in the emulator"}
+- {id: fn_hll_accumulate, sql: "select HLL_ACCUMULATE(column1) from values (7), (2), (7)", gap: "not in the emulator"}
+- {id: fn_hll_export, sql: "select HLL_EXPORT(to_binary('616263', 'hex'))", gap: "not in the emulator"}
+- {id: fn_iff, sql: "select IFF(true, 7, 2)"}
+- {id: fn_ifnull, sql: "select IFNULL(7, 2)"}
+- {id: fn_insert, sql: "select INSERT('abc', 7, 2, 'b')"}
+- {id: fn_is_array, sql: "select IS_ARRAY(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_is_binary, sql: "select IS_BINARY(parse_json('{\"a\": 1, \"b\": [1, 2]}'))", gap: "not in the emulator"}
+- {id: fn_is_boolean, sql: "select IS_BOOLEAN(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_is_char, sql: "select IS_CHAR(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_is_date, sql: "select IS_DATE(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_is_date_value, sql: "select IS_DATE_VALUE(parse_json('{\"a\": 1, \"b\": [1, 2]}'))", gap: "not in the emulator"}
+- {id: fn_is_decimal, sql: "select IS_DECIMAL(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_is_double, sql: "select IS_DOUBLE(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_is_integer, sql: "select IS_INTEGER(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_is_null_value, sql: "select IS_NULL_VALUE(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_is_object, sql: "select IS_OBJECT(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_is_real, sql: "select IS_REAL(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_is_time, sql: "select IS_TIME(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_is_timestamp_ltz, sql: "select IS_TIMESTAMP_LTZ(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_is_timestamp_ntz, sql: "select IS_TIMESTAMP_NTZ(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_is_timestamp_tz, sql: "select IS_TIMESTAMP_TZ(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_is_varchar, sql: "select IS_VARCHAR(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_is_vector, sql: "select IS_VECTOR(parse_json('{\"a\": 1, \"b\": [1, 2]}'))", gap: "not in the emulator"}
+- {id: fn_jaccard_similarity, sql: "select JACCARD_SIMILARITY('abc', 'b')", gap: "not in the emulator"}
+- {id: fn_jarowinkler_similarity, sql: "select JAROWINKLER_SIMILARITY('abc', 'b')"}
+- {id: fn_kurtosis, sql: "select KURTOSIS(column1) from values (7), (2), (7)"}
+- {id: fn_kurtosis_2, sql: "select KURTOSIS(column1) from values (2.5::float), (0.5::float), (2.5::float)"}
+- {id: fn_least, sql: "select LEAST(7)"}
+- {id: fn_least_ignore_nulls, sql: "select LEAST_IGNORE_NULLS(7)"}
+- {id: fn_left, sql: "select LEFT('abc', 7)"}
+- {id: fn_len, sql: "select LEN('abc')"}
+- {id: fn_len_2, sql: "select LEN(to_binary('616263', 'hex'))"}
+- {id: fn_length, sql: "select LENGTH('abc')"}
+- {id: fn_length_2, sql: "select LENGTH(to_binary('616263', 'hex'))"}
+- {id: fn_like_any, sql: "select LIKE_ANY('abc', 'b', 'b')", gap: "not in the emulator"}
+- {id: fn_ln, sql: "select LN(2.5::float)"}
+- {id: fn_ln_2, sql: "select LN(2.5)"}
+- {id: fn_log, sql: "select LOG(2.5::float, 0.5::float)"}
+- {id: fn_log_2, sql: "select LOG(2.5, 0.5)"}
+- {id: fn_lower, sql: "select LOWER('abc')"}
+- {id: fn_lpad, sql: "select LPAD(to_binary('616263', 'hex'), 7, to_binary('62', 'hex'))", gap: "not in the emulator"}
+- {id: fn_map_construct, sql: "select MAP_CONSTRUCT(7, 2)", gap: "not in the emulator"}
+- {id: fn_max, sql: "select MAX(column1) from values (7), (2), (7)"}
+- {id: fn_max_by, sql: "select MAX_BY(column1, column2) from values (7, 2), (2, 7), (7, 2)"}
+- {id: fn_md5, sql: "select MD5('abc')"}
+- {id: fn_md5_2, sql: "select MD5(to_binary('616263', 'hex'))"}
+- {id: fn_md5_binary, sql: "select MD5_BINARY('abc')"}
+- {id: fn_md5_binary_2, sql: "select MD5_BINARY(to_binary('616263', 'hex'))"}
+- {id: fn_md5_hex, sql: "select MD5_HEX('abc')"}
+- {id: fn_md5_hex_2, sql: "select MD5_HEX(to_binary('616263', 'hex'))"}
+- {id: fn_min, sql: "select MIN(column1) from values (7), (2), (7)"}
+- {id: fn_min_by, sql: "select MIN_BY(column1, column2) from values (7, 2), (2, 7), (7, 2)"}
+- {id: fn_mod, sql: "select MOD(7, 2)"}
+- {id: fn_mod_2, sql: "select MOD(2.5::float, 0.5::float)"}
+- {id: fn_mod_3, sql: "select MOD(2.5, 0.5)"}
+- {id: fn_mode, sql: "select MODE(column1) from values (7), (2), (7)"}
+- {id: fn_monthname, sql: "select MONTHNAME('2024-03-15'::date)"}
+- {id: fn_negate, sql: "select NEGATE(7)", gap: "not in the emulator"}
+- {id: fn_negate_2, sql: "select NEGATE(2.5::float)", gap: "not in the emulator"}
+- {id: fn_negate_3, sql: "select NEGATE(2.5)", gap: "not in the emulator"}
+- {id: fn_not, sql: "select NOT(true)"}
+- {id: fn_nullif, sql: "select NULLIF(7, 2)"}
+- {id: fn_nullifzero, sql: "select NULLIFZERO(7)"}
+- {id: fn_nullifzero_2, sql: "select NULLIFZERO(2.5::float)"}
+- {id: fn_nvl, sql: "select NVL(7, 2)"}
+- {id: fn_nvl2, sql: "select NVL2(7, 2, 2)"}
+- {id: fn_object_delete, sql: "select OBJECT_DELETE(object_construct('a', 1, 'b', 'x'), 'abc')"}
+- {id: fn_object_keys, sql: "select OBJECT_KEYS(object_construct('a', 1, 'b', 'x'))"}
+- {id: fn_object_pick, sql: "select OBJECT_PICK(object_construct('a', 1, 'b', 'x'), 'abc')"}
+- {id: fn_object_pick_2, sql: "select OBJECT_PICK(object_construct('a', 1, 'b', 'x'), array_construct(3, 1, 2))"}
+- {id: fn_octet_length, sql: "select OCTET_LENGTH('abc')"}
+- {id: fn_octet_length_2, sql: "select OCTET_LENGTH(to_binary('616263', 'hex'))"}
+- {id: fn_pi, sql: "select PI()"}
+- {id: fn_pow, sql: "select POW(2.5::float, 0.5::float)"}
+- {id: fn_pow_2, sql: "select POW(2.5, 0.5)"}
+- {id: fn_power, sql: "select POWER(2.5::float, 0.5::float)"}
+- {id: fn_power_2, sql: "select POWER(2.5, 0.5)"}
+- {id: fn_radians, sql: "select RADIANS(2.5::float)"}
+- {id: fn_regr_avgx, sql: "select REGR_AVGX(column1, column2) from values (2.5::float, 0.5::float), (0.5::float, 2.5::float), (2.5::float, 0.5::float)"}
+- {id: fn_regr_avgx_2, sql: "select REGR_AVGX(column1, column2) from values (2.5, 0.5), (0.5, 2.5), (2.5, 0.5)"}
+- {id: fn_regr_avgy, sql: "select REGR_AVGY(column1, column2) from values (2.5::float, 0.5::float), (0.5::float, 2.5::float), (2.5::float, 0.5::float)"}
+- {id: fn_regr_avgy_2, sql: "select REGR_AVGY(column1, column2) from values (2.5, 0.5), (0.5, 2.5), (2.5, 0.5)"}
+- {id: fn_regr_count, sql: "select REGR_COUNT(column1, column2) from values (2.5::float, 0.5::float), (0.5::float, 2.5::float), (2.5::float, 0.5::float)"}
+- {id: fn_regr_count_2, sql: "select REGR_COUNT(column1, column2) from values (2.5, 0.5), (0.5, 2.5), (2.5, 0.5)"}
+- {id: fn_regr_intercept, sql: "select REGR_INTERCEPT(column1, column2) from values (2.5::float, 0.5::float), (0.5::float, 2.5::float), (2.5::float, 0.5::float)"}
+- {id: fn_regr_intercept_2, sql: "select REGR_INTERCEPT(column1, column2) from values (2.5, 0.5), (0.5, 2.5), (2.5, 0.5)"}
+- {id: fn_regr_r2, sql: "select REGR_R2(column1, column2) from values (2.5::float, 0.5::float), (0.5::float, 2.5::float), (2.5::float, 0.5::float)"}
+- {id: fn_regr_r2_2, sql: "select REGR_R2(column1, column2) from values (2.5, 0.5), (0.5, 2.5), (2.5, 0.5)"}
+- {id: fn_regr_slope, sql: "select REGR_SLOPE(column1, column2) from values (2.5::float, 0.5::float), (0.5::float, 2.5::float), (2.5::float, 0.5::float)"}
+- {id: fn_regr_slope_2, sql: "select REGR_SLOPE(column1, column2) from values (2.5, 0.5), (0.5, 2.5), (2.5, 0.5)"}
+- {id: fn_regr_sxx, sql: "select REGR_SXX(column1, column2) from values (2.5::float, 0.5::float), (0.5::float, 2.5::float), (2.5::float, 0.5::float)"}
+- {id: fn_regr_sxx_2, sql: "select REGR_SXX(column1, column2) from values (2.5, 0.5), (0.5, 2.5), (2.5, 0.5)"}
+- {id: fn_regr_sxy, sql: "select REGR_SXY(column1, column2) from values (2.5::float, 0.5::float), (0.5::float, 2.5::float), (2.5::float, 0.5::float)"}
+- {id: fn_regr_sxy_2, sql: "select REGR_SXY(column1, column2) from values (2.5, 0.5), (0.5, 2.5), (2.5, 0.5)"}
+- {id: fn_regr_syy, sql: "select REGR_SYY(column1, column2) from values (2.5::float, 0.5::float), (0.5::float, 2.5::float), (2.5::float, 0.5::float)"}
+- {id: fn_regr_syy_2, sql: "select REGR_SYY(column1, column2) from values (2.5, 0.5), (0.5, 2.5), (2.5, 0.5)"}
+- {id: fn_regr_valx, sql: "select REGR_VALX(2.5::float, 0.5::float)"}
+- {id: fn_regr_valx_2, sql: "select REGR_VALX(2.5, 0.5)"}
+- {id: fn_regr_valy, sql: "select REGR_VALY(2.5::float, 0.5::float)"}
+- {id: fn_regr_valy_2, sql: "select REGR_VALY(2.5, 0.5)"}
+- {id: fn_repeat, sql: "select REPEAT('abc', 7)"}
+- {id: fn_reverse, sql: "select REVERSE('abc')"}
+- {id: fn_reverse_2, sql: "select REVERSE(to_binary('616263', 'hex'))", gap: "not in the emulator"}
+- {id: fn_right, sql: "select RIGHT('abc', 7)"}
+- {id: fn_rpad, sql: "select RPAD(to_binary('616263', 'hex'), 7, to_binary('62', 'hex'))", gap: "not in the emulator"}
+- {id: fn_rtrimmed_length, sql: "select RTRIMMED_LENGTH('abc')"}
+- {id: fn_sha1, sql: "select SHA1('abc')"}
+- {id: fn_sha1_2, sql: "select SHA1(to_binary('616263', 'hex'))"}
+- {id: fn_sha1_binary, sql: "select SHA1_BINARY('abc')"}
+- {id: fn_sha1_binary_2, sql: "select SHA1_BINARY(to_binary('616263', 'hex'))"}
+- {id: fn_sha1_hex, sql: "select SHA1_HEX('abc')"}
+- {id: fn_sha1_hex_2, sql: "select SHA1_HEX(to_binary('616263', 'hex'))"}
+- {id: fn_sign, sql: "select SIGN(7)"}
+- {id: fn_sign_2, sql: "select SIGN(2.5::float)"}
+- {id: fn_sign_3, sql: "select SIGN(2.5)"}
+- {id: fn_sin, sql: "select SIN(2.5::float)"}
+- {id: fn_sinh, sql: "select SINH(2.5::float)"}
+- {id: fn_skew, sql: "select SKEW(column1) from values (7), (2), (7)", gap: "answers differently"}
+- {id: fn_skew_2, sql: "select SKEW(column1) from values (2.5::float), (0.5::float), (2.5::float)"}
+- {id: fn_snowpark_conv, sql: "select SNOWPARK_CONV('abc', 7, 2)", gap: "not in the emulator"}
+- {id: fn_snowpark_conv_2, sql: "select SNOWPARK_CONV(7, 2, 2)", gap: "not in the emulator"}
+- {id: fn_soundex, sql: "select SOUNDEX('abc')", gap: "answers differently"}
+- {id: fn_soundex_p123, sql: "select SOUNDEX_P123('abc')", gap: "not in the emulator"}
+- {id: fn_space, sql: "select SPACE(7)"}
+- {id: fn_split, sql: "select SPLIT('abc', 'b')"}
+- {id: fn_split_part, sql: "select SPLIT_PART('abc', 'b', 7)"}
+- {id: fn_sqrt, sql: "select SQRT(2.5::float)"}
+- {id: fn_sqrt_2, sql: "select SQRT(2.5)"}
+- {id: fn_square, sql: "select SQUARE(2.5::float)"}
+- {id: fn_square_2, sql: "select SQUARE(2.5)"}
+- {id: fn_startswith, sql: "select STARTSWITH('abc', 'b')"}
+- {id: fn_startswith_2, sql: "select STARTSWITH(to_binary('616263', 'hex'), to_binary('62', 'hex'))", gap: "not in the emulator"}
+- {id: fn_stddev, sql: "select STDDEV(column1) from values (7), (2), (7)"}
+- {id: fn_stddev_2, sql: "select STDDEV(column1) from values (2.5::float), (0.5::float), (2.5::float)"}
+- {id: fn_stddev_pop, sql: "select STDDEV_POP(column1) from values (7), (2), (7)"}
+- {id: fn_stddev_pop_2, sql: "select STDDEV_POP(column1) from values (2.5::float), (0.5::float), (2.5::float)"}
+- {id: fn_stddev_samp, sql: "select STDDEV_SAMP(column1) from values (7), (2), (7)"}
+- {id: fn_stddev_samp_2, sql: "select STDDEV_SAMP(column1) from values (2.5::float), (0.5::float), (2.5::float)"}
+- {id: fn_string_as_binary, sql: "select STRING_AS_BINARY('abc')", gap: "not in the emulator"}
+- {id: fn_strip_null_value, sql: "select STRIP_NULL_VALUE(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_sum, sql: "select SUM(column1) from values (7), (2), (7)"}
+- {id: fn_sum_2, sql: "select SUM(column1) from values (2.5::float), (0.5::float), (2.5::float)"}
+- {id: fn_sum_3, sql: "select SUM(column1) from values (2.5), (0.5), (2.5)"}
+- {id: fn_sum_real, sql: "select SUM_REAL(column1) from values (7), (2), (7)", gap: "not in the emulator"}
+- {id: fn_sum_real_2, sql: "select SUM_REAL(column1) from values (2.5::float), (0.5::float), (2.5::float)", gap: "not in the emulator"}
+- {id: fn_tan, sql: "select TAN(2.5::float)"}
+- {id: fn_tanh, sql: "select TANH(2.5::float)"}
+- {id: fn_time, sql: "select TIME('2024-03-15 10:20:30'::timestamp_ltz)", gap: "not in the emulator"}
+- {id: fn_time_2, sql: "select TIME('2024-03-15 10:20:30'::timestamp_ntz)", gap: "not in the emulator"}
+- {id: fn_time_3, sql: "select TIME('2024-03-15 10:20:30 +0000'::timestamp_tz)", gap: "not in the emulator"}
+- {id: fn_timestampfromparts, sql: "select TIMESTAMPFROMPARTS('2024-03-15'::date, '10:20:30'::time)"}
+- {id: fn_timestampntzfromparts, sql: "select TIMESTAMPNTZFROMPARTS('2024-03-15'::date, '10:20:30'::time)"}
+- {id: fn_timestamp_from_parts, sql: "select TIMESTAMP_FROM_PARTS('2024-03-15'::date, '10:20:30'::time)"}
+- {id: fn_timestamp_ntz_from_parts, sql: "select TIMESTAMP_NTZ_FROM_PARTS('2024-03-15'::date, '10:20:30'::time)"}
+- {id: fn_top_k_sketch_object_construct, sql: "select TOP_K_SKETCH_OBJECT_CONSTRUCT('abc', 7, 'b', 2)", gap: "not in the emulator"}
+- {id: fn_to_json, sql: "select TO_JSON(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_to_xml, sql: "select TO_XML(parse_json('{\"a\": 1, \"b\": [1, 2]}'))", gap: "not in the emulator"}
+- {id: fn_translate, sql: "select TRANSLATE('abc', 'b', 'b')"}
+- {id: fn_try_hex_decode_binary, sql: "select TRY_HEX_DECODE_BINARY('abc')", gap: "not in the emulator"}
+- {id: fn_try_hex_decode_string, sql: "select TRY_HEX_DECODE_STRING('abc')"}
+- {id: fn_try_parse_json, sql: "select TRY_PARSE_JSON('abc')"}
+- {id: fn_try_validate_utf8, sql: "select TRY_VALIDATE_UTF8('abc')", gap: "not in the emulator"}
+- {id: fn_typeof, sql: "select TYPEOF(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
+- {id: fn_unicode, sql: "select UNICODE('abc')"}
+- {id: fn_upper, sql: "select UPPER('abc')"}
+- {id: fn_variance, sql: "select VARIANCE(column1) from values (7), (2), (7)"}
+- {id: fn_variance_2, sql: "select VARIANCE(column1) from values (2.5::float), (0.5::float), (2.5::float)"}
+- {id: fn_variance_pop, sql: "select VARIANCE_POP(column1) from values (7), (2), (7)"}
+- {id: fn_variance_pop_2, sql: "select VARIANCE_POP(column1) from values (2.5::float), (0.5::float), (2.5::float)"}
+- {id: fn_variance_samp, sql: "select VARIANCE_SAMP(column1) from values (7), (2), (7)"}
+- {id: fn_variance_samp_2, sql: "select VARIANCE_SAMP(column1) from values (2.5::float), (0.5::float), (2.5::float)"}
+- {id: fn_var_pop, sql: "select VAR_POP(column1) from values (7), (2), (7)"}
+- {id: fn_var_pop_2, sql: "select VAR_POP(column1) from values (2.5::float), (0.5::float), (2.5::float)"}
+- {id: fn_var_samp, sql: "select VAR_SAMP(column1) from values (7), (2), (7)"}
+- {id: fn_var_samp_2, sql: "select VAR_SAMP(column1) from values (2.5::float), (0.5::float), (2.5::float)"}
+- {id: fn_xmlget, sql: "select XMLGET(parse_json('{\"a\": 1, \"b\": [1, 2]}'), 'abc', 7)", gap: "not in the emulator"}
+- {id: fn_xmlget_2, sql: "select XMLGET(object_construct('a', 1, 'b', 'x'), 'abc', 7)", gap: "not in the emulator"}
+- {id: fn_xmlget_3, sql: "select XMLGET(parse_json('{\"a\": 1, \"b\": [1, 2]}'), 'abc')", gap: "not in the emulator"}
+- {id: fn_xmlget_4, sql: "select XMLGET(object_construct('a', 1, 'b', 'x'), 'abc')", gap: "not in the emulator"}
+- {id: fn_zeroifnull, sql: "select ZEROIFNULL(7)"}
+- {id: fn_zeroifnull_2, sql: "select ZEROIFNULL(2.5::float)"}
+- {id: fn_zeroifnull_3, sql: "select ZEROIFNULL(2.5)"}
+- {id: fn_zipf, sql: "select ZIPF(2.5::float, 7, 2)"}

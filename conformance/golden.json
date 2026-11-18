@@ -1566,6 +1566,2537 @@
    ]
   ]
  },
+ "fn_abs": {
+  "rows": [
+   [
+    "7"
+   ]
+  ]
+ },
+ "fn_abs_2": {
+  "rows": [
+   [
+    "2.5"
+   ]
+  ]
+ },
+ "fn_abs_3": {
+  "rows": [
+   [
+    "2.5"
+   ]
+  ]
+ },
+ "fn_acosh": {
+  "rows": [
+   [
+    "1.566799236972"
+   ]
+  ]
+ },
+ "fn_any_value": {
+  "rows": [
+   [
+    "7"
+   ]
+  ]
+ },
+ "fn_approx_count_distinct": {
+  "rows": [
+   [
+    "2"
+   ]
+  ]
+ },
+ "fn_approx_percentile_accumulate": {
+  "rows": [
+   [
+    {
+     "state": [
+      0.5,
+      1.0,
+      2.5,
+      1.0,
+      2.5,
+      1.0
+     ],
+     "type": "tdigest",
+     "version": 1
+    }
+   ]
+  ]
+ },
+ "fn_approximate_count_distinct": {
+  "rows": [
+   [
+    "2"
+   ]
+  ]
+ },
+ "fn_array_agg": {
+  "rows": [
+   [
+    [
+     7,
+     2,
+     7
+    ]
+   ]
+  ]
+ },
+ "fn_array_append": {
+  "rows": [
+   [
+    [
+     3,
+     1,
+     2,
+     7
+    ]
+   ]
+  ]
+ },
+ "fn_array_cat": {
+  "rows": [
+   [
+    [
+     3,
+     1,
+     2,
+     2,
+     9
+    ]
+   ]
+  ]
+ },
+ "fn_array_compact": {
+  "rows": [
+   [
+    [
+     3,
+     1,
+     2
+    ]
+   ]
+  ]
+ },
+ "fn_array_construct": {
+  "rows": [
+   [
+    [
+     7
+    ]
+   ]
+  ]
+ },
+ "fn_array_construct_compact": {
+  "rows": [
+   [
+    [
+     7
+    ]
+   ]
+  ]
+ },
+ "fn_array_construct_structured": {
+  "rows": [
+   [
+    [
+     7
+    ]
+   ]
+  ]
+ },
+ "fn_array_contains": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_array_contains_2": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_array_distinct": {
+  "rows": [
+   [
+    [
+     3,
+     1,
+     2
+    ]
+   ]
+  ]
+ },
+ "fn_array_except": {
+  "rows": [
+   [
+    [
+     3,
+     1
+    ]
+   ]
+  ]
+ },
+ "fn_array_insert": {
+  "rows": [
+   [
+    "[\n  3,\n  1,\n  2,\n  undefined,\n  undefined,\n  undefined,\n  undefined,\n  7\n]"
+   ]
+  ]
+ },
+ "fn_array_intersection": {
+  "rows": [
+   [
+    [
+     2
+    ]
+   ]
+  ]
+ },
+ "fn_array_max": {
+  "rows": [
+   [
+    "3"
+   ]
+  ]
+ },
+ "fn_array_min": {
+  "rows": [
+   [
+    "1"
+   ]
+  ]
+ },
+ "fn_array_position": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_array_position_2": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_array_prepend": {
+  "rows": [
+   [
+    [
+     7,
+     3,
+     1,
+     2
+    ]
+   ]
+  ]
+ },
+ "fn_array_remove": {
+  "rows": [
+   [
+    [
+     3,
+     1,
+     2
+    ]
+   ]
+  ]
+ },
+ "fn_array_remove_2": {
+  "rows": [
+   [
+    [
+     3,
+     1,
+     2
+    ]
+   ]
+  ]
+ },
+ "fn_array_remove_at": {
+  "rows": [
+   [
+    [
+     3,
+     1,
+     2
+    ]
+   ]
+  ]
+ },
+ "fn_array_repeat": {
+  "rows": [
+   [
+    [
+     7,
+     7,
+     7,
+     7,
+     7,
+     7,
+     7
+    ]
+   ]
+  ]
+ },
+ "fn_array_reverse": {
+  "rows": [
+   [
+    [
+     2,
+     1,
+     3
+    ]
+   ]
+  ]
+ },
+ "fn_array_size": {
+  "rows": [
+   [
+    "3"
+   ]
+  ]
+ },
+ "fn_array_size_2": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_array_slice": {
+  "rows": [
+   [
+    []
+   ]
+  ]
+ },
+ "fn_array_to_string": {
+  "rows": [
+   [
+    "3abc1abc2"
+   ]
+  ]
+ },
+ "fn_array_unique_agg": {
+  "rows": [
+   [
+    [
+     7,
+     2
+    ]
+   ]
+  ]
+ },
+ "fn_arrayagg": {
+  "rows": [
+   [
+    [
+     7,
+     2,
+     7
+    ]
+   ]
+  ]
+ },
+ "fn_arrays_overlap": {
+  "rows": [
+   [
+    true
+   ]
+  ]
+ },
+ "fn_as_array": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_as_binary": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_as_boolean": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_as_char": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_as_date": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_as_double": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_as_object": {
+  "rows": [
+   [
+    {
+     "a": 1,
+     "b": [
+      1,
+      2
+     ]
+    }
+   ]
+  ]
+ },
+ "fn_as_real": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_as_time": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_as_varchar": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_ascii": {
+  "rows": [
+   [
+    "97"
+   ]
+  ]
+ },
+ "fn_asinh": {
+  "rows": [
+   [
+    "1.647231146371"
+   ]
+  ]
+ },
+ "fn_atan": {
+  "rows": [
+   [
+    "1.190289949683"
+   ]
+  ]
+ },
+ "fn_atan2": {
+  "rows": [
+   [
+    "1.373400766945"
+   ]
+  ]
+ },
+ "fn_avg": {
+  "rows": [
+   [
+    "5.333333"
+   ]
+  ]
+ },
+ "fn_avg_2": {
+  "rows": [
+   [
+    "1.833333333333"
+   ]
+  ]
+ },
+ "fn_avg_3": {
+  "rows": [
+   [
+    "1.8333333"
+   ]
+  ]
+ },
+ "fn_binary_as_string": {
+  "rows": [
+   [
+    "abc"
+   ]
+  ]
+ },
+ "fn_bit_and": {
+  "rows": [
+   [
+    "2"
+   ]
+  ]
+ },
+ "fn_bit_and_agg": {
+  "rows": [
+   [
+    "2"
+   ]
+  ]
+ },
+ "fn_bit_andagg": {
+  "rows": [
+   [
+    "2"
+   ]
+  ]
+ },
+ "fn_bit_length": {
+  "rows": [
+   [
+    "24"
+   ]
+  ]
+ },
+ "fn_bit_length_2": {
+  "rows": [
+   [
+    "24"
+   ]
+  ]
+ },
+ "fn_bit_not": {
+  "rows": [
+   [
+    "-8"
+   ]
+  ]
+ },
+ "fn_bit_not_2": {
+  "rows": [
+   [
+    "bytearray(b'\\x9e\\x9d\\x9c')"
+   ]
+  ]
+ },
+ "fn_bit_or": {
+  "rows": [
+   [
+    "7"
+   ]
+  ]
+ },
+ "fn_bit_or_agg": {
+  "rows": [
+   [
+    "7"
+   ]
+  ]
+ },
+ "fn_bit_oragg": {
+  "rows": [
+   [
+    "7"
+   ]
+  ]
+ },
+ "fn_bit_shiftleft": {
+  "rows": [
+   [
+    "28"
+   ]
+  ]
+ },
+ "fn_bit_shiftleft_2": {
+  "rows": [
+   [
+    "bytearray(b'\\xb11\\x80')"
+   ]
+  ]
+ },
+ "fn_bit_shiftright": {
+  "rows": [
+   [
+    "1"
+   ]
+  ]
+ },
+ "fn_bit_shiftright_2": {
+  "rows": [
+   [
+    "bytearray(b'\\x00\\xc2\\xc4')"
+   ]
+  ]
+ },
+ "fn_bit_xor": {
+  "rows": [
+   [
+    "5"
+   ]
+  ]
+ },
+ "fn_bit_xor_agg": {
+  "rows": [
+   [
+    "2"
+   ]
+  ]
+ },
+ "fn_bit_xoragg": {
+  "rows": [
+   [
+    "2"
+   ]
+  ]
+ },
+ "fn_bitand": {
+  "rows": [
+   [
+    "2"
+   ]
+  ]
+ },
+ "fn_bitand_agg": {
+  "rows": [
+   [
+    "2"
+   ]
+  ]
+ },
+ "fn_bitandagg": {
+  "rows": [
+   [
+    "2"
+   ]
+  ]
+ },
+ "fn_bitcount": {
+  "rows": [
+   [
+    "3"
+   ]
+  ]
+ },
+ "fn_bitcount_2": {
+  "rows": [
+   [
+    "10"
+   ]
+  ]
+ },
+ "fn_bitmap_absolute_position": {
+  "rows": [
+   [
+    "196611"
+   ]
+  ]
+ },
+ "fn_bitmap_bit_position": {
+  "rows": [
+   [
+    "6"
+   ]
+  ]
+ },
+ "fn_bitmap_bucket_number": {
+  "rows": [
+   [
+    "1"
+   ]
+  ]
+ },
+ "fn_bitmap_construct_agg": {
+  "rows": [
+   [
+    "bytearray(b'\\x00\\x02\\x02\\x00\\x07\\x00\\x00\\x00\\x00\\x00')"
+   ]
+  ]
+ },
+ "fn_bitnot": {
+  "rows": [
+   [
+    "-8"
+   ]
+  ]
+ },
+ "fn_bitnot_2": {
+  "rows": [
+   [
+    "bytearray(b'\\x9e\\x9d\\x9c')"
+   ]
+  ]
+ },
+ "fn_bitor": {
+  "rows": [
+   [
+    "7"
+   ]
+  ]
+ },
+ "fn_bitor_agg": {
+  "rows": [
+   [
+    "7"
+   ]
+  ]
+ },
+ "fn_bitoragg": {
+  "rows": [
+   [
+    "7"
+   ]
+  ]
+ },
+ "fn_bitshiftleft": {
+  "rows": [
+   [
+    "28"
+   ]
+  ]
+ },
+ "fn_bitshiftleft_2": {
+  "rows": [
+   [
+    "bytearray(b'\\xb11\\x80')"
+   ]
+  ]
+ },
+ "fn_bitshiftright": {
+  "rows": [
+   [
+    "1"
+   ]
+  ]
+ },
+ "fn_bitshiftright_2": {
+  "rows": [
+   [
+    "bytearray(b'\\x00\\xc2\\xc4')"
+   ]
+  ]
+ },
+ "fn_bitxor": {
+  "rows": [
+   [
+    "5"
+   ]
+  ]
+ },
+ "fn_bitxor_agg": {
+  "rows": [
+   [
+    "2"
+   ]
+  ]
+ },
+ "fn_bitxoragg": {
+  "rows": [
+   [
+    "2"
+   ]
+  ]
+ },
+ "fn_booland": {
+  "rows": [
+   [
+    true
+   ]
+  ]
+ },
+ "fn_booland_agg": {
+  "rows": [
+   [
+    true
+   ]
+  ]
+ },
+ "fn_boolnot": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_boolor": {
+  "rows": [
+   [
+    true
+   ]
+  ]
+ },
+ "fn_boolor_agg": {
+  "rows": [
+   [
+    true
+   ]
+  ]
+ },
+ "fn_boolxor": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_boolxor_agg": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_cbrt": {
+  "rows": [
+   [
+    "1.357208808297"
+   ]
+  ]
+ },
+ "fn_cbrt_2": {
+  "rows": [
+   [
+    "1.357208808297"
+   ]
+  ]
+ },
+ "fn_char": {
+  "rows": [
+   [
+    "\u0007"
+   ]
+  ]
+ },
+ "fn_check_json": {
+  "rows": [
+   [
+    "unknown keyword \"abc\", pos 4"
+   ]
+  ]
+ },
+ "fn_check_xml": {
+  "rows": [
+   [
+    "not an XML element, pos 1"
+   ]
+  ]
+ },
+ "fn_check_xml_2": {
+  "rows": [
+   [
+    "not an XML element, pos 1"
+   ]
+  ]
+ },
+ "fn_chr": {
+  "rows": [
+   [
+    "\u0007"
+   ]
+  ]
+ },
+ "fn_coalesce": {
+  "rows": [
+   [
+    "7"
+   ]
+  ]
+ },
+ "fn_concat": {
+  "rows": [
+   [
+    "abc"
+   ]
+  ]
+ },
+ "fn_concat_2": {
+  "rows": [
+   [
+    "bytearray(b'abc')"
+   ]
+  ]
+ },
+ "fn_concat_ws": {
+  "rows": [
+   [
+    "b"
+   ]
+  ]
+ },
+ "fn_concat_ws_2": {
+  "rows": [
+   [
+    "bytearray(b'b')"
+   ]
+  ]
+ },
+ "fn_contains": {
+  "rows": [
+   [
+    true
+   ]
+  ]
+ },
+ "fn_contains_2": {
+  "rows": [
+   [
+    true
+   ]
+  ]
+ },
+ "fn_corr": {
+  "rows": [
+   [
+    "-1"
+   ]
+  ]
+ },
+ "fn_corr_2": {
+  "rows": [
+   [
+    "-1"
+   ]
+  ]
+ },
+ "fn_cos": {
+  "rows": [
+   [
+    "-0.8011436155469"
+   ]
+  ]
+ },
+ "fn_cosh": {
+  "rows": [
+   [
+    "6.132289479664"
+   ]
+  ]
+ },
+ "fn_cot": {
+  "rows": [
+   [
+    "-1.338648128304"
+   ]
+  ]
+ },
+ "fn_count": {
+  "rows": [
+   [
+    "3"
+   ]
+  ]
+ },
+ "fn_count_if": {
+  "rows": [
+   [
+    "2"
+   ]
+  ]
+ },
+ "fn_covar_pop": {
+  "rows": [
+   [
+    "-0.8888888888889"
+   ]
+  ]
+ },
+ "fn_covar_pop_2": {
+  "rows": [
+   [
+    "-0.8888888888889"
+   ]
+  ]
+ },
+ "fn_covar_samp": {
+  "rows": [
+   [
+    "-1.333333333333"
+   ]
+  ]
+ },
+ "fn_covar_samp_2": {
+  "rows": [
+   [
+    "-1.333333333333"
+   ]
+  ]
+ },
+ "fn_date": {
+  "rows": [
+   [
+    "2024-03-15"
+   ]
+  ]
+ },
+ "fn_date_2": {
+  "rows": [
+   [
+    "2024-03-15"
+   ]
+  ]
+ },
+ "fn_date_3": {
+  "rows": [
+   [
+    "2024-03-15"
+   ]
+  ]
+ },
+ "fn_date_from_parts": {
+  "rows": [
+   [
+    "0007-02-02"
+   ]
+  ]
+ },
+ "fn_datefromparts": {
+  "rows": [
+   [
+    "0007-02-02"
+   ]
+  ]
+ },
+ "fn_dayname": {
+  "rows": [
+   [
+    "Fri"
+   ]
+  ]
+ },
+ "fn_decode": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_degrees": {
+  "rows": [
+   [
+    "143.2394487827"
+   ]
+  ]
+ },
+ "fn_div0": {
+  "rows": [
+   [
+    "3.5"
+   ]
+  ]
+ },
+ "fn_div0_2": {
+  "rows": [
+   [
+    "5"
+   ]
+  ]
+ },
+ "fn_div0_3": {
+  "rows": [
+   [
+    "5"
+   ]
+  ]
+ },
+ "fn_div0null": {
+  "rows": [
+   [
+    "3.5"
+   ]
+  ]
+ },
+ "fn_div0null_2": {
+  "rows": [
+   [
+    "5"
+   ]
+  ]
+ },
+ "fn_endswith": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_endswith_2": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_equal_null": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_exp": {
+  "rows": [
+   [
+    "12.1824939607"
+   ]
+  ]
+ },
+ "fn_exp_2": {
+  "rows": [
+   [
+    "12.1824939607"
+   ]
+  ]
+ },
+ "fn_factorial": {
+  "rows": [
+   [
+    "5040"
+   ]
+  ]
+ },
+ "fn_fuzzy_subsequence_score": {
+  "rows": [
+   [
+    "1"
+   ]
+  ]
+ },
+ "fn_get": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_get_2": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_get_3": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_get_4": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_get_ignore_case": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_get_ignore_case_2": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_get_path": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_get_path_2": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_get_path_3": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_getbit": {
+  "rows": [
+   [
+    "1"
+   ]
+  ]
+ },
+ "fn_greatest": {
+  "rows": [
+   [
+    "7"
+   ]
+  ]
+ },
+ "fn_greatest_ignore_nulls": {
+  "rows": [
+   [
+    "7"
+   ]
+  ]
+ },
+ "fn_hll": {
+  "rows": [
+   [
+    "2"
+   ]
+  ]
+ },
+ "fn_hll_accumulate": {
+  "rows": [
+   [
+    "bytearray(b'+\\x00\\x01\\xb6\\x0e\\x03')"
+   ]
+  ]
+ },
+ "fn_hll_export": {
+  "rows": [
+   [
+    {
+     "precision": 12,
+     "sparse": {
+      "indices": [
+       25185
+      ],
+      "maxLzCounts": [
+       99
+      ]
+     },
+     "version": 4
+    }
+   ]
+  ]
+ },
+ "fn_iff": {
+  "rows": [
+   [
+    "7"
+   ]
+  ]
+ },
+ "fn_ifnull": {
+  "rows": [
+   [
+    "7"
+   ]
+  ]
+ },
+ "fn_insert": {
+  "rows": [
+   [
+    "abcb"
+   ]
+  ]
+ },
+ "fn_is_array": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_is_binary": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_is_boolean": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_is_char": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_is_date": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_is_date_value": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_is_decimal": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_is_double": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_is_integer": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_is_null_value": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_is_object": {
+  "rows": [
+   [
+    true
+   ]
+  ]
+ },
+ "fn_is_real": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_is_time": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_is_timestamp_ltz": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_is_timestamp_ntz": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_is_timestamp_tz": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_is_varchar": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_is_vector": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_jaccard_similarity": {
+  "rows": [
+   [
+    "0.3333333333333"
+   ]
+  ]
+ },
+ "fn_jarowinkler_similarity": {
+  "rows": [
+   [
+    "0"
+   ]
+  ]
+ },
+ "fn_kurtosis": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_kurtosis_2": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_least": {
+  "rows": [
+   [
+    "7"
+   ]
+  ]
+ },
+ "fn_least_ignore_nulls": {
+  "rows": [
+   [
+    "7"
+   ]
+  ]
+ },
+ "fn_left": {
+  "rows": [
+   [
+    "abc"
+   ]
+  ]
+ },
+ "fn_len": {
+  "rows": [
+   [
+    "3"
+   ]
+  ]
+ },
+ "fn_len_2": {
+  "rows": [
+   [
+    "3"
+   ]
+  ]
+ },
+ "fn_length": {
+  "rows": [
+   [
+    "3"
+   ]
+  ]
+ },
+ "fn_length_2": {
+  "rows": [
+   [
+    "3"
+   ]
+  ]
+ },
+ "fn_like_any": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_ln": {
+  "rows": [
+   [
+    "0.9162907318742"
+   ]
+  ]
+ },
+ "fn_ln_2": {
+  "rows": [
+   [
+    "0.9162907318742"
+   ]
+  ]
+ },
+ "fn_log": {
+  "rows": [
+   [
+    "-0.756470797366"
+   ]
+  ]
+ },
+ "fn_log_2": {
+  "rows": [
+   [
+    "-0.756470797366"
+   ]
+  ]
+ },
+ "fn_lower": {
+  "rows": [
+   [
+    "abc"
+   ]
+  ]
+ },
+ "fn_lpad": {
+  "rows": [
+   [
+    "bytearray(b'bbbbabc')"
+   ]
+  ]
+ },
+ "fn_map_construct": {
+  "rows": [
+   [
+    {
+     "7": 2
+    }
+   ]
+  ]
+ },
+ "fn_max": {
+  "rows": [
+   [
+    "7"
+   ]
+  ]
+ },
+ "fn_max_by": {
+  "rows": [
+   [
+    "2"
+   ]
+  ]
+ },
+ "fn_md5": {
+  "rows": [
+   [
+    "900150983cd24fb0d6963f7d28e17f72"
+   ]
+  ]
+ },
+ "fn_md5_2": {
+  "rows": [
+   [
+    "900150983cd24fb0d6963f7d28e17f72"
+   ]
+  ]
+ },
+ "fn_md5_binary": {
+  "rows": [
+   [
+    "bytearray(b'\\x90\\x01P\\x98<\\xd2O\\xb0\\xd6\\x96?}(\\xe1\\x7fr')"
+   ]
+  ]
+ },
+ "fn_md5_binary_2": {
+  "rows": [
+   [
+    "bytearray(b'\\x90\\x01P\\x98<\\xd2O\\xb0\\xd6\\x96?}(\\xe1\\x7fr')"
+   ]
+  ]
+ },
+ "fn_md5_hex": {
+  "rows": [
+   [
+    "900150983cd24fb0d6963f7d28e17f72"
+   ]
+  ]
+ },
+ "fn_md5_hex_2": {
+  "rows": [
+   [
+    "900150983cd24fb0d6963f7d28e17f72"
+   ]
+  ]
+ },
+ "fn_min": {
+  "rows": [
+   [
+    "2"
+   ]
+  ]
+ },
+ "fn_min_by": {
+  "rows": [
+   [
+    "7"
+   ]
+  ]
+ },
+ "fn_mod": {
+  "rows": [
+   [
+    "1"
+   ]
+  ]
+ },
+ "fn_mod_2": {
+  "rows": [
+   [
+    "0"
+   ]
+  ]
+ },
+ "fn_mod_3": {
+  "rows": [
+   [
+    "0"
+   ]
+  ]
+ },
+ "fn_mode": {
+  "rows": [
+   [
+    "7"
+   ]
+  ]
+ },
+ "fn_monthname": {
+  "rows": [
+   [
+    "Mar"
+   ]
+  ]
+ },
+ "fn_negate": {
+  "rows": [
+   [
+    "-7"
+   ]
+  ]
+ },
+ "fn_negate_2": {
+  "rows": [
+   [
+    "-2.5"
+   ]
+  ]
+ },
+ "fn_negate_3": {
+  "rows": [
+   [
+    "-2.5"
+   ]
+  ]
+ },
+ "fn_not": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_nullif": {
+  "rows": [
+   [
+    "7"
+   ]
+  ]
+ },
+ "fn_nullifzero": {
+  "rows": [
+   [
+    "7"
+   ]
+  ]
+ },
+ "fn_nullifzero_2": {
+  "rows": [
+   [
+    "2.5"
+   ]
+  ]
+ },
+ "fn_nvl": {
+  "rows": [
+   [
+    "7"
+   ]
+  ]
+ },
+ "fn_nvl2": {
+  "rows": [
+   [
+    "2"
+   ]
+  ]
+ },
+ "fn_object_delete": {
+  "rows": [
+   [
+    {
+     "a": 1,
+     "b": "x"
+    }
+   ]
+  ]
+ },
+ "fn_object_keys": {
+  "rows": [
+   [
+    [
+     "a",
+     "b"
+    ]
+   ]
+  ]
+ },
+ "fn_object_pick": {
+  "rows": [
+   [
+    {}
+   ]
+  ]
+ },
+ "fn_object_pick_2": {
+  "rows": [
+   [
+    {}
+   ]
+  ]
+ },
+ "fn_octet_length": {
+  "rows": [
+   [
+    "3"
+   ]
+  ]
+ },
+ "fn_octet_length_2": {
+  "rows": [
+   [
+    "3"
+   ]
+  ]
+ },
+ "fn_pi": {
+  "rows": [
+   [
+    "3.14159265359"
+   ]
+  ]
+ },
+ "fn_pow": {
+  "rows": [
+   [
+    "1.581138830084"
+   ]
+  ]
+ },
+ "fn_pow_2": {
+  "rows": [
+   [
+    "1.581138830084"
+   ]
+  ]
+ },
+ "fn_power": {
+  "rows": [
+   [
+    "1.581138830084"
+   ]
+  ]
+ },
+ "fn_power_2": {
+  "rows": [
+   [
+    "1.581138830084"
+   ]
+  ]
+ },
+ "fn_radians": {
+  "rows": [
+   [
+    "0.04363323129986"
+   ]
+  ]
+ },
+ "fn_regr_avgx": {
+  "rows": [
+   [
+    "1.166666666667"
+   ]
+  ]
+ },
+ "fn_regr_avgx_2": {
+  "rows": [
+   [
+    "1.166666666667"
+   ]
+  ]
+ },
+ "fn_regr_avgy": {
+  "rows": [
+   [
+    "1.833333333333"
+   ]
+  ]
+ },
+ "fn_regr_avgy_2": {
+  "rows": [
+   [
+    "1.833333333333"
+   ]
+  ]
+ },
+ "fn_regr_count": {
+  "rows": [
+   [
+    "3"
+   ]
+  ]
+ },
+ "fn_regr_count_2": {
+  "rows": [
+   [
+    "3"
+   ]
+  ]
+ },
+ "fn_regr_intercept": {
+  "rows": [
+   [
+    "3"
+   ]
+  ]
+ },
+ "fn_regr_intercept_2": {
+  "rows": [
+   [
+    "3"
+   ]
+  ]
+ },
+ "fn_regr_r2": {
+  "rows": [
+   [
+    "1"
+   ]
+  ]
+ },
+ "fn_regr_r2_2": {
+  "rows": [
+   [
+    "1"
+   ]
+  ]
+ },
+ "fn_regr_slope": {
+  "rows": [
+   [
+    "-1"
+   ]
+  ]
+ },
+ "fn_regr_slope_2": {
+  "rows": [
+   [
+    "-1"
+   ]
+  ]
+ },
+ "fn_regr_sxx": {
+  "rows": [
+   [
+    "2.666666666667"
+   ]
+  ]
+ },
+ "fn_regr_sxx_2": {
+  "rows": [
+   [
+    "2.666666666667"
+   ]
+  ]
+ },
+ "fn_regr_sxy": {
+  "rows": [
+   [
+    "-2.666666666667"
+   ]
+  ]
+ },
+ "fn_regr_sxy_2": {
+  "rows": [
+   [
+    "-2.666666666667"
+   ]
+  ]
+ },
+ "fn_regr_syy": {
+  "rows": [
+   [
+    "2.666666666667"
+   ]
+  ]
+ },
+ "fn_regr_syy_2": {
+  "rows": [
+   [
+    "2.666666666667"
+   ]
+  ]
+ },
+ "fn_regr_valx": {
+  "rows": [
+   [
+    "0.5"
+   ]
+  ]
+ },
+ "fn_regr_valx_2": {
+  "rows": [
+   [
+    "0.5"
+   ]
+  ]
+ },
+ "fn_regr_valy": {
+  "rows": [
+   [
+    "2.5"
+   ]
+  ]
+ },
+ "fn_regr_valy_2": {
+  "rows": [
+   [
+    "2.5"
+   ]
+  ]
+ },
+ "fn_repeat": {
+  "rows": [
+   [
+    "abcabcabcabcabcabcabc"
+   ]
+  ]
+ },
+ "fn_reverse": {
+  "rows": [
+   [
+    "cba"
+   ]
+  ]
+ },
+ "fn_reverse_2": {
+  "rows": [
+   [
+    "bytearray(b'cba')"
+   ]
+  ]
+ },
+ "fn_right": {
+  "rows": [
+   [
+    "abc"
+   ]
+  ]
+ },
+ "fn_rpad": {
+  "rows": [
+   [
+    "bytearray(b'abcbbbb')"
+   ]
+  ]
+ },
+ "fn_rtrimmed_length": {
+  "rows": [
+   [
+    "3"
+   ]
+  ]
+ },
+ "fn_sha1": {
+  "rows": [
+   [
+    "a9993e364706816aba3e25717850c26c9cd0d89d"
+   ]
+  ]
+ },
+ "fn_sha1_2": {
+  "rows": [
+   [
+    "a9993e364706816aba3e25717850c26c9cd0d89d"
+   ]
+  ]
+ },
+ "fn_sha1_binary": {
+  "rows": [
+   [
+    "bytearray(b'\\xa9\\x99>6G\\x06\\x81j\\xba>%qxP\\xc2l\\x9c\\xd0\\xd8\\x9d')"
+   ]
+  ]
+ },
+ "fn_sha1_binary_2": {
+  "rows": [
+   [
+    "bytearray(b'\\xa9\\x99>6G\\x06\\x81j\\xba>%qxP\\xc2l\\x9c\\xd0\\xd8\\x9d')"
+   ]
+  ]
+ },
+ "fn_sha1_hex": {
+  "rows": [
+   [
+    "a9993e364706816aba3e25717850c26c9cd0d89d"
+   ]
+  ]
+ },
+ "fn_sha1_hex_2": {
+  "rows": [
+   [
+    "a9993e364706816aba3e25717850c26c9cd0d89d"
+   ]
+  ]
+ },
+ "fn_sign": {
+  "rows": [
+   [
+    "1"
+   ]
+  ]
+ },
+ "fn_sign_2": {
+  "rows": [
+   [
+    "1"
+   ]
+  ]
+ },
+ "fn_sign_3": {
+  "rows": [
+   [
+    "1"
+   ]
+  ]
+ },
+ "fn_sin": {
+  "rows": [
+   [
+    "0.598472144104"
+   ]
+  ]
+ },
+ "fn_sinh": {
+  "rows": [
+   [
+    "6.05020448104"
+   ]
+  ]
+ },
+ "fn_skew": {
+  "rows": [
+   [
+    "-1.732049872261"
+   ]
+  ]
+ },
+ "fn_skew_2": {
+  "rows": [
+   [
+    "-1.732050807569"
+   ]
+  ]
+ },
+ "fn_snowpark_conv": {
+  "rows": [
+   [
+    "0"
+   ]
+  ]
+ },
+ "fn_snowpark_conv_2": {
+  "rows": [
+   [
+    "0"
+   ]
+  ]
+ },
+ "fn_soundex": {
+  "rows": [
+   [
+    "a120"
+   ]
+  ]
+ },
+ "fn_soundex_p123": {
+  "rows": [
+   [
+    "a120"
+   ]
+  ]
+ },
+ "fn_space": {
+  "rows": [
+   [
+    "       "
+   ]
+  ]
+ },
+ "fn_split": {
+  "rows": [
+   [
+    [
+     "a",
+     "c"
+    ]
+   ]
+  ]
+ },
+ "fn_split_part": {
+  "rows": [
+   [
+    ""
+   ]
+  ]
+ },
+ "fn_sqrt": {
+  "rows": [
+   [
+    "1.581138830084"
+   ]
+  ]
+ },
+ "fn_sqrt_2": {
+  "rows": [
+   [
+    "1.581138830084"
+   ]
+  ]
+ },
+ "fn_square": {
+  "rows": [
+   [
+    "6.25"
+   ]
+  ]
+ },
+ "fn_square_2": {
+  "rows": [
+   [
+    "6.25"
+   ]
+  ]
+ },
+ "fn_startswith": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_startswith_2": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "fn_stddev": {
+  "rows": [
+   [
+    "2.886751288213"
+   ]
+  ]
+ },
+ "fn_stddev_2": {
+  "rows": [
+   [
+    "1.154700538379"
+   ]
+  ]
+ },
+ "fn_stddev_pop": {
+  "rows": [
+   [
+    "2.357022698236"
+   ]
+  ]
+ },
+ "fn_stddev_pop_2": {
+  "rows": [
+   [
+    "0.9428090415821"
+   ]
+  ]
+ },
+ "fn_stddev_samp": {
+  "rows": [
+   [
+    "2.886751288213"
+   ]
+  ]
+ },
+ "fn_stddev_samp_2": {
+  "rows": [
+   [
+    "1.154700538379"
+   ]
+  ]
+ },
+ "fn_string_as_binary": {
+  "rows": [
+   [
+    "bytearray(b'abc')"
+   ]
+  ]
+ },
+ "fn_strip_null_value": {
+  "rows": [
+   [
+    {
+     "a": 1,
+     "b": [
+      1,
+      2
+     ]
+    }
+   ]
+  ]
+ },
+ "fn_sum": {
+  "rows": [
+   [
+    "16"
+   ]
+  ]
+ },
+ "fn_sum_2": {
+  "rows": [
+   [
+    "5.5"
+   ]
+  ]
+ },
+ "fn_sum_3": {
+  "rows": [
+   [
+    "5.5"
+   ]
+  ]
+ },
+ "fn_sum_real": {
+  "rows": [
+   [
+    "-1145128244"
+   ]
+  ]
+ },
+ "fn_sum_real_2": {
+  "rows": [
+   [
+    "4617878467915022336"
+   ]
+  ]
+ },
+ "fn_tan": {
+  "rows": [
+   [
+    "-0.7470222972387"
+   ]
+  ]
+ },
+ "fn_tanh": {
+  "rows": [
+   [
+    "0.9866142981514"
+   ]
+  ]
+ },
+ "fn_time": {
+  "rows": [
+   [
+    "10:20:30"
+   ]
+  ]
+ },
+ "fn_time_2": {
+  "rows": [
+   [
+    "10:20:30"
+   ]
+  ]
+ },
+ "fn_time_3": {
+  "rows": [
+   [
+    "10:20:30"
+   ]
+  ]
+ },
+ "fn_timestamp_from_parts": {
+  "rows": [
+   [
+    "2024-03-15 10:20:30.000"
+   ]
+  ]
+ },
+ "fn_timestamp_ntz_from_parts": {
+  "rows": [
+   [
+    "2024-03-15 10:20:30.000"
+   ]
+  ]
+ },
+ "fn_timestampfromparts": {
+  "rows": [
+   [
+    "2024-03-15 10:20:30.000"
+   ]
+  ]
+ },
+ "fn_timestampntzfromparts": {
+  "rows": [
+   [
+    "2024-03-15 10:20:30.000"
+   ]
+  ]
+ },
+ "fn_to_json": {
+  "rows": [
+   [
+    {
+     "a": 1,
+     "b": [
+      1,
+      2
+     ]
+    }
+   ]
+  ]
+ },
+ "fn_to_xml": {
+  "rows": [
+   [
+    "<SnowflakeData type=\"OBJECT\"><a type=\"INTEGER\">1</a><b type=\"ARRAY\"><e type=\"INTEGER\">1</e><e type=\"INTEGER\">2</e></b></SnowflakeData>"
+   ]
+  ]
+ },
+ "fn_top_k_sketch_object_construct": {
+  "rows": [
+   [
+    {
+     "counters": 50,
+     "datatype": "TEXT",
+     "precision": 38,
+     "scale": 0,
+     "state": [
+      [
+       "abc",
+       7
+      ],
+      [
+       "b",
+       2
+      ]
+     ],
+     "type": "approx_top_k"
+    }
+   ]
+  ]
+ },
+ "fn_translate": {
+  "rows": [
+   [
+    "abc"
+   ]
+  ]
+ },
+ "fn_try_hex_decode_binary": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_try_hex_decode_string": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_try_parse_json": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_try_validate_utf8": {
+  "rows": [
+   [
+    "abc"
+   ]
+  ]
+ },
+ "fn_typeof": {
+  "rows": [
+   [
+    "OBJECT"
+   ]
+  ]
+ },
+ "fn_unicode": {
+  "rows": [
+   [
+    "97"
+   ]
+  ]
+ },
+ "fn_upper": {
+  "rows": [
+   [
+    "ABC"
+   ]
+  ]
+ },
+ "fn_var_pop": {
+  "rows": [
+   [
+    "5.555556"
+   ]
+  ]
+ },
+ "fn_var_pop_2": {
+  "rows": [
+   [
+    "0.8888888888889"
+   ]
+  ]
+ },
+ "fn_var_samp": {
+  "rows": [
+   [
+    "8.333333"
+   ]
+  ]
+ },
+ "fn_var_samp_2": {
+  "rows": [
+   [
+    "1.333333333333"
+   ]
+  ]
+ },
+ "fn_variance": {
+  "rows": [
+   [
+    "8.333333"
+   ]
+  ]
+ },
+ "fn_variance_2": {
+  "rows": [
+   [
+    "1.333333333333"
+   ]
+  ]
+ },
+ "fn_variance_pop": {
+  "rows": [
+   [
+    "5.555556"
+   ]
+  ]
+ },
+ "fn_variance_pop_2": {
+  "rows": [
+   [
+    "0.8888888888889"
+   ]
+  ]
+ },
+ "fn_variance_samp": {
+  "rows": [
+   [
+    "8.333333"
+   ]
+  ]
+ },
+ "fn_variance_samp_2": {
+  "rows": [
+   [
+    "1.333333333333"
+   ]
+  ]
+ },
+ "fn_xmlget": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_xmlget_2": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_xmlget_3": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_xmlget_4": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "fn_zeroifnull": {
+  "rows": [
+   [
+    "7"
+   ]
+  ]
+ },
+ "fn_zeroifnull_2": {
+  "rows": [
+   [
+    "2.5"
+   ]
+  ]
+ },
+ "fn_zeroifnull_3": {
+  "rows": [
+   [
+    "2.5"
+   ]
+  ]
+ },
+ "fn_zipf": {
+  "rows": [
+   [
+    "1"
+   ]
+  ]
+ },
  "full_outer_join": {
   "rows": [
    [
