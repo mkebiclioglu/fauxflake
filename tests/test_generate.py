@@ -561,3 +561,20 @@ def test_a_list_of_known_values_holds_each_at_most_once(tmp_path):
         Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 3))
         rows = emu.cursor().execute("""select distinct "SKUS"::varchar from "RAW"."T"."TRACKS" """).fetchall()
         assert {r[0] for r in rows} == {"[]", '["professional"]', '["enterprise"]', '["professional","enterprise"]', '["enterprise","professional"]'}
+
+
+def test_a_pool_of_versions_holds_dotted_numbers(tmp_path):
+    from datetime import datetime
+
+    from fauxflake.emulator import serve
+    from fauxflake.generate import Warehouse
+    from fauxflake.spec import Spec
+
+    spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "tables": {"RAW.T.NPS": {"volume": {"rows_per_day": 400}, "columns": {
+        "ID": {"gen": "sequence"}, "SERVER_VERSION": {"gen": "pool", "pool": "version", "size": 50, "dotted": True}}}}}, tmp_path / "x.yml")
+    with serve() as emu:
+        Warehouse(emu, spec, 1.0).advance_to(datetime(2025, 1, 3))
+        seen, shaped = emu.cursor().execute("""select count(distinct "SERVER_VERSION"),
+            count(distinct case when regexp_matches("SERVER_VERSION", '^[0-9]+[.][0-9]+[.][0-9]+$') then "SERVER_VERSION" end)
+            from "RAW"."T"."NPS" """).fetchone()
+        assert seen == shaped == 50

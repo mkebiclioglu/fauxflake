@@ -2916,6 +2916,8 @@ def analyse(manifest: dict, database: str) -> Analysis:
         held = tables.get(parent, {}).get("columns", {}).get(pcol)
         mine = tables.get(child, {}).get("columns", {}).get(col)
         shared = {"gen": "pool", "pool": pcol.lower(), "size": 50}  # (a few dozen: every one of them is in both tables)
+        if re.search(r"(^|_)VERSION$", pcol):
+            shared["dotted"] = True  # (`7.3.1`: models read a version's major, minor and patch between its dots)
         if not held or not mine or held.get("gen") != "template" or held.get("templates") or sep not in str(held.get("template")):
             continue
         head, rest = str(held["template"]).split(sep, 1)

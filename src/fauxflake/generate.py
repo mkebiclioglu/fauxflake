@@ -221,6 +221,9 @@ class TableSQL:
 
     def pooled(self, d: dict, n: str) -> str:
         """The n-th text of a pool: `plan_7`, or `email_7@org3.fauxmail.net` when the pool has an ending."""
+        if d.get("dotted"):
+            # versions: `7.3.1`, one for each number of the pool, so that what the models read between the dots is numbers
+            return f"concat(5 + ({n}) % 6, '.', (({n}) // 6) % 10, '.', (({n}) // 60) % 10)"
         head = f"concat({lit(str(d['pool']) + '_')}, {n})"
         return f"concat({lit(str(d['pool']) + '_')}, {n}{self.ending(d, head)})"
 
