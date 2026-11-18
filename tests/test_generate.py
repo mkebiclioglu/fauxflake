@@ -578,3 +578,22 @@ def test_a_pool_of_versions_holds_dotted_numbers(tmp_path):
             count(distinct case when regexp_matches("SERVER_VERSION", '^[0-9]+[.][0-9]+[.][0-9]+$') then "SERVER_VERSION" end)
             from "RAW"."T"."NPS" """).fetchone()
         assert seen == shaped == 50
+
+
+def test_a_table_generated_again_on_its_own_still_finds_the_rows_it_refers_to(tmp_path):
+    from datetime import datetime
+
+    from fauxflake.emulator import serve
+    from fauxflake.generate import Warehouse
+    from fauxflake.spec import Spec
+
+    raw = {"seed": 1, "start": "2025-01-01", "tables": {
+        "RAW.T.ACCOUNTS": {"volume": {"rows_per_day": 50}, "columns": {"ID": {"gen": "sequence"}}},
+        "RAW.T.ORDERS": {"volume": {"rows_per_day": 200}, "columns": {"N": {"gen": "sequence"}, "ACCOUNT": {"gen": "fk", "ref": "RAW.T.ACCOUNTS"}}}}}
+    with serve() as emu:
+        Warehouse(emu, Spec.from_raw(raw, tmp_path / "x.yml"), 1.0).advance_to(datetime(2025, 1, 3))
+        raw["tables"]["RAW.T.ORDERS"]["columns"]["NOTE"] = {"gen": "template", "template": "note_{hex}"}
+        again = Warehouse(emu, Spec.from_raw(raw, tmp_path / "y.yml"), 1.0)  # another warehouse object: nothing carried over
+        again.advance_to(datetime(2025, 1, 3), only={"RAW.T.ORDERS"})
+        assert emu.cursor().execute("""select count(*), count(a."ID"), count(o."NOTE") from "RAW"."T"."ORDERS" o
+                                       left join "RAW"."T"."ACCOUNTS" a on a."ID" = o."ACCOUNT" """).fetchone() == (400, 400, 400)

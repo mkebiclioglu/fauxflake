@@ -756,8 +756,15 @@ class Warehouse:
 
     def _calendars(self, until: datetime, only: set[str] | None = None) -> dict[str, list[tuple[date, int, int]]]:
         cals = {}
+        needed = None
+        if only is not None:
+            # (and the tables those refer to: a reference draws from the rows its parent had by then)
+            texts = {name: json.dumps(self.spec.tables[name].raw, default=str) for name in only if name in self.spec.tables}
+            needed = set(only) | {m.upper() for text in texts.values() for m in re.findall(r'"ref": "([^"]+)"', text)}
+            if any('"link"' in text for text in texts.values()):
+                needed = None  # ids inside documents point into other tables' documents: every calendar
         for t in self.spec.tables.values():
-            if only is not None and t.name not in only:
+            if needed is not None and t.name not in needed:
                 continue
             cal = t.calendar(self.spec.start, until.date(), self.spec.seed, self.scale, self.scenario, self.spec.thin, self.spec.least)
             self.cur.execute(f"create or replace temp table cal_{t.ident} (day date, cum bigint, n bigint)")
