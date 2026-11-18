@@ -108,6 +108,11 @@ MACROS = [
     f"create or replace macro {_NS}_sf_md5_lower64(x) as ('0x' || right(md5(x::varchar), 16))::ubigint::decimal(38, 0)",
     f"create or replace macro {_NS}_sf_md5_upper64(x) as ('0x' || left(md5(x::varchar), 16))::ubigint::decimal(38, 0)",
     f"create or replace macro {_NS}_sf_array_union_agg(x) as to_json(list_distinct(flatten(list(from_json(x::json, '[\"JSON\"]')))))",
+    f"""create or replace macro {_NS}_sf_try_input(x, target) as case
+          when typeof(x) in ('VARCHAR', '"NULL"') or (target = 'DATE' and typeof(x) = 'DATE')
+            or (target = 'BOOLEAN' and typeof(x) = 'BOOLEAN') or (target = 'DOUBLE' and typeof(x) in ('DOUBLE', 'FLOAT'))
+            or (target = 'BLOB' and typeof(x) = 'BLOB') then x
+          else error('Function TRY_CAST cannot be used with arguments of type ' || typeof(x)) end""",
     f"create or replace macro {_NS}_sf_negate(x) as -x",
     f"create or replace macro {_NS}_sf_bitcount(x) as bit_count(x::bigint)",
     f"create or replace macro {_NS}_sf_getbit(x, p) as (x::bigint >> p::integer) & 1",
@@ -557,7 +562,49 @@ def _collation(spec: str) -> str | None:
     return ".".join(names) or None
 
 
+_TRY_SAME = {"DATE": ("DATE",), "BOOLEAN": ("BOOLEAN",), "DOUBLE": ("DOUBLE", "FLOAT"), "BLOB": ("BLOB",)}
+
+
+def _try_target(node: exp.Expression) -> str | None:
+    """The DuckDB type a TRY_CAST or TRY_TO_ function of Snowflake converts to, or None for anything else."""
+    if isinstance(node, exp.TryCast) and node.args.get("requires_string"):
+        kind = node.to.this
+        return {exp.DataType.Type.DATE: "DATE", exp.DataType.Type.BOOLEAN: "BOOLEAN", exp.DataType.Type.DOUBLE: "DOUBLE",
+                exp.DataType.Type.FLOAT: "DOUBLE", exp.DataType.Type.BINARY: "BLOB", exp.DataType.Type.VARBINARY: "BLOB"}.get(kind, "OTHER")
+    if not node.args.get("safe"):
+        return None
+    if isinstance(node, exp.ToNumber):
+        return "OTHER"
+    if isinstance(node, exp.TsOrDsToDate):
+        return "DATE"
+    if isinstance(node, exp.ToBoolean):
+        return "BOOLEAN"
+    if isinstance(node, exp.ToDouble):
+        return "DOUBLE"
+    if isinstance(node, (exp.TsOrDsToTime, exp.StrToTime)):
+        return "OTHER"
+    return None
+
+
+def _try_anonymous_target(node: exp.Expression) -> str | None:
+    if isinstance(node, exp.Anonymous) and isinstance(node.this, str) and re.fullmatch(
+            r"TRY_TO_(TIMESTAMP(_NTZ|_LTZ|_TZ)?|TIME|NUMBER|NUMERIC|DECIMAL)", node.name.upper()):
+        return "OTHER"
+    return None
+
+
 def _fix(node: exp.Expression) -> exp.Expression:
+    target = _try_target(node) or _try_anonymous_target(node)
+    if target and not (isinstance(node.this, exp.Anonymous) and node.this.name == _NS + "_sf_try_input"):
+        # TRY_CAST and the TRY_TO_ functions take text (or the target type itself, for a few): anything else is an error
+        # in Snowflake. The value passes through unchanged; another kind of value raises Snowflake's error
+        arg = node.this if not isinstance(node, exp.Anonymous) else (node.expressions[0] if node.expressions else None)
+        if arg is not None and not (isinstance(arg, exp.Literal) and arg.is_string) and not isinstance(arg, exp.Null):
+            checked = _fn("_sf_try_input", arg.copy(), exp.Literal.string(target))
+            if isinstance(node, exp.Anonymous):
+                node.set("expressions", [checked, *node.expressions[1:]])
+            else:
+                node.set("this", checked)
     if isinstance(node, exp.Collate) and isinstance(node.expression, (exp.Literal, exp.Var, exp.Identifier)):
         name = _collation(node.expression.name)
         if name is None:

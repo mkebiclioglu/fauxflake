@@ -128,11 +128,14 @@ def _canonical_columns(table, columns: list[str]):
     return table
 
 
-def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_schema: str | None = None) -> list[Parity]:
+def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_schema: str | None = None,
+            only: set[str] | None = None) -> list[Parity]:
     """Each model on the emulator against the same model on Snowflake, row for row. Without
     `schema`, each model is read from the schema dbt built it in (the same on both sides)."""
     duck, out = emu.cursor(), []
     for node in sorted(local.models(), key=lambda n: n["name"]):
+        if only is not None and node["unique_id"] not in only:
+            continue
         name = node.get("alias") or node["name"]
         try:
             theirs = _fetch(conn, f'select * from {node["database"]}.{remote_schema or node["schema"]}.{name}')
@@ -167,8 +170,58 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
     return out
 
 
+def outcomes(project: DbtProject) -> dict[str, tuple[str, str, object]]:
+    """What the last dbt invocation did with each node: (status, first line of the message, failures)."""
+    import json
+
+    path = project.target_path / "run_results.json"
+    if not path.exists():
+        return {}
+    out = {}
+    for r in json.loads(path.read_text()).get("results") or []:
+        message = " ".join(str(r.get("message") or "").split())
+        out[r["unique_id"]] = (str(r.get("status")), message[:300], r.get("failures"))
+    return out
+
+
+@dataclass
+class Difference:
+    node: str
+    kind: str  # emulator_only_error | snowflake_only_error | test_result | rows
+    detail: str
+
+
+def differences(local: dict, remote: dict, rows: list[Parity]) -> list[Difference]:
+    """Where the two engines did not do the same: a node that failed on one side only, a test whose result or
+    failure count differs, a model whose rows differ."""
+    out = []
+    for uid in sorted(set(local) | set(remote)):
+        mine, theirs = local.get(uid), remote.get(uid)
+        if mine is None or theirs is None:
+            continue
+        broke = lambda o: o[0] in ("error", "runtime error")  # noqa: E731
+        if broke(mine) and not broke(theirs):
+            out.append(Difference(uid, "emulator_only_error", mine[1]))
+        elif broke(theirs) and not broke(mine):
+            out.append(Difference(uid, "snowflake_only_error", theirs[1]))
+        elif uid.startswith("test.") and not broke(mine) and (mine[0], mine[2]) != (theirs[0], theirs[2]):
+            out.append(Difference(uid, "test_result", f"emulator {mine[0]} ({mine[2]}), snowflake {theirs[0]} ({theirs[2]})"))
+    for r in rows:
+        if not r.ok:
+            out.append(Difference(r.model, "rows", f"emulator={r.emulator_rows} snowflake={r.snowflake_rows} "
+                                                    f"only_emulator={r.only_emulator} only_snowflake={r.only_snowflake} {r.note}"))
+    return out
+
+
 def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datetime, days: int,
-        remote_schema: str = "FAUXFLAKE_PARITY", log=print) -> list[Parity]:
+        remote_schema: str = "FAUXFLAKE_PARITY", log=print) -> tuple[list[Parity], list[Difference]]:
+    """The same sources on both engines, the same project built on both (every node, also after one fails), then
+    what each did compared: which nodes failed on one side only, which tests answered differently, which models hold
+    other rows. Day by day for incremental models."""
+    import os
+
+    found: list[Difference] = []
+    rows: list[Parity] = []
     for i in range(days + 1):
         now = start + timedelta(days=i)
         prev = wh.now
@@ -176,10 +229,17 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
         log(f"{now:%Y-%m-%d}  seeding Snowflake")
         seed(conn, wh, after=prev, log=log)
         full = ["--full-refresh"] if i == 0 else []
-        # the same schema name on both sides: some models embed their own relation names
-        if not local.invoke(["build", *full], schema=remote_schema, quiet=True):
-            raise SystemExit(f"dbt build failed on the emulator at {now}")
-        if not remote.invoke(["build", *full], schema=remote_schema, quiet=True):
-            raise SystemExit(f"dbt build failed on Snowflake at {now}")
+        os.environ["FAUXFLAKE_TESTS_DO_NOT_BLOCK"] = "1"  # (a failing test keeps nothing else from being built and compared)
+        try:
+            # the same schema name on both sides: some models embed their own relation names
+            local.invoke(["build", *full], schema=remote_schema, quiet=True)
+            mine = outcomes(local)
+            remote.invoke(["build", *full], schema=remote_schema, quiet=True)
+            theirs = outcomes(remote)
+        finally:
+            os.environ.pop("FAUXFLAKE_TESTS_DO_NOT_BLOCK", None)
         log(f"{now:%Y-%m-%d}  built on both engines")
-    return compare(conn, wh.emu, local, remote_schema, remote_schema)
+        built = {uid for uid in mine if mine[uid][0] == "success" and theirs.get(uid, ("",))[0] == "success"}
+        rows = compare(conn, wh.emu, local, only=built)  # (each model where dbt put it: the same schema on both sides)
+        found = differences(mine, theirs, rows)
+    return rows, found

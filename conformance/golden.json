@@ -7002,6 +7002,76 @@
    ]
   ]
  },
+ "try_input_1": {
+  "rows": [
+   [
+    "2024-01-01"
+   ]
+  ]
+ },
+ "try_input_10": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "try_input_11": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "try_input_12": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "try_input_13": {
+  "rows": [
+   [
+    "5"
+   ]
+  ]
+ },
+ "try_input_14": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "try_input_15": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "try_input_16": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "try_input_17": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "try_input_18": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "try_input_2": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "try_input_3": {
+  "rows": [
+   [
+    true
+   ]
+  ]
+ },
+ "try_input_4": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "try_input_5": {
+  "rows": [
+   [
+    "5.5"
+   ]
+  ]
+ },
+ "try_input_6": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "try_input_7": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "try_input_8": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "try_input_9": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
  "try_timestamps": {
   "rows": [
    [

@@ -234,7 +234,10 @@ def profile(spec_path, connection, days, sample_pct, k_anonymity, max_categories
 @with_common
 @click.option("--connection", required=True, help="Name in ~/.snowflake/connections.toml.")
 @click.option("--days", default=2, show_default=True, help="Simulated days of incremental runs on both engines.")
-def parity(spec_path, project_dir, scale, history, db_path, keep, connection, days):
+@click.option("--schema", default="FAUXFLAKE_PARITY", show_default=True,
+              help="Schema dbt builds into on both engines (some projects name theirs in SQL, for UDFs say).")
+@click.option("--report", default=None, help="Write every difference to this JSON file.")
+def parity(spec_path, project_dir, scale, history, db_path, keep, connection, days, schema, report):
     """Build on the emulator and on real Snowflake from identical synthetic data, and compare."""
     db_path = _warehouse_dir(project_dir, db_path, keep)
     import snowflake.connector
@@ -251,13 +254,16 @@ def parity(spec_path, project_dir, scale, history, db_path, keep, connection, da
         wh = Warehouse(emu, spec, scale)
         local = DbtProject(project_dir, emulator_output(emu.port, database))
         remote = DbtProject(project_dir, snowflake_output(connection, database), name="snowflake")
-        results = run(conn, wh, local, remote, _start(spec, history), days, log=click.echo)
+        rows, found = run(conn, wh, local, remote, _start(spec, history), days, remote_schema=schema, log=click.echo)
     click.echo("")
-    for r in results:
-        mark = "same " if r.ok else "DIFF "
-        click.echo(f"{mark} {r.model:<28} emulator={r.emulator_rows:,} snowflake={r.snowflake_rows:,} "
-                   f"only_emulator={r.only_emulator:,} only_snowflake={r.only_snowflake:,} {r.note}")
-    sys.exit(0 if all(r.ok for r in results) else 1)
+    for d in found:
+        click.echo(f"DIFF {d.kind:<20} {d.node}\n     {d.detail[:400]}")
+    same = sum(1 for r in rows if r.ok)
+    click.echo(f"\n{same}/{len(rows)} models built on both engines hold the same rows; {len(found)} difference(s)")
+    if report:
+        import json as _json
+        Path(report).write_text(_json.dumps({"rows": [r.__dict__ for r in rows], "differences": [d.__dict__ for d in found]}, indent=1))
+    sys.exit(0 if not found else 1)
 
 
 @main.command()
