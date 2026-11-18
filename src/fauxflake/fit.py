@@ -159,6 +159,17 @@ def _number_flow(node: exp.Expression, depth: int = 0) -> list[exp.Column]:
     return []
 
 
+def _coalesced_with(tree: exp.Expression, text: str | None) -> list[str]:
+    """`coalesce(context_ip, context_request_ip, ''::varchar)`: the columns given this text to fall back on."""
+    out = []
+    for node in tree.find_all(exp.Coalesce):
+        args = [node.this, *node.expressions]
+        bare = [a.this if isinstance(a, exp.Cast) and a.to.is_type(*exp.DataType.TEXT_TYPES) else a for a in args]
+        if any(isinstance(a, exp.Literal) and a.is_string and a.name == text for a in bare):
+            out += [a.name.upper() for a in bare if isinstance(a, exp.Column)]
+    return out
+
+
 def _numeric_columns(tree: exp.Expression, known: tuple[str, ...] = ()) -> set[str]:
     """Columns a query uses as numbers: added up, averaged, multiplied, cast to a number, compared with a number,
     or given a number to fall back on (`coalesce(posts, 0)`)."""
@@ -660,6 +671,7 @@ class Fitter:
                 for col, other in ((a, b), (b, a)):
                     if isinstance(col, exp.Column) and isinstance(other, exp.Literal) and other.is_string and other.name == "":
                         out.append(col.name.upper())
+            out += _coalesced_with(tree, "")  # coalesce(ip, ''::varchar): in Snowflake the '' is read as the column's type
         elif how == "literal":
             for node in tree.find_all(exp.EQ, exp.NEQ, exp.Nullif, exp.In, exp.Like, exp.ILike):
                 others = [node.expression] if not isinstance(node, exp.In) else list(node.expressions)
@@ -667,6 +679,7 @@ class Fitter:
                     out.append(node.this.name.upper())
                 elif isinstance(node.expression, exp.Column) and isinstance(node.this, exp.Literal) and node.this.is_string and node.this.name == fmt:
                     out.append(node.expression.name.upper())
+            out += _coalesced_with(tree, fmt)
         elif how == "format":
             for node in tree.find_all(exp.StrToTime, exp.StrToDate, exp.TsOrDsToDate, exp.TsOrDsToTimestamp):
                 arg = node.this

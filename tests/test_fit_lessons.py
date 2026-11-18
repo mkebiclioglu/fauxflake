@@ -45,6 +45,10 @@ def test_columns_compared_with_text_are_text():
     assert Fitter._columns_used(tree, "empty") == ["GOAL"]
     assert Fitter._columns_used(tree, "literal", "CRO") == ["ROLE"]
     assert Fitter._columns_used(tree, "literal", "Not In Calc") == ["ID"]
+    # a column given text to fall back on is text: in Snowflake the text would be read as the column's type
+    fallback = parse("select coalesce(s2.context_ip, s2.context_request_ip, ''::varchar) as ip, ifnull(kind, 'none') as k, coalesce(n, 0) from t")
+    assert Fitter._columns_used(fallback, "empty") == ["CONTEXT_IP", "CONTEXT_REQUEST_IP"]
+    assert Fitter._columns_used(fallback, "literal", "none") == ["KIND"]
 
 
 def test_every_column_a_model_reads_from_a_table_is_found_at_once():
