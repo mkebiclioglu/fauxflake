@@ -316,10 +316,37 @@ class Fitter:
             smallest = min((float((t.raw.get("volume") or {}).get("rows_per_day", 1000)) for t in spec.tables.values()), default=1000.0)
             scale = min(1.0, max(1e-5, 100.0 / max(smallest, 1.0)))
         wh = Warehouse(self.emu, spec, scale)
-        wh.advance_to(datetime.combine(spec.start, datetime.min.time()) + timedelta(days=history),
-                      only={t for t in only if t in spec.tables} if only is not None else None)
+        if only is None and not os.environ.get("FAUXFLAKE_FIT_REGENERATE_ALL"):
+            only = self._changed_since_generated(spec, scale, history)
+        if only is None or only:
+            wh.advance_to(datetime.combine(spec.start, datetime.min.time()) + timedelta(days=history),
+                          only={t for t in only if t in spec.tables} if only is not None else None)
         self.dirty = False
         return wh
+
+    def _changed_since_generated(self, spec, scale: float, history: int) -> set[str] | None:  # noqa: ANN001
+        """The tables whose rows would differ from what this warehouse holds: those the spec changed since they
+        were generated, and those that refer to one. None when everything has to be generated (a first time, another
+        scale or history, something that moves every table). A table's rows are a function of its own spec, of the
+        tables it refers to and of how many rows every table has; nothing else."""
+        def calendar_of(raw: dict) -> dict:
+            return {k: raw.get(k) for k in ("volume", "grain", "gaps", "from_day", "until_day", "mode", "log", "lifecycle")}
+
+        raw = self.spec
+        everything = json.dumps([{k: v for k, v in raw.items() if k not in ("tables", "dbt", "existing", "udfs")},
+                                 {name: calendar_of(t) for name, t in sorted(self.tables.items())}], sort_keys=True, default=str)
+        prints = {}
+        for name, table in self.tables.items():
+            text = json.dumps(table, sort_keys=True, default=str)
+            parents = sorted({m.upper() for m in re.findall(r'"ref": "([^"]+)"', text)} - {name})
+            prints[name] = hash((text, tuple(json.dumps(self.tables.get(p), sort_keys=True, default=str) for p in parents)))
+        key = (id(self.emu), scale, history, everything)
+        held, self._generated = self.__dict__.get("_generated"), (key, prints)
+        if held is None or held[0] != key:
+            return None
+        there = {".".join(r) for r in self.emu.duck.execute(
+            "select table_catalog, table_schema, table_name from information_schema.tables where table_type = 'BASE TABLE'").fetchall()}
+        return {name for name in spec.tables if prints.get(name) != held[1].get(name) or name not in there}
 
     def add_column(self, table: str, col: str) -> bool:
         columns = self.tables[table].setdefault("columns", {})

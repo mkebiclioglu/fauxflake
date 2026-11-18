@@ -977,3 +977,26 @@ def test_numbers_beside_references_to_a_text_key_become_references_when_a_union_
     assert f.retype_column("model.p.tracks", "USER_ID", "BIGINT")
     assert tables["RAW.T.ACTIVITY"]["columns"]["USER_ID"] == ref and tables["RAW.T.CLICKS"]["columns"]["USER_ID"] == ref
     assert "generated as a reference" in f.learned[-1]
+
+
+def test_only_the_tables_the_spec_changed_and_those_that_refer_to_them_are_generated_again():
+    class Spec:
+        tables = {"RAW.T.A": 1, "RAW.T.B": 1, "RAW.T.C": 1}
+
+    class Emu:
+        class duck:  # noqa: N801
+            @staticmethod
+            def execute(_):
+                return type("R", (), {"fetchall": lambda self: [("RAW", "T", "A"), ("RAW", "T", "B"), ("RAW", "T", "C")]})()
+
+    tables = {"RAW.T.A": {"volume": {"rows_per_day": 10}, "columns": {"ID": {"gen": "sequence"}, "X": {"gen": "template", "template": "x_{hex}"}}},
+              "RAW.T.B": {"volume": {"rows_per_day": 10}, "columns": {"A_ID": {"gen": "fk", "ref": "RAW.T.A"}}},
+              "RAW.T.C": {"volume": {"rows_per_day": 10}, "columns": {"N": {"gen": "sequence"}}}}
+    f = fitter(tables=tables, spec={"seed": 1, "start": "2025-01-01", "tables": tables}, emu=Emu())
+    assert f._changed_since_generated(Spec, 0.001, 60) is None  # the first time: everything
+    assert f._changed_since_generated(Spec, 0.001, 60) == set()  # nothing changed: nothing
+    tables["RAW.T.A"]["columns"]["X"] = {"gen": "categorical", "values": {"a": 1.0}}
+    assert f._changed_since_generated(Spec, 0.001, 60) == {"RAW.T.A", "RAW.T.B"}  # the table, and what refers to it
+    tables["RAW.T.C"]["volume"]["rows_per_day"] = 20
+    assert f._changed_since_generated(Spec, 0.001, 60) is None  # how many rows a table has moves every table
+    assert f._changed_since_generated(Spec, 0.01, 60) is None  # another scale
