@@ -339,7 +339,14 @@ class Fitter:
         for name, table in self.tables.items():
             text = json.dumps(table, default=str)
             parents = sorted({m.upper() for m in re.findall(r'"ref": "([^"]+)"', text)} - {name})
-            prints[name] = hash((text, tuple(json.dumps(self.tables.get(p), default=str) for p in parents)))
+            # (of a table it refers to, only what its references are drawn from: the key, and a flag they keep away from)
+            flags = set(re.findall(r'"spares": "([^"]+)"', text))
+            drawn = []
+            for p in parents:
+                held = (self.tables.get(p) or {}).get("columns") or {}
+                key = next((c for c, d in held.items() if d.get("gen") in ("sequence", "hash_id")), None)
+                drawn.append(json.dumps([p, key, held.get(key), {f: held.get(f) for f in sorted(flags)}], default=str))
+            prints[name] = hash((text, tuple(drawn)))
         key = (id(self.emu), scale, history, everything)
         held, self._generated = self.__dict__.get("_generated"), (key, prints)
         if held is None or held[0] != key:

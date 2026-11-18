@@ -997,7 +997,9 @@ def test_only_the_tables_the_spec_changed_and_those_that_refer_to_them_are_gener
     assert f._changed_since_generated(Spec, 0.001, 60) is None  # the first time: everything
     assert f._changed_since_generated(Spec, 0.001, 60) == set()  # nothing changed: nothing
     tables["RAW.T.A"]["columns"]["X"] = {"gen": "categorical", "values": {"a": 1.0}}
-    assert f._changed_since_generated(Spec, 0.001, 60) == {"RAW.T.A", "RAW.T.B"}  # the table, and what refers to it
+    assert f._changed_since_generated(Spec, 0.001, 60) == {"RAW.T.A"}  # (what refers to it draws from its key, which is as it was)
+    tables["RAW.T.A"]["columns"]["ID"] = {"gen": "hash_id"}
+    assert f._changed_since_generated(Spec, 0.001, 60) == {"RAW.T.A", "RAW.T.B"}  # the table, and what refers to its key
     tables["RAW.T.C"]["volume"]["rows_per_day"] = 20
     assert f._changed_since_generated(Spec, 0.001, 60) is None  # how many rows a table has moves every table
     assert f._changed_since_generated(Spec, 0.01, 60) is None  # another scale
