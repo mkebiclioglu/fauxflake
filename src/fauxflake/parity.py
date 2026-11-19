@@ -545,7 +545,7 @@ def _is_clock(duck, both: str, column: str, kind: str, clock) -> bool:  # noqa: 
 
 
 def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datetime, days: int,
-        remote_schema: str = "FAUXFLAKE_PARITY", log=print, select: list[str] | None = None,
+        remote_schema: str = "FAUXFLAKE_PARITY", log=print, select: list[str] | None = None, exclude: list[str] | None = None,
         renamed: dict | None = None, remote_vars: str | None = None,
         remote_env: dict | None = None) -> tuple[list[Parity], list[Difference]]:
     """The same sources on both engines, the same project built on both (every node, also after one fails), then
@@ -569,7 +569,7 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
         os.environ["FAUXFLAKE_TESTS_DO_NOT_BLOCK"] = "1"  # (a failing test keeps nothing else from being built and compared)
         try:
             # the same schema name on both sides: some models embed their own relation names
-            chosen = ["--select", *select] if select else []
+            chosen = (["--select", *select] if select else []) + (["--exclude", *exclude] if exclude else [])
             here = datetime.now(timezone.utc).replace(tzinfo=None)
             local.invoke(["build", *full, *chosen], schema=remote_schema, quiet=True)
             built_here = (here, datetime.now(timezone.utc).replace(tzinfo=None))
