@@ -29,7 +29,7 @@ def _snowflake_type(kind: str) -> str:
     return TYPES.get(kind, kind.replace("DECIMAL", "NUMBER"))
 
 
-def seed(conn, wh: Warehouse, after: datetime | None = None, log=print, workers: int = 8) -> None:
+def seed(conn, wh: Warehouse, after: datetime | None = None, log=print, workers: int = 8, renamed: dict | None = None) -> None:
     """Copy the emulator's source tables (or the rows loaded since `after`) into Snowflake. Each table is written
     to a Parquet file here, one after the other (DuckDB is one connection), and loaded into Snowflake by a few
     threads at once (PUT and COPY wait on the network, not on this machine)."""
@@ -39,13 +39,16 @@ def seed(conn, wh: Warehouse, after: datetime | None = None, log=print, workers:
         work = []
         for t in wh.spec.ordered():
             db, schema, table = t.name.split(".")
+            # (a database that cannot be written there, SNOWFLAKE's own say, goes in under another name)
+            db = (renamed or {}).get(db.upper(), db)
             loaded = t.role("loaded_at")
             since = None if t.raw.get("mode") == "upsert" or not loaded else after  # (rows that change in place: replaced)
             where = f"where {loaded} > '{since}'" if since else ""
             path = Path(tmp) / f"{db}.{schema}.{table}.parquet"
+            target = f"{db}.{schema}.{table}"
             n = wh.cur.execute(f"copy (select * from {t.name} {where}) to '{path}' (format parquet)").fetchone()[0]
             described = [(c, _snowflake_type(ty)) for c, ty, *_ in wh.cur.execute(f"describe {t.name}").fetchall()]
-            work.append((t.name, db, schema, table, path, n, described, since is None))
+            work.append((target, db, schema, table, path, n, described, since is None))
         cur = conn.cursor()
         for db, schema in sorted({(w[1], w[2]) for w in work if w[7]}):
             try:
@@ -247,6 +250,25 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
         except Exception as e:  # noqa: BLE001
             out.append(Parity(node["name"], 0, 0, 0, 0, f"{type(e).__name__}: {str(e)[:160]}"))
     return out
+
+
+def _databases_built_in(conn, remote: DbtProject, schema: str, extra: list[str]) -> None:  # noqa: ANN001
+    """On Snowflake the databases a project builds in must exist before it runs (`PREP`, named by an env var): the
+    ones the parsed project names, created where they are missing."""
+    import json
+    import re
+
+    remote.invoke(["parse", *extra], schema=schema, quiet=True)
+    path = remote.target_path / "manifest.json"
+    if not path.exists():
+        return
+    names = {str(n.get("database") or "").strip('"').upper() for n in json.loads(path.read_text())["nodes"].values()
+             if n.get("resource_type") in ("model", "seed", "snapshot")}
+    for name in sorted(n for n in names if re.fullmatch(r"[A-Z_][\w$]*", n) and n != "SNOWFLAKE"):
+        try:
+            conn.cursor().execute(f"create database if not exists {name}")
+        except Exception:  # noqa: BLE001, S110 - a role that may not create databases: the build says so if one is missing
+            pass
 
 
 def _invocation(project: DbtProject) -> str | None:
@@ -485,7 +507,8 @@ def _is_clock(duck, both: str, column: str, kind: str, clock) -> bool:  # noqa: 
 
 
 def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datetime, days: int,
-        remote_schema: str = "FAUXFLAKE_PARITY", log=print, select: list[str] | None = None) -> tuple[list[Parity], list[Difference]]:
+        remote_schema: str = "FAUXFLAKE_PARITY", log=print, select: list[str] | None = None,
+        renamed: dict | None = None, remote_vars: str | None = None) -> tuple[list[Parity], list[Difference]]:
     """The same sources on both engines, the same project built on both (every node, also after one fails), then
     what each did compared: which nodes failed on one side only, which tests answered differently, which models hold
     other rows. Day by day for incremental models."""
@@ -498,8 +521,11 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
         prev = wh.now
         wh.advance_to(now)
         log(f"{now:%Y-%m-%d}  seeding Snowflake")
-        seed(conn, wh, after=prev, log=log)
+        seed(conn, wh, after=prev, log=log, renamed=renamed)
         full = ["--full-refresh"] if i == 0 else []
+        extra = ["--vars", remote_vars] if remote_vars else []
+        if i == 0:
+            _databases_built_in(conn, remote, remote_schema, extra)
         os.environ["FAUXFLAKE_TESTS_DO_NOT_BLOCK"] = "1"  # (a failing test keeps nothing else from being built and compared)
         try:
             # the same schema name on both sides: some models embed their own relation names
@@ -510,7 +536,7 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
             mine = outcomes(local)
             began = conn.cursor().execute("select sysdate()").fetchone()[0]
             with remote_session():
-                remote.invoke(["build", *full, *chosen], schema=remote_schema, quiet=True)
+                remote.invoke(["build", *full, *chosen, *extra], schema=remote_schema, quiet=True)
             ended = conn.cursor().execute("select sysdate()").fetchone()[0]
             theirs = outcomes(remote)
         finally:
