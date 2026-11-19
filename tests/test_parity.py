@@ -77,7 +77,7 @@ def test_models_are_compared_row_for_row_with_documents_by_content():
     class Project:  # the two models, as dbt lists them
         def models(self):
             return [{"unique_id": f"model.p.{n}", "name": n, "database": "D", "schema": s}
-                    for n, s in (("same", "MINE"), ("other", "MINE"), ("empty", "MINE"), ("broken", "MINE"))]
+                    for n, s in (("same", "MINE"), ("other", "MINE"), ("empty", "MINE"), ("broken", "MINE"), ("listed", "MINE"))]
 
     with serve() as emu:
         conn = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S"))
@@ -96,7 +96,11 @@ def test_models_are_compared_row_for_row_with_documents_by_content():
         for schema in ("MINE", "THEIRS"):
             cur.execute(f"create or replace view D.{schema}.BROKEN as select to_timestamp_tz(s, 'YYYY-MM-DD\"T\"HH24:MI:SS') as t "
                         "from (select '2023-02-20' as s)")
+        # text holding a list gathered without an order: the same elements, another order
+        cur.execute("""create or replace table D.MINE.LISTED as select 1 as n, '[{"a":1},{"a":2}]' as items""")
+        cur.execute("""create or replace table D.THEIRS.LISTED as select 1 as n, '[{"a":2},{"a":1}]' as items""")
         got = {r.model: r for r in compare(conn, emu, Project(), schema="MINE", remote_schema="THEIRS")}
+        assert not got["listed"].ok and got["listed"].order_only, got["listed"]
         assert got["broken"].ok and got["broken"].note.startswith("both engines fail"), got["broken"]
         assert got["same"].ok and got["same"].snowflake_rows == 1, got["same"]
         assert (got["other"].only_emulator, got["other"].only_snowflake) == (2, 2) and "N:" in got["other"].note, got["other"]

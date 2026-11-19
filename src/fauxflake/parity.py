@@ -126,6 +126,8 @@ def _comparable(column: str, kind: str, source: str, unordered: bool = False) ->
         return f"{'_fx_canon_u' if unordered else '_fx_canon'}({quoted}::varchar) as {quoted}"
     if kind in ("DOUBLE", "FLOAT"):
         return f"format('{{:.10g}}', {quoted}::double) as {quoted}"
+    if unordered and kind == "VARCHAR":  # text holding a list (`to_json(array_agg(...))`): its elements sorted too
+        return f"case when {quoted} like '[%' then _fx_canon_u({quoted}) else {quoted} end as {quoted}"
     return f"{quoted}::{kind} as {quoted}" if source == "theirs" else quoted
 
 
@@ -219,7 +221,7 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
                 both = pair(types)
                 a, b = duck.execute(both + counted).fetchone()
                 note = ""
-                if (a or b) and documents:  # the same rows once array elements are sorted: only the order differs
+                if (a or b) and (documents or 'VARCHAR' in types.values()):  # the same rows once array elements are sorted
                     a2, b2 = duck.execute(pair(types, unordered=True) + counted).fetchone()
                     if not a2 and not b2:
                         order_only = True
