@@ -29,6 +29,11 @@ def _snowflake_type(kind: str) -> str:
     return TYPES.get(kind, kind.replace("DECIMAL", "NUMBER"))
 
 
+def _ident(name: str) -> str:
+    """A part of a Snowflake name, quoted as it is stored (upper case)."""
+    return '"' + str(name).upper().replace('"', '""') + '"'
+
+
 def seed(conn, wh: Warehouse, after: datetime | None = None, log=print, workers: int = 8, renamed: dict | None = None) -> None:
     """Copy the emulator's source tables (or the rows loaded since `after`) into Snowflake. Each table is written
     to a Parquet file here, one after the other (DuckDB is one connection), and loaded into Snowflake by a few
@@ -45,28 +50,29 @@ def seed(conn, wh: Warehouse, after: datetime | None = None, log=print, workers:
             since = None if t.raw.get("mode") == "upsert" or not loaded else after  # (rows that change in place: replaced)
             where = f"where {loaded} > '{since}'" if since else ""
             path = Path(tmp) / f"{db}.{schema}.{table}.parquet"
-            target = f"{db}.{schema}.{table}"
+            target = ".".join(_ident(part) for part in (db, schema, table))  # (a part named ORDER or GROUP: quoted)
             n = wh.cur.execute(f"copy (select * from {t.name} {where}) to '{path}' (format parquet)").fetchone()[0]
             described = [(c, _snowflake_type(ty)) for c, ty, *_ in wh.cur.execute(f"describe {t.name}").fetchall()]
             work.append((target, db, schema, table, path, n, described, since is None))
         cur = conn.cursor()
         for db, schema in sorted({(w[1], w[2]) for w in work if w[7]}):
             try:
-                cur.execute(f"create database if not exists {db}")
+                cur.execute(f"create database if not exists {_ident(db)}")
             except Exception:  # noqa: BLE001, S110 - a role that may not create databases: the schema says so if it is missing
                 pass
-            cur.execute(f"create schema if not exists {db}.{schema}")
+            cur.execute(f"create schema if not exists {_ident(db)}.{_ident(schema)}")
 
         def load(item) -> str:  # noqa: ANN001
             name, db, schema, table, path, n, described, fresh = item
             c = conn.cursor()
+            stage = f"@{_ident(db)}.{_ident(schema)}.%{_ident(table)}"
             if fresh:
                 c.execute(f"create or replace table {name} ({', '.join(f'{chr(34)}{col}{chr(34)} {ty}' for col, ty in described)})")
             if n:
-                c.execute(f"put file://{path} @{db}.{schema}.%{table} auto_compress=false overwrite=true")
+                c.execute(f"put 'file://{path}' {stage} auto_compress=false overwrite=true")
                 # (a document travels as text and is parsed on arrival: loaded by name it would stay a string)
                 picked = ", ".join(f'parse_json($1:"{col}"::varchar)' if ty == "VARIANT" else f'$1:"{col}"::{ty}' for col, ty in described)
-                c.execute(f"copy into {name} from (select {picked} from @{db}.{schema}.%{table}) "
+                c.execute(f"copy into {name} from (select {picked} from {stage}) "
                           "file_format=(type=parquet use_logical_type=true) purge=true")
             c.close()
             return f"  seeded {name}: {n:,} rows"
