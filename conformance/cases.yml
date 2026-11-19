@@ -856,3 +856,16 @@
 - {id: dateadd_agg_2, sql: "select dateadd(day, -2, max(d)) from (select '2024-12-14'::date as d)"}
 - {id: dateadd_agg_3, sql: "with t as (select max(r) as m from (select '2024-12-14 08:50:33.972'::timestamp_ntz as r)) select (select dateadd(hour, 3, max(m)) from t)::varchar"}
 - {id: dateadd_agg_4, sql: "select dateadd(month, 1, min(d)) from (select '2024-01-31'::date as d)"}
+# An OBJECT keeps its keys sorted in byte order, however it was built: its text shows them so (measured on Snowflake)
+- {id: object_keys_1, sql: "select '#' || to_json(object_construct('b',1,'a',2))"}
+- {id: object_keys_2, sql: "select '#' || to_json(object_construct('B',1,'a',2,'_c',3,'Z',4,'10',5,'9',6))"}
+- {id: object_keys_3, sql: "select '#' || parse_json('{\"b\":1,\"a\":2}')::varchar"}
+- {id: object_keys_4, sql: "select '#' || to_json(object_insert(object_construct('b',1),'a',2))"}
+- {id: object_keys_5, sql: "select '#' || to_json(object_construct(*)) from (select 1 as zed, 2 as alpha)"}
+- {id: object_keys_6, sql: "select '#' || to_json(object_construct('b', object_construct('d',1,'c',2), 'a', 1))"}
+- {id: object_keys_7, sql: "select '#' || to_json(object_agg(k, v)) from (select 'b' k, 1 v union all select 'a', 2)"}
+- {id: object_keys_8, sql: "select '#' || parse_json('[1,{\"b\":2,\"a\":1}]')::varchar"}
+- {id: object_keys_9, sql: "select '#' || to_json(array_agg(object_construct('b', x, 'a', 131.0))) from (select 1 x)"}
+- {id: object_keys_10, sql: "select '#' || to_json(object_construct('b', 131.0::float, 'a', 0.1::float))", gap: "a FLOAT in an object's text is written as %.15e"}
+- {id: object_keys_11, sql: "select '#' || to_json(parse_json('{\"a\": 0.1, \"b\": 131.0, \"c\": 1e3}'))", gap: "a number written with an exponent is a FLOAT, written as %.15e; DuckDB's JSON keeps no such difference"}
+- {id: object_keys_12, sql: "select '#' || to_json(object_construct('a', 12.5::number(10,2), 'b', 131.0::number(10,1), 'e', 7::number))"}

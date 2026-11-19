@@ -26,11 +26,48 @@ def python_functions(duck) -> None:  # noqa: ANN001
             return None
         return hashlib.new(f"sha{bits}", text.encode()).hexdigest()
 
-    try:
-        duck.create_function("_fxpy_sha2", sha2, ["VARCHAR", "INTEGER"], "VARCHAR", null_handling="special")
-    except Exception:  # noqa: BLE001, S110 - registered already on this connection
-        pass
+    import pyarrow as pa
+
+    def sorted_json(values):  # noqa: ANN001, ANN202 - a batch at a time
+        return pa.array([json_sorted(v) for v in values.to_pylist()], pa.string())
+
+    for name, fn, args, kind in (("_fxpy_sha2", sha2, ["VARCHAR", "INTEGER"], None), ("_fxpy_json_sorted", sorted_json, ["VARCHAR"], "arrow")):
+        try:
+            duck.create_function(name, fn, args, "VARCHAR", null_handling="special", **({"type": kind} if kind else {}))
+        except Exception:  # noqa: BLE001, S110 - registered already on this connection
+            pass
     duck.execute(f"create or replace macro {_NS}_fx_sha2(x, n) as _fxpy_sha2(x, n)")
+    duck.execute(f"create or replace macro {_NS}_fx_json_sorted(x) as _fxpy_json_sorted(x)")
+
+
+def json_sorted(text: str | None) -> str | None:
+    """JSON text the way Snowflake writes it: the keys of every object in byte order (Snowflake keeps an OBJECT's
+    keys sorted, however it was built), numbers as they were written. Anything that is not an object or an array
+    comes back as it is."""
+    import json
+
+    if text is None or not text.lstrip().startswith(("{", "[")):
+        return text
+
+    class Raw(str):  # a number, kept as written (131.0 stays 131.0, a long decimal keeps its digits)
+        pass
+
+    def dump(v) -> str:  # noqa: ANN001
+        if isinstance(v, Raw):  # 1e3 is a FLOAT (1.000000000000000e+03), 131.0 a NUMBER written without its zeros (131)
+            if "e" in v or "E" in v:
+                return "%.15e" % float(v) if v.lower() not in ("nan", "infinity", "-infinity") else str(v)
+            return v.rstrip("0").rstrip(".") if "." in v else str(v)
+        if isinstance(v, list):
+            return "[" + ",".join(dump(x) for x in v) + "]"
+        if isinstance(v, dict):
+            return "{" + ",".join(json.dumps(k, ensure_ascii=False) + ":" + dump(v[k])
+                                  for k in sorted(v, key=lambda k: k.encode())) + "}"
+        return json.dumps(v, ensure_ascii=False)
+
+    try:
+        return dump(json.loads(text, parse_int=Raw, parse_float=Raw, parse_constant=Raw))
+    except ValueError:
+        return text
 
 
 MACROS = [
@@ -77,6 +114,7 @@ MACROS = [
     # show milliseconds, and a VARIANT string loses its JSON quotes.
     f"""create or replace macro {_NS}_sf_text(x) as case
           when typeof(x) in ('DOUBLE', 'FLOAT') then format('{{:.15g}}', x::double)
+          when typeof(x) = 'JSON' and json_type(x::json) in ('OBJECT', 'ARRAY') then {_NS}_fx_json_sorted(x::varchar)
           when typeof(x) = 'JSON' then (x::json ->> '$')
           when typeof(x) in ('TIMESTAMP', 'TIMESTAMP_NS', 'TIMESTAMP_MS', 'TIMESTAMP_S')
             then strftime(try_cast(x::varchar as timestamp), '%Y-%m-%d %H:%M:%S.%g')
@@ -917,6 +955,9 @@ def _fix(node: exp.Expression) -> exp.Expression:
         return _fn("_sf_sha2", node.this, node.args["length"])  # sha2(x, 512): DuckDB has 256 only
     if isinstance(node, exp.Anonymous) and isinstance(node.this, str) and node.name.lower() in _RENAMED:
         return _fn(_RENAMED[node.name.lower()], *node.expressions)  # (a function sqlglot has no class for)
+    if isinstance(node, exp.JSONFormat) and not node.args.get("options") \
+            and not (isinstance(node.parent, exp.Anonymous) and node.parent.name == _NS + "_fx_json_sorted"):
+        return _fn("_fx_json_sorted", node)  # TO_JSON: an object's keys in Snowflake's order
     if isinstance(node, exp.Anonymous) and node.name.upper() == "ARRAY_CONSTRUCT_STRUCTURED":
         return exp.Array(expressions=list(node.expressions))  # (the same values; only the declared type differs)
     if isinstance(node, exp.Time) and node.this is not None and not node.args.get("zone"):
