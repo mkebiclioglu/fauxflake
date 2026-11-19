@@ -143,3 +143,24 @@ def test_text_beside_a_number_takes_the_number_also_when_the_select_reads_its_ow
         got = cur.execute("""select started::date as began, case when began is not null then seats else quantity end as n,
                                     coalesce(seats, quantity) as m from D.S.T""").fetchall()
         assert [type(v).__name__ for v in got[0][1:]] == ["Decimal", "Decimal"], got
+
+
+def test_the_session_keeps_its_query_tag_and_refuses_one_longer_than_snowflake_does():
+    import pytest
+    import snowflake.connector
+    from snowflake.connector.errors import ProgrammingError
+
+    from fauxflake.emulator import serve
+
+    with serve() as emu:
+        cur = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S")).cursor()
+        shown = lambda: cur.execute("show parameters like 'query_tag' in session").fetchall()[0][1]  # noqa: E731
+        assert shown() == ""
+        cur.execute("""alter session set query_tag = 'it''s {"a": "{\\"b\\": 1}"}'""")  # (read as Snowflake reads the literal)
+        assert shown() == """it's {"a": "{"b": 1}"}"""
+        cur.execute("alter session set query_tag = '" + "x" * 2000 + "'")
+        with pytest.raises(ProgrammingError, match="invalid value"):
+            cur.execute("alter session set query_tag = '" + "x" * 2001 + "'")
+        assert shown() == "x" * 2000
+        cur.execute("alter session unset query_tag")
+        assert shown() == ""

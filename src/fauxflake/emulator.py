@@ -218,6 +218,35 @@ _ROWS_WRITTEN_OUT = re.compile(r"\s*(?:/\*.*?\*/\s*|--[^\n]*\n\s*)*insert\s+(?:o
 # (dbt writes a comment first, and reloads a seed that is already there with INSERT OVERWRITE)
 
 
+_LEADING = r"(?s)^(?:\s|--[^\n]*\n|/\*.*?\*/)*"
+_TAG_SET = re.compile(_LEADING + r"alter\s+session\s+set\s+query_tag\s*=\s*'((?:[^'\\]|''|\\.)*)'\s*;?\s*$", re.IGNORECASE)
+_TAG_UNSET = re.compile(_LEADING + r"alter\s+session\s+unset\s+query_tag\s*;?\s*$", re.IGNORECASE)
+_TAG_SHOWN = re.compile(_LEADING + r"show\s+parameters\s+like\s+'query_tag'\s+in\s+session\s*;?(?:\s|/\*.*?\*/)*$", re.IGNORECASE)
+_ESCAPES = {"\\": "\\", "'": "'", '"': '"', "n": "\n", "t": "\t", "r": "\r", "0": "\0"}
+
+
+def _query_tag(cursor, command: str, original):  # noqa: ANN001, ANN202
+    """The session's QUERY_TAG, kept as Snowflake keeps it: `show parameters` reads it back (dbt and projects nest
+    the tag they find in their own), and one longer than 2000 characters is refused. None for any other statement."""
+    text = str(command)
+    if (m := _TAG_SET.match(text)) is not None:
+        value = re.sub(r"''|\\(.)", lambda e: "'" if e.group(0) == "''" else _ESCAPES.get(e.group(1), e.group(1)), m.group(1))
+        if len(value) > 2000:
+            from snowflake.connector.errors import ProgrammingError
+
+            raise ProgrammingError(msg=f"SQL compilation error:\ninvalid value [{value}] for parameter 'QUERY_TAG'", errno=1008, sqlstate="22023")
+        cursor._conn._fx_query_tag = value
+        return original(cursor, "select 'Statement executed successfully.' as \"status\"")
+    if _TAG_UNSET.match(text):
+        cursor._conn._fx_query_tag = ""
+        return original(cursor, "select 'Statement executed successfully.' as \"status\"")
+    if _TAG_SHOWN.match(text):
+        value = getattr(cursor._conn, "_fx_query_tag", "").replace("'", "''")
+        return original(cursor, f"""select 'QUERY_TAG' as "key", '{value}' as "value", '' as "default", 'SESSION' as "level", """
+                                """'' as "description", 'STRING' as "type" """)
+    return None
+
+
 def rewrite(sql: str) -> str:
     # a seed's rows arrive written out in the INSERT: data, which real projects load in batches larger than this
     if len(sql) > MAX_STATEMENT and not _ROWS_WRITTEN_OUT.match(sql):
@@ -597,6 +626,9 @@ def _patch_fakesnow() -> None:
             self._fauxflake_layer, self._fauxflake_inline, self._fauxflake_owners = False, set(), {}
             self._fauxflake_qualify = False
             command = objects.session_functions(self, command)
+            handled = _query_tag(self, command, original)
+            if handled is not None:
+                return handled
             handled = _transaction(self, command, original)
             if handled is not None:
                 return handled
