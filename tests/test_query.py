@@ -164,3 +164,5 @@ def test_the_session_keeps_its_query_tag_and_refuses_one_longer_than_snowflake_d
         assert shown() == "x" * 2000
         cur.execute("alter session unset query_tag")
         assert shown() == ""
+        cur.execute('alter session set query_tag = \'t\'\n/* {"app": "dbt", "node_id": "model.p.m"} */')  # (dbt appends a comment)
+        assert shown() == "t"

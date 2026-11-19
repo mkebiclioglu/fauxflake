@@ -219,8 +219,9 @@ _ROWS_WRITTEN_OUT = re.compile(r"\s*(?:/\*.*?\*/\s*|--[^\n]*\n\s*)*insert\s+(?:o
 
 
 _LEADING = r"(?s)^(?:\s|--[^\n]*\n|/\*.*?\*/)*"
-_TAG_SET = re.compile(_LEADING + r"alter\s+session\s+set\s+query_tag\s*=\s*'((?:[^'\\]|''|\\.)*)'\s*;?\s*$", re.IGNORECASE)
-_TAG_UNSET = re.compile(_LEADING + r"alter\s+session\s+unset\s+query_tag\s*;?\s*$", re.IGNORECASE)
+_TRAILING = r"\s*;?(?:\s|--[^\n]*(?:\n|$)|/\*.*?\*/)*$"  # (dbt appends its query comment)
+_TAG_SET = re.compile(_LEADING + r"alter\s+session\s+set\s+query_tag\s*=\s*'((?:[^'\\]|''|\\.)*)'" + _TRAILING, re.IGNORECASE)
+_TAG_UNSET = re.compile(_LEADING + r"alter\s+session\s+unset\s+query_tag" + _TRAILING, re.IGNORECASE)
 _TAG_SHOWN = re.compile(_LEADING + r"show\s+parameters\s+like\s+'query_tag'\s+in\s+session\s*;?(?:\s|/\*.*?\*/)*$", re.IGNORECASE)
 _ESCAPES = {"\\": "\\", "'": "'", '"': '"', "n": "\n", "t": "\t", "r": "\r", "0": "\0"}
 
