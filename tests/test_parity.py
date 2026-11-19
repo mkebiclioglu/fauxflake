@@ -21,6 +21,27 @@ def test_a_column_holding_when_each_build_ran_is_the_clock_not_a_difference():
     assert not _is_clock(duck, both, "at", "TIMESTAMP WITH TIME ZONE", None)
 
 
+def test_what_dbt_writes_of_its_own_run_is_the_clock_too():
+    from datetime import timedelta
+
+    duck = duckdb.connect()
+    frozen = datetime(2026, 11, 18, 23, 0, 0)
+    here, there = (datetime(2026, 11, 19, 1, 3), datetime(2026, 11, 19, 1, 8)), (datetime(2026, 11, 19, 1, 8), datetime(2026, 11, 19, 1, 20))
+    shift = datetime.now().astimezone().utcoffset() or timedelta(0)
+    local = lambda t: (t + shift).strftime("%Y-%m-%d %H:%M:%S")  # noqa: E731 - this machine's time of day, as `now()` in Jinja
+    duck.execute(f"""create table mine as select '2026-11-19 01:03:16.512559' as last_run, 'aaa-1' as invocation,
+                     timestamp '{local(datetime(2026, 11, 19, 1, 5, 9))}' as model_time, 'x' as other""")
+    duck.execute(f"""create table theirs as select '2026-11-19 01:08:57.286279' as last_run, 'bbb-2' as invocation,
+                     timestamp '{local(datetime(2026, 11, 19, 1, 10, 33))}' as model_time, 'y' as other""")
+    both = "with m as (select * from mine), t as (select * from theirs) "
+    clock = (frozen, *there, {"local": here, "ids": ("aaa-1", "bbb-2")})
+    assert _is_clock(duck, both, "last_run", "VARCHAR", clock)  # run_started_at, as text
+    assert _is_clock(duck, both, "invocation", "VARCHAR", clock)
+    assert _is_clock(duck, both, "model_time", "TIMESTAMP", clock)
+    assert not _is_clock(duck, both, "other", "VARCHAR", clock)
+    assert not _is_clock(duck, both, "invocation", "VARCHAR", (frozen, *there, {"local": here, "ids": ("zzz", "bbb-2")}))
+
+
 def test_a_window_whose_order_has_ties_is_found():
     import snowflake.connector
 

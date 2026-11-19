@@ -191,7 +191,7 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
             names, theirs_n = _fetch_into(conn, f'select * from {node["database"]}.{remote_schema or node["schema"]}.{name}', duck, types)
             # (a view is evaluated when it is read: a CURRENT_TIMESTAMP() in it says when this read ran, after the build)
             read_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=30)
-            seen = (clock[0], clock[1], max(clock[2], read_at)) if clock else None
+            seen = (clock[0], clock[1], max(clock[2], read_at), *clock[3:]) if clock else None
         except Exception as e:  # noqa: BLE001 - a view that fails when read (its data): does the emulator's fail too?
             try:
                 read = duck.execute(f"select * from {mine}")  # (every column: a count would not evaluate them)
@@ -245,6 +245,14 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
         except Exception as e:  # noqa: BLE001
             out.append(Parity(node["name"], 0, 0, 0, 0, f"{type(e).__name__}: {str(e)[:160]}"))
     return out
+
+
+def _invocation(project: DbtProject) -> str | None:
+    """The invocation_id of the last dbt command run in the project."""
+    import json
+
+    path = project.target_path / "run_results.json"
+    return json.loads(path.read_text()).get("metadata", {}).get("invocation_id") if path.exists() else None
 
 
 def outcomes(project: DbtProject) -> dict[str, tuple[str, str, object]]:
@@ -352,9 +360,14 @@ def _unordered_aggregate(sql: str) -> str | None:
 
 def undetermined(conn, remote: DbtProject, rows: list[Parity]) -> None:  # noqa: ANN001
     """Mark each differing model whose rows the data does not determine, or that is built on one that is."""
+    import json
+
     nodes = {n["name"]: n for n in remote.models()}
-    by_id = {n["unique_id"]: n for n in nodes.values()}
+    # (the graph has the ephemeral models too: they are not compared, but what is built on them goes through them)
+    by_id = {uid: n for uid, n in json.loads((remote.target_path / "manifest.json").read_text())["nodes"].items()
+             if n.get("resource_type") in ("model", "snapshot", "seed")}
     found: dict[str, str] = {}
+    ephemeral = {uid for uid, n in by_id.items() if n.get("config", {}).get("materialized") == "ephemeral"}
     for r in rows:
         if not r.ok and r.model in nodes:
             why = _ties(conn, nodes[r.model].get("compiled_code") or "")
@@ -377,6 +390,8 @@ def undetermined(conn, remote: DbtProject, rows: list[Parity]) -> None:  # noqa:
             if parent in seen:
                 continue
             seen.add(parent)
+            if parent in ephemeral and parent not in found and (why := _ties(conn, by_id[parent].get("compiled_code") or "")):
+                found[parent] = why  # (an ephemeral model is never compared: its ties are looked for when something is built on it)
             if parent in found:
                 return parent
             hit = upstream(parent, seen)
@@ -430,21 +445,41 @@ def _instant(v):  # noqa: ANN001, ANN202
 
 
 def _is_clock(duck, both: str, column: str, kind: str, clock) -> bool:  # noqa: ANN001
-    """The column holds when the build ran: the emulator's frozen clock on its side, a time within the
-    Snowflake build on the other (CURRENT_TIMESTAMP() and the like differ by the hour of the build, not by engine)."""
-    if clock is None or not kind.startswith(("TIMESTAMP", "DATE")):
+    """The column holds when the build ran, not something the engine worked out: the emulator's frozen clock or a time
+    within its own build on its side, a time within the Snowflake build on the other (CURRENT_TIMESTAMP() and the like
+    differ by the hour of the build, not by engine). Also what dbt itself writes into rows: `run_started_at` (as a
+    timestamp or as text, in UTC or in this machine's time) and `invocation_id`, one per build.
+    `clock`: (frozen, snowflake build start, its end[, {"local": (start, end), "ids": (emulator's, Snowflake's)}])."""
+    if clock is None:
         return False
-    frozen, start, end = clock
+    frozen, start, end = clock[:3]
+    extra = clock[3] if len(clock) > 3 else {}
     q = f'"{column}"'
+    if not kind.startswith(("TIMESTAMP", "DATE")):
+        if not kind.startswith("VARCHAR"):
+            return False
+        lo_m, hi_m, lo_t, hi_t = duck.execute(
+            both + f"select (select min({q}) from m), (select max({q}) from m), (select min({q}) from t), (select max({q}) from t)").fetchone()
+        ids = extra.get("ids")
+        if ids and lo_m == hi_m == ids[0] and lo_t == hi_t == ids[1]:
+            return True  # the build's invocation_id
+        q = f"try_cast({q} as timestamp)"  # `run_started_at` written as text
+        kind = "TIMESTAMP"
     lo_m, hi_m, lo_t, hi_t = (_instant(v) for v in duck.execute(
         both + f"select (select min({q}) from m), (select max({q}) from m), (select min({q}) from t), (select max({q}) from t)").fetchone())
     if None in (lo_m, hi_m, lo_t, hi_t):
         return False
     slack = timedelta(seconds=2)
     if kind == "DATE":
-        days = {frozen.date(), start.date(), end.date()}
-        return lo_m.date() == hi_m.date() == frozen.date() and lo_t.date() in days and hi_t.date() in days
-    return frozen - slack <= lo_m <= hi_m <= frozen + slack and start - slack <= lo_t <= hi_t <= end + slack
+        days = {frozen.date(), start.date(), end.date(), *(d.date() for d in extra.get("local", ()))}
+        return lo_m.date() == hi_m.date() and lo_m.date() in days and lo_t.date() in days and hi_t.date() in days
+    shift = datetime.now().astimezone().utcoffset() or timedelta(0)  # (a time of this machine's day, as dbt writes `now()`)
+
+    def within(lo: datetime, hi: datetime, a: datetime, b: datetime) -> bool:
+        return any(a - slack <= lo + d and hi + d <= b + slack for d in (timedelta(0), -shift))
+
+    mine = within(lo_m, hi_m, frozen, frozen) or ("local" in extra and within(lo_m, hi_m, *extra["local"]))
+    return mine and within(lo_t, hi_t, start, end)
 
 
 def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datetime, days: int,
@@ -467,7 +502,9 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
         try:
             # the same schema name on both sides: some models embed their own relation names
             chosen = ["--select", *select] if select else []
+            here = datetime.now(timezone.utc).replace(tzinfo=None)
             local.invoke(["build", *full, *chosen], schema=remote_schema, quiet=True)
+            built_here = (here, datetime.now(timezone.utc).replace(tzinfo=None))
             mine = outcomes(local)
             began = conn.cursor().execute("select sysdate()").fetchone()[0]
             with remote_session():
@@ -480,7 +517,8 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
         built = {uid for uid in mine if mine[uid][0] == "success" and theirs.get(uid, ("",))[0] == "success"}
         from . import emulator
 
-        clock = (emulator.FROZEN_NOW, began, ended) if emulator.FROZEN_NOW else None
+        ids = (_invocation(local), _invocation(remote))
+        clock = (emulator.FROZEN_NOW, began, ended, {"local": built_here, "ids": ids}) if emulator.FROZEN_NOW else None
         rows = compare(conn, wh.emu, local, only=built, clock=clock)
         undetermined(conn, remote, rows)  # (each model where dbt put it: the same schema on both sides)
         found = differences(mine, theirs, rows)
