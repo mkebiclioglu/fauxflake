@@ -11,7 +11,7 @@ import contextlib
 
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .dbt import DbtProject
@@ -189,6 +189,9 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
             types = {}
         try:
             names, theirs_n = _fetch_into(conn, f'select * from {node["database"]}.{remote_schema or node["schema"]}.{name}', duck, types)
+            # (a view is evaluated when it is read: a CURRENT_TIMESTAMP() in it says when this read ran, after the build)
+            read_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=30)
+            seen = (clock[0], clock[1], max(clock[2], read_at)) if clock else None
         except Exception as e:  # noqa: BLE001 - a view that fails when read (its data): does the emulator's fail too?
             try:
                 read = duck.execute(f"select * from {mine}")  # (every column: a count would not evaluate them)
@@ -229,7 +232,7 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
                             select (select any_value({q}::varchar) from (select {q} from m except all select {q} from t)),
                                    (select any_value({q}::varchar) from (select {q} from t except all select {q} from m)),
                                    (select count(*) from (select {q} from m except all select {q} from t))""").fetchone()
-                        if got[2] and _is_clock(duck, both, c, types[c], clock):
+                        if got[2] and _is_clock(duck, both, c, types[c], seen):
                             clocks.append(c)
                         elif got[2]:
                             differing.append(f"{c}: emulator {str(got[0])[:60]!r} snowflake {str(got[1])[:60]!r}")
