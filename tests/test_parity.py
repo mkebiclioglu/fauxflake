@@ -56,7 +56,7 @@ def test_models_are_compared_row_for_row_with_documents_by_content():
     class Project:  # the two models, as dbt lists them
         def models(self):
             return [{"unique_id": f"model.p.{n}", "name": n, "database": "D", "schema": s}
-                    for n, s in (("same", "MINE"), ("other", "MINE"), ("empty", "MINE"))]
+                    for n, s in (("same", "MINE"), ("other", "MINE"), ("empty", "MINE"), ("broken", "MINE"))]
 
     with serve() as emu:
         conn = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S"))
@@ -71,7 +71,12 @@ def test_models_are_compared_row_for_row_with_documents_by_content():
         cur.execute("""create or replace table D.THEIRS.OTHER as select * from values (1, parse_json('[2, 1]')), (3, parse_json('[3]')) as t(n, v)""")
         cur.execute("create or replace table D.MINE.EMPTY as select 1 as n where false")
         cur.execute("create or replace table D.THEIRS.EMPTY as select 1 as n where false")
+        # a view whose values fail when read, on both sides (a count alone would not read them)
+        for schema in ("MINE", "THEIRS"):
+            cur.execute(f"create or replace view D.{schema}.BROKEN as select to_timestamp_tz(s, 'YYYY-MM-DD\"T\"HH24:MI:SS') as t "
+                        "from (select '2023-02-20' as s)")
         got = {r.model: r for r in compare(conn, emu, Project(), schema="MINE", remote_schema="THEIRS")}
+        assert got["broken"].ok and got["broken"].note.startswith("both engines fail"), got["broken"]
         assert got["same"].ok and got["same"].snowflake_rows == 1, got["same"]
         assert (got["other"].only_emulator, got["other"].only_snowflake) == (2, 2) and "N:" in got["other"].note, got["other"]
         assert got["empty"].ok and got["empty"].snowflake_rows == 0

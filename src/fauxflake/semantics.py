@@ -2115,6 +2115,29 @@ def coerce_union_literals(transformed: exp.Expression, conn) -> exp.Expression: 
     return transformed
 
 
+def days_added_to_aggregates(transformed: exp.Expression, conn) -> exp.Expression:  # noqa: ANN001
+    """`dateadd(day, -2, max(received_at))`: `_sf_like` keeps a DATE a DATE by its overloads, but DuckDB cannot tell
+    an aggregate's type when it expands the macro and takes the DATE one: the time of day is lost. For those, the
+    argument's type is asked and the call written out (a DATE cast back, anything else as it is)."""
+    name = _NS + "_sf_like"
+    calls = [c for c in transformed.find_all(exp.Anonymous) if c.name == name and len(c.expressions) == 2
+             and c.expressions[0].find(exp.AggFunc, exp.Window, exp.Subquery) is not None]
+    for call in calls:
+        value, added = call.expressions
+        select = call.find_ancestor(exp.Select)
+        probe = exp.Select(expressions=[exp.alias_(value.copy(), "_k")])
+        if select is not None and select.args.get("from_") is not None:
+            probe.set("from_", select.args["from_"].copy())
+            if select.args.get("joins"):
+                probe.set("joins", [j.copy() for j in select.args["joins"]])
+        try:
+            kind = conn.execute("describe " + (_cte_prefix(select) if select is not None else "") + probe.sql(dialect="duckdb")).fetchall()[0][1]
+        except Exception:  # noqa: BLE001, S112 - it reads the query around it: left to the overloads
+            continue
+        call.replace(exp.cast(added.copy(), "date") if str(kind).upper() == "DATE" else added.copy())
+    return transformed
+
+
 def union_text_kinds(transformed: exp.Expression, conn) -> exp.Expression:  # noqa: ANN001
     """`select n from a union all select t from b` with `n` a number and `t` text: Snowflake gives the column the
     number's own type (also a date's, a timestamp's, a boolean's) and text that is not one is an error. DuckDB makes
@@ -2125,31 +2148,48 @@ def union_text_kinds(transformed: exp.Expression, conn) -> exp.Expression:  # no
         if isinstance(union.parent, exp.SetOperation) or (isinstance(union.parent, exp.Subquery) and isinstance(union.parent.parent, exp.SetOperation)):
             continue
         branches = [b for b in _branches(union) if isinstance(b, exp.Select)]
-        if len(branches) < 2 or len(branches) != len(_branches(union)) or len({len(b.expressions) for b in branches}) != 1 \
-                or any(isinstance(p, exp.Star) or (isinstance(p, exp.Column) and isinstance(p.this, exp.Star)) for b in branches for p in b.expressions):
+        starred = lambda p: isinstance(p, exp.Star) or (isinstance(p, exp.Column) and isinstance(p.this, exp.Star))  # noqa: E731
+        # (a branch is either all star, `select * from x`, whose columns are converted in place, or lists no star)
+        whole = {id(b) for b in branches if len(b.expressions) == 1 and isinstance(b.expressions[0], exp.Star)
+                 and not b.expressions[0].args.get("replace") and not b.expressions[0].args.get("except_")}
+        if len(branches) < 2 or len(branches) != len(_branches(union)) \
+                or any(starred(p) for b in branches if id(b) not in whole for p in b.expressions) \
+                or len({len(b.expressions) for b in branches if id(b) not in whole}) > 1:
             continue
         prefix = _cte_prefix(union)
         try:
-            described = [[str(r[1]).upper() for r in conn.execute("describe " + prefix + b.sql(dialect="duckdb")).fetchall()] for b in branches]
+            described = [[(str(r[0]), str(r[1]).upper()) for r in conn.execute("describe " + prefix + b.sql(dialect="duckdb")).fetchall()]
+                         for b in branches]
         except Exception:  # noqa: BLE001, S112 - a branch that only binds in its context: left as it is
             continue
-        if len({len(d) for d in described}) != 1 or len(described[0]) != len(branches[0].expressions):
+        width = {len(d) for d in described}
+        if len(width) != 1 or any(len(d) != len(b.expressions) for b, d in zip(branches, described) if id(b) not in whole):
             continue
-        for i in range(len(described[0])):
-            kinds = [d[i] for d in described]
+        replaced: dict[int, list[exp.Expression]] = {}
+        for i in range(width.pop()):
+            kinds = [d[i][1] for d in described]
             if "VARCHAR" not in kinds or "JSON" in kinds:
                 continue
             typed = [k for k in kinds if k.startswith((*_NUMERIC_KINDS, "DECIMAL", "DOUBLE", "FLOAT", "TIMESTAMP", "DATE", "BOOLEAN"))]
             if not typed:
                 continue
-            target = "DOUBLE" if any(k.startswith(("DOUBLE", "FLOAT")) for k in typed) else typed[0]
-            for branch, kind in zip(branches, kinds):
+            target = exp.DataType.build("DOUBLE" if any(k.startswith(("DOUBLE", "FLOAT")) for k in typed) else typed[0], dialect="duckdb")
+            for branch, (column, kind) in zip(branches, (d[i] for d in described)):
+                if kind != "VARCHAR":
+                    continue
+                if id(branch) in whole:
+                    name = exp.to_identifier(column, quoted=True)
+                    replaced.setdefault(id(branch), []).append(exp.alias_(exp.cast(exp.column(name), target), name))
+                    continue
                 proj = branch.expressions[i]
                 value = proj.unalias()
-                if kind != "VARCHAR" or isinstance(value, (exp.Null, exp.Literal)):
+                if isinstance(value, (exp.Null, exp.Literal)):
                     continue  # (a text literal: coerce_union_literals)
-                cast = exp.cast(value.copy(), exp.DataType.build(target, dialect="duckdb"))
+                cast = exp.cast(value.copy(), target)
                 proj.replace(exp.alias_(cast, proj.alias_or_name, quoted=True) if proj.alias_or_name else cast)
+        for branch in branches:
+            if replaced.get(id(branch)):  # select * replace (cast("x" as double) as "x") from ...
+                branch.expressions[0].set("replace", replaced[id(branch)])
     return transformed
 
 

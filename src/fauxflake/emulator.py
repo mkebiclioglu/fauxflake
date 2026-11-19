@@ -990,8 +990,9 @@ def _patch_fakesnow() -> None:
                 transformed = kept[1].copy()
             else:
                 for adjust in (semantics.coerce_union_literals, semantics.resolve_equalities, semantics.mixed_kinds, semantics.union_text_kinds,
-                               semantics.shared_aliases):
-                    if adjust in (semantics.mixed_kinds, semantics.union_text_kinds) and (getattr(self._conn, "_fauxflake_txn", False) or not isinstance(
+                               semantics.days_added_to_aggregates, semantics.shared_aliases):
+                    if adjust in (semantics.mixed_kinds, semantics.union_text_kinds, semantics.days_added_to_aggregates) and (
+                            getattr(self._conn, "_fauxflake_txn", False) or not isinstance(
                             transformed, (exp.Select, exp.Create, exp.Insert, exp.Union))):
                         continue  # (a probe that fails inside a transaction would abort it; MERGE and the like are left alone)
                     one = time.monotonic()

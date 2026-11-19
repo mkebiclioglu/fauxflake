@@ -191,7 +191,9 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
             names, theirs_n = _fetch_into(conn, f'select * from {node["database"]}.{remote_schema or node["schema"]}.{name}', duck, types)
         except Exception as e:  # noqa: BLE001 - a view that fails when read (its data): does the emulator's fail too?
             try:
-                duck.execute(f"select count(*) from {mine}").fetchall()
+                read = duck.execute(f"select * from {mine}")  # (every column: a count would not evaluate them)
+                while read.fetchmany(50_000):
+                    pass
             except Exception:  # noqa: BLE001
                 out.append(Parity(node["name"], 0, 0, 0, 0, f"both engines fail to read it: {str(e)[:160]}"))
             else:
