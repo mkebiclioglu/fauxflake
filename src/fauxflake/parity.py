@@ -493,13 +493,22 @@ def undetermined(conn, remote: DbtProject, rows: list[Parity]) -> None:  # noqa:
 
 
 @contextlib.contextmanager
-def remote_session():
+def remote_session(renamed: dict | None = None):
     """dbt on Snowflake as the emulator runs: every model on the connection's warehouse (a model's
-    `snowflake_warehouse` names one of its own account), and the clock in UTC (the emulator's zone)."""
+    `snowflake_warehouse` names one of its own account), and the clock in UTC (the emulator's zone). `renamed`:
+    sources in these databases are read from the ones their data was loaded into (SNOWFLAKE's own cannot be written)."""
     import snowflake.connector
     from dbt.adapters.snowflake.impl import SnowflakeAdapter
+    from dbt.context.providers import RuntimeSourceResolver
 
-    hook, connect = SnowflakeAdapter.pre_model_hook, snowflake.connector.connect
+    hook, connect, resolve = SnowflakeAdapter.pre_model_hook, snowflake.connector.connect, RuntimeSourceResolver.resolve
+
+    def moved(self, source_name: str, table_name: str):  # noqa: ANN001, ANN202
+        relation = resolve(self, source_name, table_name)
+        target = (renamed or {}).get(str(relation.database or "").strip('"').upper())
+        return relation.replace_path(database=target) if target else relation
+
+    RuntimeSourceResolver.resolve = moved
 
     def in_utc(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
         kwargs["session_parameters"] = {**(kwargs.get("session_parameters") or {}), "TIMEZONE": "UTC"}
@@ -510,7 +519,7 @@ def remote_session():
     try:
         yield
     finally:
-        SnowflakeAdapter.pre_model_hook, snowflake.connector.connect = hook, connect
+        SnowflakeAdapter.pre_model_hook, snowflake.connector.connect, RuntimeSourceResolver.resolve = hook, connect, resolve
 
 
 def _instant(v):  # noqa: ANN001, ANN202
@@ -593,7 +602,7 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
             built_here = (here, datetime.now(timezone.utc).replace(tzinfo=None))
             mine = outcomes(local)
             began = conn.cursor().execute("select sysdate()").fetchone()[0]
-            with remote_session(), _environment(remote_env):
+            with remote_session(renamed), _environment(remote_env):
                 remote.invoke(["build", *full, *chosen, *extra], schema=remote_schema, quiet=True)
             ended = conn.cursor().execute("select sysdate()").fetchone()[0]
             theirs = outcomes(remote)
