@@ -8,7 +8,7 @@ days pass on both, and every model is compared row for row.
 from __future__ import annotations
 
 import contextlib
-
+import re
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -405,6 +405,18 @@ def _unordered_aggregate(sql: str) -> str | None:
     return None
 
 
+def _any_values(sql: str) -> set[str]:
+    """The output columns a model gives ANY_VALUE(...) of: any value of each group, not one the data decides."""
+    import sqlglot
+    from sqlglot import exp
+
+    try:
+        tree = sqlglot.parse_one(sql, read="snowflake")
+    except Exception:  # noqa: BLE001
+        return set()
+    return {a.alias.upper() for a in tree.find_all(exp.Alias) if isinstance(a.this, exp.AnyValue)}
+
+
 def undetermined(conn, remote: DbtProject, rows: list[Parity]) -> None:  # noqa: ANN001
     """Mark each differing model whose rows the data does not determine, or that is built on one that is."""
     import json
@@ -455,6 +467,9 @@ def undetermined(conn, remote: DbtProject, rows: list[Parity]) -> None:  # noqa:
                               f"{unordered[source]}, which gives no order")
         elif uid in found:
             r.undetermined = "the order of rows is not determined: " + found[uid]
+        elif (named := re.findall(r"(?:^differ in |; )([^:;]+): emulator", r.note)) and len(named) < 6 \
+                and {c.upper() for c in named} <= _any_values(nodes[r.model].get("compiled_code") or ""):
+            r.undetermined = f"differs only in ANY_VALUE() of a group with several values ({', '.join(named)}): any of them is right"
         elif (parent := upstream(uid, set())) is not None:
             r.undetermined = f"built on {by_id[parent]['name']}, whose order of rows is not determined"
 

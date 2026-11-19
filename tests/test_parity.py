@@ -105,3 +105,10 @@ def test_models_are_compared_row_for_row_with_documents_by_content():
         assert got["same"].ok and got["same"].snowflake_rows == 1, got["same"]
         assert (got["other"].only_emulator, got["other"].only_snowflake) == (2, 2) and "N:" in got["other"].note, got["other"]
         assert got["empty"].ok and got["empty"].snowflake_rows == 0
+
+
+def test_columns_made_by_any_value_are_found():
+    from fauxflake.parity import _any_values
+
+    sql = "select date, any_value(currency) as currency, sum(usage) as usage, max(x) as top from t group by 1"
+    assert _any_values(sql) == {"CURRENCY"}
