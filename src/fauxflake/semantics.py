@@ -40,6 +40,13 @@ def python_functions(duck) -> None:  # noqa: ANN001
     duck.execute(f"create or replace macro {_NS}_fx_json_sorted(x) as _fxpy_json_sorted(x)")
 
 
+# A SQL NULL put in an ARRAY is `undefined` in Snowflake: counted by ARRAY_SIZE, written `undefined`, skipped by FLATTEN
+# and ARRAY_COMPACT, read back as SQL NULL, and not the JSON null. In the emulator's JSON it is this string (U+FDD0 is a
+# noncharacter no data holds)
+UNDEFINED = "\ufdd0undefined"
+_UNDEFINED_JSON = r"""json('"\ufdd0undefined"')"""  # (written in ASCII: DuckDB counts error positions in bytes)
+
+
 def json_sorted(text: str | None) -> str | None:
     """JSON text the way Snowflake writes it: the keys of every object in byte order (Snowflake keeps an OBJECT's
     keys sorted, however it was built), numbers as they were written. Anything that is not an object or an array
@@ -57,6 +64,8 @@ def json_sorted(text: str | None) -> str | None:
             if "e" in v or "E" in v:
                 return "%.15e" % float(v) if v.lower() not in ("nan", "infinity", "-infinity") else str(v)
             return v.rstrip("0").rstrip(".") if "." in v else str(v)
+        if v == UNDEFINED:
+            return "undefined"
         if isinstance(v, list):
             return "[" + ",".join(dump(x) for x in v) + "]"
         if isinstance(v, dict):
@@ -310,7 +319,7 @@ MACROS = [
                  case when fullkey like '%]' then "key"::bigint end as INDEX,
                  "value"::json as VALUE,
                  json_extract(to_json(input), "path") as THIS
-          from json_tree(to_json(input)::varchar) where parent is not null order by id""",
+          from json_tree(to_json(input)::varchar) where parent is not null and "value" is distinct from {_UNDEFINED_JSON} order by id""",
     *[f"create or replace macro {_NS}_sf_is_{name}(v) as json_type(v::varchar) = 'VARCHAR' and try_cast((v::json ->> '$') as {kind}) is not null"
       for name, kind in {"date": "date", "time": "time", "timestamp_ntz": "timestamp", "timestamp_ltz": "timestamp", "timestamp_tz": "timestamp"}.items()],
     *[f"create or replace macro {_NS}_sf_as_{name}(v) as try_cast((v::json ->> '$') as {kind})"
@@ -336,13 +345,13 @@ MACROS = [
     f"create or replace macro {_NS}_sf_array_contains(a, v) as case when v is null then null else list_contains({_NS}_sf_list(a), to_json(v)) end",
     f"create or replace macro {_NS}_sf_array_position(a, v) as nullif(list_position({_NS}_sf_list(a), to_json(v)), 0) - 1",
     f"""create or replace macro {_NS}_sf_array_to_string(a, s) as
-          array_to_string(list_transform({_NS}_sf_list(a), lambda e: coalesce(e ->> '$', '')), s)""",
+          array_to_string(list_transform({_NS}_sf_list(a), lambda e: coalesce(nullif(e, {_UNDEFINED_JSON}) ->> '$', '')), s)""",
     f"create or replace macro {_NS}_sf_arrays_overlap(a, b) as list_has_any({_NS}_sf_list(a), {_NS}_sf_list(b))",
     f"""create or replace macro {_NS}_sf_array_slice(a, f, t) as to_json(list_slice({_NS}_sf_list(a),
           case when f >= 0 then f + 1 else f end, case when t < 0 then t - 1 else t end))""",
     f"create or replace macro {_NS}_sf_array_cat(a, b) as to_json(list_concat({_NS}_sf_list(a), {_NS}_sf_list(b)))",
-    f"create or replace macro {_NS}_sf_array_append(a, v) as to_json(list_append({_NS}_sf_list(a), to_json(v)))",
-    f"create or replace macro {_NS}_sf_array_prepend(a, v) as to_json(list_prepend(to_json(v), {_NS}_sf_list(a)))",
+    f"create or replace macro {_NS}_sf_array_append(a, v) as to_json(list_append({_NS}_sf_list(a), coalesce(to_json(v), {_UNDEFINED_JSON})))",
+    f"create or replace macro {_NS}_sf_array_prepend(a, v) as to_json(list_prepend(coalesce(to_json(v), {_UNDEFINED_JSON}), {_NS}_sf_list(a)))",
     f"create or replace macro {_NS}_sf_array_unique(a) as to_json({_NS}_sf_array_distinct({_NS}_sf_list(a)))",
     f"""create or replace macro {_NS}_sf_array_sort
           (a) as to_json({_NS}_sf_sorted(a)),
@@ -350,14 +359,15 @@ MACROS = [
     f"create or replace macro {_NS}_sf_array_max(a) as list_last(list_filter({_NS}_sf_sorted(a), lambda e: json_type(e) <> 'NULL'))",
     f"create or replace macro {_NS}_sf_array_min(a) as list_first(list_filter({_NS}_sf_sorted(a), lambda e: json_type(e) <> 'NULL'))",
     f"""create or replace macro {_NS}_sf_array_compact(a) as
-          to_json(list_filter({_NS}_sf_list(a), lambda e: e is not null and json_type(e) <> 'NULL'))""",
+          to_json(list_filter({_NS}_sf_list(a), lambda e: e is not null and json_type(e) <> 'NULL' and e <> {_UNDEFINED_JSON}))""",
     *[f"""create or replace macro {_NS}_sf_array_{name}(a, b) as to_json(list_transform(list_filter(
           list_zip({_NS}_sf_list(a), range(1, len({_NS}_sf_list(a)) + 1)),
           lambda p: len(list_filter({_NS}_sf_list(a)[1:p[2]], lambda e: e = p[1])) {op} len(list_filter({_NS}_sf_list(b), lambda e: e = p[1]))),
           lambda p: p[1]))""" for name, op in (("intersection", "<="), ("except", ">"))],
     f"create or replace macro {_NS}_sf_array_remove(a, v) as to_json(list_filter({_NS}_sf_list(a), lambda e: e <> to_json(v)))",
     f"""create or replace macro {_NS}_sf_array_insert(a, p, v) as
-          to_json(list_concat({_NS}_sf_list(a)[1:p], [to_json(v)], {_NS}_sf_list(a)[p + 1:]))""",
+          to_json(list_concat(list_concat({_NS}_sf_list(a), list_transform(range(greatest(p - len({_NS}_sf_list(a)), 0)),
+            lambda i: {_UNDEFINED_JSON}))[1:p], [coalesce(to_json(v), {_UNDEFINED_JSON})], {_NS}_sf_list(a)[p + 1:]))""",
     f"create or replace macro {_NS}_sf_array_remove_at(a, p) as to_json(list_concat({_NS}_sf_list(a)[1:p], {_NS}_sf_list(a)[p + 2:]))",
     f"create or replace macro {_NS}_sf_array_flatten(a) as to_json(flatten(list_transform({_NS}_sf_list(a), lambda e: e::json[])))",
     f"create or replace macro {_NS}_sf_array_reverse(a) as to_json(list_reverse({_NS}_sf_list(a)))",
@@ -1362,9 +1372,35 @@ def _number_texts(transformed: exp.Expression) -> None:
                                           true=cast.__class__(this=fixed, to=cast.to.copy()))], default=cast.copy()))
 
 
+def _undefined_in_arrays(transformed: exp.Expression) -> None:
+    """ARRAY_CONSTRUCT(NULL, 1) holds `undefined` where it was given a SQL NULL; an element read back is SQL NULL."""
+    marker = sqlglot.parse_one(f"select {_UNDEFINED_JSON}", read="duckdb").expressions[0]
+    def built(array: exp.Array) -> bool:  # an ARRAY_CONSTRUCT: in TO_JSON, or in one that is (nested arrays)
+        up = array.parent
+        while isinstance(up, exp.Array):
+            up = up.parent
+        return isinstance(up, exp.Anonymous) and up.name.upper() == "TO_JSON"
+
+    for array in reversed(list(transformed.find_all(exp.Array))):  # (the innermost first: an outer one copies it)
+        if built(array) and array.expressions:
+            array.set("expressions", [e if isinstance(e, exp.Literal) else exp.func("coalesce", e.copy(), marker.copy())
+                                      for e in array.expressions])
+    for access in list(transformed.find_all(exp.JSONExtract, exp.JSONExtractScalar)):
+        path = access.expression
+        indexed = not isinstance(path, (exp.JSONPath, exp.Literal)) or (
+            isinstance(path, exp.JSONPath) and any(isinstance(p, (exp.JSONPathSubscript, exp.JSONPathSlice)) for p in path.expressions)) \
+            or (isinstance(path, exp.Literal) and "[" in path.name)
+        if not indexed or (isinstance(access.parent, exp.Nullif) and access.parent.this is access):
+            continue
+        other = marker.copy() if isinstance(access, exp.JSONExtract) else \
+            exp.JSONExtractScalar(this=marker.copy(), expression=exp.Literal.string("$"))
+        access.replace(exp.Nullif(this=access.copy(), expression=other))
+
+
 def finish(transformed: exp.Expression) -> exp.Expression:
     """Fix-ups on the DuckDB side of the translation."""
     transformed = balance_chains(transformed)
+    _undefined_in_arrays(transformed)
     _number_texts(transformed)
     for agg in list(transformed.find_all(exp.ArrayAgg)):
         # ARRAY_AGG(OBJECT_CONSTRUCT(*)) is written for DuckDB with a filter that leaves out NULLs and
@@ -1566,11 +1602,25 @@ _SUPPORTED = {"BIGINT", "BLOB", "BOOLEAN", "DATE", "DOUBLE", "INTEGER", "JSON", 
 _AS_NUMBER = {"UBIGINT", "HUGEINT", "UHUGEINT"}  # beyond a signed 64-bit integer: Snowflake's NUMBER(38,0)
 
 
+def _undefined_out(cursor) -> None:  # noqa: ANN001
+    """A VARIANT holding an array with `undefined` in it reaches the client the way Snowflake writes it."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    table = cursor._arrow_table
+    for i, (_name, kind, *_rest) in enumerate(cursor._duck_conn.description):
+        if str(kind).upper() == "JSON" and i < table.num_columns and pa.types.is_string(table.column(i).type) \
+                and pc.any(pc.match_substring(table.column(i), UNDEFINED)).as_py():
+            table = table.set_column(i, table.field(i), pc.replace_substring(table.column(i), f'"{UNDEFINED}"', "undefined"))
+    cursor._arrow_table = table
+
+
 def coerce_result(cursor) -> None:  # noqa: ANN001
     """Re-select result columns whose DuckDB type the Snowflake wire protocol cannot carry:
     ARRAY and OBJECT values travel as JSON, small integers as BIGINT, everything else as text."""
     if cursor._arrow_table is None or not cursor._last_sql or not cursor._duck_conn.description:
         return
+    _undefined_out(cursor)
     casts, changed = [], False
     for i, (name, kind, *_rest) in enumerate(cursor._duck_conn.description):
         kind, alias = str(kind).upper(), '"' + name.replace('"', '""') + '"'

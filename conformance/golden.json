@@ -2048,7 +2048,16 @@
  "fn_array_insert": {
   "rows": [
    [
-    "[\n  3,\n  1,\n  2,\n  undefined,\n  undefined,\n  undefined,\n  undefined,\n  7\n]"
+    [
+     3,
+     1,
+     2,
+     "\ufdd0undefined",
+     "\ufdd0undefined",
+     "\ufdd0undefined",
+     "\ufdd0undefined",
+     7
+    ]
    ]
   ]
  },
@@ -7881,6 +7890,128 @@
     "VARCHAR",
     true,
     true
+   ]
+  ]
+ },
+ "undefined_1": {
+  "rows": [
+   [
+    "2"
+   ]
+  ]
+ },
+ "undefined_10": {
+  "rows": [
+   [
+    "#,1,x"
+   ]
+  ]
+ },
+ "undefined_11": {
+  "rows": [
+   [
+    "1",
+    "1"
+   ],
+   [
+    "3",
+    "2"
+   ]
+  ]
+ },
+ "undefined_12": {
+  "rows": [
+   [
+    "#[1,undefined]"
+   ]
+  ]
+ },
+ "undefined_13": {
+  "rows": [
+   [
+    "#[undefined,null]"
+   ]
+  ]
+ },
+ "undefined_14": {
+  "rows": [
+   [
+    "#[[undefined,1],2]"
+   ]
+  ]
+ },
+ "undefined_15": {
+  "rows": [
+   [
+    [
+     "\ufdd0undefined",
+     1
+    ]
+   ]
+  ]
+ },
+ "undefined_16": {
+  "rows": [
+   [
+    "#[1,undefined]"
+   ]
+  ]
+ },
+ "undefined_2": {
+  "rows": [
+   [
+    "#[undefined,1]"
+   ]
+  ]
+ },
+ "undefined_3": {
+  "rows": [
+   [
+    "#[undefined,1]"
+   ]
+  ]
+ },
+ "undefined_4": {
+  "rows": [
+   [
+    "2"
+   ]
+  ]
+ },
+ "undefined_5": {
+  "rows": [
+   [
+    true,
+    null,
+    "1"
+   ]
+  ]
+ },
+ "undefined_6": {
+  "rows": [
+   [
+    "0"
+   ]
+  ]
+ },
+ "undefined_7": {
+  "rows": [
+   [
+    "#[1]"
+   ]
+  ]
+ },
+ "undefined_8": {
+  "rows": [
+   [
+    false
+   ]
+  ]
+ },
+ "undefined_9": {
+  "rows": [
+   [
+    "#{\"a\":[undefined]}"
    ]
   ]
  },

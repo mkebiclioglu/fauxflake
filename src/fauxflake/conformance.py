@@ -42,6 +42,14 @@ def normalise(v):
             return json.loads(v)  # VARIANT, ARRAY and OBJECT come back as JSON text
         except ValueError:
             pass
+        import re
+
+        from .semantics import UNDEFINED
+
+        try:  # an array's `undefined` element, written bare
+            return json.loads(re.sub(r"(?<=[\[,])(\s*)undefined(?=\s*[,\]])", lambda m: m.group(1) + f'"{UNDEFINED}"', v))
+        except ValueError:
+            pass
     return str(v)
 
 

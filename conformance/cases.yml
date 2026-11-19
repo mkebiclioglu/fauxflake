@@ -350,7 +350,7 @@
 - {id: fn_array_contains_2, sql: "select ARRAY_CONTAINS(7, array_construct(3, 1, 2))"}
 - {id: fn_array_distinct, sql: "select ARRAY_DISTINCT(array_construct(3, 1, 2))"}
 - {id: fn_array_except, sql: "select ARRAY_EXCEPT(array_construct(3, 1, 2), array_construct(2, 9))"}
-- {id: fn_array_insert, sql: "select ARRAY_INSERT(array_construct(3, 1, 2), 7, 7)", gap: "answers differently"}
+- {id: fn_array_insert, sql: "select ARRAY_INSERT(array_construct(3, 1, 2), 7, 7)"}
 - {id: fn_array_intersection, sql: "select ARRAY_INTERSECTION(array_construct(3, 1, 2), array_construct(2, 9))"}
 - {id: fn_array_max, sql: "select ARRAY_MAX(array_construct(3, 1, 2))"}
 - {id: fn_array_min, sql: "select ARRAY_MIN(array_construct(3, 1, 2))"}
@@ -869,3 +869,20 @@
 - {id: object_keys_10, sql: "select '#' || to_json(object_construct('b', 131.0::float, 'a', 0.1::float))", gap: "a FLOAT in an object's text is written as %.15e"}
 - {id: object_keys_11, sql: "select '#' || to_json(parse_json('{\"a\": 0.1, \"b\": 131.0, \"c\": 1e3}'))", gap: "a number written with an exponent is a FLOAT, written as %.15e; DuckDB's JSON keeps no such difference"}
 - {id: object_keys_12, sql: "select '#' || to_json(object_construct('a', 12.5::number(10,2), 'b', 131.0::number(10,1), 'e', 7::number))"}
+# A SQL NULL in an ARRAY is `undefined`: counted, written `undefined`, skipped by FLATTEN and ARRAY_COMPACT, read as SQL NULL
+- {id: undefined_1, sql: "select array_size(array_construct(null, 1))"}
+- {id: undefined_2, sql: "select '#' || array_construct(null, 1)::varchar"}
+- {id: undefined_3, sql: "select '#' || to_json(array_construct(null, 1))"}
+- {id: undefined_4, sql: "select count(*) from table(flatten(array_construct(null, 1, parse_json('null'))))"}
+- {id: undefined_5, sql: "select get(array_construct(null, 1), 0) is null, array_construct(null, 1)[0]::varchar, array_construct(null, 1)[1]::int"}
+- {id: undefined_6, sql: "select count(*) from (select [null, null] a), lateral flatten(input => a)"}
+- {id: undefined_7, sql: "select '#' || to_json(array_compact(array_construct(null, 1, parse_json('null'))))"}
+- {id: undefined_8, sql: "select array_construct(null, 1) = array_construct(parse_json('null'), 1)"}
+- {id: undefined_9, sql: "select '#' || to_json(object_construct('a', array_construct(null)))"}
+- {id: undefined_10, sql: "select '#' || array_to_string(array_construct(null, 1, 'x'), ',')"}
+- {id: undefined_11, sql: "select f.index, f.value::varchar from table(flatten(array_construct(null, 1, null, 2))) f order by 1"}
+- {id: undefined_12, sql: "select '#' || array_append(array_construct(1), null)::varchar"}
+- {id: undefined_13, sql: "select '#' || array_construct(null::variant, parse_json('null'))::varchar"}
+- {id: undefined_14, sql: "select '#' || to_json(array_construct(array_construct(null, 1), 2))"}
+- {id: undefined_15, sql: "select array_construct(null, 1)"}
+- {id: undefined_16, sql: "select '#' || array_slice(array_construct(1, null, 2), 0, 2)::varchar"}

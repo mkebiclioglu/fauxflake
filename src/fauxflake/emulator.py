@@ -559,6 +559,11 @@ def _patch_fakesnow() -> None:
     import fakesnow.macros as _macros
 
     _macros.FS_TO_TIMESTAMP = _Template(_TO_TIMESTAMP)  # (fakesnow's casts a number to BIGINT first: 0.023 s became 0)
+    # FLATTEN skips an array's `undefined` elements and keeps the others' indexes: the rows are numbered, then left out
+    head, _, body = _macros.FS_FLATTEN.template.partition(" AS TABLE")
+    if "_fx_undefined" not in body:
+        _macros.FS_FLATTEN = _Template(f"{head} AS TABLE\n    SELECT * FROM ({body}) AS _fx_undefined\n"
+                                       f"    WHERE VALUE IS DISTINCT FROM {semantics._UNDEFINED_JSON}")
     # generated SQL can nest thousands deep (a pivot over many values, a long OR chain): give the
     # parser and the rewrites room, in the threads started from here on
     sys.setrecursionlimit(max(sys.getrecursionlimit(), 50_000))
