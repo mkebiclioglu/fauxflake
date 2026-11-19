@@ -112,3 +112,12 @@ def test_columns_made_by_any_value_are_found():
 
     sql = "select date, any_value(currency) as currency, sum(usage) as usage, max(x) as top from t group by 1"
     assert _any_values(sql) == {"CURRENCY"}
+
+
+def test_a_node_failing_on_one_side_only_on_a_grown_query_tag_is_not_an_engine_difference():
+    from fauxflake.parity import differences
+
+    tag = "Database Error 001008 (22023): SQL compilation error: invalid value [{...}] for parameter 'QUERY_TAG'"
+    mine = {"test.p.a": ("error", tag, None), "test.p.b": ("error", "Division by zero", None)}
+    theirs = {"test.p.a": ("pass", "", 0), "test.p.b": ("pass", "", 0)}
+    assert {d.node: d.kind for d in differences(mine, theirs, [])} == {"test.p.a": "undetermined", "test.p.b": "emulator_only_error"}

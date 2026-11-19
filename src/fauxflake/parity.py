@@ -322,7 +322,9 @@ def outcomes(project: DbtProject) -> dict[str, tuple[str, str, object]]:
     out = {}
     for r in json.loads(path.read_text()).get("results") or []:
         message = " ".join(str(r.get("message") or "").split())
-        out[r["unique_id"]] = (str(r.get("status")), message[:300], r.get("failures"))
+        # (the end too, where Snowflake names the parameter whose value it refused)
+        short = message if len(message) <= 300 else message[:240] + " ... " + message[-60:]
+        out[r["unique_id"]] = (str(r.get("status")), short, r.get("failures"))
     return out
 
 
@@ -342,7 +344,13 @@ def differences(local: dict, remote: dict, rows: list[Parity]) -> list[Differenc
         if mine is None or theirs is None:
             continue
         broke = lambda o: o[0] in ("error", "runtime error")  # noqa: E731
-        if broke(mine) and not broke(theirs):
+        tagged = lambda o: broke(o) and "for parameter 'QUERY_TAG'" in o[1]  # noqa: E731
+        if (tagged(mine) and not broke(theirs)) or (tagged(theirs) and not broke(mine)):
+            # a query tag that takes in the session's last one grows with each node a dbt thread runs: which node passes
+            # Snowflake's 2000 characters first goes by the order the threads take them in, not by the engine
+            out.append(Difference(uid, "undetermined", "fails on one side only on a query tag that grew past 2000 characters: "
+                                                       "which node that is goes by the order dbt's threads run them in"))
+        elif broke(mine) and not broke(theirs):
             out.append(Difference(uid, "emulator_only_error", mine[1]))
         elif broke(theirs) and not broke(mine):
             out.append(Difference(uid, "snowflake_only_error", theirs[1]))
