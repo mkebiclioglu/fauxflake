@@ -241,7 +241,10 @@ def profile(spec_path, connection, days, sample_pct, k_anonymity, max_categories
 @click.option("--snowflake-database", "renames", multiple=True, metavar="FROM=TO",
               help="Load the sources of database FROM into TO on Snowflake (for SNOWFLAKE's own, which cannot be written).")
 @click.option("--snowflake-vars", default=None, help="dbt --vars for the Snowflake build only (to point it at a renamed database).")
-def parity(spec_path, project_dir, scale, history, db_path, keep, connection, days, schema, report, select, renames, snowflake_vars):
+@click.option("--snowflake-env", "envs", multiple=True, metavar="KEY=VALUE",
+              help="An environment variable for the Snowflake build only (for a project that names a source database by one).")
+def parity(spec_path, project_dir, scale, history, db_path, keep, connection, days, schema, report, select, renames, snowflake_vars,
+           envs):
     """Build on the emulator and on real Snowflake from identical synthetic data, and compare."""
     db_path = _warehouse_dir(project_dir, db_path, keep)
     import snowflake.connector
@@ -266,7 +269,8 @@ def parity(spec_path, project_dir, scale, history, db_path, keep, connection, da
         remote = DbtProject(project_dir, snowflake_output(connection, database), name="snowflake")
         renamed = {a.upper(): b.upper() for a, _, b in (r.partition("=") for r in renames) if b}
         rows, found = run(conn, wh, local, remote, _start(spec, history), days, remote_schema=schema, log=click.echo,
-                          select=list(select) or None, renamed=renamed, remote_vars=snowflake_vars)
+                          select=list(select) or None, renamed=renamed, remote_vars=snowflake_vars,
+                          remote_env=dict(e.partition("=")[::2] for e in envs))
     click.echo("")
     for d in found:
         click.echo(f"DIFF {d.kind:<20} {d.node}\n     {d.detail[:400]}")

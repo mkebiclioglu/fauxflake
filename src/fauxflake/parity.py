@@ -151,6 +151,12 @@ def _canonical(text: str | None, unordered: bool = False) -> str | None:
 
     if text is None:
         return None
+    import re
+
+    from .semantics import UNDEFINED
+
+    # (an array's `undefined` element: Snowflake writes it bare, the emulator holds it as a marked string)
+    text = re.sub(r"(?<=[\[,])(\s*)undefined(?=\s*[,\]])", lambda m: m.group(1) + f'"{UNDEFINED}"', text)
     try:
         return json.dumps(tidy(json.loads(text)), sort_keys=True, separators=(",", ":"))
     except ValueError:
@@ -250,6 +256,23 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
         except Exception as e:  # noqa: BLE001
             out.append(Parity(node["name"], 0, 0, 0, 0, f"{type(e).__name__}: {str(e)[:160]}"))
     return out
+
+
+@contextlib.contextmanager
+def _environment(values: dict | None):
+    """Environment variables set for the Snowflake side only (a source the project points elsewhere by one)."""
+    import os
+
+    saved = {k: os.environ.get(k) for k in values or {}}
+    os.environ.update(values or {})
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def _databases_built_in(conn, remote: DbtProject, schema: str, extra: list[str]) -> None:  # noqa: ANN001
@@ -508,7 +531,8 @@ def _is_clock(duck, both: str, column: str, kind: str, clock) -> bool:  # noqa: 
 
 def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datetime, days: int,
         remote_schema: str = "FAUXFLAKE_PARITY", log=print, select: list[str] | None = None,
-        renamed: dict | None = None, remote_vars: str | None = None) -> tuple[list[Parity], list[Difference]]:
+        renamed: dict | None = None, remote_vars: str | None = None,
+        remote_env: dict | None = None) -> tuple[list[Parity], list[Difference]]:
     """The same sources on both engines, the same project built on both (every node, also after one fails), then
     what each did compared: which nodes failed on one side only, which tests answered differently, which models hold
     other rows. Day by day for incremental models."""
@@ -525,7 +549,8 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
         full = ["--full-refresh"] if i == 0 else []
         extra = ["--vars", remote_vars] if remote_vars else []
         if i == 0:
-            _databases_built_in(conn, remote, remote_schema, extra)
+            with _environment(remote_env):
+                _databases_built_in(conn, remote, remote_schema, extra)
         os.environ["FAUXFLAKE_TESTS_DO_NOT_BLOCK"] = "1"  # (a failing test keeps nothing else from being built and compared)
         try:
             # the same schema name on both sides: some models embed their own relation names
@@ -535,7 +560,7 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
             built_here = (here, datetime.now(timezone.utc).replace(tzinfo=None))
             mine = outcomes(local)
             began = conn.cursor().execute("select sysdate()").fetchone()[0]
-            with remote_session():
+            with remote_session(), _environment(remote_env):
                 remote.invoke(["build", *full, *chosen, *extra], schema=remote_schema, quiet=True)
             ended = conn.cursor().execute("select sysdate()").fetchone()[0]
             theirs = outcomes(remote)
