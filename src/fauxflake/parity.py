@@ -285,8 +285,18 @@ def _databases_built_in(conn, remote: DbtProject, schema: str, extra: list[str])
     path = remote.target_path / "manifest.json"
     if not path.exists():
         return
-    names = {str(n.get("database") or "").strip('"').upper() for n in json.loads(path.read_text())["nodes"].values()
-             if n.get("resource_type") in ("model", "seed", "snapshot")}
+    nodes = json.loads(path.read_text())["nodes"].values()
+    names = {str(n.get("database") or "").strip('"').upper() for n in nodes if n.get("resource_type") in ("model", "seed", "snapshot")}
+    # an incremental model that says `full_refresh: false` keeps what an earlier run left, --full-refresh or not:
+    # it starts from nothing here, as on the emulator
+    for n in nodes:
+        config = n.get("config") or {}
+        if n.get("resource_type") == "model" and config.get("materialized") == "incremental" and config.get("full_refresh") is False \
+                and n.get("relation_name"):
+            try:
+                conn.cursor().execute(f"drop table if exists {n['relation_name']}")
+            except Exception:  # noqa: BLE001, S110 - not there, or not a table
+                pass
     for name in sorted(n for n in names if re.fullmatch(r"[A-Z_][\w$]*", n) and n != "SNOWFLAKE"):
         try:
             conn.cursor().execute(f"create database if not exists {name}")
