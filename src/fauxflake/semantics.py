@@ -12,7 +12,7 @@ import re
 import sqlglot
 from sqlglot import exp
 
-from . import catalog, xmldoc
+from . import catalog, jsondoc, xmldoc
 
 _NS = "_fs_global.main."
 _SCALE = r"coalesce(try_cast(nullif(regexp_extract(typeof(a), ',(\d+)\)', 1), '') as integer), 0)"
@@ -37,6 +37,8 @@ def python_functions(duck) -> None:  # noqa: ANN001
             ("_fxpy_encrypt_raw", encrypt_raw, ["BLOB", "BLOB", "BLOB", "BLOB", "VARCHAR"], "VARCHAR", None),
             ("_fxpy_randstr", randstr, ["BIGINT", "HUGEINT"], "VARCHAR", None),
             ("_fxpy_parse_xml", parse_xml, ["VARCHAR"], "VARCHAR", None),
+            ("_fxpy_json_text", json_text, ["VARCHAR", "BOOLEAN"], "VARCHAR", None),
+            ("_fxpy_check_json", jsondoc.check, ["VARCHAR"], "VARCHAR", None),
             ("_fxpy_check_xml", xmldoc.check, ["VARCHAR"], "VARCHAR", None),
             ("_fxpy_to_xml", xmldoc.to_xml, ["VARCHAR"], "VARCHAR", None),
             ("_fxpy_xmlget", xmldoc.xmlget, ["VARCHAR", "VARCHAR", "BIGINT"], "VARCHAR", None),
@@ -52,6 +54,7 @@ def python_functions(duck) -> None:  # noqa: ANN001
     duck.execute(f"create or replace macro {_NS}_sf_parse_xml (s) as _fxpy_parse_xml(s::varchar)::json, (s, b) as _fxpy_parse_xml(s::varchar)::json")
     duck.execute(f"create or replace macro {_NS}_sf_check_xml (s) as _fxpy_check_xml(s::varchar), (s, b) as _fxpy_check_xml(s::varchar)")
     duck.execute(f"create or replace macro {_NS}_sf_to_xml(v) as _fxpy_to_xml(v::varchar)")
+    duck.execute(f"create or replace macro {_NS}_sf_check_json(v) as _fxpy_check_json(v::varchar)")
     duck.execute(f"create or replace macro {_NS}_sf_xmlget (x, t) as _fxpy_xmlget(x::varchar, t, 0)::json, "
                  "(x, t, n) as _fxpy_xmlget(x::varchar, t, n)::json")
     duck.execute(f"create or replace macro {_NS}_fx_json_sorted(x) as _fxpy_json_sorted(x)")
@@ -64,6 +67,17 @@ def python_functions(duck) -> None:  # noqa: ANN001
                      f"(v, k, iv, aad) as _fxpy_decrypt_raw(v, k, iv, aad, null, null, {lenient}), "
                      f"(v, k, iv, aad, m) as _fxpy_decrypt_raw(v, k, iv, aad, m, null, {lenient}), "
                      f"(v, k, iv, aad, m, tag) as _fxpy_decrypt_raw(v, k, iv, aad, m, tag, {lenient})")
+
+
+def json_text(text, lenient):  # noqa: ANN001, ANN201
+    """What PARSE_JSON reads in `text`, as JSON DuckDB reads (see jsondoc); TRY_PARSE_JSON (`lenient`) gives NULL for
+    what Snowflake refuses."""
+    try:
+        return jsondoc.normalise(text)
+    except jsondoc.JSONError as e:
+        if lenient:
+            return None
+        raise _fx_error(100069, "22P02", f"Error parsing JSON: {e}") from None
 
 
 def parse_xml(text):  # noqa: ANN001, ANN201
@@ -268,7 +282,7 @@ MACROS = [
     f"""create or replace macro {_NS}_sf_typeof(v) as case when typeof(v) <> 'JSON' then typeof(v) else
           case json_type(v::varchar)
             when 'UBIGINT' then 'INTEGER' when 'BIGINT' then 'INTEGER'
-            when 'DOUBLE' then case when regexp_matches(v::varchar, '[eE]') then 'DOUBLE' else 'DECIMAL' end
+            when 'DOUBLE' then case when regexp_matches(v::varchar, '[eE]|NaN|Infinity') then 'DOUBLE' else 'DECIMAL' end
             when 'OBJECT' then case when list_contains(json_keys(v::json), chr(64976) || 'xml') then 'XML' else 'OBJECT' end
             when 'NULL' then 'NULL_VALUE' else json_type(v::varchar) end end""",
     # A windowed AVG keeps three extra decimals, not six.
@@ -593,6 +607,7 @@ _RENAMED = {  # Snowflake function -> macro, same arguments
     "try_hex_decode_string": "_sf_try_hex", "encrypt_raw": "_sf_encrypt_raw",
     "decrypt_raw": "_sf_decrypt_raw", "try_decrypt_raw": "_sf_try_decrypt_raw",
     "parse_xml": "_sf_parse_xml", "check_xml": "_sf_check_xml", "to_xml": "_sf_to_xml", "xmlget": "_sf_xmlget",
+    "check_json": "_sf_check_json",
     **{f"is_{k}": f"_sf_is_{k}" for k in ("date", "time", "timestamp_ntz", "timestamp_ltz", "timestamp_tz")},
     **{f"as_{k}": f"_sf_as_{k}" for k in ("date", "time", "timestamp_ntz", "timestamp_ltz", "timestamp_tz", "double", "real",
                                           "number", "decimal", "boolean", "object", "array")}, "upper": "_sf_upper", "ucase": "_sf_upper",
@@ -1036,11 +1051,22 @@ def _fix(node: exp.Expression) -> exp.Expression:
         return exp.Anonymous(this="to_json", expressions=[node])
     if isinstance(node, (exp.ArrayFilter, exp.Transform, exp.Reduce)):
         node.set("this", _fn("_sf_list", node.this))  # lambdas walk a list; the array itself is JSON
-    if isinstance(node, exp.ParseJSON) and not isinstance(node.this, (exp.Literal, exp.Null)):
+    if isinstance(node, exp.ParseJSON) and not isinstance(node.this, (exp.Literal, exp.Null)) \
+            and not (isinstance(node.this, exp.Anonymous) and node.this.name == "_fxpy_json_text"):
         # (as text the way a cast gives it: a VARIANT that holds a string gives the string, not its JSON spelling
-        # with quotes, so PARSE_JSON of `"[1, 2]"` held in a VARIANT is the list)
+        # with quotes, so PARSE_JSON of `"[1, 2]"` held in a VARIANT is the list), read as Snowflake reads JSON
         text = _fn("_sf_text", node.this)
-        node.set("this", exp.Nullif(this=text, expression=exp.Literal.string("")))  # PARSE_JSON('') is NULL
+        node.set("this", exp.Anonymous(this="_fxpy_json_text", expressions=[text, exp.Boolean(this=bool(node.args.get("safe")))]))
+    elif isinstance(node, exp.ParseJSON) and isinstance(node.this, exp.Literal) and node.this.is_string:
+        try:  # a literal: read here, once
+            read = jsondoc.normalise(node.this.name)
+        except jsondoc.JSONError:  # (refused where it is read: Snowflake's error, or NULL for TRY_)
+            node.set("this", exp.Anonymous(this="_fxpy_json_text", expressions=[node.this.copy(), exp.Boolean(this=bool(node.args.get("safe")))]))
+            return node
+        if read is None:
+            return exp.Null()
+        if read != node.this.name:
+            node.set("this", exp.Literal.string(read))
     if isinstance(node, exp.Bracket) and len(node.expressions) == 1 and isinstance(node.expressions[0], exp.Literal):
         # v['a']['b'][0] is the path v:a.b[0]. Written as a path, every step stays a VARIANT access
         key, base = node.expressions[0], node.this

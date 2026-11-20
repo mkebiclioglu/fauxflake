@@ -997,6 +997,53 @@
    ]
   ]
  },
+ "check_json_1": {
+  "rows": [
+   [
+    true,
+    "incomplete array value, pos 6",
+    "missing colon, pos 6",
+    "misplaced }, pos 7",
+    null
+   ]
+  ]
+ },
+ "check_json_2": {
+  "rows": [
+   [
+    "unknown keyword \"tru\", pos 4",
+    "unknown keyword \"nul\", pos 4",
+    "garbage in the numeric literal: 1.2.3 , pos 6",
+    "unfinished string, pos 5",
+    null,
+    null
+   ]
+  ]
+ },
+ "check_json_3": {
+  "rows": [
+   [
+    null,
+    null,
+    null,
+    true,
+    null,
+    "garbage after valid input document"
+   ]
+  ]
+ },
+ "check_json_4": {
+  "rows": [
+   [
+    null,
+    null,
+    "more than one document in the input",
+    null,
+    "no number after a sign, pos 2",
+    "misplaced }, pos 8"
+   ]
+  ]
+ },
  "coalesce_variant_with_text": {
   "rows": [
    [
@@ -6130,6 +6177,40 @@
     "c"
    ]
   ]
+ },
+ "lenient_json_1": {
+  "rows": [
+   [
+    "#{\"a\":1,\"b\":[1,2,undefined]}",
+    "#[1,undefined]",
+    "1",
+    true,
+    true
+   ]
+  ]
+ },
+ "lenient_json_2": {
+  "rows": [
+   [
+    "#{\"a\":NaN,\"b\":Infinity}",
+    "DOUBLE"
+   ]
+  ]
+ },
+ "lenient_json_3": {
+  "rows": [
+   [
+    "1",
+    true,
+    true
+   ]
+  ]
+ },
+ "lenient_json_4": {
+  "error": "100069 (22P02): Error parsing JSON: incomplete array value, pos 6"
+ },
+ "lenient_json_5": {
+  "error": "100069 (22P02): Error parsing JSON: duplicate object attribute \"a\", pos 12"
  },
  "like_escape": {
   "rows": [

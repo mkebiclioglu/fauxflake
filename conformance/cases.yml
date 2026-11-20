@@ -433,7 +433,7 @@
 - {id: fn_cbrt, sql: "select CBRT(2.5::float)"}
 - {id: fn_cbrt_2, sql: "select CBRT(2.5)"}
 - {id: fn_char, sql: "select CHAR(7)"}
-- {id: fn_check_json, sql: "select CHECK_JSON('abc')", gap: "answers differently"}
+- {id: fn_check_json, sql: "select CHECK_JSON('abc')"}
 - {id: fn_check_xml, sql: "select CHECK_XML('abc')"}
 - {id: fn_check_xml_2, sql: "select CHECK_XML('abc', true)"}
 - {id: fn_chr, sql: "select CHR(7)"}
@@ -1030,3 +1030,14 @@
 - {id: epoch_float_4, sql: "select to_timestamp(d)::varchar, to_timestamp(d, 3)::varchar from (select 1.5::number(10,1) d)"}
 - {id: epoch_float_5, sql: "select to_timestamp(f::number(10,1))::varchar from (select 1.5::float f)"}
 - {id: epoch_float_6, sql: "select to_timestamp_tz(f) from (select 1.5::float f)"}
+# Recorded 2026-11-20. CHECK_JSON: NULL for JSON, else what is wrong, as Snowflake words it.
+- {id: check_json_1, sql: "select check_json('{\"a\": 1}') is null, check_json('[1, 2') , check_json('{\"a\" 1}'), check_json('{\"a\": }'), check_json('')"}
+- {id: check_json_2, sql: "select check_json('tru'), check_json('nul'), check_json('1.2.3'), check_json('\"abc'), check_json('{\"a\": 1,}'), check_json('[1,]')"}
+- {id: check_json_3, sql: "select check_json('123'), check_json('\"x\"'), check_json('null'), check_json(null) is null, check_json('  '), check_json('{} x')"}
+- {id: check_json_4, sql: "select check_json('{a: 1}'), check_json('{\"a\": NaN}'), check_json('[1] [2]'), check_json('01'), check_json('-'), check_json('{\"a\":1}}')"}
+# Recorded 2026-11-20. PARSE_JSON reads what CHECK_JSON accepts: trailing commas, keys without quotes, NaN.
+- {id: lenient_json_1, sql: "select '#' || parse_json('{a: 1, \"b\": [1, 2,],}')::varchar, '#' || parse_json('[1,]')::varchar, parse_json('01')::varchar, parse_json('') is null, parse_json('  ') is null"}
+- {id: lenient_json_2, sql: "select '#' || parse_json('{\"a\": NaN, \"b\": Infinity}')::varchar, typeof(parse_json('NaN'))"}
+- {id: lenient_json_3, sql: "select try_parse_json('{a: 1}'):a::int, try_parse_json('[1, 2') is null, try_parse_json('{} x') is null"}
+- {id: lenient_json_4, sql: "select parse_json('[1, 2')"}
+- {id: lenient_json_5, sql: "select '#' || parse_json('{\"a\": 1, \"a\": 2}')::varchar"}
