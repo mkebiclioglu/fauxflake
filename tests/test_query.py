@@ -166,3 +166,29 @@ def test_the_session_keeps_its_query_tag_and_refuses_one_longer_than_snowflake_d
         assert shown() == ""
         cur.execute('alter session set query_tag = \'t\'\n/* {"app": "dbt", "node_id": "model.p.m"} */')  # (dbt appends a comment)
         assert shown() == "t"
+
+
+def test_a_quoted_name_is_a_column_only_in_the_case_it_is_written():
+    import pytest
+    import snowflake.connector
+    from snowflake.connector.errors import ProgrammingError
+
+    from fauxflake.emulator import serve
+
+    with serve() as emu:
+        cur = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S")).cursor()
+        cur.execute("create table t (metric_name varchar, \"Mixed\" int)")
+        cur.execute("insert into t values ('a', 1)")
+        with pytest.raises(ProgrammingError, match="invalid identifier '\"Metric_Name\"'") as raised:
+            cur.execute('select\n  "Metric_Name" from t')
+        assert raised.value.errno == 904 and "error line 2 at position 2" in str(raised.value)
+        with pytest.raises(ProgrammingError, match="invalid identifier 'MIXED'"):
+            cur.execute("select mixed from t")
+        assert cur.execute('select "METRIC_NAME", metric_name, "Mixed" from t').fetchall() == [("a", "a", 1)]
+        # a name the statement gives itself, in its own case
+        assert cur.execute('with c as (select metric_name as "Metric_Name" from t) select "Metric_Name" from c').fetchall() == [("a",)]
+        assert cur.execute('select "Metric_Name" from (select metric_name as "Metric_Name" from t)').fetchall() == [("a",)]
+        cur.execute('create table u as select metric_name as "start" from t')
+        with pytest.raises(ProgrammingError, match="invalid identifier 'START'"):
+            cur.execute("select start from u")
+        assert cur.execute('select "start" from u').fetchall() == [("a",)]

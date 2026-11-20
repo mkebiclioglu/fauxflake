@@ -31,13 +31,113 @@ def python_functions(duck) -> None:  # noqa: ANN001
     def sorted_json(values):  # noqa: ANN001, ANN202 - a batch at a time
         return pa.array([json_sorted(v) for v in values.to_pylist()], pa.string())
 
-    for name, fn, args, kind in (("_fxpy_sha2", sha2, ["VARCHAR", "INTEGER"], None), ("_fxpy_json_sorted", sorted_json, ["VARCHAR"], "arrow")):
+    for name, fn, args, out, kind in (
+            ("_fxpy_sha2", sha2, ["VARCHAR", "INTEGER"], "VARCHAR", None),
+            ("_fxpy_json_sorted", sorted_json, ["VARCHAR"], "VARCHAR", "arrow"),
+            ("_fxpy_encrypt_raw", encrypt_raw, ["BLOB", "BLOB", "BLOB", "BLOB", "VARCHAR"], "VARCHAR", None),
+            ("_fxpy_decrypt_raw", decrypt_raw, ["BLOB", "BLOB", "BLOB", "BLOB", "VARCHAR", "BLOB", "BOOLEAN"], "BLOB", None)):
         try:
-            duck.create_function(name, fn, args, "VARCHAR", null_handling="special", **({"type": kind} if kind else {}))
+            duck.create_function(name, fn, args, out, null_handling="special", side_effects=name == "_fxpy_encrypt_raw",
+                                 **({"type": kind} if kind else {}))
         except Exception:  # noqa: BLE001, S110 - registered already on this connection
             pass
     duck.execute(f"create or replace macro {_NS}_fx_sha2(x, n) as _fxpy_sha2(x, n)")
     duck.execute(f"create or replace macro {_NS}_fx_json_sorted(x) as _fxpy_json_sorted(x)")
+    duck.execute(f"create or replace macro {_NS}_sf_encrypt_raw (v, k) as _fxpy_encrypt_raw(v, k, null, null, null)::json, "
+                 "(v, k, iv) as _fxpy_encrypt_raw(v, k, iv, null, null)::json, "
+                 "(v, k, iv, aad) as _fxpy_encrypt_raw(v, k, iv, aad, null)::json, "
+                 "(v, k, iv, aad, m) as _fxpy_encrypt_raw(v, k, iv, aad, m)::json")
+    for name, lenient in (("decrypt_raw", "false"), ("try_decrypt_raw", "true")):
+        duck.execute(f"create or replace macro {_NS}_sf_{name} (v, k, iv) as _fxpy_decrypt_raw(v, k, iv, null, null, null, {lenient}), "
+                     f"(v, k, iv, aad) as _fxpy_decrypt_raw(v, k, iv, aad, null, null, {lenient}), "
+                     f"(v, k, iv, aad, m) as _fxpy_decrypt_raw(v, k, iv, aad, m, null, {lenient}), "
+                     f"(v, k, iv, aad, m, tag) as _fxpy_decrypt_raw(v, k, iv, aad, m, tag, {lenient})")
+
+
+# AES as Snowflake's ENCRYPT_RAW / DECRYPT_RAW does it: a method `AES[-mode[-padding]]` (GCM when none is given),
+# the IV a mode needs (random when NULL), and Snowflake's errors for a key, an IV or a method it does not take
+_IV_BITS = {"GCM": 96, "ECB": 0, "CBC": 128, "CTR": 128, "CFB": 128, "OFB": 128}
+
+
+def _fx_error(errno: int, sqlstate: str, message: str) -> Exception:
+    """An error a Python function raises for the emulator to give as Snowflake's (see emulator.snowflake_error)."""
+    return ValueError(f"\x1ffxerr:{errno}:{sqlstate}:{message}\x1f")
+
+
+def _aes(key: bytes, iv: bytes | None, method: str | None):  # noqa: ANN202
+    parts = (method or "AES-GCM").upper().split("-")
+    mode = parts[1] if len(parts) > 1 else "GCM"
+    pad = parts[2] if len(parts) > 2 else None
+    if parts[0] != "AES" or len(parts) > 3 or mode not in _IV_BITS or (pad is not None and (pad != "PKCS" or mode not in ("ECB", "CBC"))):
+        raise _fx_error(100302, "22023", f"Malformed encryption method parameter: {method}")
+    if len(key) * 8 not in (128, 192, 256):
+        raise _fx_error(100304, "22023", f"Key size of {len(key) * 8} bits not found for encryption algorithm AES")
+    if iv is not None and len(iv) * 8 != _IV_BITS[mode]:
+        raise _fx_error(100303, "22023", f"IV/Nonce of size {len(iv) * 8} bits needs to be of size of {_IV_BITS[mode]} "
+                                         f"bits for encryption mode {mode}")
+    return mode
+
+
+def encrypt_raw(value, key, iv, aad, method):  # noqa: ANN001, ANN201
+    import json
+    import os
+
+    from cryptography.hazmat.primitives import padding
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    if value is None or key is None:
+        return None
+    value, key = bytes(value), bytes(key)
+    mode = _aes(key, None if iv is None else bytes(iv), method)
+    iv = bytes(iv) if iv is not None else (os.urandom(_IV_BITS[mode] // 8) if mode != "ECB" else None)
+    if mode == "GCM":
+        out = AESGCM(key).encrypt(iv, value, None if aad is None else bytes(aad))
+        return json.dumps({"ciphertext": out[:-16].hex().upper(), "iv": iv.hex().upper(), "tag": out[-16:].hex().upper()})
+    if mode in ("ECB", "CBC"):
+        padder = padding.PKCS7(128).padder()
+        value = padder.update(value) + padder.finalize()
+    cipher = Cipher(algorithms.AES(key), modes.ECB() if mode == "ECB" else getattr(modes, mode)(iv)).encryptor()
+    out = cipher.update(value) + cipher.finalize()
+    return json.dumps({"ciphertext": out.hex().upper(), "iv": None if iv is None else iv.hex().upper()})
+
+
+def decrypt_raw(value, key, iv, aad, method, tag, lenient):  # noqa: ANN001, ANN201
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives import padding
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    if value is None or key is None:
+        return None
+    try:
+        value, key = bytes(value), bytes(key)
+        mode = _aes(key, None if iv is None else bytes(iv), method)
+        if iv is None and mode != "ECB":
+            raise _fx_error(100303, "22023", f"IV/Nonce of size 0 bits needs to be of size of {_IV_BITS[mode]} bits for encryption mode {mode}")
+        if mode == "GCM":
+            if tag is None:
+                raise _fx_error(100308, "22023", "Decryption mode requires an AEAD tag as parameter")
+            tag = bytes(tag)
+            if len(tag) != 16:
+                raise _fx_error(100309, "22023", f"Wrong AEAD tag size. Expected 16, but got {len(tag)}")
+            try:
+                return AESGCM(key).decrypt(bytes(iv), value + tag, None if aad is None else bytes(aad))
+            except InvalidTag:
+                raise _fx_error(100311, "22023", "Decryption failed. Check encrypted data, key, AAD, or AEAD tag.") from None
+        cipher = Cipher(algorithms.AES(key), modes.ECB() if mode == "ECB" else getattr(modes, mode)(bytes(iv))).decryptor()
+        out = cipher.update(value) + cipher.finalize()
+        if mode in ("ECB", "CBC"):
+            try:
+                unpadder = padding.PKCS7(128).unpadder()
+                out = unpadder.update(out) + unpadder.finalize()
+            except ValueError:
+                raise _fx_error(100311, "22023", "Decryption failed. Check encrypted data, key, AAD, or AEAD tag.") from None
+        return out
+    except ValueError:
+        if lenient:
+            return None
+        raise
 
 
 # A SQL NULL put in an ARRAY is `undefined` in Snowflake: counted by ARRAY_SIZE, written `undefined`, skipped by FLATTEN
@@ -374,11 +474,6 @@ MACROS = [
     f"""create or replace macro {_NS}_sf_array_range
           (f, t) as to_json(range(f, t)),
           (f, t, s) as to_json(range(f, t, s))""",
-    # ENCRYPT_RAW has no local equivalent: a stable, opaque stand-in with the same shape.
-    f"create or replace macro {_NS}_sf_encrypt_raw " + ", ".join(
-        f"({args}) as json_object('ciphertext', upper(sha256(v::varchar || k::varchar)), "
-        "'iv', upper(md5(k::varchar)), 'tag', upper(md5(v::varchar)))"
-        for args in ("v, k", "v, k, iv", "v, k, iv, aad", "v, k, iv, aad, mode")),
     # A float cast to an integer rounds half away from zero (2.5 -> 3). DuckDB rounds half to even.
     # Snowflake reads text as a NUMBER with a bare exponent mark ('12e' is 12, '.e' and '.' are 0); DOUBLE does not.
     # The text DuckDB can read instead, or NULL when it reads the text as it is
@@ -421,6 +516,7 @@ _RENAMED = {  # Snowflake function -> macro, same arguments
     "soundex": "_sf_soundex", "parse_url": "_sf_parse_url", "parse_ip": "_sf_parse_ip",
     "get_ignore_case": "_sf_get_ignore_case", "object_keys": "_sf_object_keys", "hash_agg": "_sf_hash_agg",
     "try_hex_decode_string": "_sf_try_hex", "encrypt_raw": "_sf_encrypt_raw",
+    "decrypt_raw": "_sf_decrypt_raw", "try_decrypt_raw": "_sf_try_decrypt_raw",
     **{f"is_{k}": f"_sf_is_{k}" for k in ("date", "time", "timestamp_ntz", "timestamp_ltz", "timestamp_tz")},
     **{f"as_{k}": f"_sf_as_{k}" for k in ("date", "time", "timestamp_ntz", "timestamp_ltz", "timestamp_tz", "double", "real",
                                           "number", "decimal", "boolean", "object", "array")}, "upper": "_sf_upper", "ucase": "_sf_upper",
@@ -959,6 +1055,8 @@ def _fix(node: exp.Expression) -> exp.Expression:
         return exp.cast(exp.UnixToTime(this=exp.Literal.number(node.expressions[0].name)), "date")
     if isinstance(node, exp.Func) and not isinstance(node, exp.Anonymous):
         renamed = next((_RENAMED[n.lower()] for n in type(node).sql_names() if n.lower() in _RENAMED), None)
+        if renamed == "_sf_decrypt_raw" and node.args.get("safe"):
+            renamed = "_sf_try_decrypt_raw"  # (sqlglot reads TRY_DECRYPT_RAW as DECRYPT_RAW, marked safe)
         if renamed:
             return _fn(renamed, *_func_args(node))
     if isinstance(node, exp.SHA2) and isinstance(node.args.get("length"), exp.Literal) and node.args["length"].name not in ("256", ""):
@@ -1397,9 +1495,45 @@ def _undefined_in_arrays(transformed: exp.Expression) -> None:
         access.replace(exp.Nullif(this=access.copy(), expression=other))
 
 
+def _cased_twins(transformed: exp.Expression) -> None:
+    """`select "Metric_Name" from (select 1 as metric_name, 2 as "Metric_Name")`: two columns Snowflake tells apart
+    by their case, which DuckDB takes for one (the first). The second is renamed where it is made and where it is read."""
+    if not any(i.quoted and i.this != i.this.upper() for i in transformed.find_all(exp.Identifier)):
+        return
+    from sqlglot.optimizer.scope import Scope, traverse_scope
+
+    def target(ident: exp.Identifier) -> str:
+        return ident.this if ident.quoted else ident.this.upper()
+
+    for scope in traverse_scope(transformed):
+        for name, (_node, source) in scope.selected_sources.items():
+            if not isinstance(source, Scope) or not isinstance(source.expression, exp.Select):
+                continue
+            seen: dict[str, str] = {}
+            renamed: dict[str, str] = {}
+            for e in source.expression.expressions:
+                if not (isinstance(e, exp.Alias) and isinstance(e.args.get("alias"), exp.Identifier)):
+                    continue
+                said = target(e.args["alias"])
+                if said.lower() in seen and seen[said.lower()] != said:
+                    renamed[said] = f"{said}_fx{len(renamed) + 1}"
+                    e.set("alias", exp.to_identifier(renamed[said], quoted=True))
+                else:
+                    seen.setdefault(said.lower(), said)
+            if not renamed:
+                continue
+            for ref in scope.columns:
+                if isinstance(ref.this, exp.Identifier) and target(ref.this) in renamed and (not ref.table or ref.table.upper() == name.upper()):
+                    original = target(ref.this)
+                    ref.set("this", exp.to_identifier(renamed[original], quoted=True))
+                    if ref.parent is scope.expression and ref in scope.expression.expressions:
+                        ref.replace(exp.alias_(ref.copy(), exp.to_identifier(original, quoted=True)))
+
+
 def finish(transformed: exp.Expression) -> exp.Expression:
     """Fix-ups on the DuckDB side of the translation."""
     transformed = balance_chains(transformed)
+    _cased_twins(transformed)
     _undefined_in_arrays(transformed)
     _number_texts(transformed)
     for agg in list(transformed.find_all(exp.ArrayAgg)):
@@ -2227,6 +2361,121 @@ def days_added_to_aggregates(transformed: exp.Expression, conn) -> exp.Expressio
             continue
         call.replace(exp.cast(added.copy(), "date") if str(kind).upper() == "DATE" else added.copy())
     return transformed
+
+
+MIXED_CASE: set[str] = set()  # the names, in lower case, of columns somewhere named in other than upper case
+
+
+def learn_names(transformed: exp.Expression, conn=None) -> None:  # noqa: ANN001
+    """Keep in MIXED_CASE the names a statement may give columns in other than upper case (a quoted name), and,
+    given a connection, those of the columns already there."""
+    if conn is not None:
+        MIXED_CASE.update(name.lower() for (name,) in conn.execute(
+            "select distinct column_name from duckdb_columns() where column_name <> upper(column_name) and not internal "
+            "and database_name not in ('system', 'temp') and lower(schema_name) not in ('information_schema', 'pg_catalog') "
+            "and not starts_with(lower(database_name), '_fs') and not starts_with(lower(schema_name), '_fs')").fetchall())
+    if isinstance(transformed, (exp.Create, exp.Alter)):
+        MIXED_CASE.update(i.this.lower() for i in transformed.find_all(exp.Identifier) if i.quoted and i.this != i.this.upper())
+
+
+def misnamed_column(transformed: exp.Expression, conn) -> str | None:  # noqa: ANN001
+    """Snowflake keeps a quoted name as written and makes an unquoted one upper case: `"Metric_Name"` is not the
+    column METRIC_NAME, nor `metric_name` the column "Metric_Name". DuckDB matches names in any case, so the query
+    would run where Snowflake's fails. Gives Snowflake's error for a column that the relations it may come from
+    (tables, subqueries, CTEs, VALUES, FLATTEN) have only in another case."""
+    from sqlglot.optimizer.scope import Scope, traverse_scope
+
+    def target(ident: exp.Identifier) -> str:
+        return ident.this if ident.quoted else ident.this.upper()
+
+    refs = [c for c in transformed.find_all(exp.Column) if isinstance(c.this, exp.Identifier) and c.this.this
+            and not c.this.this.lower().startswith(("_fs", "_fx", "_sf"))]
+    said = {i.this.lower() for i in transformed.find_all(exp.Identifier) if i.quoted and i.this != i.this.upper()}
+    if not any(target(c.this) != c.this.this.upper() or c.this.this.lower() in MIXED_CASE or c.this.this.lower() in said
+               for c in refs):
+        return None  # (the common statement: every name upper case on both sides)
+    internal = ("_fs", "information_schema", "pg_catalog", "duckdb_", "system", "temp")
+    if any(p.lower().startswith(internal) for t in transformed.find_all(exp.Table) for p in (t.name, t.db, t.catalog) if p):
+        return None  # (the emulator's own statements, over DuckDB's catalog: its names are lower case)
+
+    def stored(table: exp.Table) -> set[str] | None:
+        rows = conn.execute(
+            "select column_name from duckdb_columns() where lower(table_name) = lower(?) "
+            "and lower(schema_name) = lower(coalesce(?, current_schema())) "
+            "and lower(database_name) = lower(coalesce(?, current_database()))",
+            [table.name, table.db or None, table.catalog or None]).fetchall()
+        return {name for (name,) in rows} or None
+
+    def outputs(node: exp.Expression) -> set[str] | None:
+        """The names of the columns a query gives, or None when they cannot be told (a `*`)."""
+        if isinstance(node, exp.SetOperation):
+            return outputs(node.left)
+        if isinstance(node, exp.Subquery):
+            return outputs(node.this)
+        if isinstance(node, exp.Values):
+            alias = node.args.get("alias")
+            listed = alias.columns if isinstance(alias, exp.TableAlias) else []
+            width = len(node.expressions[0].expressions) if node.expressions and isinstance(node.expressions[0], exp.Tuple) else 1
+            return {target(c) for c in listed} if listed else {f"COLUMN{i + 1}" for i in range(width)}
+        if not isinstance(node, exp.Select):
+            return None
+        names = set()
+        for e in node.expressions:
+            if isinstance(e, exp.Alias) and isinstance(e.args.get("alias"), exp.Identifier):
+                names.add(target(e.args["alias"]))
+            elif isinstance(e, exp.Column) and isinstance(e.this, exp.Identifier):
+                names.add(target(e.this))
+            elif e.find(exp.Star):
+                return None
+        return names
+
+    def known(source) -> set[str] | None:  # noqa: ANN001
+        if isinstance(source, Scope):
+            inner = source.expression
+            call = inner.this if isinstance(inner, exp.Table) else None
+            if isinstance(call, exp.Func) and re.search("flatten|explode", call.name if isinstance(call, exp.Anonymous) else call.sql_name(), re.I):
+                return {"SEQ", "KEY", "PATH", "INDEX", "VALUE", "THIS"}
+            return outputs(inner)
+        if isinstance(source, exp.Table):
+            alias = source.args.get("alias")
+            if isinstance(alias, exp.TableAlias) and alias.columns:
+                return {target(c) for c in alias.columns}
+            if not isinstance(source.this, exp.Identifier):  # a table function
+                name = (source.this.name if isinstance(source.this, exp.Anonymous) else source.this.sql_name()) if isinstance(source.this, exp.Func) else ""
+                return {"SEQ", "KEY", "PATH", "INDEX", "VALUE", "THIS"} if "flatten" in name.lower() else None
+            return stored(source)
+        if isinstance(source, (exp.Values, exp.Subquery)):
+            return outputs(source)
+        return None
+
+    for scope in traverse_scope(transformed):
+        sources = {}
+        for name, (_node, source) in scope.selected_sources.items():
+            try:
+                sources[name.upper()] = known(source)
+            except Exception:  # noqa: BLE001 - a relation that cannot be looked up is not checked
+                sources[name.upper()] = None
+        lateral = {target(e.args["alias"]) for e in getattr(scope.expression, "expressions", [])
+                   if isinstance(e, exp.Alias) and isinstance(e.args.get("alias"), exp.Identifier)}
+        for ref in scope.columns:
+            if not isinstance(ref.this, exp.Identifier) or ref.this.this.lower().startswith(("_fs", "_fx", "_sf")):
+                continue
+            wanted = target(ref.this)
+            if ref.table:
+                places = [sources.get(ref.table.upper())] if ref.table.upper() in sources else [None]
+            else:
+                places = [*sources.values(), lateral or set()]
+            if not places or any(p is None for p in places) or any(wanted in p for p in places):
+                continue
+            if not any(wanted.lower() == n.lower() for p in places for n in p):
+                continue  # (not a name of these relations in any case: a column of an outer query, left to DuckDB)
+            shown = '"' + ref.this.this + '"' if ref.this.quoted else ref.this.this.upper()
+            meta = ref.this.meta or {}
+            where = ""
+            if "line" in meta and "col" in meta:
+                where = f"error line {meta['line']} at position {max(0, meta['col'] - len(ref.this.this) - (2 if ref.this.quoted else 0))}\n"
+            return f"SQL compilation error: {where}invalid identifier '{shown}'"
+    return None
 
 
 def union_text_kinds(transformed: exp.Expression, conn) -> exp.Expression:  # noqa: ANN001

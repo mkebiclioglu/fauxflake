@@ -679,6 +679,10 @@ def _patch_fakesnow() -> None:
                                        errno=2003, sqlstate="42S02") from e
             raise
         except Exception as e:  # noqa: BLE001
+            said = re.search(r"\x1ffxerr:(\d+):(\w+):(.*?)\x1f", str(e), re.S)
+            if said:  # an error of Snowflake's, raised by one of the emulator's functions
+                self._sqlstate = said[2]
+                raise ProgrammingError(msg=said[3], errno=int(said[1]), sqlstate=said[2]) from e
             # Anything else would surface as an HTTP 500, which the Snowflake
             # connector retries for minutes. Fail the statement immediately instead.
             self._sqlstate = "XX000"
@@ -1048,6 +1052,17 @@ def _patch_fakesnow() -> None:
             if clock is not None:
                 clock["adjust"] += time.monotonic() - began
             _heal(self)  # a probe that failed inside a transaction aborted it
+            if isinstance(transformed, (exp.Select, exp.Create, exp.Insert, exp.Union)):
+                try:
+                    if not getattr(self._conn, "_fx_names_learned", False):
+                        semantics.learn_names(transformed, self._duck_conn)
+                        self._conn._fx_names_learned = True
+                    misnamed = semantics.misnamed_column(transformed, self._duck_conn)
+                except Exception:  # noqa: BLE001 - a check of its own that fails leaves the statement to run
+                    misnamed = None
+                if misnamed:
+                    raise ProgrammingError(msg=misnamed, errno=904, sqlstate="42000")
+            semantics.learn_names(transformed)
             remedies = {
                 "times": lambda e: semantics.numbers_as_times(transformed, e) or semantics.offsets_as_written(transformed, e),
                 "by_name": lambda e: semantics.view_past_a_schema_named_like_a_database(transformed, e),

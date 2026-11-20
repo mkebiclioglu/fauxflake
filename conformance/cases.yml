@@ -886,3 +886,30 @@
 - {id: undefined_14, sql: "select '#' || to_json(array_construct(array_construct(null, 1), 2))"}
 - {id: undefined_15, sql: "select array_construct(null, 1)"}
 - {id: undefined_16, sql: "select '#' || array_slice(array_construct(1, null, 2), 0, 2)::varchar"}
+# Recorded 2026-11-19. ENCRYPT_RAW and DECRYPT_RAW are AES as Snowflake does it, with its errors.
+- {id: aes_1, sql: "select encrypt_raw(to_binary('abc', 'utf-8'), to_binary('A1B2C3D4E5F60718', 'hex'), to_binary('416C736F4E637265FFFFFFAB', 'hex'))"}
+- {id: aes_2, sql: "select '#' || encrypt_raw(to_binary('abc', 'utf-8'), to_binary('A1B2C3D4E5F60718A1B2C3D4E5F60718', 'hex'), to_binary('416C736F4E637265FFFFFFAB', 'hex'))::varchar"}
+- {id: aes_3, sql: "select encrypt_raw(to_binary('abc', 'utf-8'), to_binary('A1B2C3D4E5F60718A1B2C3D4E5F60718', 'hex'), to_binary('416C736F4E637265FFFFFFAB', 'hex'))['ciphertext']::varchar, encrypt_raw(to_binary('abc', 'utf-8'), to_binary('A1B2C3D4E5F60718A1B2C3D4E5F60718', 'hex'), to_binary('416C736F4E637265FFFFFFAB', 'hex'), to_binary('6161', 'hex'))['tag']::varchar"}
+- {id: aes_4, sql: "select encrypt_raw(to_binary('abc', 'utf-8'), to_binary('A1B2C3D4E5F60718A1B2C3D4E5F60718', 'hex'), to_binary('416C736F4E637265FFFFFFAB416C736F', 'hex'))"}
+- {id: aes_5, sql: "select '#' || encrypt_raw(to_binary('abc', 'utf-8'), to_binary('A1B2C3D4E5F60718A1B2C3D4E5F60718', 'hex'), to_binary('416C736F4E637265FFFFFFAB416C736F', 'hex'), null, 'AES-CBC')::varchar, '#' || encrypt_raw(to_binary('abc', 'utf-8'), to_binary('A1B2C3D4E5F60718A1B2C3D4E5F60718', 'hex'), to_binary('416C736F4E637265FFFFFFAB416C736F', 'hex'), null, 'aes-ctr')::varchar"}
+- {id: aes_6, sql: "select '#' || encrypt_raw(to_binary('abc', 'utf-8'), to_binary('A1B2C3D4E5F60718A1B2C3D4E5F60718', 'hex'), null, null, 'AES-ECB')::varchar"}
+- {id: aes_7, sql: "select encrypt_raw(to_binary('abc', 'utf-8'), to_binary('A1B2C3D4E5F60718A1B2C3D4E5F60718', 'hex'), to_binary('416C736F4E637265FFFFFFAB416C736F', 'hex'), null, 'AES-ECB')"}
+- {id: aes_8, sql: "select encrypt_raw(to_binary('abc', 'utf-8'), to_binary('A1B2C3D4E5F60718A1B2C3D4E5F60718', 'hex'), to_binary('416C736F4E637265FFFFFFAB416C736F', 'hex'), null, 'AES-CBC-NOPAD')"}
+- {id: aes_9, sql: "select encrypt_raw(null, to_binary('A1B2C3D4E5F60718A1B2C3D4E5F60718', 'hex'), to_binary('416C736F4E637265FFFFFFAB', 'hex')) is null, encrypt_raw(to_binary('abc', 'utf-8'), null, to_binary('416C736F4E637265FFFFFFAB', 'hex')) is null, length(encrypt_raw(to_binary('abc', 'utf-8'), to_binary('A1B2C3D4E5F60718A1B2C3D4E5F60718', 'hex'), null)['iv']::varchar)"}
+- {id: aes_10, sql: "select encrypt_raw(to_binary('abc', 'utf-8'), to_binary('A1B2C3D4E5F60718A1B2C3D4E5F60718A1B2C3D4E5F60718A1B2C3D4E5F60718', 'hex'), to_binary('416C736F4E637265FFFFFFAB', 'hex'))['ciphertext']::varchar"}
+- {id: aes_11, sql: "select to_varchar(decrypt_raw(to_binary('4C63E1', 'hex'), to_binary('A1B2C3D4E5F60718A1B2C3D4E5F60718', 'hex'), to_binary('416C736F4E637265FFFFFFAB', 'hex'), null, 'AES-GCM', to_binary('170405AF3FCA2A1955906C0786241DEF', 'hex')), 'utf-8')"}
+- {id: aes_12, sql: "select decrypt_raw(to_binary('4C63E1', 'hex'), to_binary('A1B2C3D4E5F60718A1B2C3D4E5F60718', 'hex'), to_binary('416C736F4E637265FFFFFFAB', 'hex'), null, 'AES-GCM', to_binary('00', 'hex'))"}
+- {id: aes_13, sql: "select decrypt_raw(to_binary('4C63E2', 'hex'), to_binary('A1B2C3D4E5F60718A1B2C3D4E5F60718', 'hex'), to_binary('416C736F4E637265FFFFFFAB', 'hex'), null, 'AES-GCM', to_binary('170405AF3FCA2A1955906C0786241DEF', 'hex'))"}
+- {id: aes_14, sql: "select try_decrypt_raw(to_binary('4C63E2', 'hex'), to_binary('A1B2C3D4E5F60718A1B2C3D4E5F60718', 'hex'), to_binary('416C736F4E637265FFFFFFAB', 'hex'), null, 'AES-GCM', to_binary('170405AF3FCA2A1955906C0786241DEF', 'hex')) is null"}
+- {id: aes_15, sql: "select to_varchar(decrypt_raw(to_binary('333B87D9E667DC5D26FDA68083B606E9', 'hex'), to_binary('A1B2C3D4E5F60718A1B2C3D4E5F60718', 'hex'), to_binary('416C736F4E637265FFFFFFAB416C736F', 'hex'), null, 'AES-CBC'), 'utf-8'), to_varchar(decrypt_raw(to_binary('A02E183EF193333F22590803BEA35895', 'hex'), to_binary('A1B2C3D4E5F60718A1B2C3D4E5F60718', 'hex'), null, null, 'AES-ECB'), 'utf-8')"}
+- {id: aes_16, sql: "select to_varchar(decrypt_raw(encrypt_raw(to_binary('abc', 'utf-8'), to_binary('A1B2C3D4E5F60718A1B2C3D4E5F60718', 'hex'), null)['ciphertext']::varchar::binary, to_binary('A1B2C3D4E5F60718A1B2C3D4E5F60718', 'hex'), encrypt_raw(to_binary('abc', 'utf-8'), to_binary('A1B2C3D4E5F60718A1B2C3D4E5F60718', 'hex'), null)['iv']::varchar::binary), 'utf-8')"}
+- {id: aes_17, sql: "select sha2(lower(trim('a' || encrypt_raw(to_binary('salt', 'utf-8'), to_binary('A1B2C3D4E5F60718A1B2C3D4E5F60718', 'hex'), to_binary('416C736F4E637265FFFFFFAB', 'hex'))['ciphertext']::varchar)))"}
+# Recorded 2026-11-19. A quoted name is that name in its case; an unquoted one is upper case.
+- {id: quoted_case_1, sql: "select \"Metric_Name\" from (select 1 as metric_name)"}
+- {id: quoted_case_2, sql: "select \"METRIC_NAME\", metric_name, \"Metric_Name\" from (select 1 as metric_name, 2 as \"Metric_Name\")"}
+- {id: quoted_case_3, sql: "select start from (select 1 as \"start\")"}
+- {id: quoted_case_4, sql: "with c as (select 1 as \"Mixed\") select \"Mixed\" from c"}
+- {id: quoted_case_5, sql: "with c as (select 1 as \"Mixed\") select mixed from c"}
+- {id: quoted_case_6, sql: "select \"column1\" from values (1)"}
+- {id: quoted_case_7, sql: "select \"Value\" from table(flatten(input => parse_json('[1]')))"}
+- {id: quoted_case_8, sql: "select t.\"Metric_Name\" from (select 1 as metric_name) t"}

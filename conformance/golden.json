@@ -9,6 +9,102 @@
    ]
   ]
  },
+ "aes_1": {
+  "error": "100304 (22023): Key size of 64 bits not found for encryption algorithm AES"
+ },
+ "aes_10": {
+  "rows": [
+   [
+    "44E1F0"
+   ]
+  ]
+ },
+ "aes_11": {
+  "rows": [
+   [
+    "abc"
+   ]
+  ]
+ },
+ "aes_12": {
+  "error": "100309 (22023): Wrong AEAD tag size. Expected 16, but got 1"
+ },
+ "aes_13": {
+  "error": "100311 (22023): Decryption failed. Check encrypted data, key, AAD, or AEAD tag."
+ },
+ "aes_14": {
+  "rows": [
+   [
+    true
+   ]
+  ]
+ },
+ "aes_15": {
+  "rows": [
+   [
+    "abc",
+    "abc"
+   ]
+  ]
+ },
+ "aes_16": {
+  "error": "100308 (22023): Decryption mode requires an AEAD tag as parameter"
+ },
+ "aes_17": {
+  "rows": [
+   [
+    "9a0109dae783bafd0c6a31a3307d4a547c2be9924c96ba5fe315bee5d884734d"
+   ]
+  ]
+ },
+ "aes_2": {
+  "rows": [
+   [
+    "#{\"ciphertext\":\"4C63E1\",\"iv\":\"416C736F4E637265FFFFFFAB\",\"tag\":\"170405AF3FCA2A1955906C0786241DEF\"}"
+   ]
+  ]
+ },
+ "aes_3": {
+  "rows": [
+   [
+    "4C63E1",
+    "876BE7BEE10F5015587355D168FFE071"
+   ]
+  ]
+ },
+ "aes_4": {
+  "error": "100303 (22023): IV/Nonce of size 128 bits needs to be of size of 96 bits for encryption mode GCM"
+ },
+ "aes_5": {
+  "rows": [
+   [
+    "#{\"ciphertext\":\"333B87D9E667DC5D26FDA68083B606E9\",\"iv\":\"416C736F4E637265FFFFFFAB416C736F\"}",
+    "#{\"ciphertext\":\"E3995A\",\"iv\":\"416C736F4E637265FFFFFFAB416C736F\"}"
+   ]
+  ]
+ },
+ "aes_6": {
+  "rows": [
+   [
+    "#{\"ciphertext\":\"A02E183EF193333F22590803BEA35895\",\"iv\":null}"
+   ]
+  ]
+ },
+ "aes_7": {
+  "error": "100303 (22023): IV/Nonce of size 128 bits needs to be of size of 0 bits for encryption mode ECB"
+ },
+ "aes_8": {
+  "error": "100302 (22023): Malformed encryption method parameter: AES-CBC-NOPAD"
+ },
+ "aes_9": {
+  "rows": [
+   [
+    true,
+    true,
+    "24"
+   ]
+  ]
+ },
  "age_months": {
   "rows": [
    [
@@ -6708,6 +6804,40 @@
     "5"
    ]
   ]
+ },
+ "quoted_case_1": {
+  "error": "000904 (42000): SQL compilation error: error line 1 at position 7"
+ },
+ "quoted_case_2": {
+  "rows": [
+   [
+    "1",
+    "1",
+    "2"
+   ]
+  ]
+ },
+ "quoted_case_3": {
+  "error": "001003 (42000): SQL compilation error:"
+ },
+ "quoted_case_4": {
+  "rows": [
+   [
+    "1"
+   ]
+  ]
+ },
+ "quoted_case_5": {
+  "error": "000904 (42000): SQL compilation error: error line 1 at position 39"
+ },
+ "quoted_case_6": {
+  "error": "000904 (42000): SQL compilation error: error line 1 at position 7"
+ },
+ "quoted_case_7": {
+  "error": "000904 (42000): SQL compilation error: error line 1 at position 7"
+ },
+ "quoted_case_8": {
+  "error": "000904 (42000): SQL compilation error: error line 1 at position 7"
  },
  "quoted_identifiers": {
   "rows": [
