@@ -1031,11 +1031,33 @@ _CLOCK_CALLS = {exp.CurrentDate: "_fx_current_date", exp.CurrentTimestamp: "_fx_
                 exp.CurrentTime: "_fx_current_time", exp.Localtime: "_fx_localtime", exp.Localtimestamp: "_fx_localtimestamp"}
 
 
+def _secure_with(create: exp.Create) -> bool:
+    props = create.args.get("properties")
+    body = create.expression.unnest() if create.expression is not None else None
+    return bool(props and any(isinstance(p, exp.SecureProperty) for p in props.expressions)) \
+        and isinstance(body, exp.Query) and body.args.get("with_") is not None
+
+
+def _fenced(body: exp.Expression | None) -> bool:
+    """The body a secure view that is a WITH is made with (see _fix)."""
+    return isinstance(body, exp.Select) and isinstance(body.args.get("offset"), exp.Offset) \
+        and body.args["offset"].expression.name == "0" and isinstance(body.args.get("from_"), exp.From) \
+        and isinstance(body.args["from_"].this, exp.Subquery) and body.args["from_"].this.this.args.get("with_") is not None
+
+
 def _fix(node: exp.Expression) -> exp.Expression:
     if type(node) in _CLOCK_CALLS and not (isinstance(node, exp.CurrentDate) and node.this is not None):
         # as calls: `select current_date` is named CURRENT_DATE, and DuckDB reads the bare keyword as that name
         # (macros, which sqlglot does not turn back into the keyword when the statement is parsed again)
         return _fn(_CLOCK_CALLS[type(node)])
+    if isinstance(node, exp.Create) and node.kind == "VIEW" and _secure_with(node):
+        # measured: a filter goes no further into a secure view that is a WITH, so its body is evaluated whole (and
+        # fails on what the filter would have kept out). DuckDB pushes the filter in, but not past an OFFSET; and it
+        # drops a filter its statistics say keeps nothing (`is null` of a column with none), but not of a column
+        # whose values it cannot foresee (a CASE on random(), always true: each column as it is, by its own name)
+        fence = sqlglot.parse_one("CASE WHEN RANDOM() < 2 THEN COLUMNS(*) END", read="duckdb")
+        node.set("expression", exp.select(fence).from_(exp.Subquery(this=node.expression.unnest().copy())).offset(0))
+        return node
     target = _try_target(node) or _try_anonymous_target(node)
     if target and not (isinstance(node.this, exp.Anonymous) and node.this.name == _NS + "_sf_try_input"):
         # TRY_CAST and the TRY_TO_ functions take text (or the target type itself, for a few): anything else is an error
@@ -3040,7 +3062,7 @@ def pruned_nulls(transformed: exp.Expression, conn) -> exp.Expression | None:  #
             if row:
                 parsed = sqlglot.parse_one(row[0], read="duckdb")
                 body = parsed.expression if isinstance(parsed, exp.Create) else None
-                if isinstance(body, exp.Query) and body.args.get("with_") is not None and conn.execute(
+                if isinstance(body, exp.Query) and (body.args.get("with_") is not None or _fenced(body)) and conn.execute(
                         f"select count(*) from {_NS}_fx_secure_views where view_name = upper(?) "
                         "and schema_name = upper(coalesce(?, current_schema())) and database_name = upper(coalesce(?, current_database()))",
                         [table.name, table.db or None, table.catalog or None]).fetchone()[0]:

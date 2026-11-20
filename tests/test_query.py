@@ -242,6 +242,11 @@ def test_a_conversion_of_a_column_without_nulls_is_never_null_and_is_not_made():
             cur.execute("select count(*) from sw where n is null").fetchall()
         cur.execute("create or replace view sw as with s as (select * from v) select n from s")
         assert count("select count(*) from sw where n is null") == 0
+        # nor does DuckDB's own filter get in: a join that fails on every row, under a filter that keeps none of them
+        # (GitLab's dim_charge_central_sandbox: Snowflake fails its not_null test)
+        cur.execute("create secure view sj as with a as (select t.x as k from t join t u on t.x::number = u.i) select k from a")
+        with pytest.raises(ProgrammingError):
+            cur.execute("select count(*) from sj where k is null").fetchall()
 
 
 def test_a_view_that_converts_a_timestamp_to_a_number_is_refused_when_it_is_created():
