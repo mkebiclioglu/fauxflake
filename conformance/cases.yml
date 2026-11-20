@@ -605,7 +605,7 @@
 - {id: fn_sign_3, sql: "select SIGN(2.5)"}
 - {id: fn_sin, sql: "select SIN(2.5::float)"}
 - {id: fn_sinh, sql: "select SINH(2.5::float)"}
-- {id: fn_skew, sql: "select SKEW(column1) from values (7), (2), (7)", gap: "answers differently"}
+- {id: fn_skew, sql: "select SKEW(column1) from values (7), (2), (7)"}
 - {id: fn_skew_2, sql: "select SKEW(column1) from values (2.5::float), (0.5::float), (2.5::float)"}
 - {id: fn_snowpark_conv, sql: "select SNOWPARK_CONV('abc', 7, 2)", gap: "not in the emulator"}
 - {id: fn_snowpark_conv_2, sql: "select SNOWPARK_CONV(7, 2, 2)", gap: "not in the emulator"}
@@ -1098,3 +1098,12 @@
 - {id: parse_url_more_15, sql: "select '#' || parse_url('https://h.com/p?a=&b')::varchar"}
 - {id: parse_url_more_16, sql: "select '#' || parse_url('x:y')::varchar"}
 - {id: parse_url_more_17, sql: "select '#' || parse_url('1http://h')::varchar"}
+- {id: skew_1, sql: "select skew(column1) from values (1), (2), (10), (4)"}
+- {id: skew_2, sql: "select skew(column1::number(10,2)) from values ('7'), ('2'), ('7')"}
+- {id: skew_3, sql: "select round(skew(column1), 9) from values (1.5), (2.25), (10.125), (4.0)"}
+- {id: skew_4, sql: "select skew(column1) from values (1), (1), (1)"}
+- {id: skew_5, sql: "select skew(column1) from values (1), (2)"}
+- {id: skew_6, sql: "select g, skew(x) over (partition by g) from (select column1 x, column2 g from values (7,1),(2,1),(7,1),(1,2),(2,2),(10,2)) order by g"}
+- {id: skew_7, sql: "select round(skew(column1), 8) from values (1000001), (1000002), (1000010)"}
+- {id: skew_8, sql: "select kurtosis(column1) from values (1), (1), (1), (1)"}
+- {id: skew_9, sql: "select round(kurtosis(column1), 9), round(kurtosis(column1::float), 9) from values (7), (2), (7), (1)"}

@@ -349,6 +349,22 @@ MACROS = [
           when typeof(a) in ('DOUBLE', 'FLOAT') then v else round(v, least(2 * {_SCALE} + 6, 12)) end""",
     f"""create or replace macro {_NS}_sf_std(v, a) as case
           when typeof(a) in ('DOUBLE', 'FLOAT') or {_SCALE} > 0 then sqrt(v) else sqrt(round(v, 6)) end""",
+    f"""create or replace macro {_NS}_sf_skew_fixed(g, m2, n, d, kv) as n * sqrt(n - 1) / (n - 2)
+          * (g * pow(m2, 1.5) * (n - 2) / (n * sqrt(n - 1)) + 3 * d * m2 + n * d * d * d)
+          / pow(trunc((m2 + n * d * d) / (n - 1) * pow(10, kv)) / pow(10, kv) * (n - 1), 1.5)""",
+    # SKEW of fixed-point input is taken around the mean as AVG gives it (rounded: 6 more decimals, 3 in a window)
+    # with the variance cut to VARIANCE's scale (measured: 7, 2, 7 gives -1.732049872261, not -1.732050807569).
+    # g, v and mu are DuckDB's skewness, var_samp and avg; d is how far the rounded mean is from the true one.
+    f"""create or replace macro {_NS}_sf_skew(g, v, mu, n, a, w) as case
+          when n < 3 then null
+          when v = 0 then error(chr(31) || 'fxerr:100051:22012:Division by zero' || chr(31))::double
+          when typeof(a) in ('DOUBLE', 'FLOAT') then g
+          else {_NS}_sf_skew_fixed(g, v * (n - 1), n,
+                 mu - round(mu, case when w then {_SCALE} + 3 else greatest({_SCALE}, least({_SCALE} + 6, 12)) end),
+                 least(2 * {_SCALE} + 6, 12)) end""",
+    f"""create or replace macro {_NS}_sf_kurtosis(k, v, n) as case
+          when n < 4 then null when v = 0 then error(chr(31) || 'fxerr:100051:22012:Division by zero' || chr(31))::double
+          else k end""",
     # Casting keeps the left operand's type: DATE + INTERVAL '1 month' is still a DATE.
     f"""create or replace macro {_NS}_sf_like
           (x date, r timestamp) as r::date,
@@ -768,6 +784,17 @@ def _avg(avg: exp.Avg, window: exp.Window | None = None) -> exp.Expression:
         ifs=[exp.If(this=exp.EQ(this=count, expression=exp.Literal.number(0)), true=exp.Null())],
         default=_fn("_sf_div", total, count.copy()),
     )
+
+
+def _moment(node: exp.Skewness | exp.Kurtosis, window: exp.Window | None = None) -> exp.Expression:
+    """SKEW and KURTOSIS with Snowflake's rounding and its refusal of a column with no spread."""
+    x = node.this
+    agg = lambda kind, arg=None: _over(window, kind(this=(arg or x).copy()))  # noqa: E731
+    v, n = agg(exp.Variance), agg(exp.Count)
+    if isinstance(node, exp.Kurtosis):
+        return _fn("_sf_kurtosis", agg(exp.Kurtosis), v, n)
+    return _fn("_sf_skew", agg(exp.Skewness), v, agg(exp.Avg, exp.cast(x.copy(), "double")), n, agg(exp.Min),
+               exp.Boolean(this=window is not None))
 
 
 _ARRAYS = {  # array function -> macro and the arguments it takes, in order
@@ -1386,6 +1413,8 @@ def _fix(node: exp.Expression) -> exp.Expression:
         return exp.cast(node, "bigint")  # a position, as a NUMBER: DuckDB sums list lengths into a HUGEINT
     if isinstance(node, (exp.Variance, exp.VariancePop)) and not isinstance(node.parent, exp.Window):
         return _fn("_sf_var", node, exp.Min(this=node.this.copy()))
+    if isinstance(node, (exp.Skewness, exp.Kurtosis)) and not isinstance(node.parent, exp.Window):
+        return _moment(node)
     if isinstance(node, (exp.Stddev, exp.StddevSamp)) and not isinstance(node.parent, exp.Window):
         return _fn("_sf_std", exp.Variance(this=node.this.copy()), exp.Min(this=node.this.copy()))
     if isinstance(node, exp.StddevPop) and not isinstance(node.parent, exp.Window):
@@ -1478,6 +1507,8 @@ def _fix(node: exp.Expression) -> exp.Expression:
         return _avg(node)
     if isinstance(node, exp.Window):
         inner = node.this
+        if isinstance(inner, (exp.Skewness, exp.Kurtosis)):
+            return _moment(inner, node)
         if isinstance(inner, exp.Avg):
             return _fn("_sf_div3", _over(node, exp.Sum(this=inner.this.copy())), _over(node, exp.Count(this=inner.this.copy())))
         if isinstance(inner, exp.Anonymous) and inner.expressions:
