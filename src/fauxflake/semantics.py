@@ -324,6 +324,7 @@ MACROS = [
           (p varchar, x date) as date_trunc(p, x)::date,
           (p, x) as date_trunc(p, x::timestamp)""",
     f"create table if not exists {_NS}_fx_session as select 'SYSADMIN' as role",
+    f"create table if not exists {_NS}_fx_secure_views (database_name varchar, schema_name varchar, view_name varchar)",
     f"create or replace macro {_NS}_sf_current_role() as (select role from {_NS}_fx_session)",
     # GET_DDL: the statement DuckDB keeps for the object (DuckDB types, not Snowflake's).
     f"""create or replace macro {_NS}_sf_get_ddl(kind, name) as (
@@ -811,11 +812,33 @@ def _binary_like(node: exp.Expression) -> bool:
     return isinstance(node, exp.Anonymous) and "binary" in str(node.name).lower()
 
 
+_TEXT_MADE = ("_sf_text", "_sf_div_text", "_sf_round_div_text", "_fx_json_sorted")
+
+
+def _known_text(node: exp.Expression) -> bool:
+    """`node` is text as written: a string, `a || b`, CONCAT, COALESCE of text, text cast to text."""
+    node = node.unnest()
+    if isinstance(node, exp.Literal):
+        return node.is_string
+    if isinstance(node, (exp.DPipe, exp.Concat, exp.ConcatWs)) or any(_is(node, name) for name in _TEXT_MADE):
+        return True
+    if isinstance(node, exp.Coalesce):
+        return all(_known_text(a) for a in [node.this, *node.expressions])
+    if isinstance(node, exp.Cast) and node.to.is_type("varchar", "text") and not node.to.expressions:
+        return _known_text(node.this)
+    return False
+
+
 def _text(node: exp.Expression) -> exp.Expression:
     """The value as Snowflake prints it. A division carries its scale into the text."""
     inner = node.unnest()
-    if _is(inner, "_sf_text"):
-        return node  # already text: wrapping again only repeats the argument
+    if isinstance(inner, exp.Cast) and not isinstance(inner, exp.TryCast) and inner.to.is_type("varchar", "text") \
+            and not inner.to.expressions:
+        return _text(inner.this)  # (`x::varchar`, to be made text of x itself)
+    if _known_text(inner):
+        # already text: wrapping again only repeats the argument (_sf_text names it a dozen times, and nested
+        # wrappings multiply: a surrogate key of eleven columns took DuckDB a minute to bind)
+        return node
     if _is(inner, "_sf_div"):
         return _fn("_sf_div_text", *inner.expressions)
     if _average(inner):
@@ -2918,6 +2941,9 @@ def misnamed_column(transformed: exp.Expression, conn, probe: bool = True) -> st
 _CONVERSION = re.compile(r"_(?:sf|fs)_(?:to_(?!.*try)\w+|int|integer|text|number\w*|decimal\w*|double|float|bool\w*|date|time\w*)", re.I)
 
 
+STOPPED = exp.Null()  # (pruned_nulls: a view a filter is not pushed into)
+
+
 def pruned_nulls(transformed: exp.Expression, conn) -> exp.Expression | None:  # noqa: ANN001
     """`select id from orders_v where id is null`, with orders_v converting text to a number (`order_id::number as id`)
     and text that is no number in it: Snowflake answers no rows rather than its conversion error. A conversion is NULL
@@ -2970,6 +2996,11 @@ def pruned_nulls(transformed: exp.Expression, conn) -> exp.Expression | None:  #
             if row:
                 parsed = sqlglot.parse_one(row[0], read="duckdb")
                 body = parsed.expression if isinstance(parsed, exp.Create) else None
+                if isinstance(body, exp.Query) and body.args.get("with_") is not None and conn.execute(
+                        f"select count(*) from {_NS}_fx_secure_views where view_name = upper(?) "
+                        "and schema_name = upper(coalesce(?, current_schema())) and database_name = upper(coalesce(?, current_database()))",
+                        [table.name, table.db or None, table.catalog or None]).fetchone()[0]:
+                    body = STOPPED  # (measured: a filter goes no further into a secure view that is a WITH)
                 if body is not None and table.catalog:  # (its tables are named as the view's database sees them)
                     for t in body.find_all(exp.Table):
                         if t.db and not t.catalog:
@@ -3010,6 +3041,8 @@ def pruned_nulls(transformed: exp.Expression, conn) -> exp.Expression | None:  #
         name = column.name
         if isinstance(source, exp.Table):
             body = view(source)
+            if body is STOPPED:
+                return False
             if body is None:
                 return converted and isinstance(source.this, exp.Identifier) and none_null(source, name)
             inner = traverse_scope(body)

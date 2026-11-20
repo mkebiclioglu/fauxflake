@@ -971,6 +971,23 @@ def remember(cursor) -> None:  # noqa: ANN001
     cursor._conn._fauxflake_last_query = cursor.sfqid
 
 
+_VIEW_MADE = re.compile(_LEAD + r"create\s+(?:or\s+replace\s+)?(?P<secure>secure\s+)?(?:recursive\s+)?view\s+(?:if\s+not\s+exists\s+)?(?P<name>" + _NAME + r")")
+SECURE_VIEWS = "_fs_global.main._fx_secure_views"
+
+
+def note_secure_view(cursor, command: str) -> None:  # noqa: ANN001
+    """A view made secure is kept in SECURE_VIEWS (DuckDB's views forget it): Snowflake reads one differently (see
+    semantics.pruned_nulls). Made again without SECURE, it is no longer one."""
+    made = _VIEW_MADE.match(command)
+    if made is None:
+        return
+    fq = [p.upper() for p in qualified(cursor, made.group("name"))]
+    duck = cursor._duck_conn
+    duck.execute(f"delete from {SECURE_VIEWS} where database_name = ? and schema_name = ? and view_name = ?", fq)
+    if made.group("secure"):
+        duck.execute(f"insert into {SECURE_VIEWS} values (?, ?, ?)", fq)
+
+
 def intercept(cursor, command: str, original):  # noqa: ANN001, ANN201
     """Handle a statement about one of the objects above. Returns None for everything else."""
     head = re.match(_LEAD + r"(\w+)", command)

@@ -693,6 +693,7 @@ def _patch_fakesnow() -> None:
                         TEMPORARY[temporary] = (id(self._conn), made.group("kind"), made.group("name"))
                     objects.consume_streams(self, command)
                     objects.remember(self)
+                    objects.note_secure_view(self, command)
                     _note_empty_lookup(self, command)
                     return done
                 except ProgrammingError as e:
@@ -718,6 +719,7 @@ def _patch_fakesnow() -> None:
             done = original(self, rewrite(command), *args, **kwargs)
             objects.consume_streams(self, command)
             objects.remember(self)
+            objects.note_secure_view(self, command)
             return done
         except ProgrammingError as e:
             if "_fx_refused_conversion" in str(e.msg):  # (the check of what a TRY_ function is given, in a window)

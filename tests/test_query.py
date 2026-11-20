@@ -233,6 +233,15 @@ def test_a_conversion_of_a_column_without_nulls_is_never_null_and_is_not_made():
                 cur.execute(blocked).fetchall()
         assert count("with s as (select * from t qualify row_number() over (partition by x order by i) = 1), "
                      "r as (select x::number as n from s) select count(*) from r where n is null") == 0
+        # a secure view that is a WITH keeps the filter out (GitLab's PII views); one without a WITH does not, and a
+        # view made again without SECURE is an ordinary one
+        cur.execute("create secure view sw as with s as (select * from v) select n from s")
+        cur.execute("create secure view sp as select * from (select n from v)")
+        assert count("select count(*) from sp where n is null") == 0
+        with pytest.raises(ProgrammingError):
+            cur.execute("select count(*) from sw where n is null").fetchall()
+        cur.execute("create or replace view sw as with s as (select * from v) select n from s")
+        assert count("select count(*) from sw where n is null") == 0
 
 
 def test_a_view_that_converts_a_timestamp_to_a_number_is_refused_when_it_is_created():
