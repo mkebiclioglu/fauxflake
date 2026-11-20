@@ -238,6 +238,8 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
             read_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=30)
             seen = (clock[0], clock[1], max(clock[2], read_at), *clock[3:]) if clock else None
         except Exception as e:  # noqa: BLE001 - a view that fails when read (its data): does the emulator's fail too?
+            if _unavailable(e):
+                raise SnowflakeUnavailable(str(e)[:300], out) from e
             try:
                 read = duck.execute(f"select * from {mine}")  # (every column: a count would not evaluate them)
                 while read.fetchmany(50_000):
@@ -367,8 +369,22 @@ def outcomes(project: DbtProject) -> dict[str, tuple[str, str, object]]:
 @dataclass
 class Difference:
     node: str
-    kind: str  # emulator_only_error | snowflake_only_error | test_result | rows | undetermined
+    kind: str  # emulator_only_error | snowflake_only_error | test_result | rows | undetermined | snowflake_unavailable
     detail: str
+
+
+class SnowflakeUnavailable(Exception):  # noqa: N818
+    """Snowflake stopped answering during the comparison (a resource monitor's quota is spent, say): the models
+    not yet read are not compared, rather than each counted as a difference. `rows`: those compared before."""
+
+    def __init__(self, message: str, rows: list | None = None) -> None:
+        super().__init__(message)
+        self.rows = rows or []
+
+
+def _unavailable(e: Exception) -> bool:
+    """090073: the warehouse cannot be resumed (its resource monitor's quota is spent)."""
+    return getattr(e, "errno", None) == 90073 or "resource monitor" in str(e)
 
 
 def differences(local: dict, remote: dict, rows: list[Parity]) -> list[Difference]:
@@ -467,7 +483,9 @@ def _ties(conn, sql: str) -> str | None:  # noqa: ANN001
             try:
                 (tied,) = conn.cursor().execute(query).fetchone()
                 break
-            except Exception:  # noqa: BLE001, S112 - a window that only binds in its place: not asked
+            except Exception as e:  # noqa: BLE001 - a window that only binds in its place: not asked
+                if _unavailable(e):
+                    raise SnowflakeUnavailable(str(e)[:300]) from e
                 continue
         if tied:
             return f"{tied} tied group(s) in {' '.join(win.sql(dialect='snowflake').split())[:160]}"
@@ -714,7 +732,17 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
 
         ids = (_invocation(local), _invocation(remote))
         clock = (emulator.FROZEN_NOW, began, ended, {"local": built_here, "ids": ids}) if emulator.FROZEN_NOW else None
-        rows = compare(conn, wh.emu, local, only=built, clock=clock)
-        undetermined(conn, remote, rows)  # (each model where dbt put it: the same schema on both sides)
-        found = differences(mine, theirs, rows)
+        stopped, rows = None, []
+        try:
+            rows = compare(conn, wh.emu, local, only=built, clock=clock)
+            undetermined(conn, remote, rows)  # (each model where dbt put it: the same schema on both sides)
+        except SnowflakeUnavailable as e:
+            rows = rows or e.rows  # (all of them, when it stopped while ties were looked for)
+            stopped = Difference("(comparison)", "snowflake_unavailable",
+                                 f"Snowflake stopped answering after {len(rows)} model(s) were compared: {e}; the models "
+                                 "not read are not compared, and the differences found are not all checked for ties")
+            log(f"{now:%Y-%m-%d}  {stopped.detail}")
+        found = differences(mine, theirs, rows) + ([stopped] if stopped else [])
+        if stopped:
+            break
     return rows, found

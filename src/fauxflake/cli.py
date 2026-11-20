@@ -280,7 +280,9 @@ def parity(spec_path, project_dir, scale, history, db_path, keep, connection, da
     found_real = [d for d in found if d.kind != "undetermined"]
     click.echo(f"\n{same}/{len(rows)} models built on both engines hold the same rows; {len(found_real)} difference(s)"
                + (f"; {len(loose)} model(s) whose rows the data does not determine (ties in an ordered window: "
-                  "no engine gives the same rows twice)" if loose else ""))
+                  "no engine gives the same rows twice)" if loose else "")
+               + ("; NOT FINISHED: Snowflake stopped answering (see snowflake_unavailable above)"
+                  if any(d.kind == "snowflake_unavailable" for d in found) else ""))
     if report:
         import json as _json
         Path(report).write_text(_json.dumps({"rows": [r.__dict__ for r in rows], "differences": [d.__dict__ for d in found]}, indent=1))

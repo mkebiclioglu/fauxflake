@@ -156,3 +156,34 @@ def test_a_model_is_compared_as_the_role_reads_it_through_its_masking_policy():
         mine = _through_policies(emu, duck, "D", "S", "T", "D.S.T")
         assert duck.execute(f"select * from {mine}").fetchall() == [("***MASKED***", 1)]
         assert _through_policies(emu, duck, "D", "S", "OTHER", "D.S.OTHER") == "D.S.OTHER"
+
+
+def test_a_snowflake_that_stops_answering_stops_the_comparison_instead_of_making_each_model_a_difference():
+    import pytest
+    import snowflake.connector
+    from snowflake.connector.errors import ProgrammingError
+
+    from fauxflake.emulator import serve
+    from fauxflake.parity import SnowflakeUnavailable, _ties, compare
+
+    class Spent:  # a warehouse whose resource monitor's quota is spent
+        def cursor(self):
+            return self
+
+        def execute(self, *_args, **_kwargs):
+            raise ProgrammingError(msg="Warehouse 'WH' cannot be resumed because resource monitor 'CAP' has exceeded its quota.",
+                                   errno=90073, sqlstate="22000")
+
+    class Project:
+        def models(self):
+            return [{"unique_id": "model.p.a", "name": "a", "database": "D", "schema": "S"}]
+
+    with serve() as emu:
+        cur = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S")).cursor()
+        cur.execute("create database if not exists D")
+        cur.execute("create schema if not exists D.S")
+        cur.execute("create or replace table D.S.A as select 1 as n")
+        with pytest.raises(SnowflakeUnavailable):
+            compare(Spent(), emu, Project())
+    with pytest.raises(SnowflakeUnavailable):  # (not "no ties": that would call a difference an engine's)
+        _ties(Spent(), "select row_number() over (partition by u order by d) from t")
