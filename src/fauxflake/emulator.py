@@ -563,6 +563,48 @@ def run_guarded(cursor, work, limit: float | None = None) -> None:  # noqa: ANN0
         raise outcome["error"]
 
 
+def _merge_check(cursor, create: exp.Create) -> tuple[list[int], list[int]] | None:  # noqa: ANN001
+    """The table of a MERGE's candidates, about to be made: it also gets the target's row id, and the WHEN MATCHED
+    clauses that update and that delete are read off the MERGE as written (by their place, as fakesnow numbers them)."""
+    command = getattr(cursor, "_fx_command", None)
+    select = create.expression if isinstance(create.expression, exp.Select) else None
+    if not command or select is None or select.args.get("from_") is None:
+        return None
+    import sqlglot
+
+    try:
+        merge = sqlglot.parse_one(command, read="snowflake")
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(merge, exp.Merge):
+        return None
+    updates, deletes = [], []
+    for i, when in enumerate(merge.args.get("whens") or []):
+        if isinstance(when, exp.When) and when.args.get("matched"):
+            then = when.args.get("then")
+            (updates if isinstance(then, exp.Update) else deletes).append(i)
+    if not updates:
+        return None
+    target = select.args["from_"].this
+    select.append("expressions", exp.alias_(exp.column("rowid", table=target.alias_or_name), "_FX_TARGET_ROW"))
+    return updates, deletes
+
+
+def _refuse_nondeterministic_merge(cursor, ops: tuple[list[int], list[int]], table: str) -> None:  # noqa: ANN001
+    """Snowflake refuses a MERGE that would update one target row from two source rows, or update and delete it
+    (ERROR_ON_NONDETERMINISTIC_MERGE, on by default). DuckDB takes one of them."""
+    updates, deletes = ops
+    listed = lambda xs: ", ".join(str(x) for x in xs) or "-1"  # noqa: E731
+    (twice,) = cursor._duck_conn.execute(
+        f"select count(*) from (select _FX_TARGET_ROW, count(*) filter (where MERGE_OP in ({listed(updates)})) as u, "
+        f"count(*) filter (where MERGE_OP in ({listed(deletes)})) as d from {table} where _FX_TARGET_ROW is not null "
+        "group by 1) where u > 1 or (u >= 1 and d >= 1)").fetchone()
+    if twice:
+        from snowflake.connector.errors import ProgrammingError
+
+        raise ProgrammingError(msg="Duplicate row detected during DML action\nRow Values: [redacted]", errno=100090, sqlstate="42P18")
+
+
 _TO_TIMESTAMP = """
 CREATE OR REPLACE MACRO ${catalog}._fs_to_timestamp(val, scale) AS (
     CASE
@@ -629,6 +671,7 @@ def _patch_fakesnow() -> None:
             self._fauxflake_outer = semantics.outer_flattens(command)
             self._fauxflake_recursive = semantics.outer_flattens(command, "recursive")
             self._fauxflake_paths = semantics.flatten_paths(command)
+            self._fx_command = command if isinstance(command, str) else None
             self._fauxflake_layer, self._fauxflake_inline, self._fauxflake_owners = False, set(), {}
             self._fauxflake_qualify = False
             command = objects.session_functions(self, command)
@@ -972,7 +1015,9 @@ def _patch_fakesnow() -> None:
             # MERGE works through a temporary table, which DuckDB counts as a second database. Inside a
             # transaction it is an ordinary table next to the target, dropped when the transaction ends.
             scratch = [t for t in tree.find_all(exp.Table) if t.name.upper() == "MERGE_CANDIDATES" and not t.db]
+            merging = None
             if scratch and isinstance(tree, exp.Create):
+                merging = _merge_check(self, tree)
                 _drop_scratch(self)  # of an earlier MERGE
                 source = tree.find(exp.From)
                 target = source.this if source is not None and isinstance(source.this, exp.Table) else None
@@ -992,6 +1037,8 @@ def _patch_fakesnow() -> None:
                         properties.set("expressions", [p for p in properties.expressions if not isinstance(p, exp.TemporaryProperty)])
                     # straight to DuckDB: fakesnow's bookkeeping for a new table lives in another database
                     self._duck_conn.execute(tree.sql(dialect="duckdb"))
+                    if merging:
+                        _refuse_nondeterministic_merge(self, merging, ".".join(f'"{p}"' for p in where))
                     if not getattr(conn, "_fauxflake_healing", False):
                         conn.__dict__.setdefault("_fauxflake_journal", []).append((tree.copy(), params))
                     return
@@ -1002,6 +1049,8 @@ def _patch_fakesnow() -> None:
                 _variant_takes_text(self, tree)
             try:
                 original_execute(self, tree, params)
+                if merging:
+                    _refuse_nondeterministic_merge(self, merging, "merge_candidates")
                 if replaced:
                     _built(self, replaced[0])
                 if isinstance(tree, exp.Create):

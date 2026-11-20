@@ -2891,8 +2891,21 @@ def pruned_nulls(transformed: exp.Expression, conn) -> exp.Expression | None:  #
     def through(name: str, scope: Scope, converted: bool, depth: int) -> bool:
         """The column `name` that `scope` gives is (after a conversion when `converted`) one with no NULLs."""
         select = scope.expression
-        if not isinstance(select, exp.Select) or select.args.get("limit") or select.args.get("offset") or select.args.get("fetch"):
+        # (measured: a filter goes no further down than a LIMIT, a GROUP BY, a window whose result is read, or a
+        # QUALIFY whose windows are not partitioned by the column filtered)
+        if not isinstance(select, exp.Select) or select.args.get("limit") or select.args.get("offset") or select.args.get("fetch") \
+                or select.args.get("group"):
             return False
+        windowed = {e.alias_or_name.upper() for e in select.expressions if e.find(exp.Window)}
+        if windowed & {c.name.upper() for c in tree.find_all(exp.Column) if c.find_ancestor(exp.Select) is not select}:
+            return False
+        qualify = select.args.get("qualify")
+        if qualify is not None:
+            source_name = next((e.this.name if isinstance(e, exp.Alias) and isinstance(e.this, exp.Column) else e.name
+                                for e in select.expressions if e.alias_or_name.upper() == name.upper()), name)
+            if not all(any(isinstance(p, exp.Column) and p.name.upper() == source_name.upper() for p in w.args.get("partition_by") or [])
+                       for w in qualify.find_all(exp.Window)):
+                return False
         for e in select.expressions:
             if isinstance(e, exp.Star) or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star)):
                 continue

@@ -225,6 +225,14 @@ def test_a_conversion_of_a_column_without_nulls_is_never_null_and_is_not_made():
                 cur.execute(f"select count(*) from v where {where}").fetchall()
         with pytest.raises(ProgrammingError):
             cur.execute("select count(*) from (select x::number as n from t limit 100) where n is null").fetchall()
+        for blocked in ("with s as (select * from t qualify row_number() over (partition by i order by i) = 1), "  # (GitLab's
+                        "r as (select distinct x::number as n from s) select count(*) from r where n is null",       # orders view)
+                        "select count(*) from (select x::number as n, row_number() over (order by i) r from t) where n is null and r > 0",
+                        "select count(*) from (select x::number as n from t group by x) where n is null"):
+            with pytest.raises(ProgrammingError):
+                cur.execute(blocked).fetchall()
+        assert count("with s as (select * from t qualify row_number() over (partition by x order by i) = 1), "
+                     "r as (select x::number as n from s) select count(*) from r where n is null") == 0
 
 
 def test_a_view_that_converts_a_timestamp_to_a_number_is_refused_when_it_is_created():
@@ -297,3 +305,27 @@ def test_the_frozen_clock_is_an_instant_that_a_time_zone_shows_as_its_wall_clock
         assert la.startswith("2026-01-15 04:00:00")
         (utc,) = cur.execute("select sysdate()::varchar").fetchone()
         assert utc.startswith("2026-01-15 12:00:00")
+
+
+def test_a_merge_that_updates_a_row_from_two_source_rows_is_refused_as_snowflake_does():
+    import pytest
+    import snowflake.connector
+    from snowflake.connector.errors import ProgrammingError
+
+    from fauxflake.emulator import serve
+
+    with serve() as emu:
+        cur = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S")).cursor()
+        cur.execute("create table t (id int, v varchar)")
+        cur.execute("insert into t values (1, 'a'), (2, 'b')")
+        cur.execute("create table s (id int, v varchar)")
+        cur.execute("insert into s values (1, 'x'), (1, 'y'), (3, 'z')")
+        with pytest.raises(ProgrammingError, match="Duplicate row detected") as raised:
+            cur.execute("merge into t using s on t.id = s.id when matched then update set v = s.v when not matched then insert (id, v) values (s.id, s.v)")
+        assert raised.value.errno == 100090
+        assert cur.execute("select * from t order by id").fetchall() == [(1, "a"), (2, "b")]  # (nothing done)
+        # deleting a row matched twice is deterministic
+        cur.execute("merge into t using s on t.id = s.id when matched then delete")
+        assert cur.execute("select * from t order by id").fetchall() == [(2, "b")]
+        cur.execute("merge into t using (select 2 as id, 'q' as v) s on t.id = s.id when matched then update set v = s.v")
+        assert cur.execute("select * from t order by id").fetchall() == [(2, "q")]
