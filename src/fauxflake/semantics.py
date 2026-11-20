@@ -239,6 +239,10 @@ MACROS = [
         for kind in ("timestamp", "timestamp_ns", "timestamp_ms", "timestamp_s", "timestamptz", "date", "time", "timetz", "blob")
         if kind != allowed) + (f", (x {allowed}) as true" if allowed else "") + ", (x) as true"
       for name, allowed in (("convertible", None), ("try_date", "date"), ("try_binary", "blob"))],
+    # TO_TIMESTAMP and TO_DATE take no FLOAT (a number of seconds is a NUMBER): the same, for DOUBLE and FLOAT only
+    f"create or replace macro {_NS}_fx_no_float (x double) as {_NS}_fx_refused_conversion(x), (x float) as "
+    f"{_NS}_fx_refused_conversion(x), (x decimal) as true, (x bigint) as true, (x hugeint) as true, (x integer) as true, "
+    "(x varchar) as true, (x) as true",
     f"drop macro if exists {_NS}_fx_refused_conversion",
     # NUMBER / NUMBER keeps max(s, min(s + 6, 12)) decimals and raises on zero.
     # DuckDB returns a full-precision double, and NULL on zero. The failing cast raises without
@@ -2918,14 +2922,25 @@ def refused_conversions(transformed: exp.Expression, conn) -> tuple[int, str] | 
 
     def guard_of(node: exp.Expression) -> str:
         """The macro that refuses what `node` cannot take: a TRY_ function takes a date for a DATE, a binary for a BINARY."""
-        if isinstance(node, exp.Anonymous) and str(node.name).split(".")[-1].lower() == "_sf_try_input":
+        name = str(node.name).split(".")[-1].lower() if isinstance(node, exp.Anonymous) else ""
+        if name == "_sf_try_input":
             target = node.expressions[1].name.upper() if len(node.expressions) > 1 else ""
             return _NS + ("_fx_try_date" if target == "DATE" else "_fx_try_binary" if target == "BLOB" else "_fx_convertible")
+        if name in ("_fs_to_timestamp", "_sf_to_date"):
+            return _NS + "_fx_no_float"
         return guard
 
     def argument(node: exp.Expression) -> tuple[exp.Expression, str] | None:
         if isinstance(node, exp.Anonymous) and str(node.name).split(".")[-1].lower() == "_sf_try_input" and node.expressions:
             return node.expressions[0], "TRY_CAST"
+        if isinstance(node, exp.Anonymous) and str(node.name).split(".")[-1].lower() in ("_fs_to_timestamp", "_sf_to_date") \
+                and node.expressions:
+            value = node.expressions[0]
+            if isinstance(value, exp.Anonymous) and str(value.name).split(".")[-1].lower() == "_sf_seconds" and value.expressions:
+                value = value.expressions[0]  # (a literal number of seconds, read exactly)
+            if value.find(exp.Div, exp.Avg) or any("div" in str(a.name).lower() for a in value.find_all(exp.Anonymous)):
+                return None  # (NUMBER / NUMBER is a NUMBER in Snowflake; the emulator works it out as a DOUBLE)
+            return value, "TO_TIMESTAMP"
         if isinstance(node, exp.Cast) and not isinstance(node, exp.TryCast) and not node.args.get("safe") \
                 and node.to.this.name.upper() in _TO_NUMBER:
             name = "TO_BOOLEAN" if node.to.this == exp.DataType.Type.BOOLEAN else "TO_DOUBLE" if node.to.this in (

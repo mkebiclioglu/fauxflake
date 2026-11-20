@@ -782,7 +782,7 @@
 - {id: epoch_12, sql: "select to_timestamp(31536000000)"}
 - {id: epoch_13, sql: "select to_timestamp(1735689600, 3)"}
 - {id: epoch_14, sql: "select to_timestamp(1735689600123, 3)"}
-- {id: epoch_15, sql: "select to_timestamp_ntz(1.5::float)", gap: "a FLOAT is a compile error in Snowflake"}
+- {id: epoch_15, sql: "select to_timestamp_ntz(1.5::float)"}
 - {id: epoch_16, sql: "select to_timestamp('2024-03-01 10:00:00.5')"}
 - {id: epoch_17, sql: "select '2024-03-01'::timestamp"}
 - {id: epoch_18, sql: "select createdat::timestamp from (select 23 as createdat)"}
@@ -1023,3 +1023,10 @@
 - {id: xml_20, sql: "select '#' || xmlget(parse_xml('<a><b>1</b><c>2</c><b>3</b></a>'), 'b', 1)::varchar, xmlget(parse_xml('<a><b>1</b></a>'), 'b', 1) is null, '#' || xmlget(xmlget(parse_xml('<a><b><c>9</c></b></a>'), 'b'), 'c')::varchar"}
 - {id: xml_21, sql: "select check_xml('abc'), check_xml('<a><b></a>'), check_xml('<a></a><b></b>'), check_xml('<a x=1></a>')"}
 - {id: object_keys_13, sql: "select '#' || parse_json('{\"x\": {\"b\": 1, \"a\": 2}}'):x::varchar, '#' || parse_json('{\"x\": \"[1, 2]\"}'):x::varchar, '#' || parse_json('{\"x\": [{\"b\": 1, \"a\": 2}]}'):x::varchar"}
+# Recorded 2026-11-20. A FLOAT is no number of seconds to TO_TIMESTAMP (refused when the statement compiles).
+- {id: epoch_float_1, sql: "select to_timestamp(f) from (select 1.5::float f)"}
+- {id: epoch_float_2, sql: "select to_timestamp_ltz(f) from (select null::float f)"}
+- {id: epoch_float_3, sql: "select to_date(f) from (select 1.5::float f)"}
+- {id: epoch_float_4, sql: "select to_timestamp(d)::varchar, to_timestamp(d, 3)::varchar from (select 1.5::number(10,1) d)"}
+- {id: epoch_float_5, sql: "select to_timestamp(f::number(10,1))::varchar from (select 1.5::float f)"}
+- {id: epoch_float_6, sql: "select to_timestamp_tz(f) from (select 1.5::float f)"}
