@@ -1107,3 +1107,4 @@
 - {id: skew_7, sql: "select round(skew(column1), 8) from values (1000001), (1000002), (1000010)"}
 - {id: skew_8, sql: "select kurtosis(column1) from values (1), (1), (1), (1)"}
 - {id: skew_9, sql: "select round(kurtosis(column1), 9), round(kurtosis(column1::float), 9) from values (7), (2), (7), (1)"}
+- {id: float_text_5, sql: "select '#' || parse_json('1e3')::varchar, typeof(parse_json('1e3')), typeof(to_variant(1.5::float))", gap: "a number written with an exponent, or a FLOAT made a VARIANT, is a FLOAT; DuckDB's JSON keeps no such difference (as object_keys_11)"}

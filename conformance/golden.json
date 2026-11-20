@@ -2515,6 +2515,15 @@
    ]
   ]
  },
+ "float_text_5": {
+  "rows": [
+   [
+    "#1000",
+    "DOUBLE",
+    "DOUBLE"
+   ]
+  ]
+ },
  "float_to_integer_casts": {
   "rows": [
    [
