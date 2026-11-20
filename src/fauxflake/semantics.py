@@ -447,14 +447,21 @@ MACROS = [
     # as in Snowflake, instead of an error
     f"""create or replace macro {_NS}_sf_flattenable(x) as
           case when json_type(to_json(x)) in ('ARRAY', 'OBJECT') then to_json(x) end""",
+    # (a value that is neither, a string or a number or JSON null, is one row: itself, at the path '')
     f"""create or replace macro {_NS}_sf_flatten_recursive(input) as table
-          select hash(to_json(input))::ubigint as SEQ,
-                 case when fullkey like '%]' then null else "key" end as KEY,
-                 regexp_replace(fullkey, '^\\$\\.?', '') as PATH,
-                 case when fullkey like '%]' then "key"::bigint end as INDEX,
-                 "value"::json as VALUE,
-                 json_extract(to_json(input), "path") as THIS
-          from json_tree(to_json(input)::varchar) where parent is not null and "value" is distinct from {_UNDEFINED_JSON} order by id""",
+          select SEQ, KEY, PATH, INDEX, VALUE, THIS from (
+            select hash(to_json(input))::ubigint as SEQ,
+                   case when fullkey like '%]' then null else "key" end as KEY,
+                   regexp_replace(fullkey, '^\\$\\.?', '') as PATH,
+                   case when fullkey like '%]' then "key"::bigint end as INDEX,
+                   "value"::json as VALUE,
+                   json_extract(to_json(input), "path") as THIS,
+                   id as _fx_order
+            from json_tree(to_json(input)::varchar) where parent is not null and "value" is distinct from {_UNDEFINED_JSON}
+            union all
+            select hash(to_json(input))::ubigint, null::varchar, '', null::bigint, to_json(input), to_json(input), 0
+            where input is not null and json_type(to_json(input)) not in ('ARRAY', 'OBJECT')
+          ) order by _fx_order""",
     *[f"create or replace macro {_NS}_sf_is_{name}(v) as json_type(v::varchar) = 'VARCHAR' and try_cast((v::json ->> '$') as {kind}) is not null"
       for name, kind in {"date": "date", "time": "time", "timestamp_ntz": "timestamp", "timestamp_ltz": "timestamp", "timestamp_tz": "timestamp"}.items()],
     *[f"create or replace macro {_NS}_sf_as_{name}(v) as try_cast((v::json ->> '$') as {kind})"
@@ -1893,13 +1900,42 @@ def keep_outer_rows(transformed: exp.Expression, flags: list[bool], recursive: l
     for call, deep in zip(calls, recursive):
         if deep:
             call.set("this", _NS + "_sf_flatten_recursive")
-    for call, outer in zip(calls, flags):
+            first = call.expressions[0] if call.expressions else None
+            if isinstance(first, exp.Anonymous) and first.name.lower().endswith("_sf_flattenable"):
+                call.set("expressions", [first.expressions[0], *call.expressions[1:]])  # (a scalar is a row of its own)
+    for call, outer, deep in zip(calls, flags, [*recursive, *[False] * len(calls)][:len(calls)]):
         join = call.find_ancestor(exp.Join)
         if outer and join is not None:
             join.set("kind", None)  # an explicit INNER JOIN LATERAL FLATTEN(... OUTER => TRUE)
             join.set("side", "LEFT")
             join.set("on", exp.true())
+        elif outer:
+            _outer_on_its_own(call)
     return transformed
+
+
+def _outer_on_its_own(call: exp.Anonymous) -> None:
+    """FLATTEN(..., OUTER => TRUE) on its own, not joined: a row of NULLs when there is nothing to expand (its PATH ''
+    and THIS the input when that was an empty list or object). Written into the query: fakesnow's FLATTEN is a
+    macro of each database."""
+    table = call.parent if isinstance(call.parent, exp.Table) else None
+    if table is None or not call.expressions:
+        return
+    value = call.expressions[0]
+    given = value.expressions[0] if isinstance(value, exp.Anonymous) and value.name.lower().endswith("_sf_flattenable") else value
+    rows = sqlglot.parse_one(
+        "select * from _fx_expand union all select hash(to_json(_fx_in))::ubigint, null::varchar, "
+        "case when json_type(to_json(_fx_in)) in ('ARRAY', 'OBJECT') then '' end, null::bigint, null::json, "
+        "case when json_type(to_json(_fx_in)) in ('ARRAY', 'OBJECT') then to_json(_fx_in) end "
+        "where not exists (select 1 from _fx_expand)", read="duckdb")
+    for t in list(rows.find_all(exp.Table)):
+        if t.name == "_fx_expand":
+            t.set("this", call.copy())
+    for c in list(rows.find_all(exp.Column)):
+        if c.name == "_fx_in":
+            c.replace(given.copy())
+    alias = table.args.get("alias")
+    table.replace(exp.Subquery(this=rows, alias=alias.copy() if alias is not None else exp.TableAlias(this=exp.to_identifier("_fx_flatten"))))
 
 
 _QUOTED = re.compile(r"""'(?:[^'\\]|''|\\.)*'|"(?:[^"]|"")*"|\$\$.*?\$\$""", re.DOTALL)

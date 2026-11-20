@@ -970,3 +970,15 @@
 - {id: alias_or_column_5, sql: "with t as (select 'a.b' m, 1 u union all select 'a.c', 2) select split_part(m, '.', 1) as m, u from t order by m desc, u"}
 - {id: alias_or_column_6, sql: "with t as (select 'a.b' m, 1 u union all select 'a.c', 2) select split_part(m, '.', 1) as m, sum(u) over (partition by m) s from t order by s"}
 - {id: alias_or_column_7, sql: "with t as (select 'a.b' m, 1 u union all select 'a.c', 2) select split_part(m, '.', 1) as k, u from t qualify row_number() over (partition by k order by u desc) = 1"}
+# Recorded 2026-11-19. FLATTEN of a value that is neither an array nor an object.
+- {id: flatten_scalar_1, sql: "select count(*) from table(flatten(input => parse_json('\"abc\"')))"}
+- {id: flatten_scalar_2, sql: "select seq is not null, key, path, index, value::varchar, this::varchar from table(flatten(input => parse_json('\"abc\"'), recursive => true))"}
+- {id: flatten_scalar_3, sql: "select key, path, index, value::varchar from table(flatten(input => parse_json('5'), recursive => true))"}
+- {id: flatten_scalar_4, sql: "select key, path, index, value::varchar from table(flatten(input => parse_json('{\"a\": \"[1, 2]\", \"b\": [3]}'), recursive => true)) order by path"}
+- {id: flatten_scalar_5, sql: "select count(*) from table(flatten(input => parse_json('\"abc\"'), outer => true))"}
+- {id: flatten_scalar_6, sql: "select count(*) from table(flatten(input => parse_json('null'), recursive => true))"}
+- {id: flatten_scalar_7, sql: "select count(*) from table(flatten(input => null, recursive => true))"}
+- {id: flatten_scalar_8, sql: "select key, value::varchar from table(flatten(input => parse_json('\"abc\"'), recursive => true, outer => true))"}
+- {id: flatten_scalar_9, sql: "select seq is not null, key, path, index, value, this::varchar from table(flatten(input => parse_json('[]'), outer => true))"}
+- {id: flatten_scalar_10, sql: "select seq is not null, key, path, index, value, this::varchar from table(flatten(input => parse_json('\"abc\"'), outer => true))"}
+- {id: flatten_scalar_11, sql: "select t.x, f.value::varchar from (select parse_json('\"abc\"') x union all select parse_json('[1]')) t, lateral flatten(input => t.x, recursive => true) f order by 1"}

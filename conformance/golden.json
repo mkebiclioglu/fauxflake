@@ -1977,6 +1977,129 @@
    ]
   ]
  },
+ "flatten_scalar_1": {
+  "rows": [
+   [
+    "0"
+   ]
+  ]
+ },
+ "flatten_scalar_10": {
+  "rows": [
+   [
+    true,
+    null,
+    null,
+    null,
+    null,
+    null
+   ]
+  ]
+ },
+ "flatten_scalar_11": {
+  "rows": [
+   [
+    "\"abc\"",
+    "abc"
+   ],
+   [
+    [
+     1
+    ],
+    "1"
+   ]
+  ]
+ },
+ "flatten_scalar_2": {
+  "rows": [
+   [
+    true,
+    null,
+    "",
+    null,
+    "abc",
+    "abc"
+   ]
+  ]
+ },
+ "flatten_scalar_3": {
+  "rows": [
+   [
+    null,
+    "",
+    null,
+    "5"
+   ]
+  ]
+ },
+ "flatten_scalar_4": {
+  "rows": [
+   [
+    "a",
+    "a",
+    null,
+    [
+     1,
+     2
+    ]
+   ],
+   [
+    "b",
+    "b",
+    null,
+    [
+     3
+    ]
+   ],
+   [
+    null,
+    "b[0]",
+    "0",
+    "3"
+   ]
+  ]
+ },
+ "flatten_scalar_5": {
+  "rows": [
+   [
+    "1"
+   ]
+  ]
+ },
+ "flatten_scalar_6": {
+  "rows": [
+   [
+    "1"
+   ]
+  ]
+ },
+ "flatten_scalar_7": {
+  "rows": [
+   [
+    "0"
+   ]
+  ]
+ },
+ "flatten_scalar_8": {
+  "rows": [
+   [
+    null,
+    "abc"
+   ]
+  ]
+ },
+ "flatten_scalar_9": {
+  "rows": [
+   [
+    true,
+    null,
+    "",
+    null,
+    null,
+    []
+   ]
+  ]
+ },
  "flatten_union_arrays": {
   "rows": [
    [
