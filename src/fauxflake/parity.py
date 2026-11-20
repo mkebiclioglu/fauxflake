@@ -91,6 +91,12 @@ def _fetch_into(conn, sql: str, duck, types: dict[str, str]) -> tuple[list[str],
     cur = conn.cursor()
     cur.execute(sql)
     names = [d[0] for d in cur.description]
+    if any(d[1] in (6, 7) for d in cur.description):
+        # TIMESTAMP_LTZ and TIMESTAMP_TZ come as instants; the emulator keeps a timestamp's wall clock,
+        # which is what Snowflake gives when it is cast to TIMESTAMP_NTZ (a TZ in its own offset, an LTZ in the session's)
+        exact = lambda n: '"' + n.replace('"', '""') + '"'  # noqa: E731 - as Snowflake named it
+        cur.execute("select " + ", ".join(exact(n) + ("::timestamp_ntz " + exact(n) if d[1] in (6, 7) else "")
+                                          for n, d in zip(names, cur.description)) + f" from ({sql})")
     duck.execute("drop table if exists _theirs")
     kinds = {n: ("VARCHAR" if types.get(n.upper()) == "JSON" else types.get(n.upper(), "VARCHAR")) for n in names}
     duck.execute("create temp table _theirs (" + ", ".join(f'"{n}" {kinds[n]}' for n in names) + ")")
