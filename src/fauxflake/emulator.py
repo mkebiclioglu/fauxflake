@@ -884,6 +884,22 @@ def _patch_fakesnow() -> None:
     if '"ERROR_LOGGING"' not in tables_view:
         info.SQL_CREATE_INFORMATION_SCHEMA_TABLES_VIEW = Template(tables_view.replace(
             "'NO' AS \"IS_HYBRID\"", "'NO' AS \"IS_HYBRID\", 'NO' AS \"ERROR_LOGGING\", 'NO' AS \"IS_INTERACTIVE\", 'NO' AS \"ROW_TIMESTAMP_ON\""))
+    tables_view = info.SQL_CREATE_INFORMATION_SCHEMA_TABLES_VIEW.template
+    if "'VIEW' AS kind" not in tables_view:
+        # Snowflake lists views here too (TABLE_TYPE 'VIEW', no row count, size or retention): a project that reads a
+        # model's columns through it (GitLab's masking post-hook, on every view model) finds them
+        for old, new in [
+            ("from duckdb_tables tables", "from (select database_name, schema_name, table_name, estimated_size, 'BASE TABLE' AS kind "
+                                          "from duckdb_tables union all select database_name, schema_name, view_name, NULL, 'VIEW' AS kind "
+                                          "from duckdb_views where not internal) tables"),
+            ("'BASE TABLE' AS \"TABLE_TYPE\"", "tables.kind AS \"TABLE_TYPE\""),
+            ("'NO' AS \"IS_TRANSIENT\"", "case when tables.kind = 'VIEW' then NULL else 'NO' end AS \"IS_TRANSIENT\""),
+            ("0 AS \"BYTES\"", "case when tables.kind = 'VIEW' then NULL else 0 end AS \"BYTES\""),
+            ("1 AS \"RETENTION_TIME\"", "case when tables.kind = 'VIEW' then NULL else 1 end AS \"RETENTION_TIME\""),
+        ]:
+            assert old in tables_view, old
+            tables_view = tables_view.replace(old, new)
+        info.SQL_CREATE_INFORMATION_SCHEMA_TABLES_VIEW = Template(tables_view)
     databases_view = info.SQL_CREATE_INFORMATION_SCHEMA_DATABASES_VIEW.template
     if "OWNER_ROLE_TYPE" not in databases_view:
         info.SQL_CREATE_INFORMATION_SCHEMA_DATABASES_VIEW = Template(databases_view.replace(
@@ -1124,8 +1140,8 @@ def _patch_fakesnow() -> None:
                                                          probe=not getattr(self._conn, "_fauxflake_txn", False))
                 except Exception:  # noqa: BLE001 - a check of its own that fails leaves the statement to run
                     misnamed = None
-                refused = None
-                if not getattr(self._conn, "_fauxflake_txn", False):
+                refused = semantics.zoned_argument(transformed)
+                if refused is None and not getattr(self._conn, "_fauxflake_txn", False):
                     try:
                         refused = semantics.refused_conversions(transformed, self._duck_conn)
                     except Exception:  # noqa: BLE001 - a check of its own that fails leaves the statement to run

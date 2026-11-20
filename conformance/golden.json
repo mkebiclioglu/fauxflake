@@ -1064,6 +1064,56 @@
    ]
   ]
  },
+ "computed_index_1": {
+  "rows": [
+   [
+    "1",
+    "b",
+    true
+   ]
+  ]
+ },
+ "computed_index_2": {
+  "rows": [
+   [
+    "2",
+    "2",
+    null,
+    null
+   ]
+  ]
+ },
+ "computed_index_3": {
+  "rows": [
+   [
+    "v",
+    "1",
+    null
+   ]
+  ]
+ },
+ "computed_index_4": {
+  "rows": [
+   [
+    null,
+    null,
+    "3",
+    {
+     "n": 2
+    }
+   ]
+  ]
+ },
+ "computed_index_5": {
+  "rows": [
+   [
+    "4",
+    "b!",
+    null,
+    "v"
+   ]
+  ]
+ },
  "concat_nulls": {
   "rows": [
    [
@@ -1182,6 +1232,30 @@
    ]
   ]
  },
+ "convert_tz_10": {
+  "rows": [
+   [
+    "2025-01-01 04:00:00.000"
+   ]
+  ]
+ },
+ "convert_tz_11": {
+  "rows": [
+   [
+    "2025-01-01 04:00:00.000"
+   ]
+  ]
+ },
+ "convert_tz_12": {
+  "error": "001044 (42P13): SQL compilation error: error line 1 at position 7"
+ },
+ "convert_tz_13": {
+  "rows": [
+   [
+    "2025-01-01 19:00:00.000"
+   ]
+  ]
+ },
  "convert_tz_2": {
   "rows": [
    [
@@ -1201,6 +1275,38 @@
    [
     "2025-01-01",
     "5"
+   ]
+  ]
+ },
+ "convert_tz_5": {
+  "rows": [
+   [
+    "2025-01-01 04:00:00.000"
+   ]
+  ]
+ },
+ "convert_tz_6": {
+  "rows": [
+   [
+    "2025-07-01 19:00:00.000"
+   ]
+  ]
+ },
+ "convert_tz_7": {
+  "error": "001044 (42P13): SQL compilation error: error line 1 at position 7"
+ },
+ "convert_tz_8": {
+  "rows": [
+   [
+    "19",
+    "2024-12-31"
+   ]
+  ]
+ },
+ "convert_tz_9": {
+  "rows": [
+   [
+    "2025-03-30 01:30:00.000"
    ]
   ]
  },
@@ -7181,6 +7287,28 @@
    ]
   ]
  },
+ "object_keys_14": {
+  "error": "100071 (22000): Failed to cast variant value \"abc\" to OBJECT"
+ },
+ "object_keys_15": {
+  "error": "100071 (22000): Failed to cast variant value [1,2] to OBJECT"
+ },
+ "object_keys_16": {
+  "error": "100071 (22000): Failed to cast variant value 12 to OBJECT"
+ },
+ "object_keys_17": {
+  "rows": [
+   [
+    null,
+    null,
+    [],
+    null
+   ]
+  ]
+ },
+ "object_keys_18": {
+  "error": "100071 (22000): Failed to cast variant value \"groups_1\" to OBJECT"
+ },
  "object_keys_2": {
   "rows": [
    [
@@ -8444,6 +8572,77 @@
   "rows": [
    [
     "e8e413269662b598d26b2ee970fa4a5e"
+   ]
+  ]
+ },
+ "text_beside_boolean_1": {
+  "rows": [
+   [
+    false,
+    true,
+    false,
+    false,
+    false,
+    false,
+    false
+   ]
+  ]
+ },
+ "text_beside_boolean_2": {
+  "rows": [
+   [
+    false,
+    false,
+    true,
+    "0"
+   ],
+   [
+    false,
+    true,
+    true,
+    "false"
+   ],
+   [
+    false,
+    false,
+    true,
+    "success_x"
+   ],
+   [
+    true,
+    false,
+    false,
+    "true"
+   ],
+   [
+    null,
+    null,
+    null,
+    null
+   ]
+  ]
+ },
+ "text_beside_boolean_3": {
+  "error": "100037 (22018): Boolean value 'success_x' is not recognized"
+ },
+ "text_beside_boolean_4": {
+  "rows": [
+   [
+    "1"
+   ]
+  ]
+ },
+ "text_beside_boolean_5": {
+  "rows": [
+   [
+    "0",
+    false,
+    false
+   ],
+   [
+    "0",
+    false,
+    true
    ]
   ]
  },

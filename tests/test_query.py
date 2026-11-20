@@ -309,6 +309,40 @@ def test_the_frozen_clock_is_an_instant_that_a_time_zone_shows_as_its_wall_clock
         assert utc.startswith("2026-01-15 12:00:00")
 
 
+def test_a_converted_time_converts_again_from_its_instant_and_a_zoned_one_is_refused_where_snowflake_refuses_it():
+    import pytest
+    import snowflake.connector
+    from snowflake.connector.errors import ProgrammingError
+
+    from fauxflake.emulator import serve
+
+    with serve() as emu:
+        cur = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S")).cursor()
+        (la,) = cur.execute("select convert_timezone('America/Los_Angeles', convert_timezone('UTC', "
+                            "'2025-01-01 12:00:00 +00:00'::timestamp_tz))::timestamp_ntz::varchar").fetchone()
+        assert la.startswith("2025-01-01 04:00:00")
+        (ntz,) = cur.execute("select convert_timezone('Asia/Tokyo', '2025-01-01 12:00:00'::timestamp_ntz)::timestamp_ntz::varchar").fetchone()
+        assert ntz.startswith("2025-01-01 21:00:00")  # (read in the session's zone, UTC here)
+        with pytest.raises(ProgrammingError, match="Invalid argument types for function 'CONVERT_TIMEZONE'") as raised:
+            cur.execute("create view v as select convert_timezone('UTC', 'Asia/Tokyo', '2025-01-01 12:00:00 +00:00'::timestamp_tz) t")
+        assert raised.value.errno == 1044
+
+
+def test_information_schema_tables_lists_views_as_snowflake_does():
+    import snowflake.connector
+
+    from fauxflake.emulator import serve
+
+    with serve() as emu:
+        cur = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S")).cursor()
+        cur.execute("create table t as select 1 a")
+        cur.execute("create view v as select a, 'x'::varchar b from t")
+        rows = cur.execute("select t.table_name, t.table_type, t.row_count, c.column_name, c.data_type from d.information_schema.tables t "
+                           "join d.information_schema.columns c on c.table_schema = t.table_schema and c.table_name = t.table_name "
+                           "where t.table_schema = 'S' order by 1, 4").fetchall()
+        assert rows == [("T", "BASE TABLE", 1, "A", "NUMBER"), ("V", "VIEW", None, "A", "NUMBER"), ("V", "VIEW", None, "B", "TEXT")]
+
+
 def test_a_merge_that_updates_a_row_from_two_source_rows_is_refused_as_snowflake_does():
     import pytest
     import snowflake.connector

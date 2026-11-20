@@ -60,6 +60,11 @@ def test_a_window_whose_order_has_ties_is_found():
         # a key that is an alias of the same select
         aliased = "select u * 10 as k, s from D.S.T qualify row_number() over (partition by k order by d desc) = 1"
         assert _ties(conn, aliased).startswith("1 tied group(s)")
+        # an alias in WHERE too; a name that is a column of the FROM as well is the column (u, not u * 0)
+        filtered = "select u * 0 as u, d * 1 as dd, s from D.S.T where dd > 0 qualify row_number() over (partition by u order by dd) = 1"
+        assert _ties(conn, filtered).startswith("1 tied group(s)")  # (u = 1 twice; partitioned by u * 0 it would be 2 rows tied on d)
+        distinct = "select u * 0 as u, s as ss from D.S.T where ss is not null qualify row_number() over (partition by u order by ss) = 1"
+        assert _ties(conn, distinct) is None  # (by the column u, ss differs; by u * 0, 'a' would tie)
 
 
 def test_arrays_that_differ_only_in_order_and_where_such_order_comes_from():
@@ -123,6 +128,8 @@ def test_columns_made_by_listagg_without_an_order_are_found():
     sql = ("select a, listagg(n, ', ') over (partition by a) as open_invoices, listagg(n) within group (order by n) as kept, "
            "listagg(distinct n) as names from t group by a")
     assert _unordered_lists(sql) == {"OPEN_INVOICES", "NAMES"}
+    later = f"with o as ({sql}) select a, max(open_invoices) as list_of_open_invoices, max(kept) as k from o group by a"
+    assert _unordered_lists(later) == {"OPEN_INVOICES", "NAMES", "LIST_OF_OPEN_INVOICES"}
 
 
 def test_a_node_failing_on_one_side_only_on_a_grown_query_tag_is_not_an_engine_difference():

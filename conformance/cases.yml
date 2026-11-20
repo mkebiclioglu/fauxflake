@@ -1000,6 +1000,25 @@
 - {id: convert_tz_2, sql: "select convert_timezone('America/Los_Angeles', '2025-07-01 12:00:00 +02:00'::timestamp_tz)::varchar", gap: "a TIMESTAMP_TZ keeps its own offset in its text; the emulator keeps a timestamp's wall clock only"}
 - {id: convert_tz_3, sql: "select convert_timezone('America/Los_Angeles', '2025-01-01 12:00:00 +00:00'::timestamp_tz)::timestamp_ntz::varchar"}
 - {id: convert_tz_4, sql: "select convert_timezone('Asia/Tokyo', '2025-01-01 12:00:00 +00:00'::timestamp_tz)::date, hour(convert_timezone('Asia/Tokyo', '2025-01-01 20:00:00 +00:00'::timestamp_tz))"}
+- {id: convert_tz_5, sql: "select convert_timezone('America/Los_Angeles', convert_timezone('UTC', '2025-01-01 12:00:00 +00:00'::timestamp_tz))::timestamp_ntz::varchar"}
+- {id: convert_tz_6, sql: "select convert_timezone('Asia/Tokyo', convert_timezone('America/New_York', '2025-07-01 12:00:00 +02:00'::timestamp_tz))::timestamp_ntz::varchar"}
+- {id: convert_tz_7, sql: "select convert_timezone('UTC', 'America/Los_Angeles', convert_timezone('Asia/Tokyo', '2025-01-01 12:00:00 +00:00'::timestamp_tz))::varchar"}
+- {id: convert_tz_8, sql: "select hour(convert_timezone('America/Los_Angeles', convert_timezone('UTC', '2025-01-01 03:00:00 +00:00'::timestamp_tz))), convert_timezone('America/Los_Angeles', convert_timezone('UTC', '2025-01-01 03:00:00 +00:00'::timestamp_tz))::date"}
+- {id: convert_tz_9, sql: "select convert_timezone('Europe/Paris', convert_timezone('Asia/Kolkata', convert_timezone('UTC', '2025-03-30 00:30:00 +00:00'::timestamp_tz)))::timestamp_ntz::varchar"}
+- {id: convert_tz_10, sql: "select convert_timezone('UTC', 'America/Los_Angeles', '2025-01-01 12:00:00 +02:00')::varchar"}
+- {id: convert_tz_11, sql: "select convert_timezone('UTC', 'America/Los_Angeles', to_variant('2025-01-01 12:00:00'))::varchar"}
+- {id: convert_tz_12, sql: "select convert_timezone('UTC', 'America/Los_Angeles', to_timestamp_tz('2025-01-01 12:00:00 +02:00'))"}
+- {id: convert_tz_13, sql: "select convert_timezone('Asia/Tokyo', '2025-01-01 12:00:00 +02:00')::timestamp_ntz::varchar"}
+- {id: computed_index_1, sql: "with ta as (select array_construct(1, 'b', null, parse_json('{\"n\":2}')) l, parse_json('{\"k\":\"v\",\"n\":1, \"a.b\": 3}') o, 'k' kk, 0 i, parse_json('1') ji, parse_json('\"n\"') jk) select get(l, i)::varchar, l[i + 1]::varchar, l[i + 2] is null from ta"}
+- {id: computed_index_2, sql: "with ta as (select array_construct(1, 'b', null, parse_json('{\"n\":2}')) l, parse_json('{\"k\":\"v\",\"n\":1, \"a.b\": 3}') o, 'k' kk, 0 i, parse_json('1') ji, parse_json('\"n\"') jk) select l[i + 3]:n::int, l[i + 3].n::int, l[i + 9], l[i - 1] from ta"}
+- {id: computed_index_3, sql: "with ta as (select array_construct(1, 'b', null, parse_json('{\"n\":2}')) l, parse_json('{\"k\":\"v\",\"n\":1, \"a.b\": 3}') o, 'k' kk, 0 i, parse_json('1') ji, parse_json('\"n\"') jk) select o[kk]::varchar, o[jk]::int, l[ji]::varchar from ta"}
+- {id: computed_index_4, sql: "with ta as (select array_construct(1, 'b', null, parse_json('{\"n\":2}')) l, parse_json('{\"k\":\"v\",\"n\":1, \"a.b\": 3}') o, 'k' kk, 0 i, parse_json('1') ji, parse_json('\"n\"') jk) select o[i], l[kk], o['a' || '.b']::int, l[array_size(l) - 1] from ta"}
+- {id: computed_index_5, sql: "with ta as (select array_construct(1, 'b', null, parse_json('{\"n\":2}')) l, parse_json('{\"k\":\"v\",\"n\":1, \"a.b\": 3}') o, 'k' kk, 0 i, parse_json('1') ji, parse_json('\"n\"') jk) select array_size(l), l[array_size(l) - 3]::varchar || '!', o[upper(kk)], o[lower('K')]::varchar from ta"}
+- {id: text_beside_boolean_1, sql: "select 'success_x' = true, 'true' = true, 'abc' = false, 'yes' = true, '1' = true, 'TRUE' = true, 'on' = true"}
+- {id: text_beside_boolean_2, sql: "select x = true, x = false, x != true, x from values ('success_x'), ('true'), ('false'), ('0'), (null) as v(x) order by x"}
+- {id: text_beside_boolean_3, sql: "select true = x from values ('success_x') as v(x)"}
+- {id: text_beside_boolean_4, sql: "select count(*) from values ('success_x'), ('true') as v(x) where x = true"}
+- {id: text_beside_boolean_5, sql: "select iff(x = true, 1, 0), x in (true), x in (true, false) from values ('abc'), ('false') as v(x) order by x"}
 # Recorded 2026-11-19. XML: PARSE_XML gives an OBJECT ("@" the tag, "$" what it holds, "@name" each attribute).
 - {id: xml_1, sql: "select '#' || parse_xml('<a x=\"1\">hi</a>')::varchar"}
 - {id: xml_2, sql: "select '#' || parse_xml('<a><b>1</b><b>2</b><c y=\"z\"/></a>')::varchar"}
@@ -1023,6 +1042,11 @@
 - {id: xml_20, sql: "select '#' || xmlget(parse_xml('<a><b>1</b><c>2</c><b>3</b></a>'), 'b', 1)::varchar, xmlget(parse_xml('<a><b>1</b></a>'), 'b', 1) is null, '#' || xmlget(xmlget(parse_xml('<a><b><c>9</c></b></a>'), 'b'), 'c')::varchar"}
 - {id: xml_21, sql: "select check_xml('abc'), check_xml('<a><b></a>'), check_xml('<a></a><b></b>'), check_xml('<a x=1></a>')"}
 - {id: object_keys_13, sql: "select '#' || parse_json('{\"x\": {\"b\": 1, \"a\": 2}}'):x::varchar, '#' || parse_json('{\"x\": \"[1, 2]\"}'):x::varchar, '#' || parse_json('{\"x\": [{\"b\": 1, \"a\": 2}]}'):x::varchar"}
+- {id: object_keys_14, sql: "select object_keys(parse_json('\"abc\"'))"}
+- {id: object_keys_15, sql: "select object_keys(parse_json('[1,2]'))"}
+- {id: object_keys_16, sql: "select object_keys(parse_json('12'))"}
+- {id: object_keys_17, sql: "select object_keys(parse_json('null')), object_keys(null), object_keys(parse_json('{}')), object_keys(parse_json('{\"a\":1}'):zz)"}
+- {id: object_keys_18, sql: "select object_keys(v:g) from (select parse_json(column1) v from values ('{\"g\":{\"x\":1}}'), ('{\"g\":\"groups_1\"}'))"}
 # Recorded 2026-11-20. A FLOAT is no number of seconds to TO_TIMESTAMP (refused when the statement compiles).
 - {id: epoch_float_1, sql: "select to_timestamp(f) from (select 1.5::float f)"}
 - {id: epoch_float_2, sql: "select to_timestamp_ltz(f) from (select null::float f)"}

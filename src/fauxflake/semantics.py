@@ -481,6 +481,13 @@ MACROS = [
     f"""create or replace macro {_NS}_sf_get_ignore_case(v, k) as json_extract(v::json, '$."' || coalesce(
           list_filter(json_keys(v::json), lambda x: x = k)[1],
           list_filter(json_keys(v::json), lambda x: lower(x) = lower(k))[1], k) || '"')""",
+    # v[i] with an index worked out per row (arr[array_size(arr) - 1], obj[key_column]): a number is an element of an
+    # array, text a key of an object (a VARIANT index is a key only); anything else, or a miss, is NULL
+    f"""create or replace macro {_NS}_sf_element(v, i) as (case
+          when typeof(i) = 'VARCHAR' then json_extract(v::json, '$."' || i::varchar || '"')
+          when typeof(i) = 'JSON' then json_extract(v::json, '$."' || (try_cast(i::varchar as json) ->> '$') || '"')
+          when try_cast(i::varchar as double) >= 0 then nullif(json_extract(v::json, '$[' || floor(try_cast(i::varchar as double))::bigint
+            || ']'), json('"{UNDEFINED}"')) end)""",
     # Dates out of range roll over: month 14 is February of the next year, day 0 the day before.
     f"""create or replace macro {_NS}_sf_date_from_parts(y, m, d) as
           (make_date(y::bigint, 1, 1) + to_months((m - 1)::integer) + to_days((d - 1)::integer))::date""",
@@ -529,7 +536,10 @@ MACROS = [
           select json_group_object(k, json_extract(o, '$."' || k || '"'))
           from (select unnest(cast(to_json(keys) as varchar[])) as k) where json_exists(o, '$."' || k || '"')), '{{}}'::json)""",
     # Object keys come back sorted: Snowflake stores objects ordered by key.
-    f"create or replace macro {_NS}_sf_object_keys(o) as to_json(list_sort(json_keys(o::json)))",
+    # (of a VARIANT that holds no object: refused, as the cast to OBJECT is)
+    f"""create or replace macro {_NS}_sf_object_keys(o) as to_json(list_sort(json_keys(case when o is null then null
+          when typeof(o) <> 'JSON' or json_type(o::json) = 'OBJECT' then o::json when json_type(o::json) = 'NULL' then null
+          else error(chr(31) || 'fxerr:100071:22000:Failed to cast variant value ' || o::varchar || ' to OBJECT' || chr(31))::json end)))""",
     f"create or replace macro {_NS}_sf_hash_agg(x) as bit_xor(hash(x))",
     # FLATTEN(..., RECURSIVE => TRUE) walks every level.
     # what FLATTEN is given, when it is a list or an object; a string or a number held in a VARIANT gives no rows,
@@ -629,7 +639,7 @@ MACROS = [
           when typeof(x) <> 'JSON' then x::json
           when json_type(x::json) = 'OBJECT' then x::json
           when json_type(x::json) = 'NULL' then null
-          else error('Failed to cast variant value ' || x::varchar || ' to OBJECT')::json end""",
+          else error(chr(31) || 'fxerr:100071:22000:Failed to cast variant value ' || x::varchar || ' to OBJECT' || chr(31))::json end""",
     f"""create or replace macro {_NS}_sf_to_array(x) as case
           when x is null then null
           when typeof(x) like '%]' then to_json(x)
@@ -643,6 +653,11 @@ MACROS = [
           else a = b end""",
     # UPPER('ß') is 'SS'.
     f"create or replace macro {_NS}_sf_upper(s) as replace(upper(s), 'ẞ', 'SS')",
+    # text = TRUE compares text, with 'true' or 'false' (case and all: 'TRUE' = TRUE is FALSE); anything else is read
+    # as a boolean. (TRUE = text is the other way round: the text is converted, and refused if it is not a boolean)
+    f"""create or replace macro {_NS}_sf_eq_bool(x, b) as case
+          when typeof(x) = 'VARCHAR' then x::varchar = (case when b then 'true' when not b then 'false' end)
+          else try_cast(x as boolean) = b end""",
 ]
 
 _RENAMED = {  # Snowflake function -> macro, same arguments
@@ -924,6 +939,39 @@ def _try_anonymous_target(node: exp.Expression) -> str | None:
     return None
 
 
+ZONED_ARGUMENT = "_fx_zoned_argument"  # (a TIMESTAMP_TZ given to CONVERT_TIMEZONE's three-argument form)
+
+
+def _maybe_text(node: exp.Expression) -> bool:
+    """A side of a comparison with TRUE or FALSE that may be text: not a boolean, a number or a VARIANT as written."""
+    node = node.unnest()
+    return not isinstance(node, (exp.Boolean, exp.Null, exp.JSONExtract, exp.Bracket, exp.Predicate, exp.Not, exp.Connector)) \
+        and not (isinstance(node, exp.Literal) and not node.is_string)
+
+
+def _computed_index(node: exp.Expression) -> bool:
+    """`v[i]` with an index that is not written out: a column, an expression (not a slice)."""
+    return isinstance(node, exp.Bracket) and len(node.expressions) == 1 and not isinstance(
+        node.expressions[0], (exp.Literal, exp.Slice, exp.Null)) and not (
+        isinstance(node.expressions[0], exp.Neg) and isinstance(node.expressions[0].this, exp.Literal))
+
+
+def _zoned(value: exp.Expression | None) -> bool:
+    """`value` is a TIMESTAMP_TZ by how it is written: `x::timestamp_tz`, TO_TIMESTAMP_TZ(x), CONVERT_TIMEZONE(zone, x)."""
+    if isinstance(value, exp.Cast) and not isinstance(value, exp.TryCast):
+        return value.to.is_type("timestamptz")
+    if isinstance(value, exp.ConvertTimezone):
+        return value.args.get("source_tz") is None
+    return isinstance(value, exp.Anonymous) and str(value.name).lower() == "to_timestamp_tz"
+
+
+def zoned_argument(transformed: exp.Expression) -> tuple[int, str] | None:
+    """The error Snowflake gives a statement that passes a TIMESTAMP_TZ to CONVERT_TIMEZONE(from, to, x), or None."""
+    if any(str(f.name).split(".")[-1].lower() == ZONED_ARGUMENT for f in transformed.find_all(exp.Anonymous)):
+        return 1044, "SQL compilation error:\nInvalid argument types for function 'CONVERT_TIMEZONE'"
+    return None
+
+
 def _fix(node: exp.Expression) -> exp.Expression:
     target = _try_target(node) or _try_anonymous_target(node)
     if target and not (isinstance(node.this, exp.Anonymous) and node.this.name == _NS + "_sf_try_input"):
@@ -945,6 +993,19 @@ def _fix(node: exp.Expression) -> exp.Expression:
     if isinstance(node, exp.CollateColumnConstraint) and isinstance(node.this, (exp.Literal, exp.Var, exp.Identifier)):
         node.set("this", exp.var(_collation(node.this.name) or "BINARY"))
         return node
+    if isinstance(node, exp.ConvertTimezone) and node.args.get("source_tz") is None and node.args.get("timestamp") is not None:
+        # CONVERT_TIMEZONE(zone, x) takes a TIMESTAMP_TZ: x without a zone is read in the session's (UTC here), not as
+        # the wall clock of `zone`. Its answer keeps the instant, so another conversion of it starts from that instant
+        value = node.args["timestamp"]
+        while isinstance(value, exp.ConvertTimezone) and value.args.get("source_tz") is None and value.args.get("timestamp") is not None:
+            value = value.args["timestamp"]
+        if not (isinstance(value, exp.Cast) and value.to.is_type("timestamptz", "timestampltz")):
+            value = exp.cast(value.copy(), "timestamptz")
+        node.set("timestamp", value)
+    if isinstance(node, exp.ConvertTimezone) and node.args.get("source_tz") is not None and _zoned(node.args.get("timestamp")):
+        # CONVERT_TIMEZONE(from, to, x) takes a timestamp without a zone: a TIMESTAMP_TZ is refused when the statement
+        # compiles (a TIMESTAMP_LTZ is not). DuckDB holds both as one type: marked here, refused before it runs
+        node.set("timestamp", _fn(ZONED_ARGUMENT, node.args["timestamp"]))
     if isinstance(node, exp.Interval) and isinstance(node.this, exp.Literal) and "," in node.this.name:
         node.this.set("this", node.this.name.replace(",", " "))  # INTERVAL '1 day, 2 hours'
     if isinstance(node, (exp.Mul, exp.Add, exp.Sub)) and all(
@@ -1128,9 +1189,14 @@ def _fix(node: exp.Expression) -> exp.Expression:
                 return base
             return exp.JSONExtract(this=base, expression=exp.JSONPath(expressions=[exp.JSONPathRoot(), step]),
                                    variant_extract=True, requires_json=True)
+    if _computed_index(node):
+        return _fn("_sf_element", node.this, node.expressions[0])  # arr[array_size(arr) - 1], obj[key_column]
     if isinstance(node, exp.Dot) and isinstance(node.expression, exp.Identifier):
         # v[0].name: a field of an array element. It is a path step, not a struct field
         base, key = node.this, exp.JSONPathKey(this=node.expression.name, quoted=True)
+        if _computed_index(base) or (isinstance(base, exp.Anonymous) and str(base.name).lower().endswith("_sf_element")):
+            return exp.JSONExtract(this=base, expression=exp.JSONPath(expressions=[exp.JSONPathRoot(), key]),
+                                   variant_extract=True, requires_json=True)
         if isinstance(base, exp.JSONExtract) and base.args.get("variant_extract"):
             base.args["expression"].append("expressions", key)
             return base
@@ -1166,7 +1232,7 @@ def _fix(node: exp.Expression) -> exp.Expression:
         bracket = sqlglot.parse_one("x[0]", read="snowflake")
         bracket.set("this", node.this)
         bracket.set("expressions", [node.expression])
-        return bracket
+        return _fn("_sf_element", node.this, node.expression) if _computed_index(bracket) else bracket
     if isinstance(node, exp.Literal) and not node.is_string and "." in node.name and "e" not in node.name.lower():
         # 1.50 is NUMBER(2,1) in Snowflake: trailing zeros are not part of a literal's scale
         trimmed = node.name.rstrip("0").rstrip(".")
@@ -1195,6 +1261,13 @@ def _fix(node: exp.Expression) -> exp.Expression:
                 node.set(side, exp.cast(part, "varchar"))  # v:s || 'y'
             elif not (isinstance(part, exp.Literal) and part.is_string) and not isinstance(part, exp.DPipe):
                 node.set(side, _text(part))
+    if isinstance(node, (exp.EQ, exp.NEQ)) and isinstance(node.expression, exp.Boolean) and _maybe_text(node.this):
+        same = _fn("_sf_eq_bool", node.this, node.expression)  # is_success = TRUE, is_success a VARCHAR
+        return same if isinstance(node, exp.EQ) else exp.Not(this=same)
+    if isinstance(node, exp.In) and node.expressions and not node.args.get("query") and _maybe_text(node.this) \
+            and all(isinstance(e, exp.Boolean) for e in node.expressions):
+        tests = [_fn("_sf_eq_bool", node.this.copy(), e.copy()) for e in node.expressions]  # x IN (TRUE)
+        return exp.paren(tests[0] if len(tests) == 1 else exp.or_(*tests))
     if isinstance(node, (exp.EQ, exp.NEQ)) and node.find_ancestor(exp.Select) is not None \
             and node.find_ancestor(exp.Merge, exp.Update, exp.Delete) is None:
         left, right = node.this.unnest(), node.expression.unnest()
@@ -1268,7 +1341,7 @@ def _fix(node: exp.Expression) -> exp.Expression:
         fmt = node.args["format"]
         fmt.set("this", fmt.name.replace("Mon", "%b").replace("Dy", "%a"))
     if isinstance(node, exp.Cast) and not isinstance(node, exp.TryCast) and node.to.is_type("varchar", "text") \
-            and not node.to.expressions and not isinstance(node.this, (exp.JSONExtract, exp.Bracket)) \
+            and not node.to.expressions and not (isinstance(node.this, (exp.JSONExtract, exp.Bracket)) and not _computed_index(node.this)) \
             and not (isinstance(node.this, exp.Literal) and node.this.is_string):
         return _text(node.this)
     if isinstance(node, exp.Add) and isinstance(node.expression, exp.Interval) \

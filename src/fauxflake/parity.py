@@ -322,11 +322,13 @@ def _databases_built_in(conn, remote: DbtProject, schema: str, extra: list[str])
     nodes = json.loads(path.read_text())["nodes"].values()
     names = {str(n.get("database") or "").strip('"').upper() for n in nodes if n.get("resource_type") in ("model", "seed", "snapshot")}
     # an incremental model that says `full_refresh: false` keeps what an earlier run left, --full-refresh or not:
-    # it starts from nothing here, as on the emulator
+    # it starts from nothing here, as on the emulator. So does a snapshot (--full-refresh does not rebuild one: an
+    # earlier run's rows, and their times, would stay)
     for n in nodes:
         config = n.get("config") or {}
-        if n.get("resource_type") == "model" and config.get("materialized") == "incremental" and config.get("full_refresh") is False \
-                and n.get("relation_name"):
+        kept = n.get("resource_type") == "snapshot" or (
+            n.get("resource_type") == "model" and config.get("materialized") == "incremental" and config.get("full_refresh") is False)
+        if kept and n.get("relation_name"):
             try:
                 conn.cursor().execute(f"drop table if exists {n['relation_name']}")
             except Exception:  # noqa: BLE001, S110 - not there, or not a table
@@ -419,30 +421,49 @@ def _ties(conn, sql: str) -> str | None:  # noqa: ANN001
         if select is None or select.args.get("group") or select.args.get("from_") is None:
             continue
         keys = [p.copy() for p in win.args.get("partition_by") or []] + [o.this.copy() for o in order.expressions]
-        # (a key may be an alias of the same select, `partition by question_id` with `... as question_id`: asked
-        # again with the expression it names, when the key as written does not bind on its own)
+        # (a key may be an alias of the same select, `partition by question_id` with `... as question_id`, and so may a
+        # name in WHERE: asked again with the expression it names. A name that is also a column of the FROM is the
+        # column, as Snowflake reads it)
         named = {e.alias.upper(): e.this for e in select.expressions if isinstance(e, exp.Alias) and not e.this.find(exp.Window)}
-
-        def spelled(key: exp.Expression) -> exp.Expression:
-            return key.transform(lambda n: named[n.name.upper()].copy() if isinstance(n, exp.Column) and not n.table
-                                 and n.name.upper() in named else n)
-
         withs, scope = [], select
         while scope is not None:
             if scope.args.get("with_") is not None:
                 withs.append(scope.args["with_"])
             scope = scope.parent
         ctes = [c.sql(dialect="snowflake") for w in reversed(withs) for c in w.expressions]
-        names = ", ".join(f"_t{i}" for i in range(len(keys)))
-        tied = None
-        for attempt in (keys, [spelled(k.copy()) for k in keys]):
-            probe = exp.Select(expressions=[exp.alias_(k, f"_t{i}") for i, k in enumerate(attempt)])
-            for arg in ("from_", "joins", "where"):
+        prefix = ("with " + ", ".join(ctes) + " ") if ctes else ""
+
+        def probe_of(expressions: list, where: exp.Expression | None) -> exp.Select:
+            probe = exp.Select(expressions=expressions)
+            for arg in ("from_", "joins"):
                 if select.args.get(arg) is not None:
                     value = select.args[arg]
                     probe.set(arg, [j.copy() for j in value] if isinstance(value, list) else value.copy())
-            query = (("with " + ", ".join(ctes) + " ") if ctes else "") + \
-                f"select count(*) from (select 1 from ({probe.sql(dialect='snowflake')}) group by {names} having count(*) > 1)"
+            if where is not None:
+                probe.set("where", where)
+            return probe
+
+        where = select.args.get("where")
+        used = {c.name.upper() for k in [*keys, *([where] if where else [])] for c in k.find_all(exp.Column) if not c.table} & set(named)
+        columns = set()
+        for name in used:
+            try:
+                conn.cursor().execute(prefix + probe_of([exp.column(name)], None).sql(dialect="snowflake") + " limit 0")
+                columns.add(name)
+            except Exception:  # noqa: BLE001, S112 - an alias only
+                continue
+
+        def spelled(key: exp.Expression) -> exp.Expression:
+            for _ in range(3):  # (an alias built from another)
+                key = key.transform(lambda n: named[n.name.upper()].copy() if isinstance(n, exp.Column) and not n.table
+                                    and n.name.upper() in named and n.name.upper() not in columns else n)
+            return key
+
+        names = ", ".join(f"_t{i}" for i in range(len(keys)))
+        tied = None
+        for attempt, filtered in ((keys, where), ([spelled(k.copy()) for k in keys], spelled(where.copy()) if where else None)):
+            probe = probe_of([exp.alias_(k, f"_t{i}") for i, k in enumerate(attempt)], filtered.copy() if filtered else None)
+            query = prefix + f"select count(*) from (select 1 from ({probe.sql(dialect='snowflake')}) group by {names} having count(*) > 1)"
             try:
                 (tied,) = conn.cursor().execute(query).fetchone()
                 break
@@ -477,8 +498,15 @@ def _unordered_lists(sql: str) -> set[str]:
         tree = sqlglot.parse_one(sql, read="snowflake")
     except Exception:  # noqa: BLE001
         return set()
-    return {a.alias.upper() for a in tree.find_all(exp.Alias)
-            if any(not isinstance(g.parent, exp.WithinGroup) and not g.find(exp.Order) for g in a.this.find_all(exp.GroupConcat))}
+    aliases = list(tree.find_all(exp.Alias))
+    found = {a.alias.upper() for a in aliases
+             if any(not isinstance(g.parent, exp.WithinGroup) and not g.find(exp.Order) for g in a.this.find_all(exp.GroupConcat))}
+    while True:  # (and what a later select makes of such a column: `max(open_invoices) as list_of_open_invoices`)
+        more = {a.alias.upper() for a in aliases if a.alias.upper() not in found
+                and any(c.name.upper() in found for c in a.this.find_all(exp.Column))}
+        if not more:
+            return found
+        found |= more
 
 
 def _any_values(sql: str) -> set[str]:
