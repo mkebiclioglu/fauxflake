@@ -230,9 +230,12 @@ MACROS = [
     f"""create or replace macro {_NS}_sf_like
           (x date, r timestamp) as r::date,
           (x, r) as r""",
-    # Text of a value: floats print the way C's %g does (100, 1e+20, 0.1), timestamps always
+    # Text of a value: floats print the way C's %g does (100, 1e+20, 0.1), with 10 significant digits, up to 9 decimals
+    # past the point, and 15 at most (measured: 0.3148508346, 15.022928717, 8478738.53312303); timestamps always
     # show milliseconds, and a VARIANT string loses its JSON quotes.
     f"""create or replace macro {_NS}_sf_text(x) as case
+          when typeof(x) in ('DOUBLE', 'FLOAT') and x::double <> 0 and not isnan(x::double) and not isinf(x::double)
+            then format('{{:.{{}}g}}', x::double, least(15, greatest(10, floor(log10(abs(x::double)))::integer + 10)))
           when typeof(x) in ('DOUBLE', 'FLOAT') then format('{{:.15g}}', x::double)
           when typeof(x) = 'JSON' and json_type(x::json) in ('OBJECT', 'ARRAY') then {_NS}_fx_json_sorted(x::varchar)
           when typeof(x) = 'JSON' then (x::json ->> '$')
@@ -659,6 +662,15 @@ def _average(node: exp.Expression) -> bool:
     return isinstance(node, exp.Case) and _is(node.args.get("default"), "_sf_div")
 
 
+def _binary_like(node: exp.Expression) -> bool:
+    """A value written as a BINARY: TO_BINARY, a cast to one, a function of binaries."""
+    node = node.unnest()
+    if isinstance(node, (exp.ToBinary, exp.Unhex, exp.FromBase64)) or (
+            isinstance(node, exp.Cast) and node.to.this in (exp.DataType.Type.BINARY, exp.DataType.Type.VARBINARY, exp.DataType.Type.BLOB)):
+        return True
+    return isinstance(node, exp.Anonymous) and "binary" in str(node.name).lower()
+
+
 def _text(node: exp.Expression) -> exp.Expression:
     """The value as Snowflake prints it. A division carries its scale into the text."""
     inner = node.unnest()
@@ -1025,6 +1037,20 @@ def _fix(node: exp.Expression) -> exp.Expression:
     if isinstance(node, _ARITHMETIC):
         node.set("this", _operand(node.this))
         node.set("expression", _operand(node.expression))
+    if isinstance(node, (exp.Concat, exp.ConcatWs)) and not any(_binary_like(e) for e in node.expressions):
+        # CONCAT(x, ...) writes each value as Snowflake prints it, as || does (a FLOAT with its 10 digits); CONCAT of
+        # binaries is a binary, left as it is
+        node.set("expressions", [e if (isinstance(e, exp.Literal) and e.is_string) or isinstance(e, (exp.JSONExtract, exp.Null))
+                                 else _text(e) for e in node.expressions])
+    if isinstance(node, exp.GroupConcat) and not isinstance(node.this, exp.Distinct):
+        # LISTAGG(x) too (not LISTAGG(DISTINCT x) ... WITHIN GROUP (ORDER BY x): DuckDB wants the same x in both)
+        inner = node.this
+        if isinstance(inner, exp.Order):
+            if inner.this is not None and not isinstance(inner.this, exp.Distinct) \
+                    and not (isinstance(inner.this, exp.Literal) and inner.this.is_string):
+                inner.set("this", _text(inner.this))
+        elif inner is not None and not (isinstance(inner, exp.Literal) and inner.is_string):
+            node.set("this", _text(inner))
     if isinstance(node, exp.DPipe):
         for side in ("this", "expression"):
             part = node.args[side]

@@ -952,3 +952,8 @@
 - {id: refused_25, sql: "select try_to_number(t) from (select null::number t)"}
 - {id: refused_26, sql: "select t::number from (select null::date t)"}
 - {id: refused_27, sql: "select count(*) from (select t::float as f from (select '2025-01-01'::timestamp_ntz t) where false)"}
+# Recorded 2026-11-19. A FLOAT as text: 10 significant digits, up to 9 decimals past the point, 15 at most.
+- {id: float_text_1, sql: "select x::varchar, to_varchar(x), '#' || x, to_char(x) from (select column1::float x from values ('4.749801436513762e-10'), ('0.00019749657786943185'), ('4.1631430572869156e-05'), ('0.8921984195319782'), ('15.022928716836011'), ('656.001907248427'), ('8478738.533123035'), ('123456789012.5'), ('-3.08629643924887'), ('0'), ('1e20'), ('2.5e-300'), ('99999.99999999999')) order by x"}
+- {id: float_text_2, sql: "select listagg(x, '|') within group (order by x), concat(min(x), ''), concat_ws('-', min(x), max(x)) from (select column1::float x from values ('0.8921984195319782'), ('15.022928716836011'), ('8478738.533123035'))"}
+- {id: float_text_4, sql: "select array_to_string(array_agg(x) within group (order by x), '|') from (select column1::float x from values ('0.8921984195319782'), ('15.022928716836011'))", gap: "a FLOAT in an ARRAY is written as a FLOAT; the emulator's JSON keeps no FLOAT type (as object_keys_10)"}
+- {id: float_text_3, sql: "select (x / 3)::varchar, sqrt(x)::varchar, (x * 1.1)::varchar, avg(x)::varchar from (select 7::float x) group by x"}
