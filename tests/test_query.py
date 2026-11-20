@@ -192,3 +192,36 @@ def test_a_quoted_name_is_a_column_only_in_the_case_it_is_written():
         with pytest.raises(ProgrammingError, match="invalid identifier 'START'"):
             cur.execute("select start from u")
         assert cur.execute('select "start" from u').fetchall() == [("a",)]
+
+
+def test_a_conversion_of_a_column_without_nulls_is_never_null_and_is_not_made():
+    """Measured on Snowflake: each micro-partition knows how many NULLs a column holds, so `where n is null` over a
+    conversion of a column with none reads nothing, and a value that does not convert is no error."""
+    import pytest
+    import snowflake.connector
+    from snowflake.connector.errors import ProgrammingError
+
+    from fauxflake.emulator import serve
+
+    with serve() as emu:
+        cur = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S")).cursor()
+        cur.execute("create table t as select md5(i::varchar) as x, iff(i = 3, null, md5(i::varchar)) as y, i "
+                    "from (select seq4() as i from table(generator(rowcount => 35)))")
+        cur.execute("create view v as select x::number as n, y::number as m, upper(x)::number as u, (x::number + 1) as p, "
+                    "to_number(x) as tn, x::date as d, coalesce(x, 'a')::number as c, i from t")
+        cur.execute("create view w as select n as n2, * from v")
+        count = lambda sql: cur.execute(sql).fetchone()[0]  # noqa: E731
+        for where in ("n is null", "tn is null", "d is null", "n is null and i > 5", "n is null or i > 50", "i > 50"):
+            assert count(f"select count(*) from v where {where}") == 0, where
+        assert count("select count(*) from w where n2 is null") == 0
+        assert count("select count(*) from (select n from v where n is null) dbt_internal_test") == 0
+        assert count("select count(*) from t where x::number is null") == 0
+        assert count("with s as (select x::number as n from t) select count(*) from s where n is null") == 0
+        assert count("select count(*) from (select distinct x::number as n from t) where n is null") == 0
+        assert count("select count(*) from (select a.x::number as n from t a join t b on a.i = b.i) where n is null") == 0
+        assert count("select count(*) from (select b.x::number as n from t a left join t b on a.i = b.i + 100) where n is null") == 35
+        for where in ("m is null", "u is null", "p is null", "c is null", "n is not null", "n = 5"):
+            with pytest.raises(ProgrammingError):
+                cur.execute(f"select count(*) from v where {where}").fetchall()
+        with pytest.raises(ProgrammingError):
+            cur.execute("select count(*) from (select x::number as n from t limit 100) where n is null").fetchall()

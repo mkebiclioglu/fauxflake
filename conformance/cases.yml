@@ -924,3 +924,24 @@
 - {id: ambiguous_8, sql: "select *, 2 as id from (select 1 as id) order by id"}
 - {id: ambiguous_9, sql: "with c as (select 2 as id, * from (select 1 as id)) select id from c"}
 - {id: ambiguous_10, sql: "select id from (select *, 2 as id from (select 1 as id)) where id = 1"}
+# Recorded 2026-11-19. Conversions Snowflake refuses when it compiles: a timestamp is not seconds, nor a number.
+- {id: refused_1, sql: "select dateadd('s', t, '1970-01-01') from (select '2025-01-01 10:00:00'::timestamp_ntz t)"}
+- {id: refused_2, sql: "select dateadd('ms', t, '1970-01-01')::timestamp from (select '2025-01-01 10:00:00'::timestamp_ntz t)"}
+- {id: refused_3, sql: "select t::float from (select '2025-01-01 10:00:00'::timestamp_ntz t)"}
+- {id: refused_4, sql: "select to_numeric(t) from (select '2025-01-01 10:00:00'::timestamp_ntz t)"}
+- {id: refused_5, sql: "select t::number from (select '2025-01-01 10:00:00'::timestamp_ntz t)"}
+- {id: refused_6, sql: "select try_to_timestamp_ntz(t) from (select '2025-01-01 10:00:00'::timestamp_ntz t)"}
+- {id: refused_7, sql: "select try_to_timestamp(t) from (select '2025-01-01 10:00:00'::timestamp_ntz t)"}
+- {id: refused_8, sql: "select try_to_date(t) from (select '2025-01-01'::date t)"}
+- {id: refused_9, sql: "select try_to_date(t) from (select '2025-01-01 10:00:00'::timestamp_ntz t)"}
+- {id: refused_10, sql: "select try_to_number(t) from (select 5 t)"}
+- {id: refused_11, sql: "select try_to_timestamp_ntz(t)::date from (select '2025-01-01 10:00:00'::timestamp_ntz t)"}
+- {id: refused_12, sql: "select t::double from (select '2025-01-01'::date t)"}
+- {id: refused_13, sql: "select dateadd('s', t, '1970-01-01') from (select '2025-01-01'::date t)"}
+- {id: refused_14, sql: "select dateadd('s', t, '1970-01-01') from (select '17'::varchar t)"}
+- {id: refused_15, sql: "select try_to_boolean(t) from (select true t)"}
+- {id: refused_16, sql: "select try_to_timestamp(t) from (select '2025-01-01'::date t)"}
+- {id: refused_17, sql: "select try_to_double(t) from (select 1.5::float t)"}
+- {id: refused_18, sql: "select t::boolean from (select '2025-01-01 10:00:00'::timestamp_ntz t)"}
+- {id: refused_19, sql: "select to_double(t) from (select '2025-01-01 10:00:00'::timestamp_ntz t)"}
+- {id: refused_20, sql: "select t::number from (select '2025-01-01'::date t)"}

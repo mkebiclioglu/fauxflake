@@ -2543,6 +2543,153 @@ def misnamed_column(transformed: exp.Expression, conn, probe: bool = True) -> st
     return None
 
 
+_CONVERSION = re.compile(r"_(?:sf|fs)_(?:to_(?!.*try)\w+|int|integer|text|number\w*|decimal\w*|double|float|bool\w*|date|time\w*)", re.I)
+
+
+def pruned_nulls(transformed: exp.Expression, conn) -> exp.Expression | None:  # noqa: ANN001
+    """`select id from orders_v where id is null`, with orders_v converting text to a number (`order_id::number as id`)
+    and text that is no number in it: Snowflake answers no rows rather than its conversion error. A conversion is NULL
+    only when what it converts is, and each micro-partition knows how many NULLs a column holds: a column with none
+    leaves no partition to read, and the conversion is never made. DuckDB makes it, on every row. Seen through views,
+    subqueries and CTEs, as Snowflake pushes the filter down (not past a LIMIT, nor to the side of an outer join
+    that adds NULLs). The predicate is then false; returns the statement so, or None when no predicate is."""
+    from sqlglot.optimizer.scope import Scope, traverse_scope
+
+    def called(node: exp.Expression) -> tuple[str, list] | None:
+        if isinstance(node, exp.Dot) and isinstance(node.expression, exp.Anonymous):
+            node = node.expression
+        if isinstance(node, exp.Anonymous):
+            return str(node.name).split(".")[-1], list(node.expressions)
+        return None
+
+    def argument(node: exp.Expression) -> exp.Expression:
+        call = called(node)  # (text read as a number first: `_sf_num_text(x)`, still x)
+        return call[1][0] if call and call[0].lower() == "_sf_num_text" and call[1] else node
+
+    def conversion(node: exp.Expression) -> exp.Expression | None:
+        """What a conversion converts, when it is one of a column."""
+        while isinstance(node, exp.Paren):
+            node = node.this
+        if isinstance(node, exp.Cast) and not isinstance(node, exp.TryCast) and not node.args.get("safe"):
+            inner = argument(node.this)
+            return inner if isinstance(inner, exp.Column) else None
+        if isinstance(node, exp.Case) and node.args.get("default") is not None:
+            # TO_NUMBER(x) is written `CASE WHEN <x read as a number> IS NOT NULL THEN CAST(...) ELSE CAST(x ...) END`
+            results = [conversion(i.args["true"]) for i in node.args.get("ifs") or []] + [conversion(node.args["default"])]
+            tests = [c for i in node.args.get("ifs") or [] for c in i.this.find_all(exp.Column)]
+            names = {r.sql() if r is not None else None for r in results} | {c.sql() for c in tests}
+            return results[0] if len(names) == 1 and None not in names else None
+        call = called(node)
+        if call and _CONVERSION.fullmatch(call[0]) and call[1] and isinstance(argument(call[1][0]), exp.Column):
+            return argument(call[1][0])
+        return None
+
+    views: dict[str, exp.Expression | None] = {}
+
+    def view(table: exp.Table) -> exp.Expression | None:
+        key = table.sql(dialect="duckdb")
+        if key not in views:
+            row = conn.execute(
+                "select sql from duckdb_views() where lower(view_name) = lower(?) and not internal "
+                "and lower(schema_name) = lower(coalesce(?, current_schema())) "
+                "and lower(database_name) = lower(coalesce(?, current_database()))",
+                [table.name, table.db or None, table.catalog or None]).fetchone()
+            body = None
+            if row:
+                parsed = sqlglot.parse_one(row[0], read="duckdb")
+                body = parsed.expression if isinstance(parsed, exp.Create) else None
+                if body is not None and table.catalog:  # (its tables are named as the view's database sees them)
+                    for t in body.find_all(exp.Table):
+                        if t.db and not t.catalog:
+                            t.set("catalog", exp.to_identifier(table.catalog))
+            views[key] = body
+        return views[key]
+
+    def none_null(table: exp.Table, column: str) -> bool:
+        bare = exp.Table(this=table.this.copy(), db=table.args.get("db"), catalog=table.args.get("catalog"))
+        (nulls,) = conn.execute(f"select count(*) from {bare.sql(dialect='duckdb')} where {exp.column(column, quoted=True).sql(dialect='duckdb')} is null").fetchone()
+        return nulls == 0
+
+    def outer_side(scope: Scope, alias: str) -> bool:
+        """The relation `alias` stands on a side of an outer join that is filled with NULLs."""
+        select = scope.expression
+        joins = select.args.get("joins") or [] if isinstance(select, exp.Select) else []
+        first = select.args.get("from_").this.alias_or_name if isinstance(select, exp.Select) and select.args.get("from_") else None
+        for j in joins:
+            side = (j.args.get("side") or "").upper()
+            if side in ("LEFT", "FULL") and j.this.alias_or_name.upper() == alias.upper():
+                return True
+            if side in ("RIGHT", "FULL") and first and first.upper() == alias.upper():
+                return True
+        return False
+
+    def follow(column: exp.Column, scope: Scope, converted: bool, depth: int = 0) -> bool:
+        """The column, read in `scope`, is (after a conversion when `converted`) one of a table with no NULLs."""
+        if depth > 30:
+            return False
+        sources = scope.selected_sources
+        if column.table:
+            picked = [(a, s) for a, (_n, s) in sources.items() if a.upper() == column.table.upper()]
+        else:
+            picked = [(a, s) for a, (_n, s) in sources.items()]
+        if len(picked) != 1 or outer_side(scope, picked[0][0]):
+            return False
+        _alias, source = picked[0]
+        name = column.name
+        if isinstance(source, exp.Table):
+            body = view(source)
+            if body is None:
+                return converted and isinstance(source.this, exp.Identifier) and none_null(source, name)
+            inner = traverse_scope(body)
+            return bool(inner) and through(name, inner[-1], converted, depth + 1)
+        if isinstance(source, Scope):
+            return through(name, source, converted, depth + 1)
+        return False
+
+    def through(name: str, scope: Scope, converted: bool, depth: int) -> bool:
+        """The column `name` that `scope` gives is (after a conversion when `converted`) one with no NULLs."""
+        select = scope.expression
+        if not isinstance(select, exp.Select) or select.args.get("limit") or select.args.get("offset") or select.args.get("fetch"):
+            return False
+        for e in select.expressions:
+            if isinstance(e, exp.Star) or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star)):
+                continue
+            if e.alias_or_name.upper() != name.upper():
+                continue
+            value = e.this if isinstance(e, exp.Alias) else e
+            if isinstance(value, exp.Column):
+                return follow(value, scope, converted, depth)
+            inner = conversion(value)
+            return inner is not None and not converted and follow(inner, scope, True, depth)
+        if any(isinstance(e, exp.Star) or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star)) for e in select.expressions):
+            return follow(exp.column(name), scope, converted, depth)
+        return False
+
+    tree = transformed.copy()
+    body = tree.expression if isinstance(tree, (exp.Create, exp.Insert)) and isinstance(tree.expression, exp.Query) else tree
+    changed = False
+    for scope in traverse_scope(body):
+        where = scope.expression.args.get("where") if isinstance(scope.expression, exp.Select) else None
+        if where is None:
+            continue
+        for test in list(where.find_all(exp.Is)):
+            # (IS NULL in this select's own WHERE, not negated: NOT (x IS NULL) reads every partition with a value)
+            if not isinstance(test.expression, exp.Null) or test.find_ancestor(exp.Select) is not scope.expression \
+                    or isinstance(test.find_ancestor(exp.Not, exp.Select), exp.Not):
+                continue
+            operand = test.this
+            try:
+                inner = conversion(operand)
+                found = follow(inner, scope, True) if inner is not None else (
+                    isinstance(operand, exp.Column) and follow(operand, scope, False))
+            except Exception:  # noqa: BLE001 - what cannot be followed is read as written
+                found = False
+            if found:
+                test.replace(exp.false())
+                changed = True
+    return tree if changed else None
+
+
 def union_text_kinds(transformed: exp.Expression, conn) -> exp.Expression:  # noqa: ANN001
     """`select n from a union all select t from b` with `n` a number and `t` text: Snowflake gives the column the
     number's own type (also a date's, a timestamp's, a boolean's) and text that is not one is an error. DuckDB makes

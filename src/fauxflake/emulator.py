@@ -1076,6 +1076,8 @@ def _patch_fakesnow() -> None:
                 if "Malformed JSON" in e else None,
                 "zones": lambda e: semantics.dates_in_time_zones(transformed, self._duck_conn) if "TIMESTAMPTZ_NS" in e else None,
                 "bytes": lambda e: semantics.shifted_bytes(transformed, self._duck_conn, e),
+                "pruned": lambda e: semantics.pruned_nulls(transformed, self._duck_conn)
+                if "Conversion Error" in e or "is not recognized" in e or "Could not convert" in e else None,
                 "types": lambda e: semantics.repair_types(transformed, self._duck_conn, params)
                 if "No function matches" in e or "Could not choose a best candidate" in e else None,
             }

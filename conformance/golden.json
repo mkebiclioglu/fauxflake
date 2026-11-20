@@ -6932,6 +6932,82 @@
    ]
   ]
  },
+ "refused_1": {
+  "error": "001044 (42P13): SQL compilation error: error line 1 at position 7"
+ },
+ "refused_10": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "refused_11": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "refused_12": {
+  "error": "001007 (22023): SQL compilation error:"
+ },
+ "refused_13": {
+  "error": "001044 (42P13): SQL compilation error: error line 1 at position 7"
+ },
+ "refused_14": {
+  "rows": [
+   [
+    "1970-01-01 00:00:17.000"
+   ]
+  ]
+ },
+ "refused_15": {
+  "rows": [
+   [
+    true
+   ]
+  ]
+ },
+ "refused_16": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "refused_17": {
+  "rows": [
+   [
+    "1.5"
+   ]
+  ]
+ },
+ "refused_18": {
+  "error": "001007 (22023): SQL compilation error:"
+ },
+ "refused_19": {
+  "error": "001007 (22023): SQL compilation error:"
+ },
+ "refused_2": {
+  "error": "001044 (42P13): SQL compilation error: error line 1 at position 7"
+ },
+ "refused_20": {
+  "error": "001007 (22023): SQL compilation error:"
+ },
+ "refused_3": {
+  "error": "001007 (22023): SQL compilation error:"
+ },
+ "refused_4": {
+  "error": "001007 (22023): SQL compilation error:"
+ },
+ "refused_5": {
+  "error": "001007 (22023): SQL compilation error:"
+ },
+ "refused_6": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "refused_7": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "refused_8": {
+  "rows": [
+   [
+    "2025-01-01"
+   ]
+  ]
+ },
+ "refused_9": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
  "regexp": {
   "rows": [
    [
