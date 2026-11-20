@@ -962,3 +962,11 @@
 - {id: seeded_2, sql: "select uniform(0, 1000000, 1), uniform(1, 62, 1), uniform(0::float, 1::float, 1), uniform(-10, 10, 7), uniform(1, 6, -3)"}
 - {id: seeded_3, sql: "select s, randstr(6, s), uniform(1, 100, s) from (select seq4() s from table(generator(rowcount => 5))) order by s"}
 - {id: seeded_4, sql: "select sha2(randstr(32, x::number) || x::varchar) from (select 42 x)"}
+# Recorded 2026-11-19. A name that is both a column and an alias of the same select.
+- {id: alias_or_column_1, sql: "with t as (select 'a.b' m, 1 u union all select 'a.c', 1) select split_part(m, '.', 1) as m, row_number() over (partition by m order by u) rn from t order by rn"}
+- {id: alias_or_column_2, sql: "with t as (select 'a.b' m, 1 u union all select 'a.c', 2) select split_part(m, '.', 1) as m, u from t qualify row_number() over (partition by m order by u desc) = 1 order by u"}
+- {id: alias_or_column_3, sql: "with t as (select 'a.b' m, 1 u union all select 'a.c', 2) select split_part(m, '.', 1) as m, count(*) from t group by m order by 1"}
+- {id: alias_or_column_4, sql: "with t as (select 'a.b' m, 1 u union all select 'a.c', 2) select split_part(m, '.', 1) as m, u from t where m = 'a' order by u"}
+- {id: alias_or_column_5, sql: "with t as (select 'a.b' m, 1 u union all select 'a.c', 2) select split_part(m, '.', 1) as m, u from t order by m desc, u"}
+- {id: alias_or_column_6, sql: "with t as (select 'a.b' m, 1 u union all select 'a.c', 2) select split_part(m, '.', 1) as m, sum(u) over (partition by m) s from t order by s"}
+- {id: alias_or_column_7, sql: "with t as (select 'a.b' m, 1 u union all select 'a.c', 2) select split_part(m, '.', 1) as k, u from t qualify row_number() over (partition by k order by u desc) = 1"}
