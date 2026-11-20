@@ -592,12 +592,18 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
     other rows. Day by day for incremental models."""
     import os
 
+    from . import objects
+
     found: list[Difference] = []
     rows: list[Parity] = []
+    # both engines run as the same role: the one Snowflake's session has (masking policies show it what they show it)
+    (role,) = conn.cursor().execute("select current_role()").fetchone()
     for i in range(days + 1):
         now = start + timedelta(days=i)
         prev = wh.now
         wh.advance_to(now)
+        if role:
+            objects.set_role(wh.emu.duck, role)
         log(f"{now:%Y-%m-%d}  seeding Snowflake")
         seed(conn, wh, after=prev, log=log, renamed=renamed)
         full = ["--full-refresh"] if i == 0 else []
