@@ -202,7 +202,11 @@ def _freeze_clock(sql: str) -> str:
     def sub(m: re.Match[str]) -> str:
         if m.group(0).lower().startswith("current_date"):
             return f"'{FROZEN_NOW:%Y-%m-%d}'::date"
-        return f"'{FROZEN_NOW:%Y-%m-%d %H:%M:%S}'::timestamp"
+        if m.group(0).lower().startswith("sysdate"):
+            return f"'{FROZEN_NOW:%Y-%m-%d %H:%M:%S}'::timestamp"  # (SYSDATE is a TIMESTAMP_NTZ, in UTC)
+        # CURRENT_TIMESTAMP() is an instant (TIMESTAMP_LTZ), as the live clock: CONVERT_TIMEZONE('America/Los_Angeles',
+        # CURRENT_TIMESTAMP()) gives that zone's wall clock, not the frozen time read as one of that zone's
+        return f"'{FROZEN_NOW:%Y-%m-%d %H:%M:%S} +00:00'::timestamp_tz"
 
     if "'" not in sql and '"' not in sql and "$$" not in sql:
         return _CLOCK.sub(sub, sql)

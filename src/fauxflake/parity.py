@@ -188,6 +188,27 @@ def _canonical_functions(duck) -> None:  # noqa: ANN001
         duck.create_function(name, made(unordered), ["VARCHAR"], "VARCHAR", type="arrow")
 
 
+def _through_policies(emu, duck, database: str, schema: str, name: str, mine: str) -> str:  # noqa: ANN001
+    """The model as the session's role reads it: through the masking and row access policies set on it (the emulator
+    applies them to what a client reads; this reads DuckDB's tables)."""
+    from . import objects
+
+    if not hasattr(emu, "_fs"):
+        return mine
+    state = objects.state_of(emu._fs)
+    fq = (database.upper(), schema.upper(), name.upper())
+    masks, rows = state.masks.get(fq, {}), state.row_policies.get(fq, [])
+    if not masks and not rows:
+        return mine
+    quote = lambda c: '"' + c.replace('"', '""') + '"'  # noqa: E731
+    call = lambda fn, cols: f"_fs_global.main._udf_{fn}({', '.join(quote(c) for c in cols)})"  # noqa: E731
+    replaced = ", ".join(f"{call(fn, [col, *extra])} as {quote(col)}" for col, (fn, extra) in masks.items())
+    where = " and ".join(call(fn, cols) for fn, cols in rows)
+    duck.execute(f"create or replace temp view _fx_read_as_role as select *{' replace (' + replaced + ')' if replaced else ''} "
+                 f"from {mine}{' where ' + where if where else ''}")
+    return "_fx_read_as_role"
+
+
 def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_schema: str | None = None,
             only: set[str] | None = None, clock: tuple | None = None) -> list[Parity]:
     """Each model on the emulator against the same model on Snowflake, row for row. Without
@@ -206,6 +227,7 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
             continue
         name = node.get("alias") or node["name"]
         mine = f'{node["database"]}.{schema or node["schema"]}.{name}'
+        mine = _through_policies(emu, duck, node["database"], schema or node["schema"], name, mine)
         try:
             types = {c.upper(): ty for c, ty, *_ in duck.execute(f"describe {mine}").fetchall()}
         except Exception:  # noqa: BLE001 - the emulator cannot read it (a view over something that fails)
@@ -602,11 +624,17 @@ def _is_clock(duck, both: str, column: str, kind: str, clock) -> bool:  # noqa: 
         return lo_m.date() == hi_m.date() and lo_m.date() in days and lo_t.date() in days and hi_t.date() in days
     shift = datetime.now().astimezone().utcoffset() or timedelta(0)  # (a time of this machine's day, as dbt writes `now()`)
 
-    def within(lo: datetime, hi: datetime, a: datetime, b: datetime) -> bool:
-        return any(a - slack <= lo + d and hi + d <= b + slack for d in (timedelta(0), -shift))
+    def within(lo: datetime, hi: datetime, a: datetime, b: datetime, d: timedelta) -> bool:
+        return a - slack <= lo + d and hi + d <= b + slack
 
-    mine = within(lo_m, hi_m, frozen, frozen) or ("local" in extra and within(lo_m, hi_m, *extra["local"]))
-    return mine and within(lo_t, hi_t, start, end)
+    # (a time shown in a zone, CONVERT_TIMEZONE('America/Los_Angeles', CURRENT_TIMESTAMP()): the same offset of a
+    # quarter hour on both engines; this machine's own offset too)
+    offsets = {timedelta(0), -shift, *(timedelta(minutes=15 * k) for k in range(-14 * 4, 14 * 4 + 1))}
+    for d in offsets:
+        mine = within(lo_m, hi_m, frozen, frozen, d) or ("local" in extra and within(lo_m, hi_m, *extra["local"], d))
+        if mine and within(lo_t, hi_t, start, end, d):
+            return True
+    return False
 
 
 def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datetime, days: int,

@@ -132,3 +132,20 @@ def test_a_node_failing_on_one_side_only_on_a_grown_query_tag_is_not_an_engine_d
     mine = {"test.p.a": ("error", tag, None), "test.p.b": ("error", "Division by zero", None)}
     theirs = {"test.p.a": ("pass", "", 0), "test.p.b": ("pass", "", 0)}
     assert {d.node: d.kind for d in differences(mine, theirs, [])} == {"test.p.a": "undetermined", "test.p.b": "emulator_only_error"}
+
+
+def test_a_model_is_compared_as_the_role_reads_it_through_its_masking_policy():
+    import snowflake.connector
+
+    from fauxflake.emulator import serve
+    from fauxflake.parity import _through_policies
+
+    with serve() as emu:
+        cur = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S")).cursor()
+        cur.execute("create table t as select 'secret' as s, 1 as n")
+        cur.execute("create masking policy p as (val varchar) returns varchar -> case when current_role() = 'NOBODY' then val else '***MASKED***' end")
+        cur.execute("alter table t modify column s set masking policy p")
+        duck = emu.cursor()
+        mine = _through_policies(emu, duck, "D", "S", "T", "D.S.T")
+        assert duck.execute(f"select * from {mine}").fetchall() == [("***MASKED***", 1)]
+        assert _through_policies(emu, duck, "D", "S", "OTHER", "D.S.OTHER") == "D.S.OTHER"

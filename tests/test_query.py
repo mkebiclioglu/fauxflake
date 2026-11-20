@@ -280,3 +280,20 @@ def test_an_expression_without_a_name_is_named_as_written_also_in_a_cte_a_table_
         assert names("select * from t") == ["D", "DELTA::NUMBER", "COALESCE(DELTA, 0) + 1", "UPPER(PUBDATE)", "DELTA"]
         assert names("select a.* from (select count(*), max(delta) + 1 from src) a") == ["COUNT(*)", "MAX(DELTA) + 1"]
         assert names("select * from (select (select count(*) from src), delta + 1 from src)") == ["(SELECT COUNT(*) FROM SRC)", "DELTA + 1"]
+
+
+def test_the_frozen_clock_is_an_instant_that_a_time_zone_shows_as_its_wall_clock(monkeypatch):
+    from datetime import datetime
+
+    import snowflake.connector
+
+    from fauxflake import emulator
+    from fauxflake.emulator import serve
+
+    monkeypatch.setattr(emulator, "FROZEN_NOW", datetime(2026, 1, 15, 12, 0, 0))
+    with serve() as emu:
+        cur = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S")).cursor()
+        (la,) = cur.execute("select convert_timezone('America/Los_Angeles', current_timestamp())::timestamp_ntz::varchar").fetchone()
+        assert la.startswith("2026-01-15 04:00:00")
+        (utc,) = cur.execute("select sysdate()::varchar").fetchone()
+        assert utc.startswith("2026-01-15 12:00:00")
