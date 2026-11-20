@@ -12,7 +12,7 @@ import re
 import sqlglot
 from sqlglot import exp
 
-from . import catalog
+from . import catalog, xmldoc
 
 _NS = "_fs_global.main."
 _SCALE = r"coalesce(try_cast(nullif(regexp_extract(typeof(a), ',(\d+)\)', 1), '') as integer), 0)"
@@ -36,6 +36,10 @@ def python_functions(duck) -> None:  # noqa: ANN001
             ("_fxpy_json_sorted", sorted_json, ["VARCHAR"], "VARCHAR", "arrow"),
             ("_fxpy_encrypt_raw", encrypt_raw, ["BLOB", "BLOB", "BLOB", "BLOB", "VARCHAR"], "VARCHAR", None),
             ("_fxpy_randstr", randstr, ["BIGINT", "HUGEINT"], "VARCHAR", None),
+            ("_fxpy_parse_xml", parse_xml, ["VARCHAR"], "VARCHAR", None),
+            ("_fxpy_check_xml", xmldoc.check, ["VARCHAR"], "VARCHAR", None),
+            ("_fxpy_to_xml", xmldoc.to_xml, ["VARCHAR"], "VARCHAR", None),
+            ("_fxpy_xmlget", xmldoc.xmlget, ["VARCHAR", "VARCHAR", "BIGINT"], "VARCHAR", None),
             ("_fxpy_seeded_unit", seeded_unit, ["HUGEINT"], "DOUBLE", None),
             ("_fxpy_decrypt_raw", decrypt_raw, ["BLOB", "BLOB", "BLOB", "BLOB", "VARCHAR", "BLOB", "BOOLEAN"], "BLOB", None)):
         try:
@@ -45,6 +49,11 @@ def python_functions(duck) -> None:  # noqa: ANN001
             pass
     duck.execute(f"create or replace macro {_NS}_fx_sha2(x, n) as _fxpy_sha2(x, n)")
     duck.execute(f"create or replace macro {_NS}_sf_randstr(n, seed) as _fxpy_randstr(n, seed)")
+    duck.execute(f"create or replace macro {_NS}_sf_parse_xml (s) as _fxpy_parse_xml(s::varchar)::json, (s, b) as _fxpy_parse_xml(s::varchar)::json")
+    duck.execute(f"create or replace macro {_NS}_sf_check_xml (s) as _fxpy_check_xml(s::varchar), (s, b) as _fxpy_check_xml(s::varchar)")
+    duck.execute(f"create or replace macro {_NS}_sf_to_xml(v) as _fxpy_to_xml(v::varchar)")
+    duck.execute(f"create or replace macro {_NS}_sf_xmlget (x, t) as _fxpy_xmlget(x::varchar, t, 0)::json, "
+                 "(x, t, n) as _fxpy_xmlget(x::varchar, t, n)::json")
     duck.execute(f"create or replace macro {_NS}_fx_json_sorted(x) as _fxpy_json_sorted(x)")
     duck.execute(f"create or replace macro {_NS}_sf_encrypt_raw (v, k) as _fxpy_encrypt_raw(v, k, null, null, null)::json, "
                  "(v, k, iv) as _fxpy_encrypt_raw(v, k, iv, null, null)::json, "
@@ -55,6 +64,15 @@ def python_functions(duck) -> None:  # noqa: ANN001
                      f"(v, k, iv, aad) as _fxpy_decrypt_raw(v, k, iv, aad, null, null, {lenient}), "
                      f"(v, k, iv, aad, m) as _fxpy_decrypt_raw(v, k, iv, aad, m, null, {lenient}), "
                      f"(v, k, iv, aad, m, tag) as _fxpy_decrypt_raw(v, k, iv, aad, m, tag, {lenient})")
+
+
+def parse_xml(text):  # noqa: ANN001, ANN201
+    if text is None:
+        return None
+    try:
+        return xmldoc.to_json(text)
+    except xmldoc.XMLError as e:
+        raise _fx_error(100100, "22P02", f"Error parsing XML: {e}") from None
 
 
 # Snowflake's generator for a seed, measured: its state starts at seed × 0x9E3779B97F4A7C15 (mod 2**64) and steps as the
@@ -179,6 +197,13 @@ def json_sorted(text: str | None) -> str | None:
 
     if text is None or not text.lstrip().startswith(("{", "[")):
         return text
+    if xmldoc.MARK in text or "\\ufdd0xml" in text:  # an XML element (its mark as written, or as DuckDB escapes it): as XML
+        try:
+            value = xmldoc.loads(text)
+        except ValueError:
+            value = None
+        if xmldoc.is_element(value):
+            return xmldoc.write(value)
 
     class Raw(str):  # a number, kept as written (131.0 stays 131.0, a long decimal keeps its digits)
         pass
@@ -234,9 +259,13 @@ MACROS = [
                            union all select view_name, sql from duckdb_views() where database_name = current_database())
           where upper(n) = upper(split_part(name, '.', -1)) limit 1)""",
     # TYPEOF looks inside a VARIANT. DuckDB only says JSON.
+    # (an XML element is an object with the emulator's mark among its keys; a number written with an exponent is a
+    # FLOAT, as Snowflake reads one)
     f"""create or replace macro {_NS}_sf_typeof(v) as case when typeof(v) <> 'JSON' then typeof(v) else
           case json_type(v::varchar)
-            when 'UBIGINT' then 'INTEGER' when 'BIGINT' then 'INTEGER' when 'DOUBLE' then 'DECIMAL'
+            when 'UBIGINT' then 'INTEGER' when 'BIGINT' then 'INTEGER'
+            when 'DOUBLE' then case when regexp_matches(v::varchar, '[eE]') then 'DOUBLE' else 'DECIMAL' end
+            when 'OBJECT' then case when list_contains(json_keys(v::json), chr(64976) || 'xml') then 'XML' else 'OBJECT' end
             when 'NULL' then 'NULL_VALUE' else json_type(v::varchar) end end""",
     # A windowed AVG keeps three extra decimals, not six.
     f"""create or replace macro {_NS}_sf_div3(a, b) as case
@@ -559,6 +588,7 @@ _RENAMED = {  # Snowflake function -> macro, same arguments
     "get_ignore_case": "_sf_get_ignore_case", "object_keys": "_sf_object_keys", "hash_agg": "_sf_hash_agg",
     "try_hex_decode_string": "_sf_try_hex", "encrypt_raw": "_sf_encrypt_raw",
     "decrypt_raw": "_sf_decrypt_raw", "try_decrypt_raw": "_sf_try_decrypt_raw",
+    "parse_xml": "_sf_parse_xml", "check_xml": "_sf_check_xml", "to_xml": "_sf_to_xml", "xmlget": "_sf_xmlget",
     **{f"is_{k}": f"_sf_is_{k}" for k in ("date", "time", "timestamp_ntz", "timestamp_ltz", "timestamp_tz")},
     **{f"as_{k}": f"_sf_as_{k}" for k in ("date", "time", "timestamp_ntz", "timestamp_ltz", "timestamp_tz", "double", "real",
                                           "number", "decimal", "boolean", "object", "array")}, "upper": "_sf_upper", "ucase": "_sf_upper",
@@ -1610,6 +1640,22 @@ def _windows_without_errors(transformed: exp.Expression) -> None:
                     call.replace(exp.Case(ifs=[exp.If(this=exp.Anonymous(this=guard, expressions=[value.copy()]), true=value.copy())]))
 
 
+def _documents_as_text(transformed: exp.Expression) -> None:
+    """`v:x::varchar` when v:x is an object or an array: Snowflake writes it with its keys in order (an XML element as
+    XML); DuckDB's ->> gives the JSON as it is stored. A string at that path stays the string."""
+    for cast in list(transformed.find_all(exp.Cast)):
+        inner = cast.this.unnest() if isinstance(cast.this, exp.Paren) else cast.this
+        if not (isinstance(inner, exp.JSONExtractScalar) and cast.to.is_type("text", "varchar")):
+            continue
+        doc, path = inner.this, inner.expression
+        if doc is None or path is None:
+            continue
+        kind = exp.Anonymous(this="json_type", expressions=[doc.copy(), path.copy()])
+        whole = exp.cast(exp.Anonymous(this="json_extract", expressions=[doc.copy(), path.copy()]), "varchar")
+        cast.replace(exp.Case(ifs=[exp.If(this=exp.In(this=kind, expressions=[exp.Literal.string("OBJECT"), exp.Literal.string("ARRAY")]),
+                                          true=_fn("_fx_json_sorted", whole))], default=cast.copy()))
+
+
 def finish(transformed: exp.Expression) -> exp.Expression:
     """Fix-ups on the DuckDB side of the translation."""
     transformed = balance_chains(transformed)
@@ -1665,6 +1711,7 @@ def finish(transformed: exp.Expression) -> exp.Expression:
         # a = 'x' = FALSE: DuckDB will not chain comparisons without parentheses
         if isinstance(cmp.this, _COMPARISONS):
             cmp.set("this", exp.paren(cmp.this))
+    _documents_as_text(transformed)  # (last: the paths are as DuckDB reads them by now)
     return transformed
 
 

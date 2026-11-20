@@ -434,8 +434,8 @@
 - {id: fn_cbrt_2, sql: "select CBRT(2.5)"}
 - {id: fn_char, sql: "select CHAR(7)"}
 - {id: fn_check_json, sql: "select CHECK_JSON('abc')", gap: "answers differently"}
-- {id: fn_check_xml, sql: "select CHECK_XML('abc')", gap: "not in the emulator"}
-- {id: fn_check_xml_2, sql: "select CHECK_XML('abc', true)", gap: "not in the emulator"}
+- {id: fn_check_xml, sql: "select CHECK_XML('abc')"}
+- {id: fn_check_xml_2, sql: "select CHECK_XML('abc', true)"}
 - {id: fn_chr, sql: "select CHR(7)"}
 - {id: fn_coalesce, sql: "select COALESCE(7, 2)"}
 - {id: fn_concat, sql: "select CONCAT('abc')"}
@@ -644,7 +644,7 @@
 - {id: fn_timestamp_ntz_from_parts, sql: "select TIMESTAMP_NTZ_FROM_PARTS('2024-03-15'::date, '10:20:30'::time)"}
 - {id: fn_top_k_sketch_object_construct, sql: "select TOP_K_SKETCH_OBJECT_CONSTRUCT('abc', 7, 'b', 2)", gap: "not in the emulator"}
 - {id: fn_to_json, sql: "select TO_JSON(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
-- {id: fn_to_xml, sql: "select TO_XML(parse_json('{\"a\": 1, \"b\": [1, 2]}'))", gap: "not in the emulator"}
+- {id: fn_to_xml, sql: "select TO_XML(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
 - {id: fn_translate, sql: "select TRANSLATE('abc', 'b', 'b')"}
 - {id: fn_try_hex_decode_binary, sql: "select TRY_HEX_DECODE_BINARY('abc')"}
 - {id: fn_try_hex_decode_string, sql: "select TRY_HEX_DECODE_STRING('abc')"}
@@ -663,10 +663,10 @@
 - {id: fn_var_pop_2, sql: "select VAR_POP(column1) from values (2.5::float), (0.5::float), (2.5::float)"}
 - {id: fn_var_samp, sql: "select VAR_SAMP(column1) from values (7), (2), (7)"}
 - {id: fn_var_samp_2, sql: "select VAR_SAMP(column1) from values (2.5::float), (0.5::float), (2.5::float)"}
-- {id: fn_xmlget, sql: "select XMLGET(parse_json('{\"a\": 1, \"b\": [1, 2]}'), 'abc', 7)", gap: "not in the emulator"}
-- {id: fn_xmlget_2, sql: "select XMLGET(object_construct('a', 1, 'b', 'x'), 'abc', 7)", gap: "not in the emulator"}
-- {id: fn_xmlget_3, sql: "select XMLGET(parse_json('{\"a\": 1, \"b\": [1, 2]}'), 'abc')", gap: "not in the emulator"}
-- {id: fn_xmlget_4, sql: "select XMLGET(object_construct('a', 1, 'b', 'x'), 'abc')", gap: "not in the emulator"}
+- {id: fn_xmlget, sql: "select XMLGET(parse_json('{\"a\": 1, \"b\": [1, 2]}'), 'abc', 7)"}
+- {id: fn_xmlget_2, sql: "select XMLGET(object_construct('a', 1, 'b', 'x'), 'abc', 7)"}
+- {id: fn_xmlget_3, sql: "select XMLGET(parse_json('{\"a\": 1, \"b\": [1, 2]}'), 'abc')"}
+- {id: fn_xmlget_4, sql: "select XMLGET(object_construct('a', 1, 'b', 'x'), 'abc')"}
 - {id: fn_zeroifnull, sql: "select ZEROIFNULL(7)"}
 - {id: fn_zeroifnull_2, sql: "select ZEROIFNULL(2.5::float)"}
 - {id: fn_zeroifnull_3, sql: "select ZEROIFNULL(2.5)"}
@@ -1000,3 +1000,26 @@
 - {id: convert_tz_2, sql: "select convert_timezone('America/Los_Angeles', '2025-07-01 12:00:00 +02:00'::timestamp_tz)::varchar", gap: "a TIMESTAMP_TZ keeps its own offset in its text; the emulator keeps a timestamp's wall clock only"}
 - {id: convert_tz_3, sql: "select convert_timezone('America/Los_Angeles', '2025-01-01 12:00:00 +00:00'::timestamp_tz)::timestamp_ntz::varchar"}
 - {id: convert_tz_4, sql: "select convert_timezone('Asia/Tokyo', '2025-01-01 12:00:00 +00:00'::timestamp_tz)::date, hour(convert_timezone('Asia/Tokyo', '2025-01-01 20:00:00 +00:00'::timestamp_tz))"}
+# Recorded 2026-11-19. XML: PARSE_XML gives an OBJECT ("@" the tag, "$" what it holds, "@name" each attribute).
+- {id: xml_1, sql: "select '#' || parse_xml('<a x=\"1\">hi</a>')::varchar"}
+- {id: xml_2, sql: "select '#' || parse_xml('<a><b>1</b><b>2</b><c y=\"z\"/></a>')::varchar"}
+- {id: xml_3, sql: "select '#' || parse_xml('<a>text<b>1</b>tail</a>')::varchar"}
+- {id: xml_4, sql: "select '#' || xmlget(parse_xml('<a><b>1</b><b>2</b></a>'), 'b')::varchar, '#' || xmlget(parse_xml('<a><b>1</b><b>2</b></a>'), 'b', 1)::varchar, xmlget(parse_xml('<a><b>1</b></a>'), 'c') is null"}
+- {id: xml_5, sql: "select xmlget(parse_xml('<a><b x=\"7\">1</b></a>'), 'b'):\"$\"::varchar, xmlget(parse_xml('<a><b x=\"7\">1</b></a>'), 'b'):\"@x\"::varchar, xmlget(parse_xml('<a><b x=\"7\">1</b></a>'), 'b'):\"@\"::varchar"}
+- {id: xml_6, sql: "select check_xml('<a>1</a>') is null, check_xml('<a>1</b>'), check_xml('<a>'), check_xml(''), check_xml(null) is null"}
+- {id: xml_7, sql: "select '#' || to_xml(to_variant('abc')), '#' || to_xml(to_variant(1)), '#' || to_xml(to_variant(1.5::float)), '#' || to_xml(to_variant(true)), '#' || to_xml(parse_json('null')), to_xml(null) is null", gap: "a FLOAT in a VARIANT keeps its type in Snowflake; the emulator's JSON keeps no FLOAT type (as object_keys_10)"}
+- {id: xml_8, sql: "select '#' || to_xml(parse_json('{\"a\": {\"b\": \"x<y\"}, \"c\": [true, null, \"s\"], \"d\": 2.5}'))"}
+- {id: xml_9, sql: "select '#' || to_xml(parse_xml('<a x=\"1\"><b>t</b></a>'))"}
+- {id: xml_10, sql: "select '#' || parse_xml('<a>1</a>')::varchar, typeof(parse_xml('<a>1</a>')), parse_xml('<a>1</a>'):\"$\"::varchar, typeof(parse_xml('<a>1</a>'):\"$\")"}
+- {id: xml_11, sql: "select '#' || parse_xml('<?xml version=\"1.0\"?><r><x>a &amp; b</x></r>')::varchar"}
+- {id: xml_12, sql: "select parse_xml('<a>1</b>')"}
+- {id: xml_13, sql: "select '#' || parse_xml('<a><b/></a>')::varchar, '#' || parse_xml('<a>  <b>1</b>  </a>')::varchar"}
+- {id: xml_14, sql: "select x.value:\"@\"::varchar, x.value:\"$\"::varchar from table(flatten(input => parse_xml('<a><b>1</b><c>2</c></a>'):\"$\")) x order by 1"}
+- {id: xml_15, sql: "select '#' || parse_xml('<a><b>1</b></a>'):\"$\"::varchar, typeof(parse_xml('<a><b>1</b></a>'):\"$\")"}
+- {id: xml_16, sql: "select '#' || to_xml(parse_json('[1, \"a\", {\"k\": 2}]')), '#' || to_xml(object_construct('a', 1.5::float, 'b', 10000000000::number, 'c', 0.25))", gap: "a FLOAT in a VARIANT keeps its type in Snowflake; the emulator's JSON keeps no FLOAT type (as object_keys_10)"}
+- {id: xml_17, sql: "select typeof(parse_xml('<a>1.5</a>'):\"$\"), typeof(parse_xml('<a>abc</a>'):\"$\"), typeof(parse_xml('<a>true</a>'):\"$\"), typeof(parse_xml('<a>1e3</a>'):\"$\"), typeof(parse_xml('<a></a>'):\"$\"), typeof(parse_xml('<a>007</a>'):\"$\")", gap: "a FLOAT in a VARIANT keeps its type in Snowflake; the emulator's JSON keeps no FLOAT type (as object_keys_10)"}
+- {id: xml_18, sql: "select parse_xml('<a>007</a>'):\"$\"::varchar, parse_xml('<a>1.50</a>'):\"$\"::varchar, parse_xml('<a> 12 </a>'):\"$\"::varchar, parse_xml('<a x=\"5\"/>'):\"@x\"::varchar, typeof(parse_xml('<a x=\"5\"/>'):\"@x\")"}
+- {id: xml_19, sql: "select '#' || parse_xml('<a>&lt;b&gt; &quot;q&quot;</a>')::varchar, parse_xml('<a>&lt;b&gt;</a>'):\"$\"::varchar"}
+- {id: xml_20, sql: "select '#' || xmlget(parse_xml('<a><b>1</b><c>2</c><b>3</b></a>'), 'b', 1)::varchar, xmlget(parse_xml('<a><b>1</b></a>'), 'b', 1) is null, '#' || xmlget(xmlget(parse_xml('<a><b><c>9</c></b></a>'), 'b'), 'c')::varchar"}
+- {id: xml_21, sql: "select check_xml('abc'), check_xml('<a><b></a>'), check_xml('<a></a><b></b>'), check_xml('<a x=1></a>')"}
+- {id: object_keys_13, sql: "select '#' || parse_json('{\"x\": {\"b\": 1, \"a\": 2}}'):x::varchar, '#' || parse_json('{\"x\": \"[1, 2]\"}'):x::varchar, '#' || parse_json('{\"x\": [{\"b\": 1, \"a\": 2}]}'):x::varchar"}

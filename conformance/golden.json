@@ -7064,6 +7064,15 @@
    ]
   ]
  },
+ "object_keys_13": {
+  "rows": [
+   [
+    "#{\"a\":2,\"b\":1}",
+    "#[1, 2]",
+    "#[{\"a\":2,\"b\":1}]"
+   ]
+  ]
+ },
  "object_keys_2": {
   "rows": [
    [
@@ -9507,6 +9516,188 @@
      1,
      2
     ]
+   ]
+  ]
+ },
+ "xml_1": {
+  "rows": [
+   [
+    "#<a x=\"1\">hi</a>"
+   ]
+  ]
+ },
+ "xml_10": {
+  "rows": [
+   [
+    "#<a>1</a>",
+    "XML",
+    "1",
+    "INTEGER"
+   ]
+  ]
+ },
+ "xml_11": {
+  "rows": [
+   [
+    "#<r><x>a &amp; b</x></r>"
+   ]
+  ]
+ },
+ "xml_12": {
+  "error": "100100 (22P02): Error parsing XML: no opening tag for </b>, pos 8"
+ },
+ "xml_13": {
+  "rows": [
+   [
+    "#<a><b></b></a>",
+    "#<a><b>1</b></a>"
+   ]
+  ]
+ },
+ "xml_14": {
+  "rows": [
+   [
+    "b",
+    "1"
+   ],
+   [
+    "c",
+    "2"
+   ]
+  ]
+ },
+ "xml_15": {
+  "rows": [
+   [
+    "#<b>1</b>",
+    "XML"
+   ]
+  ]
+ },
+ "xml_16": {
+  "rows": [
+   [
+    "#<SnowflakeData type=\"ARRAY\"><e type=\"INTEGER\">1</e><e type=\"VARCHAR\">a</e><e type=\"OBJECT\"><k type=\"INTEGER\">2</k></e></SnowflakeData>",
+    "#<SnowflakeData type=\"OBJECT\"><a type=\"DOUBLE\">1.500000000000000e+00</a><b type=\"INTEGER\">10000000000</b><c type=\"DECIMAL\">0.25</c></SnowflakeData>"
+   ]
+  ]
+ },
+ "xml_17": {
+  "rows": [
+   [
+    "DECIMAL",
+    "VARCHAR",
+    "BOOLEAN",
+    "DOUBLE",
+    "VARCHAR",
+    "VARCHAR"
+   ]
+  ]
+ },
+ "xml_18": {
+  "rows": [
+   [
+    "007",
+    "1.5",
+    "12",
+    "5",
+    "INTEGER"
+   ]
+  ]
+ },
+ "xml_19": {
+  "rows": [
+   [
+    "#<a>&lt;b&gt; \"q\"</a>",
+    "<b>"
+   ]
+  ]
+ },
+ "xml_2": {
+  "rows": [
+   [
+    "#<a><b>1</b><b>2</b><c y=\"z\"></c></a>"
+   ]
+  ]
+ },
+ "xml_20": {
+  "rows": [
+   [
+    "#<b>3</b>",
+    true,
+    "#<c>9</c>"
+   ]
+  ]
+ },
+ "xml_21": {
+  "rows": [
+   [
+    "not an XML element, pos 1",
+    "missing closing tags: </b>, pos 10",
+    "more than one document in the input",
+    null
+   ]
+  ]
+ },
+ "xml_3": {
+  "rows": [
+   [
+    "#<a>text<b>1</b>tail</a>"
+   ]
+  ]
+ },
+ "xml_4": {
+  "rows": [
+   [
+    "#<b>1</b>",
+    "#<b>2</b>",
+    true
+   ]
+  ]
+ },
+ "xml_5": {
+  "rows": [
+   [
+    "1",
+    "7",
+    "b"
+   ]
+  ]
+ },
+ "xml_6": {
+  "rows": [
+   [
+    true,
+    "no opening tag for </b>, pos 8",
+    "missing closing tags: </a>, pos 3",
+    null,
+    true
+   ]
+  ]
+ },
+ "xml_7": {
+  "rows": [
+   [
+    "#<SnowflakeData type=\"VARCHAR\">abc</SnowflakeData>",
+    "#<SnowflakeData type=\"INTEGER\">1</SnowflakeData>",
+    "#<SnowflakeData type=\"DOUBLE\">1.500000000000000e+00</SnowflakeData>",
+    "#<SnowflakeData type=\"BOOLEAN\">true</SnowflakeData>",
+    "#<SnowflakeData type=\"NULL_VALUE\" xsi:nil=\"true\"/>",
+    true
+   ]
+  ]
+ },
+ "xml_8": {
+  "rows": [
+   [
+    "#<SnowflakeData type=\"OBJECT\"><a type=\"OBJECT\"><b type=\"VARCHAR\">x&lt;y</b></a><c type=\"ARRAY\"><e type=\"BOOLEAN\">true</e><e type=\"NULL_VALUE\" xsi:nil=\"true\"/><e type=\"VARCHAR\">s</e></c><d type=\"DECIMAL\">2.5</d></SnowflakeData>"
+   ]
+  ]
+ },
+ "xml_9": {
+  "rows": [
+   [
+    "#<a x=\"1\"><b>t</b></a>"
    ]
   ]
  },
