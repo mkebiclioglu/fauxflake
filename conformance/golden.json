@@ -7308,12 +7308,164 @@
    ]
   ]
  },
+ "parse_url_1": {
+  "error": "100139 (22000): Error parsing URL: scheme not specified"
+ },
+ "parse_url_2": {
+  "rows": [
+   [
+    "#{\"error\":\"scheme not specified\"}"
+   ]
+  ]
+ },
+ "parse_url_3": {
+  "rows": [
+   [
+    "#{\"fragment\":\"frag\",\"host\":\"example.com\",\"parameters\":{\"x\":\"1\",\"y\":\"2\"},\"path\":\"a/b\",\"port\":\"8080\",\"query\":\"x=1&y=2\",\"scheme\":\"https\"}"
+   ]
+  ]
+ },
+ "parse_url_4": {
+  "rows": [
+   [
+    true,
+    false
+   ]
+  ]
+ },
+ "parse_url_5": {
+  "rows": [
+   [
+    "#{\"fragment\":null,\"host\":null,\"parameters\":null,\"path\":\"a@b.com\",\"port\":null,\"query\":null,\"scheme\":\"mailto\"}",
+    "#{\"fragment\":null,\"host\":\"example.com\",\"parameters\":null,\"path\":null,\"port\":null,\"query\":null,\"scheme\":\"http\"}"
+   ]
+  ]
+ },
+ "parse_url_6": {
+  "rows": [
+   [
+    "1",
+    "example.com"
+   ]
+  ]
+ },
  "parse_url_ip": {
   "rows": [
    [
     "example.com",
     "1",
     null
+   ]
+  ]
+ },
+ "parse_url_more_1": {
+  "rows": [
+   [
+    "#{\"fragment\":null,\"host\":null,\"parameters\":null,\"path\":null,\"port\":null,\"query\":null,\"scheme\":null}"
+   ]
+  ]
+ },
+ "parse_url_more_10": {
+  "rows": [
+   [
+    "#{\"fragment\":null,\"host\":\"h.com\",\"parameters\":{},\"path\":\"p\",\"port\":null,\"query\":\"\",\"scheme\":\"https\"}"
+   ]
+  ]
+ },
+ "parse_url_more_11": {
+  "rows": [
+   [
+    "#{\"fragment\":null,\"host\":\"H.COM\",\"parameters\":null,\"path\":\"P\",\"port\":null,\"query\":null,\"scheme\":\"HTTPS\"}"
+   ]
+  ]
+ },
+ "parse_url_more_12": {
+  "error": "100139 (22000): Error parsing URL: port must be a number"
+ },
+ "parse_url_more_13": {
+  "rows": [
+   [
+    "#{\"fragment\":null,\"host\":\"h.com\",\"parameters\":{\"x\":\"%41\"},\"path\":\"a%20b\",\"port\":null,\"query\":\"x=%41\",\"scheme\":\"https\"}"
+   ]
+  ]
+ },
+ "parse_url_more_14": {
+  "rows": [
+   [
+    "#{\"fragment\":null,\"host\":\"bucket\",\"parameters\":null,\"path\":\"key/x.csv\",\"port\":null,\"query\":null,\"scheme\":\"s3\"}"
+   ]
+  ]
+ },
+ "parse_url_more_15": {
+  "rows": [
+   [
+    "#{\"fragment\":null,\"host\":\"h.com\",\"parameters\":{\"a\":\"\",\"b\":null},\"path\":\"p\",\"port\":null,\"query\":\"a=&b\",\"scheme\":\"https\"}"
+   ]
+  ]
+ },
+ "parse_url_more_16": {
+  "rows": [
+   [
+    "#{\"fragment\":null,\"host\":null,\"parameters\":null,\"path\":\"y\",\"port\":null,\"query\":null,\"scheme\":\"x\"}"
+   ]
+  ]
+ },
+ "parse_url_more_17": {
+  "rows": [
+   [
+    "#{\"fragment\":null,\"host\":\"h\",\"parameters\":null,\"path\":null,\"port\":null,\"query\":null,\"scheme\":\"1http\"}"
+   ]
+  ]
+ },
+ "parse_url_more_2": {
+  "rows": [
+   [
+    "#{\"fragment\":null,\"host\":\"user:pw@host.com\",\"parameters\":null,\"path\":\"p\",\"port\":null,\"query\":null,\"scheme\":\"http\"}"
+   ]
+  ]
+ },
+ "parse_url_more_3": {
+  "rows": [
+   [
+    "#{\"fragment\":null,\"host\":\"h.com\",\"parameters\":{\"a\":\"2\"},\"path\":\"p\",\"port\":null,\"query\":\"a=1&a=2\",\"scheme\":\"https\"}"
+   ]
+  ]
+ },
+ "parse_url_more_4": {
+  "rows": [
+   [
+    "#{\"fragment\":null,\"host\":\"h.com\",\"parameters\":{\"a\":null},\"path\":\"\",\"port\":null,\"query\":\"a\",\"scheme\":\"https\"}"
+   ]
+  ]
+ },
+ "parse_url_more_5": {
+  "rows": [
+   [
+    "#{\"fragment\":null,\"host\":\"h.com\",\"parameters\":null,\"path\":\"p;q=1\",\"port\":null,\"query\":null,\"scheme\":\"https\"}"
+   ]
+  ]
+ },
+ "parse_url_more_6": {
+  "rows": [
+   [
+    "#{\"fragment\":null,\"host\":\"h.com\",\"parameters\":null,\"path\":null,\"port\":null,\"query\":null,\"scheme\":\"ftp\"}"
+   ]
+  ]
+ },
+ "parse_url_more_7": {
+  "rows": [
+   [
+    "#{\"fragment\":null,\"host\":null,\"parameters\":null,\"path\":\"/x\",\"port\":null,\"query\":null,\"scheme\":\"http\"}"
+   ]
+  ]
+ },
+ "parse_url_more_8": {
+  "error": "100139 (22000): Error parsing URL: scheme not specified"
+ },
+ "parse_url_more_9": {
+  "rows": [
+   [
+    "#{\"fragment\":\"f\",\"host\":\"h.com\",\"parameters\":null,\"path\":null,\"port\":null,\"query\":null,\"scheme\":\"https\"}"
    ]
   ]
  },
@@ -7394,6 +7546,14 @@
  "quoted_case_1": {
   "error": "000904 (42000): SQL compilation error: error line 1 at position 7"
  },
+ "quoted_case_10": {
+  "rows": [
+   [
+    "2",
+    "3"
+   ]
+  ]
+ },
  "quoted_case_2": {
   "rows": [
    [
@@ -7424,6 +7584,9 @@
  },
  "quoted_case_8": {
   "error": "000904 (42000): SQL compilation error: error line 1 at position 7"
+ },
+ "quoted_case_9": {
+  "error": "001003 (42000): SQL compilation error:"
  },
  "quoted_identifiers": {
   "rows": [
@@ -9210,6 +9373,30 @@
     true
    ]
   ]
+ },
+ "variant_object_1": {
+  "error": "100071 (22000): Failed to cast variant value \"abc\" to OBJECT"
+ },
+ "variant_object_2": {
+  "rows": [
+   [
+    "#{\"a\":2,\"b\":1}",
+    true,
+    true
+   ]
+  ]
+ },
+ "variant_object_3": {
+  "error": "100071 (22000): Failed to cast variant value [1] to OBJECT"
+ },
+ "variant_object_4": {
+  "error": "100071 (22000): Failed to cast variant value 5 to OBJECT"
+ },
+ "variant_object_5": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "variant_object_6": {
+  "error": "100071 (22000): Failed to cast variant value \"x\" to OBJECT"
  },
  "variant_operators": {
   "rows": [

@@ -39,6 +39,7 @@ def python_functions(duck) -> None:  # noqa: ANN001
             ("_fxpy_parse_xml", parse_xml, ["VARCHAR"], "VARCHAR", None),
             ("_fxpy_json_text", json_text, ["VARCHAR", "BOOLEAN"], "VARCHAR", None),
             ("_fxpy_check_json", jsondoc.check, ["VARCHAR"], "VARCHAR", None),
+            ("_fxpy_parse_url", parse_url, ["VARCHAR", "INTEGER"], "VARCHAR", None),
             ("_fxpy_check_xml", xmldoc.check, ["VARCHAR"], "VARCHAR", None),
             ("_fxpy_to_xml", xmldoc.to_xml, ["VARCHAR"], "VARCHAR", None),
             ("_fxpy_xmlget", xmldoc.xmlget, ["VARCHAR", "VARCHAR", "BIGINT"], "VARCHAR", None),
@@ -55,6 +56,8 @@ def python_functions(duck) -> None:  # noqa: ANN001
     duck.execute(f"create or replace macro {_NS}_sf_check_xml (s) as _fxpy_check_xml(s::varchar), (s, b) as _fxpy_check_xml(s::varchar)")
     duck.execute(f"create or replace macro {_NS}_sf_to_xml(v) as _fxpy_to_xml(v::varchar)")
     duck.execute(f"create or replace macro {_NS}_sf_check_json(v) as _fxpy_check_json(v::varchar)")
+    duck.execute(f"create or replace macro {_NS}_sf_parse_url (u) as _fxpy_parse_url(u::varchar, 0)::json, "
+                 "(u, permissive) as _fxpy_parse_url(u::varchar, permissive)::json")
     duck.execute(f"create or replace macro {_NS}_sf_xmlget (x, t) as _fxpy_xmlget(x::varchar, t, 0)::json, "
                  "(x, t, n) as _fxpy_xmlget(x::varchar, t, n)::json")
     duck.execute(f"create or replace macro {_NS}_fx_json_sorted(x) as _fxpy_json_sorted(x)")
@@ -78,6 +81,57 @@ def json_text(text, lenient):  # noqa: ANN001, ANN201
         if lenient:
             return None
         raise _fx_error(100069, "22P02", f"Error parsing JSON: {e}") from None
+
+
+def parse_url(url, permissive):  # noqa: ANN001, ANN201
+    """PARSE_URL as Snowflake has it, measured (conformance parse_url_*): the scheme is what comes before the first ':'
+    (none is an error), the host what follows '//' up to the path (a user name stays in it), the path without its
+    first '/' when there is a host, the query's parameters as written (the last of a name repeated; a name without
+    '=' is null). `permissive`: an error is {"error": ...} instead."""
+    import json
+
+    if url is None:
+        return None
+    fields = dict.fromkeys(("fragment", "host", "parameters", "path", "port", "query", "scheme"))
+
+    def failed(message: str):  # noqa: ANN202
+        if permissive:
+            return json.dumps({"error": message})
+        raise _fx_error(100139, "22000", f"Error parsing URL: {message}")
+
+    if url == "":
+        return json.dumps(fields)
+    rest = url
+    if "#" in rest:
+        rest, fields["fragment"] = rest.split("#", 1)
+    if "?" in rest:
+        rest, query = rest.split("?", 1)
+        fields["query"] = query
+        params: dict = {}
+        for part in query.split("&") if query else []:
+            key, eq, value = part.partition("=")
+            params[key] = value if eq else None
+        fields["parameters"] = params
+    colon, slash = rest.find(":"), rest.find("/")
+    if colon <= 0 or (0 <= slash < colon):
+        return failed("scheme not specified")
+    fields["scheme"], rest = rest[:colon], rest[colon + 1:]
+    if rest.startswith("//"):
+        rest = rest[2:]
+        cut = rest.find("/")
+        authority, path = (rest, None) if cut < 0 else (rest[:cut], rest[cut + 1:])
+        at = authority.rfind("@")
+        hostport = authority[at + 1:]
+        if ":" in hostport:
+            host, port = hostport.rsplit(":", 1)
+            if not port.isdigit():
+                return failed("port must be a number")
+            fields["port"], authority = port, authority[:at + 1] + host
+        fields["host"] = authority or None
+        fields["path"] = path
+    else:
+        fields["path"] = rest or None
+    return json.dumps(fields)
 
 
 def parse_xml(text):  # noqa: ANN001, ANN201
@@ -390,18 +444,6 @@ MACROS = [
             case when left(regexp_replace(upper(s), '[^A-Z]', '', 'g'), 1) in ('H', 'W')
                  then {_NS}_sf_soundex_squeeze({_NS}_sf_soundex_codes(s))
                  else substr({_NS}_sf_soundex_squeeze({_NS}_sf_soundex_codes(s)), 2) end, '0', '') || '000', 3) end""",
-    # PARSE_URL gives an object; the path has no leading slash and missing parts are null.
-    f"""create or replace macro {_NS}_sf_url_query(u) as regexp_extract(u, '^[^?#]*\\?([^#]*)', 1)""",
-    f"""create or replace macro {_NS}_sf_parse_url(u) as case when u is null then null else json_object(
-          'fragment', nullif(regexp_extract(u, '#(.*)$', 1), ''),
-          'host', nullif(regexp_extract(u, '^[A-Za-z][A-Za-z0-9+.-]*://(?:[^/@?#]*@)?([^/:?#]*)', 1), ''),
-          'parameters', case when {_NS}_sf_url_query(u) = '' then null else to_json(map_from_entries(list_transform(
-              string_split({_NS}_sf_url_query(u), '&'),
-              lambda p: struct_pack(k := split_part(p, '=', 1), v := split_part(p, '=', 2))))) end,
-          'path', nullif(regexp_extract(u, '^[A-Za-z][A-Za-z0-9+.-]*://[^/?#]*/([^?#]*)', 1), ''),
-          'port', nullif(regexp_extract(u, '^[A-Za-z][A-Za-z0-9+.-]*://[^/?#]*:([0-9]+)', 1), ''),
-          'query', nullif({_NS}_sf_url_query(u), ''),
-          'scheme', nullif(regexp_extract(u, '^([A-Za-z][A-Za-z0-9+.-]*)://', 1), '')) end""",
     # PARSE_IP for IPv4 addresses, with the range of the network when a prefix is given.
     f"""create or replace macro {_NS}_sf_ipv4(h) as (split_part(h, '.', 1)::bigint * 16777216
           + split_part(h, '.', 2)::bigint * 65536 + split_part(h, '.', 3)::bigint * 256 + split_part(h, '.', 4)::bigint)""",
@@ -582,6 +624,12 @@ MACROS = [
           when {_NS}_sf_num_text(x) is not null then cast(round({_NS}_sf_num_text(x)::decimal(38, 9)) as bigint)
           when typeof(x) in ('DOUBLE', 'FLOAT') then cast(round(try_cast(x::varchar as double)) as bigint)
           else cast(x as bigint) end""",
+    f"""create or replace macro {_NS}_sf_to_object(x) as case
+          when x is null then null
+          when typeof(x) <> 'JSON' then x::json
+          when json_type(x::json) = 'OBJECT' then x::json
+          when json_type(x::json) = 'NULL' then null
+          else error('Failed to cast variant value ' || x::varchar || ' to OBJECT')::json end""",
     f"""create or replace macro {_NS}_sf_to_array(x) as case
           when x is null then null
           when typeof(x) like '%]' then to_json(x)
@@ -937,7 +985,9 @@ def _fix(node: exp.Expression) -> exp.Expression:
         if to.is_type("variant") and not isinstance(inner, exp.Null):
             return exp.ToVariant(this=inner)  # 'a'::variant is the string a, not JSON text to parse
         if to.is_type("map", "object") and not isinstance(inner, exp.Null):
-            return exp.cast(inner, "json")  # a MAP or OBJECT is held as JSON, like every semi-structured value
+            # a MAP or OBJECT is held as JSON, like every semi-structured value; a VARIANT that holds something else
+            # than an object is an error, JSON null is NULL
+            return _fn("_sf_to_object", inner)
     if isinstance(node, exp.TryCast) and node.to.is_type("date") and not isinstance(node.this, _VARIANT_ACCESS):
         return _fn("_sf_try_date", node.this)
     if isinstance(node, exp.TsOrDsToDate) and not node.args.get("format") and not isinstance(node.this, _VARIANT_ACCESS):
@@ -2765,7 +2815,11 @@ def misnamed_column(transformed: exp.Expression, conn, probe: bool = True) -> st
             if ref.table:
                 places = [sources.get(ref.table.upper())] if ref.table.upper() in sources else [None]
             else:
-                places = [*sources.values(), lateral]
+                # (an expression does not read its own alias: `"current"::number as "current"` reads a column)
+                own = next((e for e in getattr(scope.expression, "expressions", []) if ref is e or e.find(exp.Column) is not None
+                            and any(c is ref for c in e.find_all(exp.Column))), None)
+                mine_alias = target(own.args["alias"]) if isinstance(own, exp.Alias) and isinstance(own.args.get("alias"), exp.Identifier) else None
+                places = [*sources.values(), [a for a in lateral if a != mine_alias]]
             if not places or any(p is None for p in places):
                 continue
             having = [p for p in places if wanted in p]
@@ -2775,9 +2829,12 @@ def misnamed_column(transformed: exp.Expression, conn, probe: bool = True) -> st
                 continue  # (found; or not a name of these relations in any case: an outer query's, left to DuckDB)
             shown = '"' + ref.this.this + '"' if ref.this.quoted else ref.this.this.upper()
             return f"SQL compilation error: {where(ref)}invalid identifier '{shown}'"
+    made = transformed.expression if isinstance(transformed, exp.Create) else None
+    while isinstance(made, (exp.Subquery, exp.Paren)):
+        made = made.this  # (`create table t as (select ...)`)
     if isinstance(transformed, exp.Create) and str(transformed.args.get("kind", "")).upper() in ("TABLE", "VIEW") \
-            and isinstance(transformed.expression, exp.Select):
-        given = outputs(transformed.expression)  # a table or a view has each column once
+            and isinstance(made, exp.Select):
+        given = outputs(made)  # a table or a view has each column once
         named = [n for n in given or [] if n]
         doubled = next((n for i, n in enumerate(named) if n in named[:i]), None)
         if doubled is not None:

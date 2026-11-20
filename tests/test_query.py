@@ -271,6 +271,8 @@ def test_a_table_or_view_with_a_column_named_twice_is_refused():
             with pytest.raises(ProgrammingError, match="duplicate column name 'DBT_SCD_ID'") as raised:
                 cur.execute(f"create or replace {kind} u as select *, md5(id) as dbt_scd_id from t")
             assert raised.value.errno == 2025
+        with pytest.raises(ProgrammingError, match="duplicate column name 'DBT_SCD_ID'"):  # (as dbt makes a snapshot)
+            cur.execute("create or replace table u as (select *, md5(id) as dbt_scd_id from (select * from t) sbq)")
         cur.execute("create or replace view u as select * from t")
 
 

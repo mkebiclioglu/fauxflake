@@ -1041,3 +1041,36 @@
 - {id: lenient_json_3, sql: "select try_parse_json('{a: 1}'):a::int, try_parse_json('[1, 2') is null, try_parse_json('{} x') is null"}
 - {id: lenient_json_4, sql: "select parse_json('[1, 2')"}
 - {id: lenient_json_5, sql: "select '#' || parse_json('{\"a\": 1, \"a\": 2}')::varchar"}
+- {id: quoted_case_9, sql: "select \"current\"::number as \"current\" from (select 1 as current)"}
+- {id: quoted_case_10, sql: "select 2 as \"Mixed\", \"Mixed\" + 1 from (select 1 as x)"}
+# Recorded 2026-11-20. A VARIANT cast to OBJECT must hold an object.
+- {id: variant_object_1, sql: "select parse_json('\"abc\"')::object"}
+- {id: variant_object_2, sql: "select '#' || parse_json('{\"b\": 1, \"a\": 2}')::object::varchar, parse_json('null')::object is null, null::variant::object is null"}
+- {id: variant_object_3, sql: "select parse_json('[1]')::object"}
+- {id: variant_object_4, sql: "select parse_json('5')::object"}
+- {id: variant_object_5, sql: "select try_cast(parse_json('\"abc\"') as object) is null"}
+- {id: variant_object_6, sql: "select v:a::object from (select parse_json('{\"a\": \"x\"}') v)"}
+# Recorded 2026-11-20. PARSE_URL: a URL needs a scheme (unless asked to be permissive).
+- {id: parse_url_1, sql: "select parse_url('example.com/a?b=1')"}
+- {id: parse_url_2, sql: "select '#' || parse_url('example.com/a?b=1', 1)::varchar"}
+- {id: parse_url_3, sql: "select '#' || parse_url('https://example.com:8080/a/b?x=1&y=2#frag')::varchar"}
+- {id: parse_url_4, sql: "select parse_url(null) is null, parse_url('') is null"}
+- {id: parse_url_5, sql: "select '#' || parse_url('mailto:a@b.com')::varchar, '#' || parse_url('http://example.com')::varchar"}
+- {id: parse_url_6, sql: "select parse_url('https://example.com/a?b=1'):parameters:b::varchar, parse_url('https://example.com/a?b=1'):host::varchar"}
+- {id: parse_url_more_1, sql: "select '#' || parse_url('')::varchar"}
+- {id: parse_url_more_2, sql: "select '#' || parse_url('http://user:pw@host.com/p')::varchar"}
+- {id: parse_url_more_3, sql: "select '#' || parse_url('https://h.com/p?a=1&a=2')::varchar"}
+- {id: parse_url_more_4, sql: "select '#' || parse_url('https://h.com/?a')::varchar"}
+- {id: parse_url_more_5, sql: "select '#' || parse_url('https://h.com/p;q=1')::varchar"}
+- {id: parse_url_more_6, sql: "select '#' || parse_url('ftp://h.com')::varchar"}
+- {id: parse_url_more_7, sql: "select '#' || parse_url('http:/x')::varchar"}
+- {id: parse_url_more_8, sql: "select '#' || parse_url('//host/path')::varchar"}
+- {id: parse_url_more_9, sql: "select '#' || parse_url('https://h.com#f')::varchar"}
+- {id: parse_url_more_10, sql: "select '#' || parse_url('https://h.com/p?')::varchar"}
+- {id: parse_url_more_11, sql: "select '#' || parse_url('HTTPS://H.COM/P')::varchar"}
+- {id: parse_url_more_12, sql: "select '#' || parse_url('https://h.com:abc/p')::varchar"}
+- {id: parse_url_more_13, sql: "select '#' || parse_url('https://h.com/a%20b?x=%41')::varchar"}
+- {id: parse_url_more_14, sql: "select '#' || parse_url('s3://bucket/key/x.csv')::varchar"}
+- {id: parse_url_more_15, sql: "select '#' || parse_url('https://h.com/p?a=&b')::varchar"}
+- {id: parse_url_more_16, sql: "select '#' || parse_url('x:y')::varchar"}
+- {id: parse_url_more_17, sql: "select '#' || parse_url('1http://h')::varchar"}
