@@ -290,8 +290,8 @@ def test_the_frozen_clock_is_an_instant_that_a_time_zone_shows_as_its_wall_clock
     from fauxflake import emulator
     from fauxflake.emulator import serve
 
-    monkeypatch.setattr(emulator, "FROZEN_NOW", datetime(2026, 1, 15, 12, 0, 0))
     with serve() as emu:
+        monkeypatch.setattr(emulator, "FROZEN_NOW", datetime(2026, 1, 15, 12, 0, 0))  # (serve() starts with a live clock)
         cur = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S")).cursor()
         (la,) = cur.execute("select convert_timezone('America/Los_Angeles', current_timestamp())::timestamp_ntz::varchar").fetchone()
         assert la.startswith("2026-01-15 04:00:00")
