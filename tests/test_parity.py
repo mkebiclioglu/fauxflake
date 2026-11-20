@@ -117,6 +117,14 @@ def test_columns_made_by_any_value_are_found():
     assert _any_values(sql) == {"CURRENCY"}
 
 
+def test_columns_made_by_listagg_without_an_order_are_found():
+    from fauxflake.parity import _unordered_lists
+
+    sql = ("select a, listagg(n, ', ') over (partition by a) as open_invoices, listagg(n) within group (order by n) as kept, "
+           "listagg(distinct n) as names from t group by a")
+    assert _unordered_lists(sql) == {"OPEN_INVOICES", "NAMES"}
+
+
 def test_a_node_failing_on_one_side_only_on_a_grown_query_tag_is_not_an_engine_difference():
     from fauxflake.parity import differences
 

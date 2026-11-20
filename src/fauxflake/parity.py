@@ -446,6 +446,19 @@ def _unordered_aggregate(sql: str) -> str | None:
     return None
 
 
+def _unordered_lists(sql: str) -> set[str]:
+    """The output columns a model writes with LISTAGG without an order (also as a window): their values come in any order."""
+    import sqlglot
+    from sqlglot import exp
+
+    try:
+        tree = sqlglot.parse_one(sql, read="snowflake")
+    except Exception:  # noqa: BLE001
+        return set()
+    return {a.alias.upper() for a in tree.find_all(exp.Alias)
+            if any(not isinstance(g.parent, exp.WithinGroup) and not g.find(exp.Order) for g in a.this.find_all(exp.GroupConcat))}
+
+
 def _any_values(sql: str) -> set[str]:
     """The output columns a model gives ANY_VALUE(...) of: any value of each group, not one the data decides."""
     import sqlglot
@@ -511,6 +524,8 @@ def undetermined(conn, remote: DbtProject, rows: list[Parity]) -> None:  # noqa:
         elif (named := re.findall(r"(?:^differ in |; )([^:;]+): emulator", r.note)) and len(named) < 6 \
                 and {c.upper() for c in named} <= _any_values(nodes[r.model].get("compiled_code") or ""):
             r.undetermined = f"differs only in ANY_VALUE() of a group with several values ({', '.join(named)}): any of them is right"
+        elif named and len(named) < 6 and {c.upper() for c in named} <= _unordered_lists(nodes[r.model].get("compiled_code") or ""):
+            r.undetermined = f"differs only in LISTAGG without an order ({', '.join(named)}): its values come in any order"
         elif (parent := upstream(uid, set())) is not None:
             r.undetermined = f"built on {by_id[parent]['name']}, whose order of rows is not determined"
 
