@@ -397,11 +397,14 @@ def _ties(conn, sql: str) -> str | None:  # noqa: ANN001
         if select is None or select.args.get("group") or select.args.get("from_") is None:
             continue
         keys = [p.copy() for p in win.args.get("partition_by") or []] + [o.this.copy() for o in order.expressions]
-        probe = exp.Select(expressions=[exp.alias_(k, f"_t{i}") for i, k in enumerate(keys)])
-        for arg in ("from_", "joins", "where"):
-            if select.args.get(arg) is not None:
-                value = select.args[arg]
-                probe.set(arg, [j.copy() for j in value] if isinstance(value, list) else value.copy())
+        # (a key may be an alias of the same select, `partition by question_id` with `... as question_id`: asked
+        # again with the expression it names, when the key as written does not bind on its own)
+        named = {e.alias.upper(): e.this for e in select.expressions if isinstance(e, exp.Alias) and not e.this.find(exp.Window)}
+
+        def spelled(key: exp.Expression) -> exp.Expression:
+            return key.transform(lambda n: named[n.name.upper()].copy() if isinstance(n, exp.Column) and not n.table
+                                 and n.name.upper() in named else n)
+
         withs, scope = [], select
         while scope is not None:
             if scope.args.get("with_") is not None:
@@ -409,12 +412,20 @@ def _ties(conn, sql: str) -> str | None:  # noqa: ANN001
             scope = scope.parent
         ctes = [c.sql(dialect="snowflake") for w in reversed(withs) for c in w.expressions]
         names = ", ".join(f"_t{i}" for i in range(len(keys)))
-        query = (("with " + ", ".join(ctes) + " ") if ctes else "") + \
-            f"select count(*) from (select 1 from ({probe.sql(dialect='snowflake')}) group by {names} having count(*) > 1)"
-        try:
-            (tied,) = conn.cursor().execute(query).fetchone()
-        except Exception:  # noqa: BLE001, S112 - a window that only binds in its place: not asked
-            continue
+        tied = None
+        for attempt in (keys, [spelled(k.copy()) for k in keys]):
+            probe = exp.Select(expressions=[exp.alias_(k, f"_t{i}") for i, k in enumerate(attempt)])
+            for arg in ("from_", "joins", "where"):
+                if select.args.get(arg) is not None:
+                    value = select.args[arg]
+                    probe.set(arg, [j.copy() for j in value] if isinstance(value, list) else value.copy())
+            query = (("with " + ", ".join(ctes) + " ") if ctes else "") + \
+                f"select count(*) from (select 1 from ({probe.sql(dialect='snowflake')}) group by {names} having count(*) > 1)"
+            try:
+                (tied,) = conn.cursor().execute(query).fetchone()
+                break
+            except Exception:  # noqa: BLE001, S112 - a window that only binds in its place: not asked
+                continue
         if tied:
             return f"{tied} tied group(s) in {' '.join(win.sql(dialect='snowflake').split())[:160]}"
     return None

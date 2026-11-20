@@ -57,6 +57,9 @@ def test_a_window_whose_order_has_ties_is_found():
         assert _ties(conn, tied).startswith("1 tied group(s)")
         assert _ties(conn, "select row_number() over (partition by u order by d, s) from D.S.T") is None  # distinct keys
         assert _ties(conn, "select rank() over (partition by u order by d) from D.S.T") is None  # ties do not matter to RANK
+        # a key that is an alias of the same select
+        aliased = "select u * 10 as k, s from D.S.T qualify row_number() over (partition by k order by d desc) = 1"
+        assert _ties(conn, aliased).startswith("1 tied group(s)")
 
 
 def test_arrays_that_differ_only_in_order_and_where_such_order_comes_from():
