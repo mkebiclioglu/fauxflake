@@ -261,8 +261,20 @@ def rewrite(sql: str) -> str:
         # rather than parsed for a quarter of an hour
         raise ProgrammingError(msg=f"SQL statement is {len(sql) / 1_048_576:.1f} MB; Snowflake accepts at most 1 MB of SQL text.",
                                errno=1003, sqlstate="42000")
-    if FROZEN_NOW is not None:
-        sql = _freeze_clock(sql)
+    frozen = _freeze_clock(sql) if FROZEN_NOW is not None else sql
+    done = _rewritten(frozen)
+    if frozen != sql:
+        # `select current_date` is still named CURRENT_DATE, not after the frozen time put in its place
+        if len(_NAMED_AS) > 64:
+            _NAMED_AS.clear()
+        _NAMED_AS[done] = _rewritten(sql)
+    return done
+
+
+_NAMED_AS: dict[str, str] = {}  # statement with the clock frozen -> the same statement as written, for its column names
+
+
+def _rewritten(sql: str) -> str:
     for pattern, replacement, _why in REWRITES:
         sql = pattern.sub(replacement, sql, count=1)
     if _MERGE.match(sql):
@@ -922,7 +934,7 @@ def _patch_fakesnow() -> None:
     upstream_parse = cursor_module.parse_one
 
     def parse_named(command):  # noqa: ANN001, ANN202
-        return semantics.name_expressions(upstream_parse(command), command)
+        return semantics.name_expressions(upstream_parse(command), _NAMED_AS.get(command, command))
 
     cursor_module.parse_one = parse_named
     original_transform = FakeSnowflakeCursor._transform

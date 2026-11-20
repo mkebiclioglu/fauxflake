@@ -318,6 +318,25 @@ def test_the_frozen_clock_is_an_instant_that_a_time_zone_shows_as_its_wall_clock
         assert utc.startswith("2026-01-15 12:00:00")
 
 
+def test_a_bare_clock_keyword_is_named_as_written_with_the_clock_live_or_frozen(monkeypatch):
+    from datetime import date, datetime
+
+    import snowflake.connector
+
+    from fauxflake import emulator
+    from fauxflake.emulator import serve
+
+    with serve() as emu:
+        cur = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S")).cursor()
+        cur.execute("select current_date, current_timestamp, localtimestamp, 1")  # (DuckDB took CURRENT_DATE for the name)
+        assert [d[0] for d in cur.description] == ["CURRENT_DATE", "CURRENT_TIMESTAMP", "LOCALTIMESTAMP", "1"]
+        monkeypatch.setattr(emulator, "FROZEN_NOW", datetime(2026, 1, 15, 12, 0, 0))
+        cur.execute("create or replace table t as select 1 as a, current_date, current_timestamp() from (select 1)")
+        cur.execute("select * from t")
+        assert [d[0] for d in cur.description] == ["A", "CURRENT_DATE", "CURRENT_TIMESTAMP()"]  # (not '2026-01-15'::DATE)
+        assert cur.fetchone()[1] == date(2026, 1, 15)
+
+
 def test_a_converted_time_converts_again_from_its_instant_and_a_zoned_one_is_refused_where_snowflake_refuses_it():
     import pytest
     import snowflake.connector

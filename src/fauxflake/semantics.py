@@ -352,6 +352,11 @@ MACROS = [
     f"""create or replace macro {_NS}_sf_skew_fixed(g, m2, n, d, kv) as n * sqrt(n - 1) / (n - 2)
           * (g * pow(m2, 1.5) * (n - 2) / (n * sqrt(n - 1)) + 3 * d * m2 + n * d * d * d)
           / pow(trunc((m2 + n * d * d) / (n - 1) * pow(10, kv)) / pow(10, kv) * (n - 1), 1.5)""",
+    f"create or replace macro {_NS}_fx_current_date() as today()",
+    f"create or replace macro {_NS}_fx_current_timestamp() as get_current_timestamp()",
+    f"create or replace macro {_NS}_fx_current_time() as get_current_time()",
+    f"create or replace macro {_NS}_fx_localtime() as current_localtime()",
+    f"create or replace macro {_NS}_fx_localtimestamp() as current_localtimestamp()",
     # SKEW of fixed-point input is taken around the mean as AVG gives it (rounded: 6 more decimals, 3 in a window)
     # with the variance cut to VARIANCE's scale (measured: 7, 2, 7 gives -1.732049872261, not -1.732050807569).
     # g, v and mu are DuckDB's skewness, var_samp and avg; d is how far the rounded mean is from the true one.
@@ -1022,7 +1027,15 @@ def zoned_argument(transformed: exp.Expression) -> tuple[int, str] | None:
     return None
 
 
+_CLOCK_CALLS = {exp.CurrentDate: "_fx_current_date", exp.CurrentTimestamp: "_fx_current_timestamp",
+                exp.CurrentTime: "_fx_current_time", exp.Localtime: "_fx_localtime", exp.Localtimestamp: "_fx_localtimestamp"}
+
+
 def _fix(node: exp.Expression) -> exp.Expression:
+    if type(node) in _CLOCK_CALLS and not (isinstance(node, exp.CurrentDate) and node.this is not None):
+        # as calls: `select current_date` is named CURRENT_DATE, and DuckDB reads the bare keyword as that name
+        # (macros, which sqlglot does not turn back into the keyword when the statement is parsed again)
+        return _fn(_CLOCK_CALLS[type(node)])
     target = _try_target(node) or _try_anonymous_target(node)
     if target and not (isinstance(node.this, exp.Anonymous) and node.this.name == _NS + "_sf_try_input"):
         # TRY_CAST and the TRY_TO_ functions take text (or the target type itself, for a few): anything else is an error
