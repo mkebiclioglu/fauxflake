@@ -238,10 +238,29 @@ def test_a_view_that_converts_a_timestamp_to_a_number_is_refused_when_it_is_crea
         cur = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S")).cursor()
         cur.execute("create table t (t timestamp_ntz, d date, n number, s varchar, j variant)")  # (no rows: nothing is read)
         for refused, errno in (("t::float", 1007), ("to_numeric(t)", 1007), ("t::number", 1007), ("d::int", 1007),
-                               ("t::boolean", 1007), ("dateadd('s', t, '1970-01-01')", 1044), ("upper(s)::number + d::number", 1007)):
+                               ("t::boolean", 1007), ("dateadd('s', t, '1970-01-01')", 1044), ("upper(s)::number + d::number", 1007),
+                               ("try_to_timestamp_ntz(t)::date", 1065), ("try_to_date(t)", 1065), ("try_to_number(d)", 1065)):
             with pytest.raises(ProgrammingError) as raised:
                 cur.execute(f"create or replace view v as select {refused} as x from t")
             assert raised.value.errno == errno, refused
         for fine in ("n::float", "s::number", "to_numeric(s)", "j::number", "s::boolean", "n::boolean", "dateadd('s', n, '1970-01-01')",
-                     "dateadd('s', s, '1970-01-01')", "date_part(epoch_second, t)::number", "t::date", "t::varchar"):
+                     "dateadd('s', s, '1970-01-01')", "date_part(epoch_second, t)::number", "t::date", "t::varchar",
+                     "try_to_date(d)", "try_to_timestamp(s)", "try_to_number(s)"):
             cur.execute(f"create or replace view v as select {fine} as x from t")
+
+
+def test_a_table_or_view_with_a_column_named_twice_is_refused():
+    import pytest
+    import snowflake.connector
+    from snowflake.connector.errors import ProgrammingError
+
+    from fauxflake.emulator import serve
+
+    with serve() as emu:
+        cur = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S")).cursor()
+        cur.execute("create table t as select 1 as id, 2 as dbt_scd_id")
+        for kind in ("table", "view"):
+            with pytest.raises(ProgrammingError, match="duplicate column name 'DBT_SCD_ID'") as raised:
+                cur.execute(f"create or replace {kind} u as select *, md5(id) as dbt_scd_id from t")
+            assert raised.value.errno == 2025
+        cur.execute("create or replace view u as select * from t")

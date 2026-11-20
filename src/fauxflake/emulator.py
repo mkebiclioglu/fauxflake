@@ -672,6 +672,10 @@ def _patch_fakesnow() -> None:
             objects.remember(self)
             return done
         except ProgrammingError as e:
+            if "_fx_refused_conversion" in str(e.msg):  # (the check of what a TRY_ function is given, in a window)
+                self._sqlstate = "22023"
+                raise ProgrammingError(msg="SQL compilation error:\nFunction TRY_CAST cannot be used with arguments of these types",
+                                       errno=1065, sqlstate="22023") from e
             if e.errno == 2003 and "does not exist" in str(e.msg) and "not authorized" not in str(e.msg):
                 # Snowflake's wording, which clients look for: dbt reads "no such table" as "no columns yet"
                 self._sqlstate = "42S02"
@@ -679,6 +683,10 @@ def _patch_fakesnow() -> None:
                                        errno=2003, sqlstate="42S02") from e
             raise
         except Exception as e:  # noqa: BLE001
+            tried = re.search(r"Function TRY_CAST cannot be used with arguments of type [^'\n]*", str(e))
+            if tried:  # (the emulator's check of what a TRY_ function is given)
+                self._sqlstate = "22023"
+                raise ProgrammingError(msg=f"SQL compilation error:\n{tried[0]}", errno=1065, sqlstate="22023") from e
             said = re.search(r"\x1ffxerr:(\d+):(\w+):(.*?)\x1f", str(e), re.S)
             if said:  # an error of Snowflake's, raised by one of the emulator's functions
                 self._sqlstate = said[2]
@@ -1070,8 +1078,9 @@ def _patch_fakesnow() -> None:
                 if refused:
                     raise ProgrammingError(msg=refused[1], errno=refused[0], sqlstate="42P13" if refused[0] == 1044 else "22023")
                 if misnamed:
-                    ambiguous = "ambiguous" in misnamed
-                    raise ProgrammingError(msg=misnamed, errno=2028 if ambiguous else 904, sqlstate="42601" if ambiguous else "42000")
+                    errno, state = (2028, "42601") if "ambiguous" in misnamed else (2025, "42S21") if "duplicate column" in misnamed \
+                        else (904, "42000")
+                    raise ProgrammingError(msg=misnamed, errno=errno, sqlstate=state)
             semantics.learn_names(transformed)
             remedies = {
                 "times": lambda e: semantics.numbers_as_times(transformed, e) or semantics.offsets_as_written(transformed, e),

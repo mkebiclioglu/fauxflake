@@ -185,10 +185,11 @@ MACROS = [
     # made), so DuckDB refuses the call when it binds it; any other type is the untyped form. (The emulator's
     # connections cast anything to text implicitly, so overloads that accept types would accept these too.)
     f"create or replace macro {_NS}_fx_refused_conversion(x) as true",
-    f"create or replace macro {_NS}_fx_convertible " + ", ".join(
+    *[f"create or replace macro {_NS}_fx_{name} " + ", ".join(
         f"(x {kind}) as {_NS}_fx_refused_conversion(x)"
-        for kind in ("timestamp", "timestamp_ns", "timestamp_ms", "timestamp_s", "timestamptz", "date", "time", "timetz", "blob"))
-    + ", (x) as true",
+        for kind in ("timestamp", "timestamp_ns", "timestamp_ms", "timestamp_s", "timestamptz", "date", "time", "timetz", "blob")
+        if kind != allowed) + (f", (x {allowed}) as true" if allowed else "") + ", (x) as true"
+      for name, allowed in (("convertible", None), ("try_date", "date"), ("try_binary", "blob"))],
     f"drop macro if exists {_NS}_fx_refused_conversion",
     # NUMBER / NUMBER keeps max(s, min(s + 6, 12)) decimals and raises on zero.
     # DuckDB returns a full-precision double, and NULL on zero. The failing cast raises without
@@ -1540,9 +1541,26 @@ def _cased_twins(transformed: exp.Expression) -> None:
                         ref.replace(exp.alias_(ref.copy(), exp.to_identifier(original, quoted=True)))
 
 
+def _windows_without_errors(transformed: exp.Expression) -> None:
+    """`row_number() over (partition by try_to_number(id))`: the check of what a TRY_ function is given raises with
+    error(), which DuckDB takes for volatile and refuses in a window's PARTITION BY and ORDER BY. There the check is
+    the one made when the statement is bound (a date, a time or a timestamp is refused), which is not volatile."""
+    for window in list(transformed.find_all(exp.Window)):
+        for part in [*(window.args.get("partition_by") or []), window.args.get("order")]:
+            if part is None:
+                continue
+            for call in list(part.find_all(exp.Anonymous)):
+                if str(call.name).split(".")[-1].lower() == "_sf_try_input" and call.expressions:
+                    target = call.expressions[1].name.upper() if len(call.expressions) > 1 else ""
+                    guard = _NS + ("_fx_try_date" if target == "DATE" else "_fx_try_binary" if target == "BLOB" else "_fx_convertible")
+                    value = call.expressions[0]
+                    call.replace(exp.Case(ifs=[exp.If(this=exp.Anonymous(this=guard, expressions=[value.copy()]), true=value.copy())]))
+
+
 def finish(transformed: exp.Expression) -> exp.Expression:
     """Fix-ups on the DuckDB side of the translation."""
     transformed = balance_chains(transformed)
+    _windows_without_errors(transformed)
     _cased_twins(transformed)
     _undefined_in_arrays(transformed)
     _number_texts(transformed)
@@ -2416,8 +2434,9 @@ def misnamed_column(transformed: exp.Expression, conn, probe: bool = True) -> st
                 for s in transformed.find_all(exp.Select)) or any(
         len(names) != len(set(names)) for s in transformed.find_all(exp.Select) if s is not transformed
         for names in [[e.alias_or_name.upper() for e in s.expressions if not starred(e)]])
-    if not (cased or twice):
-        return None  # (the common statement)
+    if not (cased or twice) or (isinstance(transformed, exp.Create) and isinstance(transformed.this, exp.Table)
+                                and transformed.this.name.upper() == "MERGE_CANDIDATES"):
+        return None  # (the common statement; or fakesnow's own for a MERGE, which repeats columns by design)
     internal = ("_fs", "information_schema", "pg_catalog", "duckdb_", "system", "temp")
     if any(p.lower().startswith(internal) for t in transformed.find_all(exp.Table) for p in (t.name, t.db, t.catalog) if p):
         return None  # (the emulator's own statements, over DuckDB's catalog: its names are lower case)
@@ -2550,6 +2569,13 @@ def misnamed_column(transformed: exp.Expression, conn, probe: bool = True) -> st
                 continue  # (found; or not a name of these relations in any case: an outer query's, left to DuckDB)
             shown = '"' + ref.this.this + '"' if ref.this.quoted else ref.this.this.upper()
             return f"SQL compilation error: {where(ref)}invalid identifier '{shown}'"
+    if isinstance(transformed, exp.Create) and str(transformed.args.get("kind", "")).upper() in ("TABLE", "VIEW") \
+            and isinstance(transformed.expression, exp.Select):
+        given = outputs(transformed.expression)  # a table or a view has each column once
+        named = [n for n in given or [] if n]
+        doubled = next((n for i, n in enumerate(named) if n in named[:i]), None)
+        if doubled is not None:
+            return f"SQL compilation error:\nduplicate column name '{doubled}'"
     return None
 
 
@@ -2714,7 +2740,16 @@ def refused_conversions(transformed: exp.Expression, conn) -> tuple[int, str] | 
         return None
     guard = _NS + "_fx_convertible"
 
+    def guard_of(node: exp.Expression) -> str:
+        """The macro that refuses what `node` cannot take: a TRY_ function takes a date for a DATE, a binary for a BINARY."""
+        if isinstance(node, exp.Anonymous) and str(node.name).split(".")[-1].lower() == "_sf_try_input":
+            target = node.expressions[1].name.upper() if len(node.expressions) > 1 else ""
+            return _NS + ("_fx_try_date" if target == "DATE" else "_fx_try_binary" if target == "BLOB" else "_fx_convertible")
+        return guard
+
     def argument(node: exp.Expression) -> tuple[exp.Expression, str] | None:
+        if isinstance(node, exp.Anonymous) and str(node.name).split(".")[-1].lower() == "_sf_try_input" and node.expressions:
+            return node.expressions[0], "TRY_CAST"
         if isinstance(node, exp.Cast) and not isinstance(node, exp.TryCast) and not node.args.get("safe") \
                 and node.to.this.name.upper() in _TO_NUMBER:
             name = "TO_BOOLEAN" if node.to.this == exp.DataType.Type.BOOLEAN else "TO_DOUBLE" if node.to.this in (
@@ -2743,7 +2778,7 @@ def refused_conversions(transformed: exp.Expression, conn) -> tuple[int, str] | 
         for original, copied in reversed(pairs):
             if id(original) in marks:
                 arg = argument(copied)[0]
-                replaced = exp.Case(ifs=[exp.If(this=exp.Anonymous(this=guard, expressions=[arg.copy()]), true=copied.copy())])
+                replaced = exp.Case(ifs=[exp.If(this=exp.Anonymous(this=guard_of(copied), expressions=[arg.copy()]), true=copied.copy())])
                 if copied is copy:
                     copy = replaced
                 else:
@@ -2764,6 +2799,8 @@ def refused_conversions(transformed: exp.Expression, conn) -> tuple[int, str] | 
                 continue
             if name == "DATEADD":
                 return 1044, "SQL compilation error:\nInvalid argument types for function 'DATEADD'"
+            if name == "TRY_CAST":
+                return 1065, "SQL compilation error:\nFunction TRY_CAST cannot be used with arguments of these types"
             return 1007, f"SQL compilation error:\ninvalid type [{node.sql(dialect='snowflake')}] for parameter '{name}'"
     return 1007, "SQL compilation error:\ninvalid type for a conversion"
 
