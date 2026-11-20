@@ -264,3 +264,19 @@ def test_a_table_or_view_with_a_column_named_twice_is_refused():
                 cur.execute(f"create or replace {kind} u as select *, md5(id) as dbt_scd_id from t")
             assert raised.value.errno == 2025
         cur.execute("create or replace view u as select * from t")
+
+
+def test_an_expression_without_a_name_is_named_as_written_also_in_a_cte_a_table_takes():
+    import snowflake.connector
+
+    from fauxflake.emulator import serve
+
+    with serve() as emu:
+        cur = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S")).cursor()
+        cur.execute("create table src as select 1 delta, '2025-01-01' pubdate")
+        cur.execute("create table t as (with s as (select * from src), r as (select pubdate::date as d, delta::NUMBER, "
+                    "coalesce(delta, 0) + 1, upper(pubdate), (delta) from s) select * from r)")
+        names = lambda sql: [d[0] for d in cur.execute(sql).description]  # noqa: E731
+        assert names("select * from t") == ["D", "DELTA::NUMBER", "COALESCE(DELTA, 0) + 1", "UPPER(PUBDATE)", "DELTA"]
+        assert names("select a.* from (select count(*), max(delta) + 1 from src) a") == ["COUNT(*)", "MAX(DELTA) + 1"]
+        assert names("select * from (select (select count(*) from src), delta + 1 from src)") == ["(SELECT COUNT(*) FROM SRC)", "DELTA + 1"]

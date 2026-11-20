@@ -3319,15 +3319,20 @@ def name_expressions(tree: exp.Expression, command: str) -> exp.Expression:
     if not isinstance(query, exp.Select):
         return tree
 
-    def unnamed(e: exp.Expression) -> bool:
-        return not isinstance(e, (exp.Alias, exp.Column, exp.Star, exp.Dot, exp.Aliases, exp.PropertyEQ)) and not e.find(exp.Star) \
-            or isinstance(e, exp.Count) and isinstance(e.this, exp.Star)
+    def unnamed(e: exp.Expression) -> bool:  # (an expression, not a column, a `*` or `t.*`)
+        return not isinstance(e, (exp.Alias, exp.Column, exp.Star, exp.Dot, exp.Aliases, exp.PropertyEQ))
 
-    if not any(unnamed(e) for e in query.expressions):
+    inner = any(unnamed(e) or (isinstance(e, exp.Paren) and isinstance(e.unnest(), exp.Column))
+                for s in tree.find_all(exp.Select) if s is not query for e in s.expressions)
+    if not inner and not any(unnamed(e) for e in query.expressions):
         return tree
     try:
         tokens = _SNOWFLAKE.tokenize(command)
     except Exception:  # noqa: BLE001 - the names stay DuckDB's
+        return tree
+    if inner:
+        _name_inner_expressions(tree, query, command, tokens, unnamed)
+    if not any(unnamed(e) for e in query.expressions):
         return tree
     depth, base, start, pieces, first = 0, None, None, [], None
     for i, token in enumerate(tokens):
@@ -3366,6 +3371,61 @@ def name_expressions(tree: exp.Expression, command: str) -> exp.Expression:
             if len(name) <= 250:
                 e.replace(exp.alias_(e.copy(), exp.to_identifier(name, quoted=True)))
     return tree
+
+
+def _name_inner_expressions(tree: exp.Expression, outer: exp.Select, command: str, tokens: list, unnamed) -> None:  # noqa: ANN001
+    """The same names in a CTE or a subquery, whose columns a `select *` passes on (`delta::number` in a CTE is the
+    column DELTA::NUMBER of the table). The select is found in the text by a name it reads (its own, not a
+    subquery's): back from there to its SELECT, and its listing split at its commas."""
+    depth, depths = 0, []
+    for token in tokens:
+        kind = token.token_type.name
+        if kind in _CLOSES:
+            depth -= 1
+        depths.append(depth)
+        if kind in _OPENS:
+            depth += 1
+    at = {token.start: i for i, token in enumerate(tokens)}
+    for select in list(tree.find_all(exp.Select)):
+        if select is outer or not any(unnamed(e) or (isinstance(e, exp.Paren) and isinstance(e.unnest(), exp.Column))
+                                      for e in select.expressions):
+            continue
+        anchors = [i.meta["start"] for i in select.find_all(exp.Identifier)
+                   if i.meta and i.meta.get("start") in at and i.find_ancestor(exp.Select) is select]
+        if not anchors:
+            continue
+        k = at[min(anchors)]
+        low, j = depths[k], k
+        while j > 0:  # back to the SELECT of this select
+            j -= 1
+            low = min(low, depths[j])
+            if tokens[j].token_type.name == "SELECT" and depths[j] <= low:
+                break
+        else:
+            continue
+        base, first = depths[j], j + 1
+        while first < len(tokens) and tokens[first].token_type.name in ("DISTINCT", "ALL"):
+            first += 1
+        pieces = []
+        for i in range(first, len(tokens)):
+            kind = tokens[i].token_type.name
+            if depths[i] < base or (depths[i] == base and kind in _ENDS_A_LISTING):
+                pieces.append((first, i - 1))
+                break
+            if depths[i] == base and kind == "COMMA":
+                pieces.append((first, i - 1))
+                first = i + 1
+        else:
+            pieces.append((first, len(tokens) - 1))
+        if len(pieces) != len(select.expressions) or any(x > y for x, y in pieces):
+            continue  # (not read the way the parser read it)
+        for (x, y), e in zip(pieces, list(select.expressions)):
+            if isinstance(e, exp.Paren) and isinstance(e.unnest(), exp.Column):
+                e.replace(e.unnest().copy())
+            elif unnamed(e):
+                name = command[tokens[x].start:tokens[y].end + 1].upper()
+                if len(name) <= 250:
+                    e.replace(exp.alias_(e.copy(), exp.to_identifier(name, quoted=True)))
 
 
 def aliases_over_tables(transformed: exp.Expression) -> exp.Expression | None:
