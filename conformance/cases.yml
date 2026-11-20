@@ -945,3 +945,10 @@
 - {id: refused_18, sql: "select t::boolean from (select '2025-01-01 10:00:00'::timestamp_ntz t)"}
 - {id: refused_19, sql: "select to_double(t) from (select '2025-01-01 10:00:00'::timestamp_ntz t)"}
 - {id: refused_20, sql: "select t::number from (select '2025-01-01'::date t)"}
+- {id: refused_21, sql: "select dateadd('s', t, '1970-01-01') from (select null::timestamp_ntz t)"}
+- {id: refused_22, sql: "select t::float from (select null::timestamp_ntz t)"}
+- {id: refused_23, sql: "select to_numeric(t) from (select null::timestamp_ntz t)"}
+- {id: refused_24, sql: "select try_to_timestamp_ntz(t) from (select null::timestamp_ntz t)"}
+- {id: refused_25, sql: "select try_to_number(t) from (select null::number t)"}
+- {id: refused_26, sql: "select t::number from (select null::date t)"}
+- {id: refused_27, sql: "select count(*) from (select t::float as f from (select '2025-01-01'::timestamp_ntz t) where false)"}

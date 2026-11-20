@@ -6983,6 +6983,31 @@
  "refused_20": {
   "error": "001007 (22023): SQL compilation error:"
  },
+ "refused_21": {
+  "error": "001044 (42P13): SQL compilation error: error line 1 at position 7"
+ },
+ "refused_22": {
+  "error": "001007 (22023): SQL compilation error:"
+ },
+ "refused_23": {
+  "error": "001007 (22023): SQL compilation error:"
+ },
+ "refused_24": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "refused_25": {
+  "rows": [
+   [
+    null
+   ]
+  ]
+ },
+ "refused_26": {
+  "error": "001007 (22023): SQL compilation error:"
+ },
+ "refused_27": {
+  "error": "001007 (22023): SQL compilation error:"
+ },
  "refused_3": {
   "error": "001007 (22023): SQL compilation error:"
  },

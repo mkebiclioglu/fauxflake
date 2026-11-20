@@ -180,6 +180,16 @@ def json_sorted(text: str | None) -> str | None:
 
 
 MACROS = [
+    # what Snowflake will not convert to a number or a boolean when it compiles a statement: a date, a time, a
+    # timestamp, a binary. For those types the macro calls a function that is gone (it is dropped once the macro is
+    # made), so DuckDB refuses the call when it binds it; any other type is the untyped form. (The emulator's
+    # connections cast anything to text implicitly, so overloads that accept types would accept these too.)
+    f"create or replace macro {_NS}_fx_refused_conversion(x) as true",
+    f"create or replace macro {_NS}_fx_convertible " + ", ".join(
+        f"(x {kind}) as {_NS}_fx_refused_conversion(x)"
+        for kind in ("timestamp", "timestamp_ns", "timestamp_ms", "timestamp_s", "timestamptz", "date", "time", "timetz", "blob"))
+    + ", (x) as true",
+    f"drop macro if exists {_NS}_fx_refused_conversion",
     # NUMBER / NUMBER keeps max(s, min(s + 6, 12)) decimals and raises on zero.
     # DuckDB returns a full-precision double, and NULL on zero. The failing cast raises without
     # making the expression volatile, so `a / b as r, r * 2` can still reuse the alias.
@@ -2688,6 +2698,74 @@ def pruned_nulls(transformed: exp.Expression, conn) -> exp.Expression | None:  #
                 test.replace(exp.false())
                 changed = True
     return tree if changed else None
+
+
+_TO_NUMBER = ("DECIMAL", "NUMERIC", "DOUBLE", "FLOAT", "REAL", "INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "HUGEINT", "UBIGINT", "BOOLEAN")
+
+
+def refused_conversions(transformed: exp.Expression, conn) -> tuple[int, str] | None:  # noqa: ANN001
+    """Snowflake refuses, when it compiles a statement, one that converts a date, a time or a timestamp to a number
+    (`uploaded_at::float`, `to_numeric(created_at)`) or adds one to a date (`dateadd('s', uploaded_at, ...)`), whatever
+    the rows. DuckDB fails only when it converts a value: a view would be created and fail where it is read, and a
+    query over NULLs or no rows would answer. A copy of the query, each conversion guarded by a macro DuckDB binds
+    for the types Snowflake converts only, is bound (not run): the error Snowflake gives, or None."""
+    body = transformed.expression if isinstance(transformed, (exp.Create, exp.Insert)) else transformed
+    if not isinstance(body, exp.Query):
+        return None
+    guard = _NS + "_fx_convertible"
+
+    def argument(node: exp.Expression) -> tuple[exp.Expression, str] | None:
+        if isinstance(node, exp.Cast) and not isinstance(node, exp.TryCast) and not node.args.get("safe") \
+                and node.to.this.name.upper() in _TO_NUMBER:
+            name = "TO_BOOLEAN" if node.to.this == exp.DataType.Type.BOOLEAN else "TO_DOUBLE" if node.to.this in (
+                exp.DataType.Type.DOUBLE, exp.DataType.Type.FLOAT) else "TO_NUMBER"
+            return node.this, name
+        if isinstance(node, exp.Interval) and node.this is not None and not isinstance(node.this, exp.Literal):
+            return node.this, "DATEADD"
+        if isinstance(node, (exp.DateAdd, exp.TimestampAdd, exp.TsOrDsAdd, exp.DatetimeAdd, exp.TimeAdd)) and node.expression is not None:
+            return node.expression, "DATEADD"
+        if isinstance(node, exp.Anonymous) and str(node.name).split(".")[-1].lower() in ("_sf_int", "_sf_bool") and node.expressions:
+            return node.expressions[0], "TO_BOOLEAN" if str(node.name).lower().endswith("bool") else "TO_NUMBER"
+        return None
+
+    kinds = (exp.Cast, exp.Interval, exp.Anonymous, exp.DateAdd, exp.TimestampAdd, exp.TsOrDsAdd, exp.DatetimeAdd, exp.TimeAdd)
+    candidates = [(n, *a) for n in body.find_all(*kinds)
+                  if (a := argument(n)) is not None and not isinstance(a[0], (exp.Literal, exp.Null))]
+    if not candidates:
+        return None
+
+    def guarded(only=None) -> str:  # noqa: ANN001
+        copy = body.copy()
+        marks = {id(n) for n, _a, _ in candidates if only is None or n is only}
+        # (the copy's nodes are found again by their place in the same walk; the deepest are guarded first, so
+        # that a conversion inside another is guarded inside the other's guard)
+        pairs = list(zip(body.walk(), copy.walk()))
+        for original, copied in reversed(pairs):
+            if id(original) in marks:
+                arg = argument(copied)[0]
+                replaced = exp.Case(ifs=[exp.If(this=exp.Anonymous(this=guard, expressions=[arg.copy()]), true=copied.copy())])
+                if copied is copy:
+                    copy = replaced
+                else:
+                    copied.replace(replaced)
+        return copy.sql(dialect="duckdb")
+
+    try:
+        conn.execute("describe " + guarded())
+        return None
+    except Exception as e:  # noqa: BLE001
+        if "_fx_refused_conversion" not in str(e).lower():
+            return None
+    for node, _arg, name in candidates:  # which conversion it is
+        try:
+            conn.execute("describe " + guarded(node))
+        except Exception as e:  # noqa: BLE001
+            if "_fx_refused_conversion" not in str(e).lower():
+                continue
+            if name == "DATEADD":
+                return 1044, "SQL compilation error:\nInvalid argument types for function 'DATEADD'"
+            return 1007, f"SQL compilation error:\ninvalid type [{node.sql(dialect='snowflake')}] for parameter '{name}'"
+    return 1007, "SQL compilation error:\ninvalid type for a conversion"
 
 
 def union_text_kinds(transformed: exp.Expression, conn) -> exp.Expression:  # noqa: ANN001

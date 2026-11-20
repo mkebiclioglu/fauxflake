@@ -1061,6 +1061,14 @@ def _patch_fakesnow() -> None:
                                                          probe=not getattr(self._conn, "_fauxflake_txn", False))
                 except Exception:  # noqa: BLE001 - a check of its own that fails leaves the statement to run
                     misnamed = None
+                refused = None
+                if not getattr(self._conn, "_fauxflake_txn", False):
+                    try:
+                        refused = semantics.refused_conversions(transformed, self._duck_conn)
+                    except Exception:  # noqa: BLE001 - a check of its own that fails leaves the statement to run
+                        refused = None
+                if refused:
+                    raise ProgrammingError(msg=refused[1], errno=refused[0], sqlstate="42P13" if refused[0] == 1044 else "22023")
                 if misnamed:
                     ambiguous = "ambiguous" in misnamed
                     raise ProgrammingError(msg=misnamed, errno=2028 if ambiguous else 904, sqlstate="42601" if ambiguous else "42000")

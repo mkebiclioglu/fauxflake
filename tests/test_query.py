@@ -225,3 +225,23 @@ def test_a_conversion_of_a_column_without_nulls_is_never_null_and_is_not_made():
                 cur.execute(f"select count(*) from v where {where}").fetchall()
         with pytest.raises(ProgrammingError):
             cur.execute("select count(*) from (select x::number as n from t limit 100) where n is null").fetchall()
+
+
+def test_a_view_that_converts_a_timestamp_to_a_number_is_refused_when_it_is_created():
+    import pytest
+    import snowflake.connector
+    from snowflake.connector.errors import ProgrammingError
+
+    from fauxflake.emulator import serve
+
+    with serve() as emu:
+        cur = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S")).cursor()
+        cur.execute("create table t (t timestamp_ntz, d date, n number, s varchar, j variant)")  # (no rows: nothing is read)
+        for refused, errno in (("t::float", 1007), ("to_numeric(t)", 1007), ("t::number", 1007), ("d::int", 1007),
+                               ("t::boolean", 1007), ("dateadd('s', t, '1970-01-01')", 1044), ("upper(s)::number + d::number", 1007)):
+            with pytest.raises(ProgrammingError) as raised:
+                cur.execute(f"create or replace view v as select {refused} as x from t")
+            assert raised.value.errno == errno, refused
+        for fine in ("n::float", "s::number", "to_numeric(s)", "j::number", "s::boolean", "n::boolean", "dateadd('s', n, '1970-01-01')",
+                     "dateadd('s', s, '1970-01-01')", "date_part(epoch_second, t)::number", "t::date", "t::varchar"):
+            cur.execute(f"create or replace view v as select {fine} as x from t")
