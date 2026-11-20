@@ -6559,6 +6559,41 @@
    ]
   ]
  },
+ "number_beside_text_1": {
+  "rows": [
+   [
+    "384.00000",
+    "384.00000",
+    "384.00000",
+    "384.00000"
+   ]
+  ]
+ },
+ "number_beside_text_2": {
+  "rows": [
+   [
+    "384.0000000"
+   ]
+  ]
+ },
+ "number_beside_text_3": {
+  "error": "100038 (22018): Numeric value '' is not recognized"
+ },
+ "number_beside_text_4": {
+  "rows": [
+   [
+    "1.5"
+   ]
+  ]
+ },
+ "number_beside_text_5": {
+  "rows": [
+   [
+    "384",
+    "384.00000"
+   ]
+  ]
+ },
  "number_cast_to_timestamp": {
   "rows": [
    [

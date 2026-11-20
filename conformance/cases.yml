@@ -989,3 +989,9 @@
 - {id: flatten_path_4, sql: "select t.i, f.value::varchar from (select 1 i, parse_json('{\"all\": [1, 2], \"any\": [3]}') x union all select 2, parse_json('{\"any\": [4]}')) t, lateral flatten(input => t.x, path => 'all', outer => true) f order by 1, 2"}
 - {id: flatten_path_5, sql: "select count(*) from (select parse_json('{\"all\": [1, 2], \"any\": [3, 4, 5]}') x) t, lateral flatten(input => t.x, path => 'all', outer => true) a, lateral flatten(input => t.x, path => 'any', outer => true) b"}
 - {id: flatten_path_6, sql: "select value::varchar, path from table(flatten(input => parse_json('{\"a\": {\"b\": [7, 8]}}'), path => 'a.b'))"}
+# Recorded 2026-11-19. Text beside an exact number is a NUMBER with 5 decimals: ifnull(384, '') is 384.00000.
+- {id: number_beside_text_1, sql: "select ifnull(n, '')::varchar, coalesce(n, 'x')::varchar, iff(n > 0, n, '')::varchar, nvl(n, '')::varchar from (select 384::number(38,0) n)"}
+- {id: number_beside_text_2, sql: "select ifnull(n, '')::varchar from (select 384::number(20,7) n)"}
+- {id: number_beside_text_3, sql: "select ifnull(n, '') from (select null::number n)"}
+- {id: number_beside_text_4, sql: "select ifnull(f, '')::varchar from (select 1.5::float f)"}
+- {id: number_beside_text_5, sql: "select coalesce(n, '12')::varchar, coalesce(n, s)::varchar from (select 384::number(38,0) n, 'x'::varchar s)"}

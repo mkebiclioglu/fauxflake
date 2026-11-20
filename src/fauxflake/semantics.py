@@ -3078,6 +3078,21 @@ def mixed_kinds(transformed: exp.Expression, conn) -> exp.Expression:  # noqa: A
             times = [k for k in mine if k.startswith("TIMESTAMP")]
             if numbers:
                 target = "DOUBLE" if any(k.startswith(("DOUBLE", "FLOAT")) for k in numbers) else "DECIMAL(38, 5)"
+                words = [a for a, k in zip(args, mine) if k == "VARCHAR" and isinstance(a, exp.Literal) and a.is_string
+                         and not re.fullmatch(r"\s*[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?\s*", a.name)]
+                if words and target != "DOUBLE":
+                    # ifnull(crm_id, ''): text that is no number beside an exact number makes the result a NUMBER with 5
+                    # decimals (at least: more when the number has more), measured: 384 is 384.00000. The text is an
+                    # error only where it is taken
+                    scales = [int(m.group(1)) for k in numbers if (m := re.match(r"DECIMAL\(\d+,\s*(\d+)\)", k))]
+                    exact = f"DECIMAL(38, {max([5, *scales])})"
+                    for arg, kind in zip(args, mine):
+                        if arg in words:
+                            said = "Numeric value '" + arg.name + "' is not recognized"
+                            arg.replace(exp.cast(exp.Anonymous(this="error", expressions=[exp.Literal.string(said)]), exact))
+                        elif kind.startswith(_NUMERIC_KINDS):
+                            arg.replace(exp.cast(arg.copy(), exact))
+                    continue
             elif times:
                 target = times[0]
             elif "DATE" in mine:
