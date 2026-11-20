@@ -35,6 +35,8 @@ def python_functions(duck) -> None:  # noqa: ANN001
             ("_fxpy_sha2", sha2, ["VARCHAR", "INTEGER"], "VARCHAR", None),
             ("_fxpy_json_sorted", sorted_json, ["VARCHAR"], "VARCHAR", "arrow"),
             ("_fxpy_encrypt_raw", encrypt_raw, ["BLOB", "BLOB", "BLOB", "BLOB", "VARCHAR"], "VARCHAR", None),
+            ("_fxpy_randstr", randstr, ["BIGINT", "HUGEINT"], "VARCHAR", None),
+            ("_fxpy_seeded_unit", seeded_unit, ["HUGEINT"], "DOUBLE", None),
             ("_fxpy_decrypt_raw", decrypt_raw, ["BLOB", "BLOB", "BLOB", "BLOB", "VARCHAR", "BLOB", "BOOLEAN"], "BLOB", None)):
         try:
             duck.create_function(name, fn, args, out, null_handling="special", side_effects=name == "_fxpy_encrypt_raw",
@@ -42,6 +44,7 @@ def python_functions(duck) -> None:  # noqa: ANN001
         except Exception:  # noqa: BLE001, S110 - registered already on this connection
             pass
     duck.execute(f"create or replace macro {_NS}_fx_sha2(x, n) as _fxpy_sha2(x, n)")
+    duck.execute(f"create or replace macro {_NS}_sf_randstr(n, seed) as _fxpy_randstr(n, seed)")
     duck.execute(f"create or replace macro {_NS}_fx_json_sorted(x) as _fxpy_json_sorted(x)")
     duck.execute(f"create or replace macro {_NS}_sf_encrypt_raw (v, k) as _fxpy_encrypt_raw(v, k, null, null, null)::json, "
                  "(v, k, iv) as _fxpy_encrypt_raw(v, k, iv, null, null)::json, "
@@ -52,6 +55,27 @@ def python_functions(duck) -> None:  # noqa: ANN001
                      f"(v, k, iv, aad) as _fxpy_decrypt_raw(v, k, iv, aad, null, null, {lenient}), "
                      f"(v, k, iv, aad, m) as _fxpy_decrypt_raw(v, k, iv, aad, m, null, {lenient}), "
                      f"(v, k, iv, aad, m, tag) as _fxpy_decrypt_raw(v, k, iv, aad, m, tag, {lenient})")
+
+
+# Snowflake's generator for a seed, measured: its state starts at seed × 0x9E3779B97F4A7C15 (mod 2**64) and steps as the
+# 64-bit LCG of PCG's constants. UNIFORM(lo, hi, seed) is the first state as a fraction of 2**64 (the same on every row:
+# uniform(0, 1000000, 1) is 618034); RANDSTR(n, seed) takes a character of 0-9a-zA-Z from each state in turn.
+_PHI, _LCG_MUL, _LCG_INC, _ALPHABET = 0x9E3779B97F4A7C15, 6364136223846793005, 1442695040888963407, \
+    "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def seeded_unit(seed):  # noqa: ANN001, ANN201
+    return None if seed is None else ((int(seed) * _PHI) % 2**64) / 2**64
+
+
+def randstr(n, seed):  # noqa: ANN001, ANN201
+    if n is None or seed is None:
+        return None
+    state, out = (int(seed) * _PHI) % 2**64, []
+    for _ in range(max(0, int(n))):
+        out.append(_ALPHABET[(state * 62) >> 64])
+        state = (state * _LCG_MUL + _LCG_INC) % 2**64
+    return "".join(out)
 
 
 # AES as Snowflake's ENCRYPT_RAW / DECRYPT_RAW does it: a method `AES[-mode[-padding]]` (GCM when none is given),
@@ -204,9 +228,6 @@ MACROS = [
           (p, x) as date_trunc(p, x::timestamp)""",
     f"create table if not exists {_NS}_fx_session as select 'SYSADMIN' as role",
     f"create or replace macro {_NS}_sf_current_role() as (select role from {_NS}_fx_session)",
-    # RANDSTR(n, seed): n characters from [0-9A-Za-z], the same for the same seed
-    f"""create or replace macro {_NS}_sf_randstr(n, seed) as array_to_string(list_transform(range(n::bigint), lambda i:
-          substr('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz', 1 + (hash(i, seed) % 62)::integer, 1)), '')""",
     # GET_DDL: the statement DuckDB keeps for the object (DuckDB types, not Snowflake's).
     f"""create or replace macro {_NS}_sf_get_ddl(kind, name) as (
           select sql from (select table_name as n, sql from duckdb_tables() where database_name = current_database()
@@ -898,8 +919,8 @@ def _fix(node: exp.Expression) -> exp.Expression:
             node.set("this", _fn("_sf_text", node.this))
     if isinstance(node, exp.Randstr):
         # sqlglot writes RANDSTR as a correlated subquery, which the planner chokes on once it is repeated
-        seed = node.args.get("generator") or exp.Rand()
-        return _fn("_sf_randstr", node.this, exp.Anonymous(this="hash", expressions=[seed]))
+        seed = node.args.get("generator") or exp.Rand()  # (RANDOM() is a 64-bit integer, a seed as any other)
+        return _fn("_sf_randstr", node.this, exp.cast(seed, "hugeint"))
     if isinstance(node, exp.MapCat):  # keys of the second map win
         return exp.Anonymous(this="json_merge_patch", expressions=[exp.cast(node.this, "json"), exp.cast(node.expression, "json")])
     name = node.sql_name().upper() if isinstance(node, exp.Func) and not isinstance(node, exp.Anonymous) else \
@@ -1013,8 +1034,7 @@ def _fix(node: exp.Expression) -> exp.Expression:
         # UNIFORM(lo, hi, RANDOM()): written out here so it also works inside CTEs and views
         gen = node.args.get("gen")
         unit = exp.Anonymous(this="random") if isinstance(gen, exp.Rand) or gen is None else \
-            sqlglot.parse_one("(hash(0) % 1000003) / 1000003.0", read="duckdb").transform(
-                lambda n: gen.copy() if isinstance(n, exp.Literal) and n.name == "0" and isinstance(n.parent, exp.Anonymous) else n)
+            exp.Anonymous(this="_fxpy_seeded_unit", expressions=[exp.cast(gen.copy(), "hugeint")])  # (Snowflake's, for a seed)
         lo, hi = node.this, node.expression
         real = any(isinstance(b, exp.Cast) and b.to.is_type("double", "float") or (isinstance(b, exp.Literal) and "." in b.name)
                    for b in (lo, hi))

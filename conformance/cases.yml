@@ -957,3 +957,8 @@
 - {id: float_text_2, sql: "select listagg(x, '|') within group (order by x), concat(min(x), ''), concat_ws('-', min(x), max(x)) from (select column1::float x from values ('0.8921984195319782'), ('15.022928716836011'), ('8478738.533123035'))"}
 - {id: float_text_4, sql: "select array_to_string(array_agg(x) within group (order by x), '|') from (select column1::float x from values ('0.8921984195319782'), ('15.022928716836011'))", gap: "a FLOAT in an ARRAY is written as a FLOAT; the emulator's JSON keeps no FLOAT type (as object_keys_10)"}
 - {id: float_text_3, sql: "select (x / 3)::varchar, sqrt(x)::varchar, (x * 1.1)::varchar, avg(x)::varchar from (select 7::float x) group by x"}
+# Recorded 2026-11-19. Snowflake's generator for a seed: RANDSTR and UNIFORM give its values.
+- {id: seeded_1, sql: "select randstr(12, 0), randstr(12, 1), randstr(4, 9), randstr(20, 123456789), randstr(8, -5), randstr(0, 3)"}
+- {id: seeded_2, sql: "select uniform(0, 1000000, 1), uniform(1, 62, 1), uniform(0::float, 1::float, 1), uniform(-10, 10, 7), uniform(1, 6, -3)"}
+- {id: seeded_3, sql: "select s, randstr(6, s), uniform(1, 100, s) from (select seq4() s from table(generator(rowcount => 5))) order by s"}
+- {id: seeded_4, sql: "select sha2(randstr(32, x::number) || x::varchar) from (select 42 x)"}
