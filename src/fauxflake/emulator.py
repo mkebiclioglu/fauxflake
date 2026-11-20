@@ -1057,11 +1057,13 @@ def _patch_fakesnow() -> None:
                     if not getattr(self._conn, "_fx_names_learned", False):
                         semantics.learn_names(transformed, self._duck_conn)
                         self._conn._fx_names_learned = True
-                    misnamed = semantics.misnamed_column(transformed, self._duck_conn)
+                    misnamed = semantics.misnamed_column(transformed, self._duck_conn,
+                                                         probe=not getattr(self._conn, "_fauxflake_txn", False))
                 except Exception:  # noqa: BLE001 - a check of its own that fails leaves the statement to run
                     misnamed = None
                 if misnamed:
-                    raise ProgrammingError(msg=misnamed, errno=904, sqlstate="42000")
+                    ambiguous = "ambiguous" in misnamed
+                    raise ProgrammingError(msg=misnamed, errno=2028 if ambiguous else 904, sqlstate="42601" if ambiguous else "42000")
             semantics.learn_names(transformed)
             remedies = {
                 "times": lambda e: semantics.numbers_as_times(transformed, e) or semantics.offsets_as_written(transformed, e),

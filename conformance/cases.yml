@@ -913,3 +913,14 @@
 - {id: quoted_case_6, sql: "select \"column1\" from values (1)"}
 - {id: quoted_case_7, sql: "select \"Value\" from table(flatten(input => parse_json('[1]')))"}
 - {id: quoted_case_8, sql: "select t.\"Metric_Name\" from (select 1 as metric_name) t"}
+# Recorded 2026-11-19. A name a subquery gives twice is ambiguous.
+- {id: ambiguous_1, sql: "select id from (select 2 as id, * from (select 1 as id, 3 as x))"}
+- {id: ambiguous_2, sql: "select x from (select 2 as id, * from (select 1 as id, 3 as x))"}
+- {id: ambiguous_3, sql: "select count(*) from (select 2 as id, * from (select 1 as id, 3 as x))"}
+- {id: ambiguous_4, sql: "select id from (select 1 as id, 2 as id)"}
+- {id: ambiguous_5, sql: "select s.id from (select 2 as id, * from (select 1 as id)) s"}
+- {id: ambiguous_6, sql: "select id from (select a.*, b.* from (select 1 as id) a join (select 2 as id) b on true)"}
+- {id: ambiguous_7, sql: "select id from (select a.*, b.* from (select 1 as id) a join (select 1 as id) b using (id))"}
+- {id: ambiguous_8, sql: "select *, 2 as id from (select 1 as id) order by id"}
+- {id: ambiguous_9, sql: "with c as (select 2 as id, * from (select 1 as id)) select id from c"}
+- {id: ambiguous_10, sql: "select id from (select *, 2 as id from (select 1 as id)) where id = 1"}

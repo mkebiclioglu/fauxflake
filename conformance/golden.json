@@ -182,6 +182,44 @@
    ]
   ]
  },
+ "ambiguous_1": {
+  "error": "002028 (42601): SQL compilation error:"
+ },
+ "ambiguous_10": {
+  "error": "002028 (42601): SQL compilation error:"
+ },
+ "ambiguous_2": {
+  "rows": [
+   [
+    "3"
+   ]
+  ]
+ },
+ "ambiguous_3": {
+  "rows": [
+   [
+    "1"
+   ]
+  ]
+ },
+ "ambiguous_4": {
+  "error": "002028 (42601): SQL compilation error:"
+ },
+ "ambiguous_5": {
+  "error": "002028 (42601): SQL compilation error:"
+ },
+ "ambiguous_6": {
+  "error": "002028 (42601): SQL compilation error:"
+ },
+ "ambiguous_7": {
+  "error": "002028 (42601): SQL compilation error:"
+ },
+ "ambiguous_8": {
+  "error": "002028 (42601): SQL compilation error:"
+ },
+ "ambiguous_9": {
+  "error": "002028 (42601): SQL compilation error:"
+ },
  "arithmetic_on_text_inside_aggregate": {
   "rows": [
    [

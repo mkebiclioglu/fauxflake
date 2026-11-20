@@ -2378,36 +2378,64 @@ def learn_names(transformed: exp.Expression, conn=None) -> None:  # noqa: ANN001
         MIXED_CASE.update(i.this.lower() for i in transformed.find_all(exp.Identifier) if i.quoted and i.this != i.this.upper())
 
 
-def misnamed_column(transformed: exp.Expression, conn) -> str | None:  # noqa: ANN001
-    """Snowflake keeps a quoted name as written and makes an unquoted one upper case: `"Metric_Name"` is not the
-    column METRIC_NAME, nor `metric_name` the column "Metric_Name". DuckDB matches names in any case, so the query
-    would run where Snowflake's fails. Gives Snowflake's error for a column that the relations it may come from
-    (tables, subqueries, CTEs, VALUES, FLATTEN) have only in another case."""
+def misnamed_column(transformed: exp.Expression, conn, probe: bool = True) -> str | None:  # noqa: ANN001
+    """Snowflake's compilation errors for names that DuckDB resolves where Snowflake does not:
+
+    * a quoted name is that name in its case, an unquoted one upper case: `"Metric_Name"` is not the column
+      METRIC_NAME, nor `metric_name` the column "Metric_Name" (DuckDB matches names in any case);
+    * a name that a subquery gives twice is ambiguous, `select id from (select 1 as id, * from t)` with an ID in t
+      (DuckDB takes the first).
+
+    The columns of the relations a name may come from are followed through tables, subqueries, CTEs, `*`, VALUES
+    and FLATTEN. `probe`: the columns of a table may be asked by reading none of its rows (not in a transaction,
+    which a failed statement would abort)."""
     from sqlglot.optimizer.scope import Scope, traverse_scope
 
     def target(ident: exp.Identifier) -> str:
         return ident.this if ident.quoted else ident.this.upper()
 
+    def starred(e: exp.Expression) -> bool:
+        return isinstance(e, exp.Star) or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star))
+
     refs = [c for c in transformed.find_all(exp.Column) if isinstance(c.this, exp.Identifier) and c.this.this
             and not c.this.this.lower().startswith(("_fs", "_fx", "_sf"))]
     said = {i.this.lower() for i in transformed.find_all(exp.Identifier) if i.quoted and i.this != i.this.upper()}
-    if not any(target(c.this) != c.this.this.upper() or c.this.this.lower() in MIXED_CASE or c.this.this.lower() in said
-               for c in refs):
-        return None  # (the common statement: every name upper case on both sides)
+    cased = any(target(c.this) != c.this.this.upper() or c.this.this.lower() in MIXED_CASE or c.this.this.lower() in said
+                for c in refs)
+    twice = any((s is not transformed or s.args.get("order")) and len(s.expressions) > 1 and any(starred(e) for e in s.expressions)
+                for s in transformed.find_all(exp.Select)) or any(
+        len(names) != len(set(names)) for s in transformed.find_all(exp.Select) if s is not transformed
+        for names in [[e.alias_or_name.upper() for e in s.expressions if not starred(e)]])
+    if not (cased or twice):
+        return None  # (the common statement)
     internal = ("_fs", "information_schema", "pg_catalog", "duckdb_", "system", "temp")
     if any(p.lower().startswith(internal) for t in transformed.find_all(exp.Table) for p in (t.name, t.db, t.catalog) if p):
         return None  # (the emulator's own statements, over DuckDB's catalog: its names are lower case)
 
-    def stored(table: exp.Table) -> set[str] | None:
-        rows = conn.execute(
-            "select column_name from duckdb_columns() where lower(table_name) = lower(?) "
-            "and lower(schema_name) = lower(coalesce(?, current_schema())) "
-            "and lower(database_name) = lower(coalesce(?, current_database()))",
-            [table.name, table.db or None, table.catalog or None]).fetchall()
-        return {name for (name,) in rows} or None
+    looked: dict[str, list[str] | None] = {}
 
-    def outputs(node: exp.Expression) -> set[str] | None:
-        """The names of the columns a query gives, or None when they cannot be told (a `*`)."""
+    def stored(table: exp.Table) -> list[str] | None:
+        bare = exp.Table(this=table.this.copy(), db=table.args.get("db"), catalog=table.args.get("catalog")).sql(dialect="duckdb")
+        if bare not in looked:
+            if probe:
+                try:
+                    looked[bare] = [d[0] for d in conn.execute(f"select * from {bare} limit 0").description]
+                except Exception:  # noqa: BLE001 - not a table this connection can read: not checked
+                    looked[bare] = None
+            else:
+                rows = conn.execute(
+                    "select column_name from duckdb_columns() where lower(table_name) = lower(?) "
+                    "and lower(schema_name) = lower(coalesce(?, current_schema())) "
+                    "and lower(database_name) = lower(coalesce(?, current_database())) order by column_index",
+                    [table.name, table.db or None, table.catalog or None]).fetchall()
+                looked[bare] = [name for (name,) in rows] or None
+        return looked[bare]
+
+    scopes = traverse_scope(transformed)
+    scope_of = {id(sc.expression): sc for sc in scopes}
+
+    def outputs(node: exp.Expression) -> list[str] | None:
+        """The names of the columns a query gives, in order and with repeats, or None when they cannot be told."""
         if isinstance(node, exp.SetOperation):
             return outputs(node.left)
         if isinstance(node, exp.Subquery):
@@ -2416,47 +2444,85 @@ def misnamed_column(transformed: exp.Expression, conn) -> str | None:  # noqa: A
             alias = node.args.get("alias")
             listed = alias.columns if isinstance(alias, exp.TableAlias) else []
             width = len(node.expressions[0].expressions) if node.expressions and isinstance(node.expressions[0], exp.Tuple) else 1
-            return {target(c) for c in listed} if listed else {f"COLUMN{i + 1}" for i in range(width)}
+            return [target(c) for c in listed] if listed else [f"COLUMN{i + 1}" for i in range(width)]
         if not isinstance(node, exp.Select):
             return None
-        names = set()
+        names: list[str] = []
         for e in node.expressions:
             if isinstance(e, exp.Alias) and isinstance(e.args.get("alias"), exp.Identifier):
-                names.add(target(e.args["alias"]))
+                names.append(target(e.args["alias"]))
             elif isinstance(e, exp.Column) and isinstance(e.this, exp.Identifier):
-                names.add(target(e.this))
-            elif e.find(exp.Star):
-                return None
+                names.append(target(e.this))
+            elif starred(e):
+                if e.args.get("except_") or e.args.get("replace") or e.args.get("rename") or (
+                        isinstance(e, exp.Column) and (e.this.args.get("except_") or e.this.args.get("replace"))):
+                    return None
+                sc = scope_of.get(id(node))
+                joins = node.args.get("joins") or []
+                wanted = e.table.upper() if isinstance(e, exp.Column) and e.table else None
+                if sc is None or any(j.args.get("kind") == "NATURAL" or j.args.get("method") == "NATURAL" for j in joins):
+                    return None
+                # (an unqualified `*` over a USING join gives the columns joined on once; `a.*, b.*` gives them twice)
+                shared = {target(u) if isinstance(u, exp.Identifier) else u.name.upper()
+                          for j in joins for u in j.args.get("using") or []} if not wanted else set()
+                given: set[str] = set()
+                for alias, (_n, src) in sc.selected_sources.items():
+                    if wanted and alias.upper() != wanted:
+                        continue
+                    more = known(src)
+                    if more is None:
+                        return None
+                    for n in more:
+                        if n in shared and n in given:
+                            continue
+                        given.add(n)
+                        names.append(n)
+            else:
+                names.append("")  # an expression without a name of its own: a name no one asks for
         return names
 
-    def known(source) -> set[str] | None:  # noqa: ANN001
+    def known(source) -> list[str] | None:  # noqa: ANN001
+        flatten = ["SEQ", "KEY", "PATH", "INDEX", "VALUE", "THIS"]
         if isinstance(source, Scope):
             inner = source.expression
             call = inner.this if isinstance(inner, exp.Table) else None
             if isinstance(call, exp.Func) and re.search("flatten|explode", call.name if isinstance(call, exp.Anonymous) else call.sql_name(), re.I):
-                return {"SEQ", "KEY", "PATH", "INDEX", "VALUE", "THIS"}
+                return flatten
             return outputs(inner)
         if isinstance(source, exp.Table):
             alias = source.args.get("alias")
             if isinstance(alias, exp.TableAlias) and alias.columns:
-                return {target(c) for c in alias.columns}
+                return [target(c) for c in alias.columns]
             if not isinstance(source.this, exp.Identifier):  # a table function
                 name = (source.this.name if isinstance(source.this, exp.Anonymous) else source.this.sql_name()) if isinstance(source.this, exp.Func) else ""
-                return {"SEQ", "KEY", "PATH", "INDEX", "VALUE", "THIS"} if "flatten" in name.lower() else None
+                return flatten if "flatten" in name.lower() else None
             return stored(source)
         if isinstance(source, (exp.Values, exp.Subquery)):
             return outputs(source)
         return None
 
-    for scope in traverse_scope(transformed):
-        sources = {}
+    def where(ref: exp.Column) -> str:
+        meta = ref.this.meta or {}
+        if "line" in meta and "col" in meta:
+            return f"error line {meta['line']} at position {max(0, meta['col'] - len(ref.this.this) - (2 if ref.this.quoted else 0))}\n"
+        return ""
+
+    for scope in scopes:
+        sources: dict[str, list[str] | None] = {}
         for name, (_node, source) in scope.selected_sources.items():
             try:
                 sources[name.upper()] = known(source)
             except Exception:  # noqa: BLE001 - a relation that cannot be looked up is not checked
                 sources[name.upper()] = None
-        lateral = {target(e.args["alias"]) for e in getattr(scope.expression, "expressions", [])
-                   if isinstance(e, exp.Alias) and isinstance(e.args.get("alias"), exp.Identifier)}
+        lateral = [target(e.args["alias"]) for e in getattr(scope.expression, "expressions", [])
+                   if isinstance(e, exp.Alias) and isinstance(e.args.get("alias"), exp.Identifier)]
+        order = scope.expression.args.get("order") if isinstance(scope.expression, exp.Select) else None
+        if order is not None:  # ORDER BY reads the select's own columns first
+            given = outputs(scope.expression)
+            for ref in order.find_all(exp.Column):
+                if given is not None and not ref.table and isinstance(ref.this, exp.Identifier) \
+                        and ref.find_ancestor(exp.Select) is scope.expression and given.count(target(ref.this)) > 1:
+                    return f"SQL compilation error: ambiguous column name '{target(ref.this)}'"
         for ref in scope.columns:
             if not isinstance(ref.this, exp.Identifier) or ref.this.this.lower().startswith(("_fs", "_fx", "_sf")):
                 continue
@@ -2464,17 +2530,16 @@ def misnamed_column(transformed: exp.Expression, conn) -> str | None:  # noqa: A
             if ref.table:
                 places = [sources.get(ref.table.upper())] if ref.table.upper() in sources else [None]
             else:
-                places = [*sources.values(), lateral or set()]
-            if not places or any(p is None for p in places) or any(wanted in p for p in places):
+                places = [*sources.values(), lateral]
+            if not places or any(p is None for p in places):
                 continue
-            if not any(wanted.lower() == n.lower() for p in places for n in p):
-                continue  # (not a name of these relations in any case: a column of an outer query, left to DuckDB)
+            having = [p for p in places if wanted in p]
+            if len(having) == 1 and having[0] is not lateral and having[0].count(wanted) > 1 and wanted not in lateral:
+                return f"SQL compilation error: ambiguous column name '{wanted}'"
+            if having or not any(wanted.lower() == n.lower() for p in places for n in p):
+                continue  # (found; or not a name of these relations in any case: an outer query's, left to DuckDB)
             shown = '"' + ref.this.this + '"' if ref.this.quoted else ref.this.this.upper()
-            meta = ref.this.meta or {}
-            where = ""
-            if "line" in meta and "col" in meta:
-                where = f"error line {meta['line']} at position {max(0, meta['col'] - len(ref.this.this) - (2 if ref.this.quoted else 0))}\n"
-            return f"SQL compilation error: {where}invalid identifier '{shown}'"
+            return f"SQL compilation error: {where(ref)}invalid identifier '{shown}'"
     return None
 
 
