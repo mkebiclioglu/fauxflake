@@ -624,6 +624,7 @@ def _patch_fakesnow() -> None:
         try:
             self._fauxflake_outer = semantics.outer_flattens(command)
             self._fauxflake_recursive = semantics.outer_flattens(command, "recursive")
+            self._fauxflake_paths = semantics.flatten_paths(command)
             self._fauxflake_layer, self._fauxflake_inline, self._fauxflake_owners = False, set(), {}
             self._fauxflake_qualify = False
             command = objects.session_functions(self, command)
@@ -884,7 +885,8 @@ def _patch_fakesnow() -> None:
             _note_semi_types(self, expression)
         out = original_transform(self, semantics.rewrite(expression), params)
         out = semantics.finish(semantics.parenthesize_arrows(out))
-        out = semantics.keep_outer_rows(out, getattr(self, "_fauxflake_outer", []), getattr(self, "_fauxflake_recursive", []))
+        out = semantics.keep_outer_rows(out, getattr(self, "_fauxflake_outer", []), getattr(self, "_fauxflake_recursive", []),
+                                        getattr(self, "_fauxflake_paths", []))
         if os.environ.get("FAUXFLAKE_SHOW_SQL"):  # what DuckDB is actually asked to run
             print(out.sql(dialect="duckdb"), file=sys.stderr)
         return out

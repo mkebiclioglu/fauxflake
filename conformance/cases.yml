@@ -982,3 +982,10 @@
 - {id: flatten_scalar_9, sql: "select seq is not null, key, path, index, value, this::varchar from table(flatten(input => parse_json('[]'), outer => true))"}
 - {id: flatten_scalar_10, sql: "select seq is not null, key, path, index, value, this::varchar from table(flatten(input => parse_json('\"abc\"'), outer => true))"}
 - {id: flatten_scalar_11, sql: "select t.x, f.value::varchar from (select parse_json('\"abc\"') x union all select parse_json('[1]')) t, lateral flatten(input => t.x, recursive => true) f order by 1"}
+# Recorded 2026-11-19. FLATTEN at a PATH inside its input.
+- {id: flatten_path_1, sql: "select key, index, value::varchar, path from table(flatten(input => parse_json('{\"all\": [1, 2], \"any\": [3]}'), path => 'all'))"}
+- {id: flatten_path_2, sql: "select count(*) from table(flatten(input => parse_json('{\"all\": [1, 2]}'), path => 'none'))"}
+- {id: flatten_path_3, sql: "select count(*) from table(flatten(input => parse_json('{\"all\": [1, 2]}'), path => 'none', outer => true))"}
+- {id: flatten_path_4, sql: "select t.i, f.value::varchar from (select 1 i, parse_json('{\"all\": [1, 2], \"any\": [3]}') x union all select 2, parse_json('{\"any\": [4]}')) t, lateral flatten(input => t.x, path => 'all', outer => true) f order by 1, 2"}
+- {id: flatten_path_5, sql: "select count(*) from (select parse_json('{\"all\": [1, 2], \"any\": [3, 4, 5]}') x) t, lateral flatten(input => t.x, path => 'all', outer => true) a, lateral flatten(input => t.x, path => 'any', outer => true) b"}
+- {id: flatten_path_6, sql: "select value::varchar, path from table(flatten(input => parse_json('{\"a\": {\"b\": [7, 8]}}'), path => 'a.b'))"}

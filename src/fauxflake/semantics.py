@@ -1877,6 +1877,47 @@ def outer_flattens(sql: str, option: str = "outer") -> list[bool]:
     return flags
 
 
+def flatten_paths(sql: str) -> list[str | None]:
+    """For each FLATTEN(...) in order: the PATH => '...' it was called with, if any."""
+    paths = []
+    for m in _FLATTEN_CALL.finditer(sql):
+        depth, i = 1, m.end()
+        while i < len(sql) and depth:
+            depth += {"(": 1, ")": -1}.get(sql[i], 0)
+            i += 1
+        given = re.search(r"\bpath\s*=>\s*'((?:[^']|'')*)'", sql[m.end():i], re.IGNORECASE)
+        paths.append(given.group(1).replace("''", "'") if given else None)
+    return paths
+
+
+def _flatten_at(call: exp.Anonymous, path: str) -> None:
+    """FLATTEN(input => x, path => 'a.b'): what is expanded is x:a.b, and each row's PATH starts with a.b."""
+    if not call.expressions:
+        return
+    first = call.expressions[0]
+    holder, value = (first, first.expressions[0]) if isinstance(first, exp.Anonymous) and first.name.lower().endswith("_sf_flattenable") \
+        else (None, first)
+    jsonpath = "$" + ("" if path.startswith("[") else ".") + path
+    reached = exp.Anonymous(this="json_extract", expressions=[exp.Anonymous(this="to_json", expressions=[value.copy()]),
+                                                              exp.Literal.string(jsonpath)])
+    if holder is not None:
+        holder.set("expressions", [reached, *holder.expressions[1:]])
+    else:
+        call.set("expressions", [reached, *call.expressions[1:]])
+    table = call.parent if isinstance(call.parent, exp.Table) else None
+    if table is None:
+        return
+    quoted = path.replace("'", "''")
+    rows = sqlglot.parse_one(
+        f"select SEQ, KEY, case when PATH = '' then '{quoted}' when PATH like '[%' then '{quoted}' || PATH "
+        f"else '{quoted}.' || PATH end as PATH, INDEX, VALUE, THIS from _fx_expand", read="duckdb")
+    for t in list(rows.find_all(exp.Table)):
+        if t.name == "_fx_expand":
+            t.set("this", call)  # (the call itself, moved: what is done to it next, OUTER or RECURSIVE, is done here)
+    alias = table.args.get("alias")
+    table.replace(exp.Subquery(this=rows, alias=alias.copy() if alias is not None else exp.TableAlias(this=exp.to_identifier("_fx_flatten"))))
+
+
 _OPERATORS = (exp.Binary, exp.Unary, exp.In, exp.Between, exp.Is)
 
 
@@ -1889,12 +1930,18 @@ def parenthesize_arrows(transformed: exp.Expression) -> exp.Expression:
     return transformed
 
 
-def keep_outer_rows(transformed: exp.Expression, flags: list[bool], recursive: list[bool] = ()) -> exp.Expression:
-    """FLATTEN(..., OUTER => TRUE) keeps rows that have nothing to expand: a LEFT lateral join."""
+def keep_outer_rows(transformed: exp.Expression, flags: list[bool], recursive: list[bool] = (),
+                    paths: list[str | None] = ()) -> exp.Expression:
+    """FLATTEN(..., OUTER => TRUE) keeps rows that have nothing to expand: a LEFT lateral join. Also the other
+    options: RECURSIVE, and PATH (see `_flatten_at`)."""
     calls = [n for n in transformed.find_all(exp.Anonymous) if n.name.upper() == "_FS_FLATTEN"]
     for call in calls:
         if call.expressions and not (isinstance(call.expressions[0], exp.Anonymous) and call.expressions[0].name.lower().endswith("_sf_flattenable")):
             call.set("expressions", [_fn("_sf_flattenable", call.expressions[0]), *call.expressions[1:]])
+    if len(paths) == len(calls):
+        for call, path in zip(calls, paths):
+            if path:
+                _flatten_at(call, path)
     if not any(flags) and not any(recursive):
         return transformed
     for call, deep in zip(calls, recursive):

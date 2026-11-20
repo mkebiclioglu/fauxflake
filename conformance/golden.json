@@ -1938,6 +1938,71 @@
    ]
   ]
  },
+ "flatten_path_1": {
+  "rows": [
+   [
+    null,
+    "0",
+    "1",
+    "all[0]"
+   ],
+   [
+    null,
+    "1",
+    "2",
+    "all[1]"
+   ]
+  ]
+ },
+ "flatten_path_2": {
+  "rows": [
+   [
+    "0"
+   ]
+  ]
+ },
+ "flatten_path_3": {
+  "rows": [
+   [
+    "1"
+   ]
+  ]
+ },
+ "flatten_path_4": {
+  "rows": [
+   [
+    "1",
+    "1"
+   ],
+   [
+    "1",
+    "2"
+   ],
+   [
+    "2",
+    null
+   ]
+  ]
+ },
+ "flatten_path_5": {
+  "rows": [
+   [
+    "6"
+   ]
+  ]
+ },
+ "flatten_path_6": {
+  "rows": [
+   [
+    "7",
+    "a.b[0]"
+   ],
+   [
+    "8",
+    "a.b[1]"
+   ]
+  ]
+ },
  "flatten_recursive": {
   "rows": [
    [
