@@ -995,3 +995,8 @@
 - {id: number_beside_text_3, sql: "select ifnull(n, '') from (select null::number n)"}
 - {id: number_beside_text_4, sql: "select ifnull(f, '')::varchar from (select 1.5::float f)"}
 - {id: number_beside_text_5, sql: "select coalesce(n, '12')::varchar, coalesce(n, s)::varchar from (select 384::number(38,0) n, 'x'::varchar s)"}
+# Recorded 2026-11-19. CONVERT_TIMEZONE with two arguments: an instant, shown in that zone.
+- {id: convert_tz_1, sql: "select convert_timezone('America/Los_Angeles', '2025-01-01 12:00:00 +00:00'::timestamp_tz)::varchar", gap: "a TIMESTAMP_TZ keeps its own offset in its text; the emulator keeps a timestamp's wall clock only"}
+- {id: convert_tz_2, sql: "select convert_timezone('America/Los_Angeles', '2025-07-01 12:00:00 +02:00'::timestamp_tz)::varchar", gap: "a TIMESTAMP_TZ keeps its own offset in its text; the emulator keeps a timestamp's wall clock only"}
+- {id: convert_tz_3, sql: "select convert_timezone('America/Los_Angeles', '2025-01-01 12:00:00 +00:00'::timestamp_tz)::timestamp_ntz::varchar"}
+- {id: convert_tz_4, sql: "select convert_timezone('Asia/Tokyo', '2025-01-01 12:00:00 +00:00'::timestamp_tz)::date, hour(convert_timezone('Asia/Tokyo', '2025-01-01 20:00:00 +00:00'::timestamp_tz))"}
