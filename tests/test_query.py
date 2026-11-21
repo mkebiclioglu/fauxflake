@@ -242,15 +242,67 @@ def test_a_conversion_of_a_column_without_nulls_is_never_null_and_is_not_made():
             cur.execute("select count(*) from sw where n is null").fetchall()
         cur.execute("create or replace view sw as with s as (select * from v) select n from s")
         assert count("select count(*) from sw where n is null") == 0
-        # nor does DuckDB's own filter get in: a join that fails on every row, under a filter that keeps none of them
-        # (GitLab's dim_charge_central_sandbox: Snowflake fails its not_null test)
-        cur.execute("create secure view sj as with a as (select t.x as k from t join t u on t.x::number = u.i) select k from a")
+        # nor does DuckDB's own filter get in: a column that fails on every row read, under a filter on a value
+        # Snowflake does not follow into a secure view (LOWER of a column: measured, it fails)
+        cur.execute("create secure view sj as with a as (select distinct lower(t.x) as k, t.x::number as m from t) select * from a")
         with pytest.raises(ProgrammingError):
             cur.execute("select count(*) from sj where k is null").fetchall()
         # and the fence keeps every value (it once read RANDOM(), which became Snowflake's 64-bit one: half came out NULL)
         cur.execute("create secure view sk as with s as (select i from t) select i from s")
         assert count("select count(*) from sk where i is null") == 0
         assert count("select count(*) from sk") == count("select count(*) from t") > 1
+
+
+def test_a_filter_goes_into_a_secure_view_while_what_it_tests_cannot_fail():
+    # measured on Snowflake (2,000 rows, one text that is no number): `is null` reaches the table through a secure
+    # view that is a WITH when it tests a column, a number made a number or arithmetic of one, and the rows it keeps
+    # out are never made; a conversion of text stops it, and the view is read whole
+    import pytest
+    import snowflake.connector
+    from snowflake.connector.errors import ProgrammingError
+
+    from fauxflake.emulator import serve
+
+    with serve() as emu:
+        conn = snowflake.connector.connect(**emu.connect_kwargs(database="ANALYTICS", schema="CI"))
+        cur = conn.cursor()
+        count = lambda sql: cur.execute(sql).fetchone()[0]  # noqa: E731
+        cur.execute("create table pt (id number, x varchar, u number, tx varchar) as select seq4(), "
+                    "iff(seq4() = 0, 'a', seq4()::varchar), seq4(), seq4()::varchar from table(generator(rowcount => 2000))")
+        views = {
+            "s_d_id": "with s as (select distinct id::number n, x::number m from pt) select * from s",
+            "s_d_txt": "with s as (select distinct tx::number n, x::number m from pt) select * from s",
+            "s_d_plain": "with s as (select distinct id n, x::number m from pt) select * from s",
+            "s_d_expr": "with s as (select distinct id + 1 n, x::number m from pt) select * from s",
+            "s_d_nullif": "with s as (select distinct id n, nullif(u, '') k from pt) select * from s",
+            "s_qual": "with s0 as (select * from pt qualify row_number() over (partition by id order by u desc) = 1), "
+                      "s as (select distinct id::number n, nullif(u, '') k from s0) select * from s",
+            "s_j": "with a as (select t.x as k from pt t join pt u on t.x::number = u.id) select k from a",
+            "s_md_x": "with s as (select distinct md5(tx) n, x::number m from pt) select * from s",
+            "s_low_x": "with s as (select distinct lower(tx) n, x::number m from pt) select * from s",
+            "s_sha": "with s as (select distinct sha2(trim(lower(tx || 'salt'))) n, nullif(u, '') m from pt) select * from s",
+            "s_vc": "with s as (select distinct tx::varchar n, x::number m from pt) select * from s",
+            "s_vc_id": "with s as (select distinct id::varchar n, x::number m from pt) select * from s",
+            "s_gkey": "with a as (select tx::varchar n, sum(x::number) s from pt group by 1) select * from a",
+            "s_ugj": "with a as (select t.id n, t.x::number m from pt t join pt u on t.x::number = u.id union select id, u from pt), "
+                     "b as (select n, sum(m) s from a group by n) select * from b",
+            "s_un_star": "with a as (select id n, x::number m from pt), b as (select u n, x::number m from pt), "
+                         "c as (select * from a union select * from b) select * from c",
+        }
+        cur.execute("create view p_g as select id n, sum(x::number) s from pt group by 1")
+        for name, body in views.items():
+            cur.execute(f"create secure view {name} as {body}")
+        cur.execute("create view p_d_txt as with s as (select distinct tx::number n, x::number m from pt) select * from s")
+        for name in ("s_d_id", "s_d_plain", "s_d_expr", "s_d_nullif", "s_qual", "s_j", "s_md_x", "p_d_txt", "s_vc", "s_gkey",
+                     "s_ugj", "s_un_star", "p_g"):
+            assert count(f"select count(*) from {name} where n is null" if name != "s_j" else
+                         "select count(*) from s_j where k is null") == 0, name
+        for failing in ("select count(*) from s_d_txt where n is null", "select count(*) from s_d_id where m is null",
+                        "select count(*) from s_low_x where n is null", "select count(*) from s_sha where n is null",
+                        "select count(*) from s_vc_id where n is null", "select count(*) from p_g where s is null",
+                        "select count(*) from s_d_id", "select count(*) from s_d_nullif"):
+            with pytest.raises(ProgrammingError):
+                cur.execute(failing).fetchall()
 
 
 def test_a_view_that_converts_a_timestamp_to_a_number_is_refused_when_it_is_created():

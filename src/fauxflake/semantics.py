@@ -1048,6 +1048,14 @@ def _fenced(body: exp.Expression | None) -> bool:
         and isinstance(body.args["from_"].this, exp.Subquery) and body.args["from_"].this.this.args.get("with_") is not None
 
 
+def _unfenced(body: exp.Expression | None) -> exp.Expression | None:
+    """The WITH a fenced body holds (see _fenced), or the body as it is."""
+    return body.args["from_"].this.this if _fenced(body) else body
+
+
+_NUMERIC_KIND = re.compile(r"(?:U?(?:TINY|SMALL|BIG|HUGE)?INT(?:EGER)?|DECIMAL.*|DOUBLE|FLOAT|REAL)", re.I)
+
+
 def _fix(node: exp.Expression) -> exp.Expression:
     if type(node) in _CLOCK_CALLS and not (isinstance(node, exp.CurrentDate) and node.this is not None):
         # as calls: `select current_date` is named CURRENT_DATE, and DuckDB reads the bare keyword as that name
@@ -2849,6 +2857,25 @@ def misnamed_column(transformed: exp.Expression, conn, probe: bool = True) -> st
     def target(ident: exp.Identifier) -> str:
         return ident.this if ident.quoted else ident.this.upper()
 
+    def has_column(source: exp.Table | Scope, name: str) -> bool | None:
+        """The source gives a column of that name (None: cannot be told)."""
+        if isinstance(source, Scope):
+            names = outputs(source)
+            return None if names is None else name.upper() in (n.upper() for n in names)
+        names = columns_of(source) if isinstance(source, exp.Table) else None
+        return None if names is None else name.upper() in (n.upper() for n in names)
+
+    def columns_of(table: exp.Table) -> list[str] | None:
+        """A table's or a view's columns, in order, from the catalog."""
+        if not isinstance(table.this, exp.Identifier):
+            return None
+        rows = conn.execute(
+            "select column_name from duckdb_columns() where lower(table_name) = lower(?) "
+            "and lower(schema_name) = lower(coalesce(?, current_schema())) "
+            "and lower(database_name) = lower(coalesce(?, current_database())) order by column_index",
+            [table.name, table.db or None, table.catalog or None]).fetchall()
+        return [r[0] for r in rows] or None
+
     def starred(e: exp.Expression) -> bool:
         return isinstance(e, exp.Star) or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star))
 
@@ -3016,7 +3043,6 @@ def misnamed_column(transformed: exp.Expression, conn, probe: bool = True) -> st
 _CONVERSION = re.compile(r"_(?:sf|fs)_(?:to_(?!.*try)\w+|int|integer|text|number\w*|decimal\w*|double|float|bool\w*|date|time\w*)", re.I)
 
 
-STOPPED = exp.Null()  # (pruned_nulls: a view a filter is not pushed into)
 
 
 def pruned_nulls(transformed: exp.Expression, conn) -> exp.Expression | None:  # noqa: ANN001
@@ -3058,6 +3084,7 @@ def pruned_nulls(transformed: exp.Expression, conn) -> exp.Expression | None:  #
         return None
 
     views: dict[str, exp.Expression | None] = {}
+    secure: set[str] = set()
 
     def view(table: exp.Table) -> exp.Expression | None:
         key = table.sql(dialect="duckdb")
@@ -3071,11 +3098,15 @@ def pruned_nulls(transformed: exp.Expression, conn) -> exp.Expression | None:  #
             if row:
                 parsed = sqlglot.parse_one(row[0], read="duckdb")
                 body = parsed.expression if isinstance(parsed, exp.Create) else None
-                if isinstance(body, exp.Query) and (body.args.get("with_") is not None or _fenced(body)) and conn.execute(
+                # (a fenced body is one; the list of secure views is not kept with a warehouse kept on disk)
+                if _fenced(body) or isinstance(body, exp.Query) and body.args.get("with_") is not None and conn.execute(
                         f"select count(*) from {_NS}_fx_secure_views where view_name = upper(?) "
                         "and schema_name = upper(coalesce(?, current_schema())) and database_name = upper(coalesce(?, current_database()))",
                         [table.name, table.db or None, table.catalog or None]).fetchone()[0]:
-                    body = STOPPED  # (measured: a filter goes no further into a secure view that is a WITH)
+                    # measured: into a secure view that is a WITH, the filter goes on only while what it tests cannot
+                    # fail (a column, a number made a number, `id + 1`), not past a conversion of text
+                    secure.add(key)
+                    body = _unfenced(body)
                 if body is not None and table.catalog:  # (its tables are named as the view's database sees them)
                     for t in body.find_all(exp.Table):
                         if t.db and not t.catalog:
@@ -3083,10 +3114,31 @@ def pruned_nulls(transformed: exp.Expression, conn) -> exp.Expression | None:  #
             views[key] = body
         return views[key]
 
-    def none_null(table: exp.Table, column: str) -> bool:
+    def kind_of(node: exp.Expression) -> str:
+        """What a conversion makes: 'text', 'number' or 'other'."""
+        while isinstance(node, exp.Paren):
+            node = node.this
+        if isinstance(node, exp.Case) and node.args.get("default") is not None:
+            return kind_of(node.args["default"])
+        if isinstance(node, exp.Cast):
+            to = node.to
+            return "text" if to.is_type(*exp.DataType.TEXT_TYPES) else "number" if to.is_type(*exp.DataType.NUMERIC_TYPES) else "other"
+        call = called(node)
+        name = call[0].lower() if call else ""
+        return "text" if name == "_sf_text" else "number" if re.fullmatch(
+            r"_(?:sf|fs)_(?:int|integer|number\w*|decimal\w*|double|float|to_number|to_decimal|to_numeric|to_double)", name) else "other"
+
+    def none_null(table: exp.Table, column: str, guarded: bool = False, target: str | None = None) -> bool:
+        """No NULLs in the column; when `guarded` (inside a secure view) a conversion of it goes no further unless it
+        makes what the column is (text of text, a number of a number: measured, the others are not followed)."""
         bare = exp.Table(this=table.this.copy(), db=table.args.get("db"), catalog=table.args.get("catalog"))
-        (nulls,) = conn.execute(f"select count(*) from {bare.sql(dialect='duckdb')} where {exp.column(column, quoted=True).sql(dialect='duckdb')} is null").fetchone()
-        return nulls == 0
+        col = exp.column(column, quoted=True).sql(dialect="duckdb")
+        (nulls, kind) = conn.execute(f"select count(*) filter (where {col} is null), any_value(typeof({col})) "
+                                     f"from {bare.sql(dialect='duckdb')}").fetchone()
+        if nulls or not guarded or target is None:
+            return not nulls
+        own = "number" if kind and _NUMERIC_KIND.match(kind) else "text" if kind and re.match(r"VARCHAR|TEXT|STRING", kind, re.I) else None
+        return own is not None and own == target
 
     def outer_side(scope: Scope, alias: str) -> bool:
         """The relation `alias` stands on a side of an outer join that is filled with NULLs."""
@@ -3101,8 +3153,9 @@ def pruned_nulls(transformed: exp.Expression, conn) -> exp.Expression | None:  #
                 return True
         return False
 
-    def follow(column: exp.Column, scope: Scope, converted: bool, depth: int = 0) -> bool:
-        """The column, read in `scope`, is (after a conversion when `converted`) one of a table with no NULLs."""
+    def follow(column: exp.Column, scope: Scope, target: str | None, depth: int = 0, guarded: bool = False) -> bool:
+        """The column, read in `scope`, is (after a conversion to `target`, when there is one) one of a table with no
+        NULLs. `guarded`: the filter is inside a secure view, where a column it reaches as it is will do too."""
         if depth > 30:
             return False
         sources = scope.selected_sources
@@ -3110,29 +3163,90 @@ def pruned_nulls(transformed: exp.Expression, conn) -> exp.Expression | None:  #
             picked = [(a, s) for a, (_n, s) in sources.items() if a.upper() == column.table.upper()]
         else:
             picked = [(a, s) for a, (_n, s) in sources.items()]
+            if len(picked) > 1:  # (a bare column beside a join: the one source that has it)
+                picked = [(a, s) for a, s in picked if has_column(s, column.name) is not False]
         if len(picked) != 1 or outer_side(scope, picked[0][0]):
             return False
         _alias, source = picked[0]
         name = column.name
         if isinstance(source, exp.Table):
             body = view(source)
-            if body is STOPPED:
-                return False
             if body is None:
-                return converted and isinstance(source.this, exp.Identifier) and none_null(source, name)
+                # (a column as it is, inside a secure view: DuckDB's own pruning is fenced out of those)
+                return (target is not None or guarded) and isinstance(source.this, exp.Identifier) \
+                    and none_null(source, name, guarded, target)
             inner = traverse_scope(body)
-            return bool(inner) and through(name, inner[-1], converted, depth + 1)
+            guarded = guarded or source.sql(dialect="duckdb") in secure
+            return bool(inner) and through(name, inner[-1], target, depth + 1, guarded)
         if isinstance(source, Scope):
-            return through(name, source, converted, depth + 1)
+            return through(name, source, target, depth + 1, guarded)
         return False
 
-    def through(name: str, scope: Scope, converted: bool, depth: int) -> bool:
-        """The column `name` that `scope` gives is (after a conversion when `converted`) one with no NULLs."""
+    def has_column(source: exp.Table | Scope, name: str) -> bool | None:
+        """The source gives a column of that name (None: cannot be told)."""
+        if isinstance(source, Scope):
+            names = outputs(source)
+            return None if names is None else name.upper() in (n.upper() for n in names)
+        names = columns_of(source) if isinstance(source, exp.Table) else None
+        return None if names is None else name.upper() in (n.upper() for n in names)
+
+    def columns_of(table: exp.Table) -> list[str] | None:
+        """A table's or a view's columns, in order, from the catalog."""
+        if not isinstance(table.this, exp.Identifier):
+            return None
+        rows = conn.execute(
+            "select column_name from duckdb_columns() where lower(table_name) = lower(?) "
+            "and lower(schema_name) = lower(coalesce(?, current_schema())) "
+            "and lower(database_name) = lower(coalesce(?, current_database())) order by column_index",
+            [table.name, table.db or None, table.catalog or None]).fetchall()
+        return [r[0] for r in rows] or None
+
+    def starred(e: exp.Expression) -> bool:
+        return isinstance(e, exp.Star) or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star))
+
+    def outputs(scope: Scope, depth: int = 0) -> list[str] | None:
+        """The names of the columns `scope` gives, in order, when they can be told without a catalog."""
         select = scope.expression
-        # (measured: a filter goes no further down than a LIMIT, a GROUP BY, a window whose result is read, or a
-        # QUALIFY whose windows are not partitioned by the column filtered)
-        if not isinstance(select, exp.Select) or select.args.get("limit") or select.args.get("offset") or select.args.get("fetch") \
-                or select.args.get("group"):
+        if depth > 30:
+            return None
+        if isinstance(select, exp.Union):
+            return outputs(scope.set_operation_scopes[0], depth + 1) if scope.set_operation_scopes else None
+        if not isinstance(select, exp.Select):
+            return None
+        names: list[str] = []
+        for e in select.expressions:
+            if starred(e):
+                sources = list(scope.selected_sources.values())
+                if len(sources) != 1:
+                    return None
+                source = sources[0][1]
+                more = outputs(source, depth + 1) if isinstance(source, Scope) else columns_of(source) \
+                    if isinstance(source, exp.Table) else None
+                if more is None:
+                    return None
+                names += more
+            else:
+                names.append(e.alias_or_name)
+        return names
+
+    def through(name: str, scope: Scope, target: str | None, depth: int, guarded: bool = False) -> bool:
+        """The column `name` that `scope` gives is (after a conversion to `target`) one with no NULLs."""
+        select = scope.expression
+        if isinstance(select, exp.Union) and not isinstance(select, (exp.Except, exp.Intersect)):
+            # (measured: into each branch of a UNION, the column in the same place)
+            first = outputs(scope)
+            upper = [n.upper() for n in first or []]
+            if name.upper() not in upper or len(scope.set_operation_scopes) < 2:
+                return False
+            at = upper.index(name.upper())
+            for branch in scope.set_operation_scopes:
+                names = outputs(branch)
+                if names is None or len(names) <= at or not through(names[at], branch, target, depth + 1, guarded):
+                    return False
+            return True
+        # (measured: a filter goes no further down than a LIMIT, an aggregate (a GROUP BY key it does), a window whose
+        # result is read, or a QUALIFY whose windows are not partitioned by the column filtered)
+        if not isinstance(select, exp.Select) or select.args.get("limit") or select.args.get("offset") or select.args.get("fetch"):
             return False
         windowed = {e.alias_or_name.upper() for e in select.expressions if e.find(exp.Window)}
         if windowed & {c.name.upper() for c in tree.find_all(exp.Column) if c.find_ancestor(exp.Select) is not select}:
@@ -3144,18 +3258,39 @@ def pruned_nulls(transformed: exp.Expression, conn) -> exp.Expression | None:  #
             if not all(any(isinstance(p, exp.Column) and p.name.upper() == source_name.upper() for p in w.args.get("partition_by") or [])
                        for w in qualify.find_all(exp.Window)):
                 return False
-        for e in select.expressions:
-            if isinstance(e, exp.Star) or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star)):
+        group = select.args.get("group")
+        keys = list(group.expressions) if group is not None else []
+        for position, e in enumerate(select.expressions, 1):
+            if starred(e):
                 continue
             if e.alias_or_name.upper() != name.upper():
                 continue
             value = e.this if isinstance(e, exp.Alias) else e
+            if group is not None and not any(
+                    k == value or (isinstance(k, exp.Literal) and k.is_int and int(k.name) == position)
+                    or (isinstance(k, exp.Column) and not k.table and k.name.upper() == e.alias_or_name.upper()) for k in keys):
+                return False  # (an aggregate, or a value made of a key: the filter stays above the GROUP BY)
+            arithmetic = False
+            while isinstance(value, (exp.Add, exp.Sub, exp.Mul, exp.Neg, exp.Paren, exp.MD5)):
+                arithmetic = True
+                # (measured: `id + 1 is null` is `id is null`: arithmetic of one column and constants, and MD5 of one,
+                # also into a secure view; LOWER, SHA2 and || of a column are not followed into a secure view)
+                parts = [value.this] if isinstance(value, (exp.Neg, exp.Paren, exp.MD5)) else [value.this, value.expression]
+                kept = [p for p in parts if not isinstance(p, exp.Literal)]
+                if len(kept) != 1:
+                    return False
+                value = kept[0]
+                call = called(value)  # (MD5 of a value read as text: `md5(_sf_text(x))`, still x)
+                if call and call[0].lower() == "_sf_text" and len(call[1]) == 1:
+                    value = call[1][0]
             if isinstance(value, exp.Column):
-                return follow(value, scope, converted, depth)
+                return follow(value, scope, target, depth, guarded)
+            if arithmetic:
+                return False  # (measured: `x::number + 1 is null` reads every row)
             inner = conversion(value)
-            return inner is not None and not converted and follow(inner, scope, True, depth)
-        if any(isinstance(e, exp.Star) or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star)) for e in select.expressions):
-            return follow(exp.column(name), scope, converted, depth)
+            return inner is not None and target is None and follow(inner, scope, kind_of(value), depth, guarded)
+        if group is None and any(starred(e) for e in select.expressions):
+            return follow(exp.column(name), scope, target, depth, guarded)
         return False
 
     tree = transformed.copy()
@@ -3173,8 +3308,8 @@ def pruned_nulls(transformed: exp.Expression, conn) -> exp.Expression | None:  #
             operand = test.this
             try:
                 inner = conversion(operand)
-                found = follow(inner, scope, True) if inner is not None else (
-                    isinstance(operand, exp.Column) and follow(operand, scope, False))
+                found = follow(inner, scope, kind_of(operand)) if inner is not None else (
+                    isinstance(operand, exp.Column) and follow(operand, scope, None))
             except Exception:  # noqa: BLE001 - what cannot be followed is read as written
                 found = False
             if found:
@@ -3813,7 +3948,7 @@ def semi_kinds(create: exp.Create, known) -> dict[str, str]:  # noqa: ANN001
             return None
         select = scope.expression
         if isinstance(select, exp.SetOperation):
-            return in_scope(scope.union_scopes[0], name, depth + 1) if scope.union_scopes else None
+            return in_scope(scope.set_operation_scopes[0], name, depth + 1) if scope.set_operation_scopes else None
         if not isinstance(select, exp.Select):
             return None
         stars = []
