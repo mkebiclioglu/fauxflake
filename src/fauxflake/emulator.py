@@ -684,6 +684,7 @@ def _patch_fakesnow() -> None:
         return timed_execute(self, command, *args, **kwargs)
 
     def timed_execute(self, command, *args, **kwargs):  # noqa: ANN001
+        semantics.reset_seeded()
         try:
             self._fauxflake_outer = semantics.outer_flattens(command)
             self._fauxflake_recursive = semantics.outer_flattens(command, "recursive")

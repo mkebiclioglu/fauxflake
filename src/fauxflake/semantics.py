@@ -7,6 +7,7 @@ return different values or types. Each fix here exists because a case in
 
 from __future__ import annotations
 
+import itertools
 import re
 
 import sqlglot
@@ -44,9 +45,11 @@ def python_functions(duck) -> None:  # noqa: ANN001
             ("_fxpy_to_xml", xmldoc.to_xml, ["VARCHAR"], "VARCHAR", None),
             ("_fxpy_xmlget", xmldoc.xmlget, ["VARCHAR", "VARCHAR", "BIGINT"], "VARCHAR", None),
             ("_fxpy_seeded_unit", seeded_unit, ["HUGEINT"], "DOUBLE", None),
+            ("_fxpy_seeded_random", seeded_random, ["HUGEINT", "BIGINT"], "BIGINT", None),
             ("_fxpy_decrypt_raw", decrypt_raw, ["BLOB", "BLOB", "BLOB", "BLOB", "VARCHAR", "BLOB", "BOOLEAN"], "BLOB", None)):
         try:
-            duck.create_function(name, fn, args, out, null_handling="special", side_effects=name == "_fxpy_encrypt_raw",
+            duck.create_function(name, fn, args, out, null_handling="special",
+                                 side_effects=name in ("_fxpy_encrypt_raw", "_fxpy_seeded_random"),
                                  **({"type": kind} if kind else {}))
         except Exception:  # noqa: BLE001, S110 - registered already on this connection
             pass
@@ -152,6 +155,28 @@ _PHI, _LCG_MUL, _LCG_INC, _ALPHABET = 0x9E3779B97F4A7C15, 6364136223846793005, 1
 
 def seeded_unit(seed):  # noqa: ANN001, ANN201
     return None if seed is None else ((int(seed) * _PHI) % 2**64) / 2**64
+
+
+_SEEDED: dict[tuple[int, int], int] = {}  # (call, seed) -> generator state, for the statement being run
+
+
+def reset_seeded() -> None:
+    """Each statement starts RANDOM(seed) over (Snowflake: the same seed gives the same sequence each time)."""
+    _SEEDED.clear()
+
+
+def seeded_random(seed, call):  # noqa: ANN001, ANN201
+    """RANDOM(seed): a 64-bit integer, the next of that seed's sequence on each row (Snowflake's generator state, its
+    output function unknown: the values are not Snowflake's)."""
+    if seed is None:
+        return None
+    key = (int(call), int(seed))
+    state = _SEEDED.get(key, (int(seed) * _PHI) % 2**64)
+    _SEEDED[key] = (state * _LCG_MUL + _LCG_INC) % 2**64
+    return state - 2**64 if state >= 2**63 else state
+
+
+_SEEDED_CALLS = itertools.count(1)
 
 
 def randstr(n, seed):  # noqa: ANN001, ANN201
@@ -772,8 +797,35 @@ def _number_format(value: exp.Expression, model: str) -> exp.Expression | None:
 
 
 
-def _fn(name: str, *args: exp.Expression) -> exp.Anonymous:
-    return exp.Anonymous(this=_NS + name, expressions=list(args))
+_VOLATILE = {"random", "uuid", "gen_random_uuid", "uuid_string", "_fx_random", "_fxpy_seeded_random"}
+_ONCE = itertools.count(1)
+
+
+def _volatile(node: exp.Expression) -> bool:
+    """A value made anew each time it is read (RANDOM(), UUID_STRING())."""
+    return any(isinstance(n, (exp.Rand, *((exp.Uuid,) if hasattr(exp, "Uuid") else ()))) or
+               isinstance(n, exp.Anonymous) and isinstance(n.this, str) and n.this.lower().removeprefix(_NS.lower()) in _VOLATILE
+               for n in node.walk())
+
+
+def _fn(name: str, *args: exp.Expression) -> exp.Expression:
+    call = exp.Anonymous(this=_NS + name, expressions=list(args))
+    if not any(isinstance(a, exp.Expression) and _volatile(a) for a in args):
+        return call
+    # a macro names its argument more than once, and DuckDB makes a volatile one anew at each: each such argument is
+    # made once per row into a list, and the macro reads it through a lambda's own name
+    names, values = [], []
+    for i, a in enumerate(args):
+        if isinstance(a, exp.Expression) and _volatile(a):
+            names.append(exp.to_identifier(f"__fx_once{next(_ONCE)}"))
+            values.append(a)
+            call.expressions[i] = exp.column(names[-1].name)
+    body: exp.Expression = call
+    for ident, value in zip(reversed(names), reversed(values)):
+        body = exp.Anonymous(this="list_extract", expressions=[exp.Transform(
+            this=exp.Array(expressions=[value]), expression=exp.Lambda(this=body, expressions=[ident], colon=True)),
+            exp.Literal.number(1)])
+    return body
 
 
 def _over(window: exp.Window | None, agg: exp.Expression) -> exp.Expression:
@@ -1063,6 +1115,10 @@ def _fix(node: exp.Expression) -> exp.Expression:
         return _fn(_CLOCK_CALLS[type(node)])
     if isinstance(node, exp.Rand) and node.this is None:
         return _fn("_fx_random")
+    if isinstance(node, exp.Rand):
+        # RANDOM(seed): a sequence of its own for each call (fakesnow's setseed() leaves a result it cannot describe)
+        return exp.Anonymous(this="_fxpy_seeded_random", expressions=[
+            exp.cast(node.this.copy(), "HUGEINT"), exp.Literal.number(next(_SEEDED_CALLS))])
     if isinstance(node, exp.Create) and node.kind == "VIEW" and _secure_with(node):
         # measured: a filter goes no further into a secure view that is a WITH, so its body is evaluated whole (and
         # fails on what the filter would have kept out). DuckDB pushes the filter in, but not past an OFFSET; and it

@@ -444,6 +444,26 @@ def test_random_is_a_64_bit_integer_also_in_a_cte():
         low, high, n = cur.execute("with r as (select random() as x from table(generator(rowcount => 2000)) where random() <> 0) "
                                    "select min(x), max(x), count(*) from r").fetchone()
         assert n == 2000 and low < -8e18 and high > 8e18
+        # a macro that names its argument twice reads one value of it (measured: TYPEOF is INTEGER on all 2,000 rows)
+        assert cur.execute("select typeof(random()::variant) t, count(*) from table(generator(rowcount => 2000)) "
+                           "group by 1").fetchall() == [("INTEGER", 2000)]
+
+
+def test_seeded_random_starts_its_sequence_again_in_each_statement_and_each_row_takes_the_next():
+    # measured on Snowflake: random(5) = random(5) in a row, random(5) <> random(6), 100 rows give 100 values, a
+    # statement run again gives the same ones (the values themselves are not Snowflake's: its output function is unknown)
+    import snowflake.connector
+
+    from fauxflake.emulator import serve
+
+    with serve() as emu:
+        cur = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S")).cursor()
+        assert cur.execute("select random(5) = random(5), random(5) = random(6)").fetchone() == (True, False)
+        rows = "with c as (select random(5) r from table(generator(rowcount => 100))) select r from c"
+        first = [r for (r,) in cur.execute(rows).fetchall()]
+        assert len(set(first)) == 100 and all(isinstance(r, int) and -2**63 <= r < 2**63 for r in first)
+        assert [r for (r,) in cur.execute(rows).fetchall()] == first
+        assert cur.execute("select typeof(random(5)::variant)").fetchone() == ("INTEGER",)
 
 
 def test_a_converted_time_converts_again_from_its_instant_and_a_zoned_one_is_refused_where_snowflake_refuses_it():
