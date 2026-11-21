@@ -909,6 +909,11 @@ def _known_text(node: exp.Expression) -> bool:
         return node.is_string
     if isinstance(node, (exp.DPipe, exp.Concat, exp.ConcatWs)) or any(_is(node, name) for name in _TEXT_MADE):
         return True
+    if isinstance(node, (exp.Replace, exp.Trim, exp.Lower, exp.Upper, exp.RegexpReplace, exp.MD5, exp.Substring, exp.Left,
+                         exp.Right, exp.Pad, exp.Initcap, exp.SplitPart, exp.Translate)):
+        return True  # (text whatever they read: datavault4dbt's hash keys nest them, each wrapped, in every key)
+    if isinstance(node, exp.Nullif):
+        return _known_text(node.this)
     if isinstance(node, exp.Coalesce):
         return all(_known_text(a) for a in [node.this, *node.expressions])
     if isinstance(node, exp.Cast) and node.to.is_type("varchar", "text") and not node.to.expressions:
@@ -1561,7 +1566,7 @@ def _fix(node: exp.Expression) -> exp.Expression:
         return _fn("_sf_div", node.this, node.expression)
     if isinstance(node, (exp.TimestampTrunc, exp.DateTrunc)):
         return _fn("_sf_date_trunc", exp.Literal.string(node.unit.name.lower()), node.this)
-    if isinstance(node, _HASHES) and not (isinstance(node.this, exp.Literal) and node.this.is_string):
+    if isinstance(node, _HASHES) and not _known_text(node.this):
         node.set("this", _fn("_sf_text", node.this))  # MD5(42) hashes the text '42'
     if isinstance(node, exp.CurrentRole) or (isinstance(node, exp.Anonymous) and node.name.upper() == "INVOKER_ROLE"):
         # looked up when the query runs, so a policy or view written under one role answers for the role reading it

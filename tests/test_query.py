@@ -522,3 +522,34 @@ def test_a_merge_that_updates_a_row_from_two_source_rows_is_refused_as_snowflake
         assert cur.execute("select * from t order by id").fetchall() == [(2, "b")]
         cur.execute("merge into t using (select 2 as id, 'q' as v) s on t.id = s.id when matched then update set v = s.v")
         assert cur.execute("select * from t order by id").fetchall() == [(2, "q")]
+
+
+def test_a_hash_key_of_text_functions_wraps_each_column_once_and_binds_at_once():
+    # datavault4dbt's hash keys: MD5 of NULLIF(CAST(REGEXP_REPLACE(CONCAT(IFNULL(CONCAT('"', REPLACE(TRIM(CAST(col AS
+    # STRING))...))))))). Each text function was wrapped again in _sf_text, which names its argument a dozen times:
+    # a stage of 19 columns took DuckDB five minutes to bind over 6,000 rows
+    import time
+
+    import snowflake.connector
+    import sqlglot
+
+    from fauxflake import semantics
+    from fauxflake.emulator import serve
+
+    column = ("IFNULL((CONCAT('\"', REPLACE(REPLACE(REPLACE(TRIM(CAST({c} AS STRING)), '\\\\', '\\\\\\\\'), '\"', '\\\\\"'), "
+              "'^^', '--'), '\"')), '^^')")
+    key = ("IFNULL(LOWER(MD5(NULLIF(CAST(REGEXP_REPLACE(REGEXP_REPLACE(CONCAT(" + ", '||', ".join(column.format(c=c) for c in "abcdef")
+           + "), char(10), ''), char(13), '') AS STRING), '^^||^^||^^||^^||^^||^^'))), '00000000000000000000000000000000')")
+    sql = f"select {key} as hk from t"
+    written = semantics.rewrite(sqlglot.parse_one(sql, read="snowflake")).sql(dialect="duckdb")
+    assert written.upper().count("_SF_TEXT(") == 6
+    with serve() as emu:
+        cur = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S")).cursor()
+        cur.execute("create table t as select seq4() a, 'x' || seq4() b, 1.5 c, current_date() d, true e, null f "
+                    "from table(generator(rowcount => 3000))")
+        started = time.monotonic()
+        hashes = cur.execute(f"select hk from ({sql}) order by 1 limit 1").fetchall()
+        assert time.monotonic() - started < 10 and len(hashes[0][0]) == 32
+        # the same key as Snowflake makes it: MD5 of the text of each value
+        assert cur.execute("select md5('\"0\"||\"x0\"||\"1.5\"||\"' || current_date()::varchar || '\"||\"true\"||^^')").fetchone()[0] \
+            == cur.execute(f"select lower(hk) from ({sql.replace('from t', 'from t where a = 0')})").fetchone()[0]
