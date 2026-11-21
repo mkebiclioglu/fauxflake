@@ -1059,8 +1059,10 @@ def _fix(node: exp.Expression) -> exp.Expression:
         # measured: a filter goes no further into a secure view that is a WITH, so its body is evaluated whole (and
         # fails on what the filter would have kept out). DuckDB pushes the filter in, but not past an OFFSET; and it
         # drops a filter its statistics say keeps nothing (`is null` of a column with none), but not of a column
-        # whose values it cannot foresee (a CASE on random(), always true: each column as it is, by its own name)
-        fence = sqlglot.parse_one("CASE WHEN RANDOM() < 2 THEN COLUMNS(*) END", read="duckdb")
+        # whose values it cannot foresee (a CASE on a random number, always true: each column as it is, by its own name;
+        # not on RANDOM() itself, which is Snowflake's 64-bit one once this rewrite reaches it)
+        fence = sqlglot.parse_one("CASE WHEN _fx_any IS NOT NULL THEN COLUMNS(*) END", read="duckdb")
+        fence.find(exp.Column).replace(_fn("_fx_random"))
         node.set("expression", exp.select(fence).from_(exp.Subquery(this=node.expression.unnest().copy())).offset(0))
         return node
     target = _try_target(node) or _try_anonymous_target(node)
