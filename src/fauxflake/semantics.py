@@ -2085,6 +2085,8 @@ def rewrite(node: exp.Expression) -> exp.Expression:
         laterals = [j.this for j in node.args["joins"] if isinstance(j.this, (exp.Lateral, exp.TableFromRows))]
         if isinstance(base, (exp.Table, exp.Subquery)) and base.alias_or_name and len(laterals) == len(node.args["joins"]):
             for i, lateral in enumerate(laterals):
+                if isinstance(lateral.this, (exp.Query, exp.Subquery)):
+                    continue  # (a LATERAL subquery has its own FROM: its bare columns are of that first)
                 for col in lateral.find_all(exp.Column):
                     if not col.table and (i == 0 or col.name.upper() not in _FLATTEN_OUTPUT):
                         col.set("table", exp.to_identifier(base.alias_or_name))
