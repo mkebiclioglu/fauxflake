@@ -109,6 +109,11 @@ _TXN_BEGIN = re.compile(r"(?is)^(?:\s|--[^\n]*\n|/\*.*?\*/)*(?:begin(?:\s+(?:wor
 _TXN_END = re.compile(r"(?is)^(?:\s|--[^\n]*\n|/\*.*?\*/)*(commit|rollback)(?:\s+work)?\s*;?\s*$")
 _TXN_KEEPS = re.compile(r"(?is)^(?:\s|--[^\n]*\n|/\*.*?\*/)*(insert|update|delete|merge|select|with|call|show|desc|describe|set|unset|use|copy|execute|explain|\()\b")
 _TWO_DATABASES = "a single transaction can only write to a single attached database"
+# failures that are not of the data a statement reads (whose answer an empty side of a join could change)
+_NOT_DATA_ERRORS = ("Binder Error", "Parser Error", "Catalog Error", "does not exist", "syntax error", "Not implemented",
+                    "SQL compilation error", "INTERRUPT", "Interrupt", "timed out", "Duplicate row detected", _TWO_DATABASES)
+# DuckDB's word for text that is no number, and Snowflake's (fakesnow answers 100035, Snowflake's for a timestamp)
+_NOT_A_NUMBER = re.compile(r"Could not convert string (['\"])(.*?)\1 to (?:U?(?:TINY|SMALL|BIG|HUGE)?INT(?:EGER|8|16|32|64|128)?|DECIMAL[^ ]*|DOUBLE|FLOAT)\b", re.S)
 
 
 def _transaction(cursor, command: str, original):  # noqa: ANN001, ANN202
@@ -743,6 +748,11 @@ def _patch_fakesnow() -> None:
                 self._sqlstate = "42S02"
                 raise ProgrammingError(msg=f"{e.raw_msg or e.msg}\nObject does not exist or not authorized.",
                                        errno=2003, sqlstate="42S02") from e
+            text = _NOT_A_NUMBER.search(str(e.msg)) if e.errno == 100035 else None
+            if text:
+                self._sqlstate = "22018"
+                # (DuckDB's words kept after Snowflake's: the fitter reads the value and the type from them)
+                raise ProgrammingError(msg=f"Numeric value '{text[2]}' is not recognized\n{e.msg}", errno=100038, sqlstate="22018") from e
             raise
         except Exception as e:  # noqa: BLE001
             tried = re.search(r"Function TRY_CAST cannot be used with arguments of type [^'\n]*", str(e))
@@ -1182,6 +1192,8 @@ def _patch_fakesnow() -> None:
                 if "Conversion Error" in e or "is not recognized" in e or "Could not convert" in e else None,
                 "types": lambda e: semantics.repair_types(transformed, self._duck_conn, params)
                 if "No function matches" in e or "Could not choose a best candidate" in e else None,
+                "empty_sides": lambda e: semantics.empty_join_sides(transformed, self._duck_conn)
+                if not any(w in e for w in _NOT_DATA_ERRORS) else None,
             }
             used: collections.Counter = collections.Counter()
             while True:

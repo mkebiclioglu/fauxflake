@@ -1788,6 +1788,24 @@
    ]
   ]
  },
+ "empty_join_1": {
+  "error": "100038 (22018): Numeric value 'x' is not recognized"
+ },
+ "empty_join_2": {
+  "error": "100038 (22018): Numeric value 'x' is not recognized"
+ },
+ "empty_join_3": {
+  "error": "100038 (22018): Numeric value 'x' is not recognized"
+ },
+ "empty_join_4": {
+  "error": "100038 (22018): Numeric value 'x' is not recognized"
+ },
+ "empty_join_5": {
+  "error": "100071 (22000): Failed to cast variant value \"g\" to OBJECT"
+ },
+ "empty_join_6": {
+  "error": "100038 (22018): Numeric value 'x' is not recognized"
+ },
  "empty_key_path": {
   "rows": [
    [

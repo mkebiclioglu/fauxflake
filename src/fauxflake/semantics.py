@@ -357,6 +357,9 @@ MACROS = [
     f"create or replace macro {_NS}_fx_current_time() as get_current_time()",
     f"create or replace macro {_NS}_fx_localtime() as current_localtime()",
     f"create or replace macro {_NS}_fx_localtimestamp() as current_localtimestamp()",
+    # RANDOM(): a 64-bit integer, any of them (fakesnow's rewrite of it is made again in each SELECT a CTE is part of)
+    f"""create or replace macro {_NS}_fx_random() as cast(cast(floor(random() * 4294967296) as hugeint) * 4294967296
+          + cast(floor(random() * 4294967296) as hugeint) - 9223372036854775808 as bigint)""",
     # SKEW of fixed-point input is taken around the mean as AVG gives it (rounded: 6 more decimals, 3 in a window)
     # with the variance cut to VARIANCE's scale (measured: 7, 2, 7 gives -1.732049872261, not -1.732050807569).
     # g, v and mu are DuckDB's skewness, var_samp and avg; d is how far the rounded mean is from the true one.
@@ -1050,6 +1053,8 @@ def _fix(node: exp.Expression) -> exp.Expression:
         # as calls: `select current_date` is named CURRENT_DATE, and DuckDB reads the bare keyword as that name
         # (macros, which sqlglot does not turn back into the keyword when the statement is parsed again)
         return _fn(_CLOCK_CALLS[type(node)])
+    if isinstance(node, exp.Rand) and node.this is None:
+        return _fn("_fx_random")
     if isinstance(node, exp.Create) and node.kind == "VIEW" and _secure_with(node):
         # measured: a filter goes no further into a secure view that is a WITH, so its body is evaluated whole (and
         # fails on what the filter would have kept out). DuckDB pushes the filter in, but not past an OFFSET; and it
@@ -1171,7 +1176,7 @@ def _fix(node: exp.Expression) -> exp.Expression:
             node.set("this", _fn("_sf_text", node.this))
     if isinstance(node, exp.Randstr):
         # sqlglot writes RANDSTR as a correlated subquery, which the planner chokes on once it is repeated
-        seed = node.args.get("generator") or exp.Rand()  # (RANDOM() is a 64-bit integer, a seed as any other)
+        seed = node.args.get("generator") or _fn("_fx_random")  # (RANDOM() is a 64-bit integer, a seed as any other)
         return _fn("_sf_randstr", node.this, exp.cast(seed, "hugeint"))
     if isinstance(node, exp.MapCat):  # keys of the second map win
         return exp.Anonymous(this="json_merge_patch", expressions=[exp.cast(node.this, "json"), exp.cast(node.expression, "json")])
@@ -1301,7 +1306,7 @@ def _fix(node: exp.Expression) -> exp.Expression:
     if isinstance(node, exp.Uniform):
         # UNIFORM(lo, hi, RANDOM()): written out here so it also works inside CTEs and views
         gen = node.args.get("gen")
-        unit = exp.Anonymous(this="random") if isinstance(gen, exp.Rand) or gen is None else \
+        unit = exp.Anonymous(this="random") if isinstance(gen, exp.Rand) or gen is None or _is(gen, "_fx_random") else \
             exp.Anonymous(this="_fxpy_seeded_unit", expressions=[exp.cast(gen.copy(), "hugeint")])  # (Snowflake's, for a seed)
         lo, hi = node.this, node.expression
         real = any(isinstance(b, exp.Cast) and b.to.is_type("double", "float") or (isinstance(b, exp.Literal) and "." in b.name)
@@ -3172,6 +3177,125 @@ def pruned_nulls(transformed: exp.Expression, conn) -> exp.Expression | None:  #
                 test.replace(exp.false())
                 changed = True
     return tree if changed else None
+
+
+def empty_join_sides(transformed: exp.Expression, conn, limit: int = 40) -> exp.Expression | None:  # noqa: ANN001
+    """`from e left join bad on ...` with e empty and bad failing (text converted to a number, OBJECT_KEYS of a
+    string): Snowflake answers, DuckDB fails. Snowflake reads first the side of a join that decides whether there are
+    rows at all, and when it has none the other side is never read (measured, with emptiness known only as it runs
+    too: either side of an inner or cross join, the left of a LEFT JOIN, the right of a RIGHT JOIN; never a FULL JOIN).
+    The join has no rows then whatever the other side holds, so that side can be read as no rows without changing
+    the answer. Asked after a failure: the sides that are empty are looked for, and the statement is returned with
+    their partners read as no rows, or None when there is none. Between two sides that read no table (VALUES, a
+    GENERATOR) the order follows Snowflake's estimates of their rows, and the failing side is mostly read first
+    (measured): left as it is then."""
+    tree = transformed.copy()
+    asked = [0]
+
+    def scope_ctes(node: exp.Expression) -> tuple[list[exp.CTE], bool]:
+        found: list[exp.CTE] = []
+        recursive = False
+        while node is not None:
+            with_ = node.args.get("with_") if isinstance(node, exp.Query) else None
+            if with_ is not None:
+                found = list(with_.expressions) + found
+                recursive = recursive or bool(with_.args.get("recursive"))
+            node = node.parent
+        return found, recursive
+
+    def none_in(select: exp.Select, source: exp.Expression, joins: list[exp.Join] = ()) -> bool:
+        """No rows in `source` joined to `joins`, as asked of DuckDB; False when it cannot be asked (a side that is
+        correlated, or that fails itself)."""
+        if asked[0] >= limit:
+            return False
+        asked[0] += 1
+        probe = exp.select("1").from_(source.copy()).limit(1)
+        for j in joins:
+            probe.append("joins", j.copy())
+        found, recursive = scope_ctes(select)
+        if found:
+            probe.set("with_", exp.With(expressions=[c.copy() for c in found], recursive=recursive or None))
+        try:
+            return conn.execute(probe.sql(dialect="duckdb")).fetchone() is None
+        except Exception:  # noqa: BLE001 - read as having rows
+            return False
+
+    def reads_a_table(nodes: list[exp.Expression], select: exp.Select, depth: int = 0) -> bool:
+        named = {c.alias_or_name.upper(): c.this for c in scope_ctes(select)[0]}
+        for node in nodes:
+            for t in node.find_all(exp.Table):
+                if not isinstance(t.this, exp.Identifier):
+                    continue  # (a table function: RANGE, UNNEST)
+                body = named.get(t.name.upper()) if not t.db else None
+                if body is None or depth > 20 or reads_a_table([body], select, depth + 1):
+                    return True
+        return False
+
+    def emptied(source: exp.Expression, select: exp.Select) -> exp.Expression | None:
+        if isinstance(source, exp.Table) and isinstance(source.this, exp.Identifier):
+            alias = source.args.get("alias")
+            name = alias.copy() if alias is not None else exp.TableAlias(this=exp.to_identifier(source.name))
+            inner: exp.Expression = source.copy()
+            inner.set("alias", None)
+            if not source.db:  # (a CTE also read where it has rows is made all the same: its body is read here)
+                body = next((c.this for c in reversed(scope_ctes(select)[0]) if c.alias_or_name.upper() == source.name.upper()), None)
+                if body is not None:
+                    inner = exp.Subquery(this=body.copy())
+        elif isinstance(source, exp.Subquery) and isinstance(source.this, exp.Query) and source.args.get("alias") is not None:
+            name = source.args["alias"].copy()
+            inner = exp.Subquery(this=source.this.copy())
+        else:
+            return None
+        done = exp.Subquery(this=exp.select("*").from_(inner).limit(0), alias=name)
+        done.meta["fx_no_rows"] = True
+        return done
+
+    changed = False
+    for select in list(tree.find_all(exp.Select)):
+        joins = select.args.get("joins") or []
+        from_ = select.args.get("from_")
+        if not joins or from_ is None or any(a.meta.get("fx_no_rows") for a in _ancestors(select)):
+            continue
+        empty: bool | None = None  # (what is joined so far has no rows; None: not asked yet)
+        made: set[int] = set()  # (-1 the FROM, k the k-th join)
+        for k, join in enumerate(joins):
+            side, kind = (join.args.get("side") or "").upper(), (join.args.get("kind") or "").upper()
+            right = join.this
+            if side == "FULL" or not isinstance(right, (exp.Table, exp.Subquery)):  # (a FULL JOIN, a LATERAL, an UNNEST)
+                empty = False if side in ("RIGHT", "FULL") else (True if empty else None)
+                continue
+            if side == "RIGHT":
+                empty = none_in(select, right)
+                if empty:
+                    made.update(range(-1, k))
+                continue
+            if empty is None:
+                empty = none_in(select, from_.this, joins[:k])
+            if empty:
+                made.add(k)
+            elif side == "LEFT":
+                pass
+            elif kind not in ("SEMI", "ANTI") and none_in(select, right):
+                made.update(range(-1, k))
+                empty = True
+            else:
+                empty = None  # (an inner join of two sides with rows may have none: asked again at the next join)
+        if made and not reads_a_table([from_.this, *(j.this for j in joins)], select):
+            continue
+        for k in sorted(made):
+            source = from_.this if k == -1 else joins[k].this
+            done = emptied(source, select)
+            if done is not None:
+                source.replace(done)
+                changed = True
+    return tree if changed else None
+
+
+def _ancestors(node: exp.Expression):  # noqa: ANN202
+    node = node.parent
+    while node is not None:
+        yield node
+        node = node.parent
 
 
 _TO_NUMBER = ("DECIMAL", "NUMERIC", "DOUBLE", "FLOAT", "REAL", "INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "HUGEINT", "UBIGINT", "BOOLEAN")

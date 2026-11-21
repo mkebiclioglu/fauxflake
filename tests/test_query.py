@@ -342,6 +342,54 @@ def test_a_bare_clock_keyword_is_named_as_written_with_the_clock_live_or_frozen(
         assert cur.fetchone()[1] == date(2026, 1, 15)
 
 
+def test_the_side_of_a_join_with_no_rows_leaves_the_other_side_unread_as_snowflake_does():
+    import pytest
+    import snowflake.connector
+    from snowflake.connector.errors import ProgrammingError
+
+    from fauxflake.emulator import serve
+
+    with serve() as emu:
+        cur = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S")).cursor()
+        cur.execute("create table t as select seq4() as i, 'x' || seq4() as s, parse_json('\"g\"') as g "
+                    "from table(generator(rowcount => 50))")
+        cur.execute("create table nothing as select * from t where false")
+        # (measured on Snowflake: each answers, though `bad` fails on every row it reads)
+        bad = "bad as (select i, s::number as n from t)"
+        keys = "bad as (select i, k.value::string as n from t, lateral flatten(input => object_keys(g)) k)"
+        none = "e as (select a.* from t a join t b on a.i = b.i + 1000)"  # (no rows, known only as it runs)
+        for q in [f"with {none}, {bad} select max(bad.n) from e left join bad on e.i = bad.i",
+                  f"with {none}, {bad} select max(bad.n) from bad join e on e.i = bad.i",
+                  f"with {none}, {bad} select max(bad.n) from bad right join e on e.i = bad.i",
+                  f"with {none}, {bad} select count(*) from e left join bad on e.i = bad.n",
+                  f"with {none}, {keys} select max(bad.n) from e left join bad on e.i = bad.i",
+                  f"with {bad} select max(bad.n) from nothing e left join bad on e.i = bad.i",
+                  f"with {none}, {bad} select max(bad.n) from e left join bad on e.i = bad.i left join t z on z.i = e.i",
+                  f"create table built as with {none}, {bad} select e.i, bad.n from e left join bad on e.i = bad.i"]:
+            cur.execute(q)
+        assert cur.execute("select count(*) from built").fetchone() == (0,)
+        # ...and these fail, as there: the side read first has rows, or a FULL JOIN reads both
+        for q in [f"with {none}, {bad} select max(bad.n) from bad left join e on e.i = bad.i",
+                  f"with {none}, {bad} select max(bad.n) from e full join bad on e.i = bad.i",
+                  f"with {none}, {bad} select max(bad.n) from t z left join e on z.i = e.i left join bad on e.i = bad.i"]:
+            with pytest.raises(ProgrammingError, match="Numeric value 'x0' is not recognized") as e:
+                cur.execute(q)
+            assert e.value.errno == 100038
+
+
+def test_random_is_a_64_bit_integer_also_in_a_cte():
+    import snowflake.connector
+
+    from fauxflake.emulator import serve
+
+    with serve() as emu:
+        cur = snowflake.connector.connect(**emu.connect_kwargs(database="D", schema="S")).cursor()
+        # (fakesnow's rewrite of RANDOM() was made again by each SELECT the CTE is part of, and overflowed)
+        low, high, n = cur.execute("with r as (select random() as x from table(generator(rowcount => 2000)) where random() <> 0) "
+                                   "select min(x), max(x), count(*) from r").fetchone()
+        assert n == 2000 and low < -8e18 and high > 8e18
+
+
 def test_a_converted_time_converts_again_from_its_instant_and_a_zoned_one_is_refused_where_snowflake_refuses_it():
     import pytest
     import snowflake.connector
