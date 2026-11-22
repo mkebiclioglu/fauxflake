@@ -162,6 +162,8 @@ class Spec:
     recent: int | None = None  # the last days of that history that hold the full volume ...
     older: float | None = None  # ... and the share of it the days before them hold (a long history costs what a short one does)
     least_rows: int | None = None  # every table holds at least this many rows when a run begins, whatever the scale
+    # the account around the databases, as SHOW lists it: {warehouses: [...], resource_monitors: [...], parameters: {...}}
+    account: dict = field(default_factory=dict)
 
     @property
     def least(self) -> tuple[int, int] | None:
@@ -194,7 +196,8 @@ class Spec:
                    history=int(raw["history"]) if raw.get("history") else None,
                    recent=int(raw["recent"]) if raw.get("recent") else None,
                    older=float(raw["older"]) if raw.get("older") else None,
-                   least_rows=int(raw["least_rows"]) if raw.get("least_rows") else None)
+                   least_rows=int(raw["least_rows"]) if raw.get("least_rows") else None,
+                   account=dict(raw.get("account") or {}))
         spec.validate()
         for var, value in (spec.dbt.get("env") or {}).items():
             os.environ.setdefault(var, str(value))  # placeholders for env vars the project requires

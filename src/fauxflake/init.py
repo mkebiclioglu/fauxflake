@@ -3514,6 +3514,13 @@ def write_spec(project, path: Path, database: str, emu=None, fit: bool = True, l
     if env:
         spec["dbt"]["env"] = env
         notes.insert(0, f"set placeholders for {len(env)} environment variable(s) the project requires (dbt.env in the spec)")
+    from . import account
+
+    if shown := sorted(account.shown_by(project.dir)):  # SHOW WAREHOUSES and the like: a fresh account has little to show
+        spec["account"] = {k.replace(" ", "_"): [] for k in shown if k != "parameters"}
+        notes.append(f"the project reads the account ({', '.join(f'SHOW {k.upper()}' for k in shown)}): a fresh one has only "
+                     "the session's warehouse, LOCAL. List yours under `account:` in the spec (`fauxflake parity` reads "
+                     "Snowflake's own)")
     path.write_text(HEADER + yaml.safe_dump(spec, sort_keys=False, default_flow_style=None, width=110))
     if fit and emu is not None:
         notes += _fit(project, path, database, emu, manifest, analysis, log)

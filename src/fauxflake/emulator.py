@@ -28,7 +28,7 @@ from typing import Iterator
 import duckdb
 from sqlglot import exp
 
-from . import objects, semantics
+from . import account, objects, semantics
 
 # Statements the emulator cannot run as-is, rewritten before they are parsed.
 # Every entry is a known difference from Snowflake: keep the list short and
@@ -699,8 +699,9 @@ def _patch_fakesnow() -> None:
             handled = _transaction(self, command, original)
             if handled is not None:
                 return handled
-            handled = objects.intercept(self, command, original)  # functions, procedures, streams, tasks, policies
-            if handled is not None:
+            handled = account.intercept(self, command, original) or objects.intercept(self, command, original)
+            if handled is not None:  # (warehouses, monitors, parameters; functions, procedures, streams, tasks, policies)
+                objects.remember(self)
                 return handled
             temporary = _temporary(self, command)
             for _ in range(8):

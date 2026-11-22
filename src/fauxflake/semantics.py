@@ -13,7 +13,7 @@ import re
 import sqlglot
 from sqlglot import exp
 
-from . import catalog, jsondoc, xmldoc
+from . import account, catalog, jsondoc, xmldoc
 
 _NS = "_fs_global.main."
 _SCALE = r"coalesce(try_cast(nullif(regexp_extract(typeof(a), ',(\d+)\)', 1), '') as integer), 0)"
@@ -350,6 +350,7 @@ MACROS = [
           (p, x) as date_trunc(p, x::timestamp)""",
     f"create table if not exists {_NS}_fx_session as select 'SYSADMIN' as role",
     f"create table if not exists {_NS}_fx_secure_views (database_name varchar, schema_name varchar, view_name varchar)",
+    *account.SETUP,  # warehouses, resource monitors, network policies and parameters (account.py)
     f"create or replace macro {_NS}_sf_current_role() as (select role from {_NS}_fx_session)",
     # GET_DDL: the statement DuckDB keeps for the object (DuckDB types, not Snowflake's).
     f"""create or replace macro {_NS}_sf_get_ddl(kind, name) as (
@@ -2961,7 +2962,7 @@ def misnamed_column(transformed: exp.Expression, conn, probe: bool = True) -> st
     def stored(table: exp.Table) -> list[str] | None:
         bare = exp.Table(this=table.this.copy(), db=table.args.get("db"), catalog=table.args.get("catalog")).sql(dialect="duckdb")
         if bare not in looked:
-            if probe:
+            if probe or table.name.startswith("__fx_result_"):  # (a RESULT_SCAN's rows, registered: not in the catalog)
                 try:
                     looked[bare] = [d[0] for d in conn.execute(f"select * from {bare} limit 0").description]
                 except Exception:  # noqa: BLE001 - not a table this connection can read: not checked
@@ -3084,8 +3085,9 @@ def misnamed_column(transformed: exp.Expression, conn, probe: bool = True) -> st
             having = [p for p in places if wanted in p]
             if len(having) == 1 and having[0] is not lateral and having[0].count(wanted) > 1 and wanted not in lateral:
                 return f"SQL compilation error: ambiguous column name '{wanted}'"
-            if having or not any(wanted.lower() == n.lower() for p in places for n in p):
-                continue  # (found; or not a name of these relations in any case: an outer query's, left to DuckDB)
+            if having or not (scope.is_root or scope.is_cte) and not any(wanted.lower() == n.lower() for p in places for n in p):
+                continue  # (found; or not a name of these relations in any case: an outer query's, left to DuckDB;
+                # only a subquery sees an outer query's columns)
             shown = '"' + ref.this.this + '"' if ref.this.quoted else ref.this.this.upper()
             return f"SQL compilation error: {where(ref)}invalid identifier '{shown}'"
     made = transformed.expression if isinstance(transformed, exp.Create) else None

@@ -278,7 +278,8 @@ production weekly and opens a pull request with what moved.
 | **System views and functions** | `INFORMATION_SCHEMA`; `ACCOUNT_USAGE` and `ORGANIZATION_USAGE` as generated sources with their real columns; table functions such as `TASK_HISTORY()` with the right columns and no rows |
 | **Transactions** | `BEGIN`, `COMMIT`, `ROLLBACK`: DML and `MERGE` roll back, DDL commits the open transaction, and a statement that fails leaves it open |
 | **Tags** | `CREATE TAG` with allowed values, `SET TAG` and `UNSET TAG` on objects and columns, `SHOW TAGS`, `TAG_REFERENCES`, `TAG_REFERENCES_ALL_COLUMNS` and `SYSTEM$GET_TAG`, with inheritance from schema and database |
-| **Accepted, with nothing to act on** | grants, comments, clustering keys, warehouses, session settings, `SHOW` for account-level objects |
+| **The account** | `CREATE`, `ALTER` and `DROP` of warehouses, resource monitors and network policies; `ALTER ACCOUNT SET`; `SHOW PARAMETERS` at every scope with Snowflake's defaults; every account-level `SHOW` with the columns a real account returns, listing what the spec's `account:` names and what the project created |
+| **Accepted, with nothing to act on** | grants, comments, clustering keys, session settings |
 
 When the emulator does not know a statement it fails at once with a message that starts with
 `fauxflake emulator:`. It does not hang and it does not pass silently.
@@ -337,6 +338,7 @@ distributions with measurements from production, reading aggregates only.
 | `existing` | relations the project reads before it builds them; they start each run empty. `keeps` lists columns a snapshot table still has from an earlier version of its model |
 | `udfs` | stand-ins, in DuckDB SQL, for functions that exist only in your account |
 | `locations` | cloud storage prefixes that `COPY INTO` should read from a local directory instead |
+| `account` | what the account holds, as `SHOW` lists it: `warehouses`, `resource_monitors`, `network_policies`, `users`, `roles` and other kinds, each a list of objects in `CREATE`'s properties or `SHOW`'s column names (`{name: transforming, warehouse_size: medium, auto_suspend: 60}`), and `parameters` set on the account. A fresh account has only the session's warehouse, `LOCAL`. `parity` reads Snowflake's own instead |
 | `dbt` | `database`, `target` (the name `target.name` sees), `role`, `env` (placeholders for environment variables), `expected_failures` |
 
 How the data is made: the whole history is a deterministic function of

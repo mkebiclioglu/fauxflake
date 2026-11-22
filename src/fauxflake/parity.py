@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from . import account
 from .dbt import DbtProject
 from .generate import Warehouse
 
@@ -706,6 +707,8 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
             objects.set_role(wh.emu.duck, role)
         log(f"{now:%Y-%m-%d}  seeding Snowflake")
         seed(conn, wh, after=prev, log=log, renamed=renamed)
+        # the account's warehouses, monitors and parameters as Snowflake shows them now: both engines read the same
+        account.mirror(wh.emu, conn, account.shown_by(local.dir))
         full = ["--full-refresh"] if i == 0 else []
         extra = ["--vars", remote_vars] if remote_vars else []
         if i == 0:

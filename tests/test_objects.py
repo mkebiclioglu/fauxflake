@@ -244,7 +244,7 @@ def test_external_tables_account_objects_and_schema_clone(run):
     assert run("select count(*), max(order_id) from ext_orders") == [(0, None)]
     run("create or replace external table t (x int as (value:x::int)) location = @s file_format = (type = csv)")
     assert run("select count(*) from t") == [(2,)]  # a table that already holds rows keeps them
-    assert run("show warehouses") == [] and run("show grants to role sysadmin") == []
+    assert [r[0] for r in run("show warehouses")] == ["LOCAL"] and run("show grants to role sysadmin") == []
     run("rollback")
     run("create or replace schema analytics.backup clone analytics.ci")
     assert run("select (select count(*) from analytics.backup.t), (select count(*) from analytics.backup.v)") == [(2, 2)]
@@ -743,3 +743,82 @@ def test_a_snapshot_keeps_columns_from_before_when_it_is_built_anew(run):
     assert run("show tables like 'SNAP'") == []  # hidden from dbt, as any stand-in
     run("create or replace transient table ANALYTICS.CI.SNAP as (select 1 as id, 'a' as name)")
     assert run("select id, name, old_region from snap") == [(1, "a", None)]
+
+
+def test_the_account_holds_warehouses_monitors_policies_and_parameters_as_show_lists_them(run):
+    from fauxflake import account
+
+    def shown(sql, *columns):
+        cur = run.emu._fs.connect(database="ANALYTICS", schema="CI").cursor()
+        cur.execute(sql)
+        names = [d[0] for d in cur.description]
+        return names, [tuple(dict(zip(names, r))[c] for c in columns) for r in cur.fetchall()]
+
+    # every column a real account's SHOW WAREHOUSES has, in its order; a fresh account has the session's own
+    names, rows = shown("show warehouses", "name", "size", "is_current", "auto_suspend")
+    assert names == [c for c, _ in account.catalog()["columns"]["warehouses"]] and len(names) == 38
+    assert rows == [("LOCAL", "X-Small", "Y", 600)]
+    run("create resource monitor rm with credit_quota = 10 triggers on 75 percent do notify on 100 percent do suspend")
+    run("create warehouse if not exists etl warehouse_size = 'XLARGE' auto_suspend = 60 initially_suspended = true "
+        "resource_monitor = rm statement_timeout_in_seconds = 600")
+    assert run("create warehouse if not exists etl") == [("ETL already exists, statement succeeded.",)]
+    run("alter warehouse etl set auto_resume = false max_cluster_count = 3")
+    run("alter account set statement_timeout_in_seconds = 3600")
+    run("alter resource monitor rm set credit_quota = 50")
+    run("create network policy office allowed_ip_list = ('10.0.0.1', '10.0.0.2') blocked_ip_list = ('10.0.0.3')")
+    run("alter network policy office add allowed_ip_list = ('10.0.0.4')")
+    _, rows = shown("show warehouses like 'e%'", "name", "state", "size", "auto_suspend", "auto_resume", "max_cluster_count", "resource_monitor")
+    assert rows == [("ETL", "SUSPENDED", "X-Large", 60, "false", 3, "RM")]
+    run("show resource monitors")
+    assert run("""select "name", "credit_quota", "remaining_credits", "level", "notify_at", "suspend_at"
+                  from table(result_scan(last_query_id()))""") == [("RM", "50.00", "50.00", "WAREHOUSE", "75%", "100%")]
+    assert shown("show network policies", "name", "entries_in_allowed_ip_list", "entries_in_blocked_ip_list")[1] == [("OFFICE", 3, 1)]
+    # parameters: the default unless set, on the account or on the object, at the level it was set
+    assert shown("show parameters like 'statement_timeout%' in account", "value", "default", "level")[1] == [("3600", "172800", "ACCOUNT")]
+    assert shown("show parameters like 'STATEMENT_TIMEOUT_IN_SECONDS' in warehouse etl", "value", "level")[1] == [("600", "WAREHOUSE")]
+    assert shown("show parameters like 'DATA_RETENTION_TIME_IN_DAYS' in account", "value", "level")[1] == [("1", "")]
+    assert len(run("show parameters in account")) > 300
+    run("alter account unset statement_timeout_in_seconds")
+    assert shown("show parameters like 'STATEMENT_TIMEOUT_IN_SECONDS' in warehouse etl", "value", "level")[1] == [("600", "WAREHOUSE")]
+    assert shown("show parameters like 'STATEMENT_TIMEOUT_IN_SECONDS' in account", "value", "level")[1] == [("172800", "")]
+    run("drop warehouse etl")
+    with pytest.raises(Exception, match="does not exist"):
+        run("drop warehouse etl")
+    run("drop warehouse if exists etl")
+    with pytest.raises(Exception, match="does not exist"):
+        run("show parameters in warehouse etl")
+    # each form of SHOW GRANTS has its own columns
+    assert shown("show grants of role sysadmin", "role")[0] == ["created_on", "role", "granted_to", "grantee_name", "granted_by", "expires_on"]
+
+
+def test_the_spec_names_the_accounts_objects(emu):
+    from fauxflake import account
+
+    account.load(emu, {"warehouses": [{"name": "transforming", "warehouse_size": "medium", "auto_suspend": 0,
+                                       "statement_timeout_in_seconds": 7200}],
+                       "resource_monitors": [{"name": "monthly", "credit_quota": 100, "level": "ACCOUNT"}],
+                       "users": [{"name": "ALICE", "disabled": "false", "default_role": "ANALYST"}],
+                       "parameters": {"STATEMENT_TIMEOUT_IN_SECONDS": 3600}})
+    emu.ensure_database("ANALYTICS", "CI")
+    cur = emu._fs.connect(database="ANALYTICS", schema="CI").cursor()
+    cur.execute("show warehouses")
+    assert [(r[0], r[3], r[11]) for r in cur.fetchall()] == [("LOCAL", "X-Small", 600), ("TRANSFORMING", "Medium", None)]
+    cur.execute("show parameters like 'STATEMENT_TIMEOUT_IN_SECONDS' in warehouse transforming")
+    assert [r[1:4] for r in cur.fetchall()] == [("7200", "172800", "WAREHOUSE")]
+    cur.execute("show resource monitors")
+    assert [(r[0], r[1], r[4]) for r in cur.fetchall()] == [("MONTHLY", "100.00", "ACCOUNT")]
+    cur.execute("show users")
+    assert [(r[0], r[15]) for r in cur.fetchall()] == [("ALICE", "ANALYST")]
+    with pytest.raises(ValueError, match="not something SHOW lists"):
+        account.load(emu, {"warehouse": [{"name": "x"}]})
+
+
+def test_a_model_reads_show_output_through_result_scan_as_dbt_sends_it(run):
+    # dbt's sql_header runs SHOW, then the model reads it back; each statement ends with dbt's query comment
+    run('SHOW PARAMETERS IN ACCOUNT;\n/* {"app": "dbt", "node_id": "model.p.ld__parameters"} */')
+    assert run("""select count(*) > 300, count_if("level" = '') > 300 from table(result_scan(last_query_id()))""") == [(True, True)]
+    run("begin")
+    run('show warehouses /* {"app": "dbt"} */')
+    # a column SHOW WAREHOUSES does not have is Snowflake's invalid identifier, not DuckDB's alias error
+    with pytest.raises(Exception, match=r"""(?s)000904.*invalid identifier '"budget"'"""):
+        run('create or replace table w as select "name" as name, "budget" as budget from table(result_scan(last_query_id()))')

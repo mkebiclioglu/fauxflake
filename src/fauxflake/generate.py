@@ -24,7 +24,7 @@ from datetime import date, datetime, timedelta
 
 import duckdb
 
-from . import emulator, objects
+from . import account, emulator, objects
 from .spec import Spec, Table, quoted
 
 
@@ -761,6 +761,7 @@ class Warehouse:
         self.emu, self.spec, self.scale, self.scenario = emu, spec, scale, scenario
         self.freeze_clock = freeze_clock
         emulator.define_udfs(emu, spec.udfs)
+        account.load(emu, spec.account)  # warehouses, resource monitors, parameters
         if spec.dbt.get("role"):  # the role policies see: `dbt: {role: ANALYST}`
             objects.set_role(emu.duck, str(spec.dbt["role"]))
         self.cur: duckdb.DuckDBPyConnection = emu.cursor()
