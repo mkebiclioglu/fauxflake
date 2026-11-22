@@ -3765,25 +3765,31 @@ def _kinds_past_aliases(select: exp.Select, calls: list, conn) -> tuple[list, li
     # an alias many times (FAILURE_MESSAGE, itself a long expression) had DuckDB write the alias out at every mention,
     # and took minutes to bind
     alias_kinds = described([e.copy() for e in needed.values()]) if needed else []
-    if alias_kinds is None:
-        return [], []
-    typed = dict(zip(needed, alias_kinds))
+    if alias_kinds is None:  # (the aliases do not bind on their own: asked along with the arguments, as the SELECT has them)
+        kinds = described([*(e.copy() for e in needed.values()), *(exp.alias_(a.copy(), f"_k{i}") for i, a in enumerate(flat))])
+        return (kept, kinds[len(needed):]) if kinds is not None else ([], [])
+    typed = {}
+    for name, kind in zip(needed, alias_kinds):
+        try:
+            if kind not in ("NULL", '"NULL"'):
+                typed[name] = exp.DataType.build(kind, dialect="duckdb")
+        except Exception:  # noqa: BLE001, S112 - a kind sqlglot cannot write back: that alias is asked along as before
+            continue
+    # (an alias of no kind of its own, NULL, or one sqlglot cannot write: defined in the probe, as the SELECT does)
+    along = [name for name in needed if name not in typed]
 
     def unaliased(a: exp.Expression) -> exp.Expression:
         a = a.copy()
         for c in list(a.find_all(exp.Column)):
-            if not c.table and c.name.upper() in typed and typed[c.name.upper()] not in ("NULL", '"NULL"'):
-                c.replace(exp.cast(exp.Null(), exp.DataType.build(typed[c.name.upper()], dialect="duckdb")))
+            if not c.table and c.name.upper() in typed:
+                c.replace(exp.cast(exp.Null(), typed[c.name.upper()].copy()))
         return a
 
-    try:
-        args = [exp.alias_(unaliased(a), f"_k{i}") for i, a in enumerate(flat)]
-    except Exception:  # noqa: BLE001 - a kind sqlglot cannot write back: ask with the aliases as they are
-        args = [*(e.copy() for e in needed.values()), *(exp.alias_(a.copy(), f"_k{i}") for i, a in enumerate(flat))]
-        kinds = described(args)
+    kinds = described([*(unaliased(needed[n]) for n in along), *(exp.alias_(unaliased(a), f"_k{i}") for i, a in enumerate(flat))])
+    if kinds is None:  # (as the SELECT has them, every alias defined: what binds in its place binds here)
+        kinds = described([*(e.copy() for e in needed.values()), *(exp.alias_(a.copy(), f"_k{i}") for i, a in enumerate(flat))])
         return (kept, kinds[len(needed):]) if kinds is not None else ([], [])
-    kinds = described(args)
-    return (kept, kinds) if kinds is not None else ([], [])
+    return kept, kinds[len(along):]
 
 
 def mixed_kinds(transformed: exp.Expression, conn) -> exp.Expression:  # noqa: ANN001

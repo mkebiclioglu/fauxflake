@@ -390,8 +390,8 @@ def _existing_on_snowflake(conn, wh: Warehouse, renamed: dict | None, log=print,
         db = (renamed or {}).get(db, db)
         try:
             cur.execute(f"create schema if not exists {_ident(db)}.{_ident(schema)}")
-            cur.execute(existing_view(f"{db}.{schema}.{table}", rel.get("columns") or {},
-                                      table=rel.get("as") == "table" or name.upper() in tables))
+            columns = {c: _snowflake_type(str(k).upper()) for c, k in (rel.get("columns") or {}).items()}  # (DuckDB's names)
+            cur.execute(existing_view(f"{db}.{schema}.{table}", columns, table=rel.get("as") == "table" or name.upper() in tables))
             made += 1
         except Exception as e:  # noqa: BLE001 - one Snowflake will not make is left to the build, as before
             if getattr(e, "errno", None) in (1998, 2002):
