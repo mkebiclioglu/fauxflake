@@ -230,8 +230,16 @@ def test_times_written_from_the_clock_are_the_clock_on_both_engines():
     duck.execute("create table t as select * from (values ('2026-10-23 01:58:39.367'::timestamp), ('2026-11-21 01:58:39.367'::timestamp), "
                  "('2026-11-22 01:00:00'::timestamp)) t(c)")
     frozen, built = datetime(2026, 11, 22, 1, 58, 27), (datetime(2026, 11, 22, 1, 58, 30), datetime(2026, 11, 22, 1, 58, 50))
-    assert _clock_relative(duck, "", '"c"', frozen, *built)
-    # the same values outside the Snowflake build, or a shift that is not the same for every row: an engine difference
-    assert not _clock_relative(duck, "", '"c"', frozen, datetime(2026, 11, 23), datetime(2026, 11, 24))
+    assert _clock_relative(duck, "", '"c"', [(frozen, *built)])
+    # the same values outside the Snowflake build: an engine difference
+    assert not _clock_relative(duck, "", '"c"', [(frozen, datetime(2026, 11, 23), datetime(2026, 11, 24))])
     duck.execute("update t set c = c + interval 1 day where c < '2026-11-01'")
-    assert not _clock_relative(duck, "", '"c"', frozen, *built)
+    assert not _clock_relative(duck, "", '"c"', [(frozen, *built)])
+    # an incremental model's rows of two days (a data vault's LDTS): each the clock of its own day's build
+    duck.execute("create or replace table m as select * from (values ('2026-11-22 04:02:03'::timestamp), ('2026-11-22 04:09:41'::timestamp)) t(c)")
+    duck.execute("create or replace table t as select * from (values ('2026-11-22 04:02:30.366'::timestamp), ('2026-11-22 04:10:02.5'::timestamp)) t(c)")
+    two_days = [(datetime(2026, 11, 22, 4, 2, 3), datetime(2026, 11, 22, 4, 2, 20), datetime(2026, 11, 22, 4, 2, 50)),
+                (datetime(2026, 11, 22, 4, 9, 41), datetime(2026, 11, 22, 4, 9, 55), datetime(2026, 11, 22, 4, 10, 20))]
+    assert _clock_relative(duck, "", '"c"', two_days)
+    duck.execute("update t set c = c + interval 5 minute where c > '2026-11-22 04:05'")  # (fits no day's build)
+    assert not _clock_relative(duck, "", '"c"', two_days)

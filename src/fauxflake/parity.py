@@ -93,29 +93,47 @@ def _fetch_into(conn, sql: str, duck, types: dict[str, str]) -> tuple[list[str],
     cur = conn.cursor()
     cur.execute(sql)
     names = [d[0] for d in cur.description]
+    query = sql
     if any(d[1] in (6, 7) for d in cur.description):
         # TIMESTAMP_LTZ and TIMESTAMP_TZ come as instants; the emulator keeps a timestamp's wall clock,
         # which is what Snowflake gives when it is cast to TIMESTAMP_NTZ (a TZ in its own offset, an LTZ in the session's)
         exact = lambda n: '"' + n.replace('"', '""') + '"'  # noqa: E731 - as Snowflake named it
-        cur.execute("select " + ", ".join(exact(n) + ("::timestamp_ntz " + exact(n) if d[1] in (6, 7) else "")
-                                          for n, d in zip(names, cur.description)) + f" from ({sql})")
-    duck.execute("drop table if exists _theirs")
+        query = "select " + ", ".join(exact(n) + ("::timestamp_ntz " + exact(n) if d[1] in (6, 7) else "")
+                                      for n, d in zip(names, cur.description)) + f" from ({sql})"
+        cur.execute(query)
     kinds = {n: ("VARCHAR" if types.get(n.upper()) == "JSON" else types.get(n.upper(), "VARCHAR")) for n in names}
-    duck.execute("create temp table _theirs (" + ", ".join(f'"{n}" {kinds[n]}' for n in names) + ")")
+
+    def chunks():  # noqa: ANN202 - rows as Python values, a chunk at a time
+        while rows := cur.fetchmany(100_000):
+            yield pa.table({n: [None if r[i] is None else r[i] for r in rows] for i, n in enumerate(names)})
+
+    def load(batches) -> int:  # noqa: ANN001
+        duck.execute("drop table if exists _theirs")
+        duck.execute("create temp table _theirs (" + ", ".join(f'"{n}" {kinds[n]}' for n in names) + ")")
+        count = 0
+        for batch in batches:
+            duck.register("_batch", batch)
+            duck.execute("insert into _theirs by name select * from _batch")
+            duck.unregister("_batch")
+            count += batch.num_rows
+        return count
+
+    described = list(cur.description)
     try:
-        batches = cur.fetch_arrow_batches()
+        return names, load(cur.fetch_arrow_batches())
+    except pa.ArrowInvalid:
+        # the chunks disagree on a column's Arrow type: a timestamp of the year 1 or 8888 (a data vault's ghost records)
+        # does not fit nanoseconds, and its chunk comes in another unit. Read again with the times as text (DuckDB reads
+        # them back into the column's type): still Arrow, where millions of rows as Python values would not fit in memory
+        exact = lambda n: '"' + n.replace('"', '""') + '"'  # noqa: E731
+        cur.execute("select " + ", ".join(
+            f"to_varchar({exact(d[0])}, 'YYYY-MM-DD HH24:MI:SS.FF9') {exact(d[0])}" if d[1] in (3, 4, 6, 7, 8) and d[1] != 3
+            else f"to_varchar({exact(d[0])}, 'YYYY-MM-DD') {exact(d[0])}" if d[1] == 3 else exact(d[0]) for d in described)
+                    + f" from ({query})")
+        return names, load(cur.fetch_arrow_batches())
     except Exception:  # noqa: BLE001 - a result that does not come as Arrow: rows, a chunk at a time
-        def chunks():
-            while rows := cur.fetchmany(100_000):
-                yield pa.table({n: [None if r[i] is None else r[i] for r in rows] for i, n in enumerate(names)})
-        batches = chunks()
-    count = 0
-    for batch in batches:
-        duck.register("_batch", batch)
-        duck.execute("insert into _theirs by name select * from _batch")
-        duck.unregister("_batch")
-        count += batch.num_rows
-    return names, count
+        cur.execute(query)
+        return names, load(chunks())
 
 
 @dataclass
@@ -736,7 +754,10 @@ def _is_clock(duck, both: str, column: str, kind: str, clock) -> bool:  # noqa: 
     shift = datetime.now().astimezone().utcoffset() or timedelta(0)  # (a time of this machine's day, as dbt writes `now()`)
 
     def within(lo: datetime, hi: datetime, a: datetime, b: datetime, d: timedelta) -> bool:
-        return a - slack <= lo + d and hi + d <= b + slack
+        try:
+            return a - slack <= lo + d and hi + d <= b + slack
+        except OverflowError:  # (a data vault's ghost record of the year 1, less an offset: no time of a build)
+            return False
 
     # (a time shown in a zone, CONVERT_TIMEZONE('America/Los_Angeles', CURRENT_TIMESTAMP()): the same offset of a
     # quarter hour on both engines; this machine's own offset too)
@@ -747,27 +768,31 @@ def _is_clock(duck, both: str, column: str, kind: str, clock) -> bool:  # noqa: 
             return True
     # (from the first Snowflake build of the run: a model that reads another by name, not through ref(), can run before
     # that one is built again, and read what an earlier day's build wrote)
-    return _clock_relative(duck, both, q, frozen, min(start, extra.get("since") or start) - slack, end + slack)
+    # (each day's build: a model that reads another by name, not through ref(), can run before that one is built again
+    # and read what an earlier day wrote; an incremental model keeps every day's rows)
+    days = [(f, b - slack, e + slack) for f, b, e in extra.get("builds") or [(frozen, start, end)] if f is not None]
+    days[-1] = (days[-1][0], days[-1][1], max(days[-1][2], end + slack))  # (a view read after the build: its read)
+    return _clock_relative(duck, both, q, days)
 
 
-def _clock_relative(duck, both: str, q: str, frozen: datetime, lo: datetime, hi: datetime) -> bool:  # noqa: ANN001
-    """Times written from the clock (`dateadd('day', -30, current_timestamp)`): a statement reads the clock once, so each
-    engine's values are its own clock plus the same offsets. Sorted, every Snowflake value then lies one shift away from
-    the emulator's, and that shift puts the emulator's frozen clock inside the Snowflake build."""
+def _clock_relative(duck, both: str, q: str, days: list[tuple]) -> bool:  # noqa: ANN001
+    """Times written from the clock (`dateadd('day', -30, current_timestamp)`): a statement reads the clock once, so the
+    emulator's values are its clock that day plus some offsets, and Snowflake's are its clock during that day's build
+    plus the same offsets. The distinct values one side has and the other lacks pair up in order, each pair as many
+    times on both sides, and each pair's difference puts the emulator's clock of some day inside that day's Snowflake
+    build. `days`: (emulator clock, build start, end)."""
     # (only the values one side has and the other lacks: a row the two agree on, an hour truncated, say, is no evidence)
-    mine = [_instant(v) for (v,) in duck.execute(
-        both + f"select v from (select {q} v from m except all select {q} from t) order by 1 nulls last limit 10001").fetchall()]
-    theirs = [_instant(v) for (v,) in duck.execute(
-        both + f"select v from (select {q} v from t except all select {q} from m) order by 1 nulls last limit 10001").fetchall()]
-    if not mine or len(mine) != len(theirs) or len(mine) > 10000:
-        return False
-    if [v is None for v in mine] != [v is None for v in theirs]:
-        return False
-    shifts = [b - a for a, b in zip(mine, theirs) if a is not None]
-    if not shifts or max(shifts) - min(shifts) > timedelta(milliseconds=2):
-        return False
-    return lo <= frozen + min(shifts) <= hi
+    def counted(a: str, b: str) -> list[tuple]:
+        return [(_instant(v), n) for v, n in duck.execute(
+            both + f"select v, count(*) from (select {q} v from {a} except all select {q} from {b}) group by v "
+                   "order by v nulls last limit 10001").fetchall()]
 
+    mine, theirs = counted("m", "t"), counted("t", "m")
+    if not mine or not days or len(mine) != len(theirs) or len(mine) > 10000:
+        return False
+    if any((a is None) != (b is None) or n != k for (a, n), (b, k) in zip(mine, theirs)):
+        return False
+    return all(any(lo <= frozen + (b - a) <= hi for frozen, lo, hi in days) for (a, _), (b, _) in zip(mine, theirs) if a is not None)
 
 def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datetime, days: int,
         remote_schema: str = "FAUXFLAKE_PARITY", log=print, select: list[str] | None = None, exclude: list[str] | None = None,
@@ -782,7 +807,7 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
 
     found: list[Difference] = []
     rows: list[Parity] = []
-    first_began = None  # when the first Snowflake build of the run began
+    builds: list[tuple] = []  # each day's (emulator clock, Snowflake build start, its end)
     # both engines run as the same role: the one Snowflake's session has (masking policies show it what they show it)
     (role,) = conn.cursor().execute("select current_role()").fetchone()
     for i in range(days + 1):
@@ -806,6 +831,12 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
             # the same schema name on both sides: some models embed their own relation names
             chosen = (["--select", *select] if select else []) + (["--exclude", *exclude] if exclude else [])
             here = datetime.now(timezone.utc).replace(tzinfo=None)
+            from . import emulator
+
+            if emulator.FROZEN_NOW is not None and i > 0:
+                # the clock moves between the days, as Snowflake's does: a load stamped with SYSDATE() (a data vault's
+                # LDTS) is newer than the last one on both engines, not the same moment again on the emulator's
+                emulator.FROZEN_NOW = conn.cursor().execute("select sysdate()").fetchone()[0]
             local.invoke(["build", *full, *chosen], schema=remote_schema, quiet=True)
             built_here = (here, datetime.now(timezone.utc).replace(tzinfo=None))
             mine = outcomes(local)
@@ -821,8 +852,8 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
         from . import emulator
 
         ids = (_invocation(local), _invocation(remote))
-        first_began = first_began or began
-        clock = (emulator.FROZEN_NOW, began, ended, {"local": built_here, "ids": ids, "since": first_began}) if emulator.FROZEN_NOW else None
+        builds.append((emulator.FROZEN_NOW, began, ended))
+        clock = (emulator.FROZEN_NOW, began, ended, {"local": built_here, "ids": ids, "builds": list(builds)}) if emulator.FROZEN_NOW else None
         stopped, rows = None, []
         try:
             rows = compare(conn, wh.emu, local, only=built, clock=clock)
