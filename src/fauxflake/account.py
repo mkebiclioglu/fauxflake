@@ -319,7 +319,30 @@ _SHOW = re.compile(_LEAD + r"show\s+(?:terse\s+)?(?P<kind>[a-z][a-z ]*?)(?P<rest
 _SHOW_PARAMETERS = re.compile(_LEAD + r"show\s+parameters(?:\s+like\s+'(?P<like>(?:[^']|'')*)')?"
                               r"(?:\s+(?:in|for)\s+(?P<scope>account|session|warehouse|database|schema|table|task|user|function|procedure)"
                               r"(?:\s+(?P<name>" + _NAME + r"))?)?[\s;]*$")
-_TRAILING_COMMENT = re.compile(r"(?s)(?:\s*;)?\s*(?:/\*(?:(?!\*/).)*\*/\s*;?\s*|--[^\n]*\s*)+$")
+
+
+def without_trailing_comments(command: str) -> str:
+    """The statement without the comments after it (dbt appends its query comment), in one pass from the end: a pattern
+    of repeated comments anchored at the end backtracks exponentially over a model full of `--` lines."""
+    text = command.rstrip().rstrip(";").rstrip()
+    while True:
+        if text.endswith("*/") and (start := text.rfind("/*")) >= 0:
+            text = text[:start].rstrip().rstrip(";").rstrip()
+            continue
+        line_start = text.rfind("\n") + 1
+        quoted, at = False, -1
+        for i, ch in enumerate(text[line_start:]):  # a `--` on the last line, outside a string
+            if ch == "'":
+                quoted = not quoted
+            elif not quoted and text.startswith("--", line_start + i):
+                at = line_start + i
+                break
+        if at >= 0:
+            text = text[:at].rstrip().rstrip(";").rstrip()
+            continue
+        return text
+
+
 _ROLE = re.compile(_LEAD + r"(?P<verb>create|drop)\s+(?P<replace>or\s+replace\s+)?role\s+(?P<exists>if\s+(?:not\s+)?exists\s+)?"
                    r"(?P<name>" + _NAME + r")(?P<rest>.*?)[\s;]*$")
 # the role a GRANT or REVOKE names: `... to role r`, `... to r` (a grantee is a role unless it says otherwise), `grant role r to ...`
@@ -346,7 +369,7 @@ def intercept(cursor, command: str, original):  # noqa: ANN001, ANN201
     if not head or head.group(1).lower() not in ("create", "alter", "drop", "show", "grant", "revoke"):
         return None
     duck = cursor._duck_conn
-    command = _TRAILING_COMMENT.sub("", command)  # (dbt appends its query comment after the statement)
+    command = without_trailing_comments(command)  # (dbt appends its query comment after the statement)
     if head.group(1).lower() in ("grant", "revoke"):
         return _grant(cursor, original, command)
     if m := _ROLE.match(command):

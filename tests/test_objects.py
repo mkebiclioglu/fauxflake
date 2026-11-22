@@ -845,3 +845,17 @@ def test_a_grant_names_a_role_the_account_has_once_its_roles_are_described(emu):
     cur.execute("drop role reporter")
     with pytest.raises(Exception, match="does not exist"):
         cur.execute("revoke select on table t from role reporter")
+
+
+def test_comments_after_a_long_statement_are_stripped_in_linear_time(run):
+    import time
+
+    from fauxflake.account import without_trailing_comments
+
+    banner = "\n".join(f"-- line {i} ##### #     # -----" for i in range(40))  # (datavault4dbt's header)
+    sql = f"create or replace view v as (\n{banner}\nselect 1 as x -- the value\n)\n/* {{\"app\": \"dbt\"}} */"
+    started = time.monotonic()
+    assert without_trailing_comments(sql).endswith(")")
+    run(sql)
+    assert time.monotonic() - started < 5
+    assert without_trailing_comments("show warehouses like 'a--b' -- note\n/* c */;") == "show warehouses like 'a--b'"
