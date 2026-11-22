@@ -3052,6 +3052,13 @@ def misnamed_column(transformed: exp.Expression, conn, probe: bool = True) -> st
             return f"error line {meta['line']} at position {max(0, meta['col'] - len(ref.this.this) - (2 if ref.this.quoted else 0))}\n"
         return ""
 
+    def correlated(scope: Scope) -> bool:
+        while scope is not None:
+            if scope.is_subquery or scope.is_udtf or scope.expression.find_ancestor(exp.Lateral) is not None:
+                return True
+            scope = scope.parent
+        return False
+
     for scope in scopes:
         sources: dict[str, list[str] | None] = {}
         for name, (_node, source) in scope.selected_sources.items():
@@ -3085,9 +3092,9 @@ def misnamed_column(transformed: exp.Expression, conn, probe: bool = True) -> st
             having = [p for p in places if wanted in p]
             if len(having) == 1 and having[0] is not lateral and having[0].count(wanted) > 1 and wanted not in lateral:
                 return f"SQL compilation error: ambiguous column name '{wanted}'"
-            if having or not (scope.is_root or scope.is_cte) and not any(wanted.lower() == n.lower() for p in places for n in p):
+            if having or correlated(scope) and not any(wanted.lower() == n.lower() for p in places for n in p):
                 continue  # (found; or not a name of these relations in any case: an outer query's, left to DuckDB;
-                # only a subquery sees an outer query's columns)
+                # only a subquery, a lateral or a table function, or what is inside one, sees an outer query's columns)
             shown = '"' + ref.this.this + '"' if ref.this.quoted else ref.this.this.upper()
             return f"SQL compilation error: {where(ref)}invalid identifier '{shown}'"
     made = transformed.expression if isinstance(transformed, exp.Create) else None
