@@ -15,6 +15,8 @@ import json
 import re
 from decimal import Decimal
 
+from . import jsondoc
+
 MARK = "﷐xml"
 
 
@@ -186,7 +188,7 @@ def to_json(text: str) -> str | None:
         if isinstance(v, Decimal):
             return str(v)
         if isinstance(v, float):
-            return repr(v) if "e" in repr(v) else "%.17e" % v
+            return jsondoc.float_text(v)
         return json.dumps(v, ensure_ascii=False)
 
     return encode(element)

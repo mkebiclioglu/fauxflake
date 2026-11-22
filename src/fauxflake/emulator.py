@@ -692,15 +692,25 @@ def _patch_fakesnow() -> None:
         SELECT hash(TO_JSON(input))::UBIGINT AS SEQ, e.k AS KEY,
                COALESCE(e.k, '[' || (e.i - 1) || ']') AS PATH,
                CASE WHEN e.k IS NOT NULL THEN NULL ELSE (e.i - 1)::BIGINT END AS INDEX,
-               e.v AS VALUE, TO_JSON(input) AS THIS
+               e.v AS VALUE, _fs_global.main._sf_doc(input) AS THIS
         FROM (SELECT UNNEST(CASE WHEN json_type(TO_JSON(input)) = 'OBJECT'
-                 THEN list_transform(json_keys(TO_JSON(input)),
-                                     lambda x, i: struct_pack(k := x, v := CAST(TO_JSON(input) -> x AS JSON), i := i))
-                 ELSE list_transform(CAST(TO_JSON(input) AS JSON[]), lambda x, i: struct_pack(k := NULL::VARCHAR, v := x, i := i))
+                 THEN list_transform(list_zip(json_keys(TO_JSON(input)), CASE WHEN _fs_global.main._sf_floats(input)
+                          THEN _fxpy_elements(input::VARCHAR)::JSON[] ELSE CAST(json_extract(TO_JSON(input), '$$.*') AS JSON[]) END),
+                        lambda p, i: struct_pack(k := p[1], v := CAST(p[2] AS JSON), i := i))
+                 ELSE list_transform(_fs_global.main._sf_list(input), lambda x, i: struct_pack(k := NULL::VARCHAR, v := x, i := i))
                  END, recursive := true)) AS e(k, v, i)
         ORDER BY e.i
     ) AS _fx_undefined
     WHERE VALUE IS DISTINCT FROM {semantics._UNDEFINED_JSON}""")
+    # OBJECT_CONSTRUCT writes each value's own text (DuckDB's json_group_object writes a FLOAT anew, as a NUMBER)
+    _macros.FS_OBJECT_CONSTRUCT = _Template(_macros.FS_OBJECT_CONSTRUCT.template.replace(
+        "list_extract(vals, idx) AS value", "list_extract(vals, idx) AS value, idx").replace(
+        "COALESCE(json_group_object(key, value), '{}'::JSON)",
+        "COALESCE(('{' || string_agg(to_json(key)::VARCHAR || ':' || COALESCE(value::VARCHAR, 'null'), ',' ORDER BY idx) || '}')::JSON, '{}'::JSON)"))
+    _macros.FS_OBJECT_CONSTRUCT_STAR = _Template(_macros.FS_OBJECT_CONSTRUCT_STAR.template.replace(
+        "COALESCE(json_group_object(key, value::JSON), '{}'::JSON)",
+        "COALESCE(('{' || string_agg(to_json(key)::VARCHAR || ':' || value::VARCHAR, ',') || '}')::JSON, '{}'::JSON)").replace(
+        "SELECT TO_JSON(COLUMNS(*))", "SELECT _fs_global.main._sf_jv(COLUMNS(*))"))
     # generated SQL can nest thousands deep (a pivot over many values, a long OR chain): give the
     # parser and the rewrites room, in the threads started from here on
     sys.setrecursionlimit(max(sys.getrecursionlimit(), 50_000))
@@ -1182,7 +1192,7 @@ def _patch_fakesnow() -> None:
                 transformed = kept[1].copy()
             else:
                 for adjust in (semantics.coerce_union_literals, semantics.resolve_equalities, semantics.mixed_kinds, semantics.union_text_kinds,
-                               semantics.days_added_to_aggregates, semantics.rounded_divisions, semantics.shared_aliases):
+                               semantics.days_added_to_aggregates, semantics.rounded_divisions, semantics.shared_aliases, semantics.kept_floats):
                     if adjust in (semantics.mixed_kinds, semantics.union_text_kinds, semantics.days_added_to_aggregates,
                                   semantics.rounded_divisions) and (
                             getattr(self._conn, "_fauxflake_txn", False) or not isinstance(

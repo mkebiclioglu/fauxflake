@@ -46,7 +46,10 @@ def python_functions(duck) -> None:  # noqa: ANN001
             ("_fxpy_xmlget", xmldoc.xmlget, ["VARCHAR", "VARCHAR", "BIGINT"], "VARCHAR", None),
             ("_fxpy_seeded_unit", seeded_unit, ["HUGEINT"], "DOUBLE", None),
             ("_fxpy_seeded_random", seeded_random, ["HUGEINT", "BIGINT"], "BIGINT", None),
-            ("_fxpy_decrypt_raw", decrypt_raw, ["BLOB", "BLOB", "BLOB", "BLOB", "VARCHAR", "BLOB", "BOOLEAN"], "BLOB", None)):
+            ("_fxpy_decrypt_raw", decrypt_raw, ["BLOB", "BLOB", "BLOB", "BLOB", "VARCHAR", "BLOB", "BOOLEAN"], "BLOB", None),
+            ("_fxpy_elements", jsondoc.elements, ["VARCHAR"], "VARCHAR[]", None),
+            ("_fxpy_get", jsondoc.get, ["VARCHAR", "VARCHAR"], "VARCHAR", None),
+            ("_fxpy_merged", jsondoc.merged, ["VARCHAR", "VARCHAR", "VARCHAR"], "VARCHAR", None)):
         try:
             duck.create_function(name, fn, args, out, null_handling="special",
                                  side_effects=name in ("_fxpy_encrypt_raw", "_fxpy_seeded_random"),
@@ -289,7 +292,7 @@ def json_sorted(text: str | None) -> str | None:
     import json
 
     if text is None or not text.lstrip().startswith(("{", "[")):
-        return text
+        return jsondoc.shown(text) if text is not None and jsondoc.FLOAT.search(text) else text
     if xmldoc.MARK in text or "\\ufdd0xml" in text:  # an XML element (its mark as written, or as DuckDB escapes it): as XML
         try:
             value = xmldoc.loads(text)
@@ -322,6 +325,45 @@ def json_sorted(text: str | None) -> str | None:
 
 
 MACROS = [
+    # A FLOAT in a VARIANT is written with its exponent (jsondoc.FLOAT); a document that holds one is read and written
+    # in Python, where each number keeps its text, instead of by DuckDB's JSON functions, which write numbers anew
+    # (the substrings first: a regular expression over every document costs five times the extraction it guards)
+    f"""create or replace macro {_NS}_sf_floats(v) as (contains(v::varchar, 'e+') or contains(v::varchar, 'e-'))
+          and regexp_matches(v::varchar, '{jsondoc.FLOAT_SQL}')""",
+    f"""create or replace macro {_NS}_sf_get(v, p) as case
+          when {_NS}_sf_floats(v) then _fxpy_get(v::varchar, p::varchar)::json else v -> p end""",
+    f"""create or replace macro {_NS}_sf_float_text(d) as case
+          when d <> 0 and not isnan(d) and not isinf(d)
+            then format('{{:.{{}}g}}', d, least(15, greatest(10, floor(log10(abs(d)))::integer + 10)))
+          else format('{{:.15g}}', d) end""",
+    f"""create or replace macro {_NS}_sf_scalar_text(e) as case
+          when {_NS}_sf_floats(e) and json_type(e::json) = 'DOUBLE' then {_NS}_sf_float_text(try_cast(e as double)) else e::json ->> '$' end""",
+    f"""create or replace macro {_NS}_sf_get_text(v, p) as case
+          when {_NS}_sf_floats(v) then {_NS}_sf_scalar_text(_fxpy_get(v::varchar, p::varchar)::json) else v ->> p end""",
+    # (a document as JSON: what is JSON already keeps its text)
+    f"create or replace macro {_NS}_sf_doc(x) as case when typeof(x) = 'JSON' then x::json else to_json(x) end",
+    f"create or replace macro {_NS}_sf_json_doc(t) as case when {_NS}_sf_floats(t) then t::json else json(t) end",
+    # A value put in a VARIANT (an array's element, an object's value, x::variant): JSON, a timestamp as Snowflake writes it
+    # (milliseconds; an offset of zero is Z: the emulator's clock runs in UTC, as parity's Snowflake session does)
+    f"""create or replace macro {_NS}_sf_jv(x) as case
+          when typeof(x) = 'JSON' then x::json
+          when typeof(x) in ('DOUBLE', 'FLOAT') then (case when isnan(x::double) then 'NaN'
+            when isinf(x::double) then case when x::double > 0 then 'Infinity' else '-Infinity' end
+            else printf('%.16e', x::double) end)::json
+          when typeof(x) in ('TIMESTAMP', 'TIMESTAMP_NS', 'TIMESTAMP_MS', 'TIMESTAMP_S')
+            then to_json(strftime(try_cast(x::varchar as timestamp), '%Y-%m-%d %H:%M:%S.%g'))
+          when typeof(x) = 'TIMESTAMP WITH TIME ZONE'
+            then to_json(strftime(timezone('UTC', try_cast(x::varchar as timestamptz)), '%Y-%m-%d %H:%M:%S.%g') || ' Z')
+          else to_json(x) end""",
+    f"""create or replace macro {_NS}_sf_list(x) as case
+          when typeof(x) = 'JSON[]' then x::json[]
+          when typeof(x) = 'JSON' and {_NS}_sf_floats(x) then _fxpy_elements(x::varchar)::json[]
+          else to_json(x)::json[] end""",
+    # a list as a JSON array, each element as it goes into a VARIANT (to_json would write a FLOAT as a NUMBER)
+    f"""create or replace macro {_NS}_sf_json_list(l) as
+          ('[' || array_to_string(list_transform(l, lambda e: coalesce({_NS}_sf_jv(e)::varchar, 'null')), ',') || ']')::json""",
+    f"""create or replace macro {_NS}_sf_json_map(k, v) as ('{{' || array_to_string(list_transform(list_zip(k, v),
+          lambda p: to_json(p[1]::varchar)::varchar || ':' || coalesce({_NS}_sf_jv(p[2])::varchar, 'null')), ',') || '}}')::json""",
     # what Snowflake will not convert to a number or a boolean when it compiles a statement: a date, a time, a
     # timestamp, a binary. For those types the macro calls a function that is gone (it is dropped once the macro is
     # made), so DuckDB refuses the call when it binds it; any other type is the untyped form. (The emulator's
@@ -412,20 +454,13 @@ MACROS = [
             then format('{{:.{{}}g}}', x::double, least(15, greatest(10, floor(log10(abs(x::double)))::integer + 10)))
           when typeof(x) in ('DOUBLE', 'FLOAT') then format('{{:.15g}}', x::double)
           when typeof(x) = 'JSON' and json_type(x::json) in ('OBJECT', 'ARRAY') then {_NS}_fx_json_sorted(x::varchar)
+          when typeof(x) = 'JSON' and {_NS}_sf_floats(x) and json_type(x::json) = 'DOUBLE' then {_NS}_sf_float_text(try_cast(x as double))
           when typeof(x) = 'JSON' then (x::json ->> '$')
           when typeof(x) in ('TIMESTAMP', 'TIMESTAMP_NS', 'TIMESTAMP_MS', 'TIMESTAMP_S')
             then strftime(try_cast(x::varchar as timestamp), '%Y-%m-%d %H:%M:%S.%g')
           when typeof(x) = 'TIMESTAMP WITH TIME ZONE'
             then strftime(timezone('UTC', try_cast(x::varchar as timestamptz)), '%Y-%m-%d %H:%M:%S.%g') || ' Z'
           else x::varchar end""",
-    # A value put in a VARIANT (an array's element, an object's value, x::variant): JSON, a timestamp as Snowflake writes it
-    # (milliseconds; an offset of zero is Z: the emulator's clock runs in UTC, as parity's Snowflake session does)
-    f"""create or replace macro {_NS}_sf_jv(x) as case
-          when typeof(x) in ('TIMESTAMP', 'TIMESTAMP_NS', 'TIMESTAMP_MS', 'TIMESTAMP_S')
-            then to_json(strftime(try_cast(x::varchar as timestamp), '%Y-%m-%d %H:%M:%S.%g'))
-          when typeof(x) = 'TIMESTAMP WITH TIME ZONE'
-            then to_json(strftime(timezone('UTC', try_cast(x::varchar as timestamptz)), '%Y-%m-%d %H:%M:%S.%g') || ' Z')
-          else to_json(x) end""",
     # Text of a division: NUMBER / NUMBER prints every decimal of its scale ('1.500000').
     f"""create or replace macro {_NS}_sf_fixed(v, s) as
           rtrim(left(v::decimal(38, 12)::varchar, length(v::decimal(38, 12)::varchar) - (12 - s)), '.')""",
@@ -450,7 +485,7 @@ MACROS = [
     f"create or replace macro {_NS}_sf_try_base64_binary(x) as try(from_base64(x::varchar))",
     f"create or replace macro {_NS}_sf_md5_lower64(x) as ('0x' || right(md5(x::varchar), 16))::ubigint::decimal(38, 0)",
     f"create or replace macro {_NS}_sf_md5_upper64(x) as ('0x' || left(md5(x::varchar), 16))::ubigint::decimal(38, 0)",
-    f"create or replace macro {_NS}_sf_array_union_agg(x) as to_json(list_distinct(flatten(list(from_json(x::json, '[\"JSON\"]')))))",
+    f"create or replace macro {_NS}_sf_array_union_agg(x) as {_NS}_sf_json_list(list_distinct(flatten(list({_NS}_sf_list(x)))))",
     f"""create or replace macro {_NS}_sf_try_input(x, target) as case
           when typeof(x) in ('VARCHAR', '"NULL"') or (target = 'DATE' and typeof(x) = 'DATE')
             or (target = 'BOOLEAN' and typeof(x) = 'BOOLEAN') or (target = 'DOUBLE' and typeof(x) in ('DOUBLE', 'FLOAT'))
@@ -460,7 +495,7 @@ MACROS = [
     f"create or replace macro {_NS}_sf_negate(x) as -x",
     f"create or replace macro {_NS}_sf_bitcount(x) as case when typeof(x) = 'BLOB' then bit_count(x::bit) else bit_count(x::bigint) end",
     f"create or replace macro {_NS}_sf_getbit(x, p) as (x::bigint >> p::integer) & 1",
-    f"create or replace macro {_NS}_sf_array_repeat(x, n) as to_json(list_transform(range(n::bigint), lambda i: x))",
+    f"create or replace macro {_NS}_sf_array_repeat(x, n) as {_NS}_sf_json_list(list_transform(range(n::bigint), lambda i: x))",
     f"create or replace macro {_NS}_sf_binary_as_string(b) as decode(b::blob)",
     f"create or replace macro {_NS}_sf_string_as_binary(s) as encode(s::varchar)",
     f"create or replace macro {_NS}_sf_jaccard(a, b) as jaccard(a::varchar, b::varchar)",
@@ -478,14 +513,19 @@ MACROS = [
     f"create or replace macro {_NS}_sf_array_distinct(l) as list_filter(l, lambda x, i: list_position(l, x) = i)",
     f"create or replace macro {_NS}_sf_jarowinkler(a, b) as round(jaro_winkler_similarity(upper(a), upper(b)) * 100)::bigint",
     f"""create or replace macro {_NS}_sf_object_insert
-          (o, k, v) as json_merge_patch(o::json, json_object(k::varchar, v)),
-          (o, k, v, f) as json_merge_patch(o::json, json_object(k::varchar, v))""",
+          (o, k, v) as case when {_NS}_sf_floats(o) or {_NS}_sf_floats(v) then _fxpy_merged(o::varchar, k::varchar, {_NS}_sf_jv(v)::varchar)::json
+                          else json_merge_patch(o::json, json_object(k::varchar, v)) end,
+          (o, k, v, f) as case when {_NS}_sf_floats(o) or {_NS}_sf_floats(v) then _fxpy_merged(o::varchar, k::varchar, {_NS}_sf_jv(v)::varchar)::json
+                          else json_merge_patch(o::json, json_object(k::varchar, v)) end""",
     f"create or replace macro {_NS}_sf_object_delete(o, k) as json_merge_patch(o::json, json_object(k::varchar, null))",
     f"create or replace macro {_NS}_sf_object_pick(o, k) as json_object(k::varchar, json_extract(o::json, '$.' || k))",
     *[f"create or replace macro {_NS}_sf_is_{name}(v) as json_type(v::varchar) in ({kinds})" for name, kinds in {
         "object": "'OBJECT'", "array": "'ARRAY'", "integer": "'UBIGINT', 'BIGINT'", "varchar": "'VARCHAR'",
         "char": "'VARCHAR'", "boolean": "'BOOLEAN'", "decimal": "'UBIGINT', 'BIGINT', 'DOUBLE'",
         "double": "'UBIGINT', 'BIGINT', 'DOUBLE'", "real": "'UBIGINT', 'BIGINT', 'DOUBLE'"}.items()],
+    # a FLOAT is no DECIMAL (IS_DECIMAL is false, AS_NUMBER is NULL); NaN and Infinity are FLOATs too
+    f"""create or replace macro {_NS}_sf_is_decimal(v) as json_type(v::varchar) in ('UBIGINT', 'BIGINT', 'DOUBLE')
+          and not regexp_matches(v::varchar, '{jsondoc.FLOAT_SQL}|NaN|Infinity')""",
     f"create or replace macro {_NS}_sf_as_integer(v) as case when json_type(v::varchar) in ('UBIGINT', 'BIGINT') then v::bigint end",
     f"create or replace macro {_NS}_sf_as_varchar(v) as case when json_type(v::varchar) = 'VARCHAR' then v::json ->> '$' end",
     f"""create or replace macro {_NS}_sf_split_to_table(s, d) as table
@@ -544,9 +584,9 @@ MACROS = [
     # v[i] with an index worked out per row (arr[array_size(arr) - 1], obj[key_column]): a number is an element of an
     # array, text a key of an object (a VARIANT index is a key only); anything else, or a miss, is NULL
     f"""create or replace macro {_NS}_sf_element(v, i) as (case
-          when typeof(i) = 'VARCHAR' then json_extract(v::json, '$."' || i::varchar || '"')
-          when typeof(i) = 'JSON' then json_extract(v::json, '$."' || (try_cast(i::varchar as json) ->> '$') || '"')
-          when try_cast(i::varchar as double) >= 0 then nullif(json_extract(v::json, '$[' || floor(try_cast(i::varchar as double))::bigint
+          when typeof(i) = 'VARCHAR' then {_NS}_sf_get(v::json, '$."' || i::varchar || '"')
+          when typeof(i) = 'JSON' then {_NS}_sf_get(v::json, '$."' || (try_cast(i::varchar as json) ->> '$') || '"')
+          when try_cast(i::varchar as double) >= 0 then nullif({_NS}_sf_get(v::json, '$[' || floor(try_cast(i::varchar as double))::bigint
             || ']'), json('"{UNDEFINED}"')) end)""",
     # Dates out of range roll over: month 14 is February of the next year, day 0 the day before.
     f"""create or replace macro {_NS}_sf_date_from_parts(y, m, d) as
@@ -605,7 +645,7 @@ MACROS = [
     # what FLATTEN is given, when it is a list or an object; a string or a number held in a VARIANT gives no rows,
     # as in Snowflake, instead of an error
     f"""create or replace macro {_NS}_sf_flattenable(x) as
-          case when json_type(to_json(x)) in ('ARRAY', 'OBJECT') then to_json(x) end""",
+          case when json_type({_NS}_sf_doc(x)) in ('ARRAY', 'OBJECT') then {_NS}_sf_doc(x) end""",
     # (a value that is neither, a string or a number or JSON null, is one row: itself, at the path '')
     f"""create or replace macro {_NS}_sf_flatten_recursive(input) as table
           select SEQ, KEY, PATH, INDEX, VALUE, THIS from (
@@ -630,6 +670,11 @@ MACROS = [
             (v, p) as case when json_type(v::varchar) in ('UBIGINT', 'BIGINT', 'DOUBLE') then round(v::double, 0) end,
             (v, p, s) as case when json_type(v::varchar) in ('UBIGINT', 'BIGINT', 'DOUBLE') then round(v::double, s::integer) end"""
       for name in ("double", "real", "number", "decimal")],
+    *[f"""create or replace macro {_NS}_sf_as_{name}
+            (v) as case when {_NS}_sf_is_decimal(v) then v::double end,
+            (v, p) as case when {_NS}_sf_is_decimal(v) then round(v::double, 0) end,
+            (v, p, s) as case when {_NS}_sf_is_decimal(v) then round(v::double, s::integer) end"""
+      for name in ("number", "decimal")],
     f"""create or replace macro {_NS}_sf_sha2
           (x) as sha256(x::varchar),
           (x, n) as case when n = 256 then sha256(x::varchar) else {_NS}_fx_sha2(x::varchar, n::integer) end""",
@@ -639,39 +684,38 @@ MACROS = [
     f"create or replace macro {_NS}_sf_as_array(v) as case when json_type(v::varchar) = 'ARRAY' then v::json end",
     # Arrays: a stored ARRAY is JSON, an array built inside a query may be a DuckDB list.
     # Every array function reads either as a list of JSON values and answers with JSON.
-    f"create or replace macro {_NS}_sf_list(x) as to_json(x)::json[]",
     f"""create or replace macro {_NS}_sf_sorted(a) as list_transform(list_sort(list_transform({_NS}_sf_list(a),
           lambda e: struct_pack(n := case when json_type(e) in ('UBIGINT', 'BIGINT', 'DOUBLE') then e::double end,
                                 s := e::varchar, e := e))), lambda x: x.e)""",
-    f"create or replace macro {_NS}_sf_array_contains(a, v) as case when v is null then null else list_contains({_NS}_sf_list(a), to_json(v)) end",
-    f"create or replace macro {_NS}_sf_array_position(a, v) as nullif(list_position({_NS}_sf_list(a), to_json(v)), 0) - 1",
+    f"create or replace macro {_NS}_sf_array_contains(a, v) as case when v is null then null else list_contains({_NS}_sf_list(a), {_NS}_sf_jv(v)) end",
+    f"create or replace macro {_NS}_sf_array_position(a, v) as nullif(list_position({_NS}_sf_list(a), {_NS}_sf_jv(v)), 0) - 1",
     f"""create or replace macro {_NS}_sf_array_to_string(a, s) as
-          array_to_string(list_transform({_NS}_sf_list(a), lambda e: coalesce(nullif(e, {_UNDEFINED_JSON}) ->> '$', '')), s)""",
+          array_to_string(list_transform({_NS}_sf_list(a), lambda e: coalesce({_NS}_sf_scalar_text(nullif(e, {_UNDEFINED_JSON})), '')), s)""",
     f"create or replace macro {_NS}_sf_arrays_overlap(a, b) as list_has_any({_NS}_sf_list(a), {_NS}_sf_list(b))",
-    f"""create or replace macro {_NS}_sf_array_slice(a, f, t) as to_json(list_slice({_NS}_sf_list(a),
+    f"""create or replace macro {_NS}_sf_array_slice(a, f, t) as {_NS}_sf_json_list(list_slice({_NS}_sf_list(a),
           case when f >= 0 then f + 1 else f end, case when t < 0 then t - 1 else t end))""",
-    f"create or replace macro {_NS}_sf_array_cat(a, b) as to_json(list_concat({_NS}_sf_list(a), {_NS}_sf_list(b)))",
-    f"create or replace macro {_NS}_sf_array_append(a, v) as to_json(list_append({_NS}_sf_list(a), coalesce(to_json(v), {_UNDEFINED_JSON})))",
-    f"create or replace macro {_NS}_sf_array_prepend(a, v) as to_json(list_prepend(coalesce(to_json(v), {_UNDEFINED_JSON}), {_NS}_sf_list(a)))",
-    f"create or replace macro {_NS}_sf_array_unique(a) as to_json({_NS}_sf_array_distinct({_NS}_sf_list(a)))",
+    f"create or replace macro {_NS}_sf_array_cat(a, b) as {_NS}_sf_json_list(list_concat({_NS}_sf_list(a), {_NS}_sf_list(b)))",
+    f"create or replace macro {_NS}_sf_array_append(a, v) as {_NS}_sf_json_list(list_append({_NS}_sf_list(a), coalesce({_NS}_sf_jv(v), {_UNDEFINED_JSON})))",
+    f"create or replace macro {_NS}_sf_array_prepend(a, v) as {_NS}_sf_json_list(list_prepend(coalesce({_NS}_sf_jv(v), {_UNDEFINED_JSON}), {_NS}_sf_list(a)))",
+    f"create or replace macro {_NS}_sf_array_unique(a) as {_NS}_sf_json_list({_NS}_sf_array_distinct({_NS}_sf_list(a)))",
     f"""create or replace macro {_NS}_sf_array_sort
-          (a) as to_json({_NS}_sf_sorted(a)),
-          (a, up) as to_json(case when up then {_NS}_sf_sorted(a) else list_reverse({_NS}_sf_sorted(a)) end)""",
+          (a) as {_NS}_sf_json_list({_NS}_sf_sorted(a)),
+          (a, up) as {_NS}_sf_json_list(case when up then {_NS}_sf_sorted(a) else list_reverse({_NS}_sf_sorted(a)) end)""",
     f"create or replace macro {_NS}_sf_array_max(a) as list_last(list_filter({_NS}_sf_sorted(a), lambda e: json_type(e) <> 'NULL'))",
     f"create or replace macro {_NS}_sf_array_min(a) as list_first(list_filter({_NS}_sf_sorted(a), lambda e: json_type(e) <> 'NULL'))",
     f"""create or replace macro {_NS}_sf_array_compact(a) as
-          to_json(list_filter({_NS}_sf_list(a), lambda e: e is not null and json_type(e) <> 'NULL' and e <> {_UNDEFINED_JSON}))""",
-    *[f"""create or replace macro {_NS}_sf_array_{name}(a, b) as to_json(list_transform(list_filter(
+          {_NS}_sf_json_list(list_filter({_NS}_sf_list(a), lambda e: e is not null and json_type(e) <> 'NULL' and e <> {_UNDEFINED_JSON}))""",
+    *[f"""create or replace macro {_NS}_sf_array_{name}(a, b) as {_NS}_sf_json_list(list_transform(list_filter(
           list_zip({_NS}_sf_list(a), range(1, len({_NS}_sf_list(a)) + 1)),
           lambda p: len(list_filter({_NS}_sf_list(a)[1:p[2]], lambda e: e = p[1])) {op} len(list_filter({_NS}_sf_list(b), lambda e: e = p[1]))),
           lambda p: p[1]))""" for name, op in (("intersection", "<="), ("except", ">"))],
-    f"create or replace macro {_NS}_sf_array_remove(a, v) as to_json(list_filter({_NS}_sf_list(a), lambda e: e <> to_json(v)))",
+    f"create or replace macro {_NS}_sf_array_remove(a, v) as {_NS}_sf_json_list(list_filter({_NS}_sf_list(a), lambda e: e <> {_NS}_sf_jv(v)))",
     f"""create or replace macro {_NS}_sf_array_insert(a, p, v) as
-          to_json(list_concat(list_concat({_NS}_sf_list(a), list_transform(range(greatest(p - len({_NS}_sf_list(a)), 0)),
-            lambda i: {_UNDEFINED_JSON}))[1:p], [coalesce(to_json(v), {_UNDEFINED_JSON})], {_NS}_sf_list(a)[p + 1:]))""",
-    f"create or replace macro {_NS}_sf_array_remove_at(a, p) as to_json(list_concat({_NS}_sf_list(a)[1:p], {_NS}_sf_list(a)[p + 2:]))",
-    f"create or replace macro {_NS}_sf_array_flatten(a) as to_json(flatten(list_transform({_NS}_sf_list(a), lambda e: e::json[])))",
-    f"create or replace macro {_NS}_sf_array_reverse(a) as to_json(list_reverse({_NS}_sf_list(a)))",
+          {_NS}_sf_json_list(list_concat(list_concat({_NS}_sf_list(a), list_transform(range(greatest(p - len({_NS}_sf_list(a)), 0)),
+            lambda i: {_UNDEFINED_JSON}))[1:p], [coalesce({_NS}_sf_jv(v), {_UNDEFINED_JSON})], {_NS}_sf_list(a)[p + 1:]))""",
+    f"create or replace macro {_NS}_sf_array_remove_at(a, p) as {_NS}_sf_json_list(list_concat({_NS}_sf_list(a)[1:p], {_NS}_sf_list(a)[p + 2:]))",
+    f"create or replace macro {_NS}_sf_array_flatten(a) as {_NS}_sf_json_list(flatten(list_transform({_NS}_sf_list(a), lambda e: {_NS}_sf_list(e))))",
+    f"create or replace macro {_NS}_sf_array_reverse(a) as {_NS}_sf_json_list(list_reverse({_NS}_sf_list(a)))",
     f"""create or replace macro {_NS}_sf_array_range
           (f, t) as to_json(range(f, t)),
           (f, t, s) as to_json(range(f, t, s))""",
@@ -707,9 +751,16 @@ MACROS = [
           else to_json([x]) end""",
     # A VARIANT holding the string 12 equals the text '12'. As JSON it is '"12"', so compare its value.
     # typeof() is known when the query is planned: for ordinary columns this is exactly `a = b`.
+    # two VARIANTs are equal by value: a FLOAT and a NUMBER of the same value (1.5000000000000000e+00 and 1.5) too
+    # (try_cast: DuckDB folds a constant even in a branch not taken, and `status = 'returned'` reaches here as text)
+    f"""create or replace macro {_NS}_sf_json_key(v) as case
+          when json_type(try_cast(v::varchar as json)) in ('UBIGINT', 'BIGINT', 'DOUBLE') then try_cast(v as double)::varchar
+          else json(try_cast(v::varchar as json)) end""",
+    f"create or replace macro {_NS}_sf_same_json(a, b) as {_NS}_sf_json_key(a) = {_NS}_sf_json_key(b)",
     f"""create or replace macro {_NS}_sf_eq(a, b) as case
           when typeof(a) = 'JSON' and typeof(b) <> 'JSON' then (a::json ->> '$') = b::varchar
           when typeof(b) = 'JSON' and typeof(a) <> 'JSON' then a::varchar = (b::json ->> '$')
+          when typeof(a) = 'JSON' and typeof(b) = 'JSON' then {_NS}_sf_same_json(a, b)
           else a = b end""",
     # UPPER('ß') is 'SS'.
     f"create or replace macro {_NS}_sf_upper(s) as replace(upper(s), 'ẞ', 'SS')",
@@ -1315,7 +1366,7 @@ def _fix(node: exp.Expression) -> exp.Expression:
             gone = [x for key in args[1:] for x in (key, exp.Null())]
             return plain_fn("json_merge_patch", target, plain_fn("json_object", *gone))
         if name == "OBJECT_INSERT":
-            return plain_fn("json_merge_patch", target, plain_fn("json_object", args[1], exp.ToVariant(this=_jv(args[2]))))
+            return _fn("_sf_object_insert", target, args[1], exp.ToVariant(this=_jv(args[2])))
         keys = args[1] if len(args) == 2 and not (isinstance(args[1], exp.Literal) and args[1].is_string) else plain_fn("list_value", *args[1:])
         return _fn("_sf_object_pick", target, keys)
     if isinstance(node, exp.Struct) and not node.expressions:
@@ -2253,6 +2304,10 @@ def _undefined_out(cursor) -> None:  # noqa: ANN001
         if str(kind).upper() == "JSON" and i < table.num_columns and pa.types.is_string(table.column(i).type) \
                 and pc.any(pc.match_substring(table.column(i), UNDEFINED)).as_py():
             table = table.set_column(i, table.field(i), pc.replace_substring(table.column(i), f'"{UNDEFINED}"', "undefined"))
+        if str(kind).upper() == "JSON" and i < table.num_columns and pa.types.is_string(table.column(i).type) \
+                and pc.any(pc.match_substring_regex(table.column(i), jsondoc.FLOAT_SQL)).as_py():
+            shown = pa.array([None if v is None else jsondoc.shown(v) for v in table.column(i).to_pylist()], pa.string())
+            table = table.set_column(i, table.field(i), shown)  # (a FLOAT with the 16 digits Snowflake shows)
     cursor._arrow_table = table
 
 
@@ -2870,6 +2925,8 @@ def resolve_equalities(transformed: exp.Expression, conn) -> exp.Expression:  # 
                 same = exp.EQ(this=value(left), expression=exp.cast(right.copy(), "varchar"))
             elif kinds[1] == "JSON" and kinds[0] != "JSON":
                 same = exp.EQ(this=exp.cast(left.copy(), "varchar"), expression=value(right))
+            elif kinds == ("JSON", "JSON"):  # by value (see _sf_same_json), still an equality DuckDB can hash
+                same = exp.EQ(this=_fn("_sf_json_key", left.copy()), expression=_fn("_sf_json_key", right.copy()))
             else:
                 same = exp.EQ(this=left.copy(), expression=right.copy())
             call.replace(exp.paren(same))
@@ -4446,3 +4503,49 @@ def group_by_all_written_out(transformed: exp.Expression) -> exp.Expression | No
             select.set("group", None)
         changed = True
     return tree if changed else None
+
+
+def kept_floats(transformed: exp.Expression, conn=None) -> exp.Expression:  # noqa: ANN001, ARG001
+    """A FLOAT in a VARIANT is written with its exponent (jsondoc.FLOAT), a NUMBER without: Snowflake keeps the two
+    apart (TYPEOF, TO_JSON's 1.500000000000000e+00, a FLOAT's ten digits as text). DuckDB's JSON functions write every
+    number anew and lose that, so the statement as fakesnow wrote it reads and builds VARIANTs through the emulator's
+    own: TO_JSON of what is JSON already is the JSON itself, a list or a map is written element by element (_sf_json_list,
+    _sf_json_map), v:path is _sf_get, and PARSE_JSON of a document with a FLOAT in it keeps the text it was given."""
+    def named(node: exp.Expression, *names: str) -> bool:
+        return isinstance(node, exp.Anonymous) and isinstance(node.this, str) and node.name.lower().split(".")[-1] in names
+
+    def swap(node: exp.Expression) -> exp.Expression:
+        if isinstance(node, exp.JSONFormat) and node.this is not None and not node.args.get("options") \
+                and not node.args.get("is_json"):  # (Snowflake's TO_JSON: text)
+            return exp.cast(swap(exp.Anonymous(this="TO_JSON", expressions=[node.this])), "text")
+        if named(node, "to_json") and len(node.expressions) == 1:
+            arg = node.expressions[0]
+            inner = arg.this if isinstance(arg, (exp.Filter, exp.Window, exp.WithinGroup)) else arg
+            inner = inner.this if isinstance(inner, (exp.Filter, exp.WithinGroup)) else inner
+            if named(arg, "_sf_jv", "_sf_json_list", "_sf_json_map", "_sf_get"):
+                return arg
+            if isinstance(arg, exp.Array) or isinstance(inner, exp.ArrayAgg):
+                return _fn("_sf_json_list", arg)
+            if named(arg, "map") and len(arg.expressions) == 2:
+                return _fn("_sf_json_map", *arg.expressions)
+            return _fn("_sf_jv", arg)  # (what is JSON already as it is, a FLOAT with its exponent)
+        if isinstance(node, exp.JSONExtract) and node.expression is not None and not node.args.get("expressions"):
+            return _fn("_sf_get", node.this, node.expression)
+        if isinstance(node, exp.JSONExtractScalar) and node.expression is not None and not node.args.get("expressions"):
+            return _fn("_sf_get_text", node.this, node.expression)
+        if isinstance(node, exp.ParseJSON) and not node.args.get("safe"):
+            arg = node.this
+            if isinstance(arg, exp.Literal) and arg.is_string and jsondoc.FLOAT.search(arg.name):
+                return exp.cast(arg.copy(), "json")
+            if named(arg, "_fxpy_json_text"):
+                return _fn("_sf_json_doc", arg)
+        return node
+
+    # (inside out: an argument is made over before what it is given to looks at it)
+    for node in reversed(list(transformed.walk(bfs=False))):
+        made = swap(node)
+        if made is not node:
+            if node is transformed:
+                return made
+            node.replace(made)
+    return transformed

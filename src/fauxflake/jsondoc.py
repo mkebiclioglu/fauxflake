@@ -199,6 +199,8 @@ def read(text: str):  # noqa: ANN201
 
 
 def _dump(v) -> str:  # noqa: ANN001
+    if isinstance(v, _Number) and ("e" in v.text or "E" in v.text):
+        return float_text(float(v))  # a number written with an exponent is a FLOAT
     if isinstance(v, _Number):
         text = v.text
         if text.startswith("."):
@@ -212,6 +214,121 @@ def _dump(v) -> str:  # noqa: ANN001
         return "{" + ",".join(json.dumps(k, ensure_ascii=False) + ":" + _dump(x) for k, x in v.items()) + "}"
     if isinstance(v, list):
         return "[" + ",".join(_dump(x) for x in v) + "]"
+    return json.dumps(v, ensure_ascii=False)
+
+
+# A FLOAT held in a VARIANT is written with its exponent and all 17 digits (1.5000000000000000e+00; Snowflake's TO_JSON
+# shows 16 of them), a NUMBER without an exponent: the text alone tells them apart. DuckDB's own JSON functions write every number again (1.5), so where a
+# document holds one, the emulator reads and writes it here instead (semantics: _sf_get, _sf_list and the builders).
+import re as _re
+
+FLOAT = _re.compile(r"[0-9]\.[0-9]{16}e[+-][0-9]")
+FLOAT_SQL = "[0-9][.][0-9]{16}e[-+][0-9]"  # (the same, for regexp_matches)
+
+
+class _Kept(str):
+    """A number, or a whole value, as its text."""
+
+
+def _kept(text: str):  # noqa: ANN202
+    return json.loads(text, parse_float=_Kept, parse_int=_Kept, parse_constant=_Kept)
+
+
+def _write(v) -> str:  # noqa: ANN001
+    if isinstance(v, _Kept):
+        return str(v)
+    if isinstance(v, dict):
+        return "{" + ",".join(json.dumps(k, ensure_ascii=False) + ":" + _write(x) for k, x in v.items()) + "}"
+    if isinstance(v, list):
+        return "[" + ",".join(_write(x) for x in v) + "]"
+    return json.dumps(v, ensure_ascii=False)
+
+
+def float_text(v: float) -> str:
+    """A FLOAT as it goes into a VARIANT."""
+    if v != v:
+        return "NaN"
+    if v in (float("inf"), float("-inf")):
+        return "Infinity" if v > 0 else "-Infinity"
+    return "%.16e" % v
+
+
+def shown(text: str) -> str:
+    """A VARIANT's text as Snowflake shows it: each FLOAT with 16 digits."""
+    return _re.sub(r"-?[0-9]\.[0-9]{16}e[+-][0-9]+", lambda m: "%.15e" % float(m.group()), text)
+
+
+def elements(text: str | None) -> list | None:
+    """The elements of a JSON array (or the values of an object), each as its own text."""
+    if text is None:
+        return None
+    v = _kept(text)
+    if isinstance(v, dict):
+        v = list(v.values())
+    return [_write(x) for x in v] if isinstance(v, list) else None
+
+
+_STEP = _re.compile(r'\.(?:"((?:[^"\\]|\\.)*)"|([^.\[]+))|\[\s*(-?\d+)\s*\]|\[\s*"((?:[^"\\]|\\.)*)"\s*\]')
+
+
+def get(text: str | None, path: str | None) -> str | None:
+    """`text` -> `path` (a JSON path DuckDB reads: $.a, $."a b", $[0], $.a[1].b; or a key, or an index), keeping
+    each number's text."""
+    if text is None or path is None:
+        return None
+    v = _kept(text)
+    if not path.startswith("$"):  # (v -> 'name' is a key; v -> 0 an index)
+        if isinstance(v, list) and path.lstrip("-").isdigit():
+            return _write(v[int(path)]) if -len(v) <= int(path) < len(v) else None
+        return _write(v[path]) if isinstance(v, dict) and path in v else None
+    at = 1
+    while at < len(path):
+        m = _STEP.match(path, at)
+        if m is None:
+            return None
+        quoted, bare, index, keyed = m.groups()
+        at = m.end()
+        if index is not None:
+            i = int(index)
+            if not isinstance(v, list) or not -len(v) <= i < len(v):
+                return None
+            v = v[i]
+            continue
+        name = bare if bare is not None else json.loads('"' + (quoted if quoted is not None else keyed) + '"')
+        if not isinstance(v, dict) or name not in v:
+            return None
+        v = v[name]
+    return _write(v)
+
+
+def merged(text: str | None, name: str | None, value: str | None) -> str | None:
+    """json_merge_patch(text, {name: value}) for one key, keeping each number's text: a null value removes the key."""
+    if text is None:
+        return None
+    v = _kept(text)
+    if not isinstance(v, dict):
+        return text
+    if value is None or value == "null":
+        v.pop(name, None)
+    else:
+        v[name] = _Kept(value)
+    return _write(v)
+
+
+def _canonical(v) -> str:  # noqa: ANN001
+    if isinstance(v, _Kept):
+        if v in ("NaN", "Infinity", "-Infinity"):
+            return str(v)
+        if "e" in v or "E" in v:
+            return float_text(float(v))
+        if "." in v:
+            shortest = repr(float(v))
+            return shortest if "e" not in shortest else str(v)
+        return str(v)
+    if isinstance(v, dict):
+        return "{" + ",".join(json.dumps(k, ensure_ascii=False) + ":" + _canonical(x) for k, x in v.items()) + "}"
+    if isinstance(v, list):
+        return "[" + ",".join(_canonical(x) for x in v) + "]"
     return json.dumps(v, ensure_ascii=False)
 
 
@@ -230,7 +347,10 @@ def normalise(text: str | None) -> str | None:
         return None
     try:
         json.loads(text, object_pairs_hook=_no_twice)
-        return text if text.strip() else None
+        if not _re.search(r"[0-9][eE]", text):
+            return text if text.strip() else None
+        # a FLOAT in it: written as the emulator keeps one, the other numbers as DuckDB writes them (1.50 is 1.5)
+        return _canonical(_kept(text))
     except (ValueError, KeyError):
         pass
     if not text.strip():

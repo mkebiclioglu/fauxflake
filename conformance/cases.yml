@@ -866,8 +866,8 @@
 - {id: object_keys_7, sql: "select '#' || to_json(object_agg(k, v)) from (select 'b' k, 1 v union all select 'a', 2)"}
 - {id: object_keys_8, sql: "select '#' || parse_json('[1,{\"b\":2,\"a\":1}]')::varchar"}
 - {id: object_keys_9, sql: "select '#' || to_json(array_agg(object_construct('b', x, 'a', 131.0))) from (select 1 x)"}
-- {id: object_keys_10, sql: "select '#' || to_json(object_construct('b', 131.0::float, 'a', 0.1::float))", gap: "a FLOAT in an object's text is written as %.15e"}
-- {id: object_keys_11, sql: "select '#' || to_json(parse_json('{\"a\": 0.1, \"b\": 131.0, \"c\": 1e3}'))", gap: "a number written with an exponent is a FLOAT, written as %.15e; DuckDB's JSON keeps no such difference"}
+- {id: object_keys_10, sql: "select '#' || to_json(object_construct('b', 131.0::float, 'a', 0.1::float))"}
+- {id: object_keys_11, sql: "select '#' || to_json(parse_json('{\"a\": 0.1, \"b\": 131.0, \"c\": 1e3}'))"}
 - {id: object_keys_12, sql: "select '#' || to_json(object_construct('a', 12.5::number(10,2), 'b', 131.0::number(10,1), 'e', 7::number))"}
 # A SQL NULL in an ARRAY is `undefined`: counted, written `undefined`, skipped by FLATTEN and ARRAY_COMPACT, read as SQL NULL
 - {id: undefined_1, sql: "select array_size(array_construct(null, 1))"}
@@ -955,7 +955,7 @@
 # Recorded 2026-11-19. A FLOAT as text: 10 significant digits, up to 9 decimals past the point, 15 at most.
 - {id: float_text_1, sql: "select x::varchar, to_varchar(x), '#' || x, to_char(x) from (select column1::float x from values ('4.749801436513762e-10'), ('0.00019749657786943185'), ('4.1631430572869156e-05'), ('0.8921984195319782'), ('15.022928716836011'), ('656.001907248427'), ('8478738.533123035'), ('123456789012.5'), ('-3.08629643924887'), ('0'), ('1e20'), ('2.5e-300'), ('99999.99999999999')) order by x"}
 - {id: float_text_2, sql: "select listagg(x, '|') within group (order by x), concat(min(x), ''), concat_ws('-', min(x), max(x)) from (select column1::float x from values ('0.8921984195319782'), ('15.022928716836011'), ('8478738.533123035'))"}
-- {id: float_text_4, sql: "select array_to_string(array_agg(x) within group (order by x), '|') from (select column1::float x from values ('0.8921984195319782'), ('15.022928716836011'))", gap: "a FLOAT in an ARRAY is written as a FLOAT; the emulator's JSON keeps no FLOAT type (as object_keys_10)"}
+- {id: float_text_4, sql: "select array_to_string(array_agg(x) within group (order by x), '|') from (select column1::float x from values ('0.8921984195319782'), ('15.022928716836011'))"}
 - {id: float_text_3, sql: "select (x / 3)::varchar, sqrt(x)::varchar, (x * 1.1)::varchar, avg(x)::varchar from (select 7::float x) group by x"}
 # Recorded 2026-11-19. Snowflake's generator for a seed: RANDSTR and UNIFORM give its values.
 - {id: seeded_1, sql: "select randstr(12, 0), randstr(12, 1), randstr(4, 9), randstr(20, 123456789), randstr(8, -5), randstr(0, 3)"}
@@ -1026,7 +1026,7 @@
 - {id: xml_4, sql: "select '#' || xmlget(parse_xml('<a><b>1</b><b>2</b></a>'), 'b')::varchar, '#' || xmlget(parse_xml('<a><b>1</b><b>2</b></a>'), 'b', 1)::varchar, xmlget(parse_xml('<a><b>1</b></a>'), 'c') is null"}
 - {id: xml_5, sql: "select xmlget(parse_xml('<a><b x=\"7\">1</b></a>'), 'b'):\"$\"::varchar, xmlget(parse_xml('<a><b x=\"7\">1</b></a>'), 'b'):\"@x\"::varchar, xmlget(parse_xml('<a><b x=\"7\">1</b></a>'), 'b'):\"@\"::varchar"}
 - {id: xml_6, sql: "select check_xml('<a>1</a>') is null, check_xml('<a>1</b>'), check_xml('<a>'), check_xml(''), check_xml(null) is null"}
-- {id: xml_7, sql: "select '#' || to_xml(to_variant('abc')), '#' || to_xml(to_variant(1)), '#' || to_xml(to_variant(1.5::float)), '#' || to_xml(to_variant(true)), '#' || to_xml(parse_json('null')), to_xml(null) is null", gap: "a FLOAT in a VARIANT keeps its type in Snowflake; the emulator's JSON keeps no FLOAT type (as object_keys_10)"}
+- {id: xml_7, sql: "select '#' || to_xml(to_variant('abc')), '#' || to_xml(to_variant(1)), '#' || to_xml(to_variant(1.5::float)), '#' || to_xml(to_variant(true)), '#' || to_xml(parse_json('null')), to_xml(null) is null"}
 - {id: xml_8, sql: "select '#' || to_xml(parse_json('{\"a\": {\"b\": \"x<y\"}, \"c\": [true, null, \"s\"], \"d\": 2.5}'))"}
 - {id: xml_9, sql: "select '#' || to_xml(parse_xml('<a x=\"1\"><b>t</b></a>'))"}
 - {id: xml_10, sql: "select '#' || parse_xml('<a>1</a>')::varchar, typeof(parse_xml('<a>1</a>')), parse_xml('<a>1</a>'):\"$\"::varchar, typeof(parse_xml('<a>1</a>'):\"$\")"}
@@ -1035,8 +1035,8 @@
 - {id: xml_13, sql: "select '#' || parse_xml('<a><b/></a>')::varchar, '#' || parse_xml('<a>  <b>1</b>  </a>')::varchar"}
 - {id: xml_14, sql: "select x.value:\"@\"::varchar, x.value:\"$\"::varchar from table(flatten(input => parse_xml('<a><b>1</b><c>2</c></a>'):\"$\")) x order by 1"}
 - {id: xml_15, sql: "select '#' || parse_xml('<a><b>1</b></a>'):\"$\"::varchar, typeof(parse_xml('<a><b>1</b></a>'):\"$\")"}
-- {id: xml_16, sql: "select '#' || to_xml(parse_json('[1, \"a\", {\"k\": 2}]')), '#' || to_xml(object_construct('a', 1.5::float, 'b', 10000000000::number, 'c', 0.25))", gap: "a FLOAT in a VARIANT keeps its type in Snowflake; the emulator's JSON keeps no FLOAT type (as object_keys_10)"}
-- {id: xml_17, sql: "select typeof(parse_xml('<a>1.5</a>'):\"$\"), typeof(parse_xml('<a>abc</a>'):\"$\"), typeof(parse_xml('<a>true</a>'):\"$\"), typeof(parse_xml('<a>1e3</a>'):\"$\"), typeof(parse_xml('<a></a>'):\"$\"), typeof(parse_xml('<a>007</a>'):\"$\")", gap: "a FLOAT in a VARIANT keeps its type in Snowflake; the emulator's JSON keeps no FLOAT type (as object_keys_10)"}
+- {id: xml_16, sql: "select '#' || to_xml(parse_json('[1, \"a\", {\"k\": 2}]')), '#' || to_xml(object_construct('a', 1.5::float, 'b', 10000000000::number, 'c', 0.25))"}
+- {id: xml_17, sql: "select typeof(parse_xml('<a>1.5</a>'):\"$\"), typeof(parse_xml('<a>abc</a>'):\"$\"), typeof(parse_xml('<a>true</a>'):\"$\"), typeof(parse_xml('<a>1e3</a>'):\"$\"), typeof(parse_xml('<a></a>'):\"$\"), typeof(parse_xml('<a>007</a>'):\"$\")"}
 - {id: xml_18, sql: "select parse_xml('<a>007</a>'):\"$\"::varchar, parse_xml('<a>1.50</a>'):\"$\"::varchar, parse_xml('<a> 12 </a>'):\"$\"::varchar, parse_xml('<a x=\"5\"/>'):\"@x\"::varchar, typeof(parse_xml('<a x=\"5\"/>'):\"@x\")"}
 - {id: xml_19, sql: "select '#' || parse_xml('<a>&lt;b&gt; &quot;q&quot;</a>')::varchar, parse_xml('<a>&lt;b&gt;</a>'):\"$\"::varchar"}
 - {id: xml_20, sql: "select '#' || xmlget(parse_xml('<a><b>1</b><c>2</c><b>3</b></a>'), 'b', 1)::varchar, xmlget(parse_xml('<a><b>1</b></a>'), 'b', 1) is null, '#' || xmlget(xmlget(parse_xml('<a><b><c>9</c></b></a>'), 'b'), 'c')::varchar"}
@@ -1117,7 +1117,7 @@
 - {id: lateral_sub_2, sql: "with la as (select column1 i from values (1), (2), (3)), lb as (select column1 i, column2 n from values (1, 10), (1, 11), (2, 20)) select la.i, x.n from la left join lateral (select n from lb where lb.i = la.i) x order by 1, 2"}
 - {id: lateral_sub_3, sql: "with la as (select column1 i from values (1), (2), (3)), lb as (select column1 i, column2 n from values (1, 10), (1, 11), (2, 20)) select la.i, x.n from la, lateral (select n from lb where lb.i = la.i) x order by 1, 2"}
 - {id: lateral_sub_4, sql: "with la as (select column1 i from values (1), (2), (3)), lb as (select column1 i, column2 n from values (1, 10), (1, 11), (2, 20)) select la.i, x.m from la left join lateral (select n m from lb where lb.i = la.i) x on true order by 1, 2"}
-- {id: float_text_5, sql: "select '#' || parse_json('1e3')::varchar, typeof(parse_json('1e3')), typeof(to_variant(1.5::float))", gap: "a number written with an exponent, or a FLOAT made a VARIANT, is a FLOAT; DuckDB's JSON keeps no such difference (as object_keys_11)"}
+- {id: float_text_5, sql: "select '#' || parse_json('1e3')::varchar, typeof(parse_json('1e3')), typeof(to_variant(1.5::float))"}
 # Recorded 2026-11-22 in UTC. An offset of zero prints as Z: in text, in JSON, in LISTAGG and in TZH formats.
 - {id: zero_offset_text, sql: "select to_char('2025-01-01 09:24:47.71 +00:00'::timestamp_ltz), '2025-01-01 09:24:47.71 +00:00'::timestamp_ltz::varchar, to_char('2025-01-01 09:24:47.71 +00:00'::timestamp_tz), 'x' || '2025-01-01 09:24:47.71 +00:00'::timestamp_ltz, concat('x', '2025-07-01 09:24:47.71 +00:00'::timestamp_ltz)"}
 - {id: zero_offset_json, sql: "select to_json(object_construct('t', '2025-01-01 09:24:47.71 +00:00'::timestamp_ltz, 'n', '2025-01-01 09:24:47.71'::timestamp_ntz, 'd', '2025-01-01'::date)), array_construct('2025-01-01 09:24:47.71 +00:00'::timestamp_ltz)::varchar, '2025-01-01 09:24:47.71 +00:00'::timestamp_ltz::variant::varchar, to_varchar(to_variant('2025-01-01 09:24:47.71'::timestamp_ntz))"}
@@ -1128,3 +1128,19 @@
 - {id: float_round_half, sql: "select round(4.725::float, 2), round(2.675::float, 2), round(0.285::float, 2), round(1.005::float, 2), round(0.125::float, 2), round(-4.725::float, 2), round(4.725::float * 1, 2)"}
 - {id: division_rounded_scaled, sql: "select round(avg(d), 2), round(9.45 / 2, 2), round(sum(d) / count(*), 2), round(avg(f), 2), round(sum(d) / 2, 2), trunc(sum(d) / 3, 3) from (select column1::number(3,2) d, column1::float f from values (4.72), (4.73))"}
 - {id: division_rounded_window, sql: "select round(avg(d) over (), 2), round(d / 1, 1), round(d / 7, 5), round(d / 2, 2) from (select column1::number(3,2) d from values (4.72), (4.73), (9.45)) order by d"}
+# Recorded 2026-11-22. A FLOAT keeps its type inside a VARIANT: TYPEOF says DOUBLE, its text has ten digits, TO_JSON
+# writes 1.500000000000000e+00; through extraction, FLATTEN, the array and object functions, and PARSE_JSON of text.
+- {id: float_variant_typeof, sql: "select typeof(v:a), typeof(v:b[0]), typeof(parse_json(t):c), typeof(v:d), typeof(v) from (select object_construct('a', column1, 'b', array_construct(column1), 'd', column2) v, '{\"c\": 1e3}' t from values (1.5::float, 2.5::number(3,1)))"}
+- {id: float_variant_text, sql: "select v:a::varchar, '#' || v::varchar, '#' || to_json(v), '#' || v:b::varchar, array_to_string(v:b, '|') from (select object_construct('a', column1, 'b', array_construct(column1, 1e20::float, 0.1)) v from values (0.8921984195319782::float))"}
+- {id: float_variant_build, sql: "select '#' || to_json(object_insert(object_construct('a', x), 'b', x * 2)), '#' || to_json(array_append(array_construct(x), x)), '#' || to_json(array_cat(array_construct(x), array_construct(1))), '#' || to_json(array_slice(array_construct(x, 2, x), 0, 2)), '#' || to_json(array_prepend(array_construct(1), x)), '#' || to_json(array_compact(array_construct(x, null)))  from (select column1::float x from values (1.5))"}
+- {id: float_variant_agg, sql: "select '#' || to_json(array_agg(x) within group (order by x)), '#' || to_json(object_agg(k, x)), array_to_string(array_agg(x) within group (order by x), ','), '#' || to_json(array_agg(distinct x) within group (order by x)) from (select column1 k, column2::float x from values ('a', 1.5), ('b', 0.25))"}
+- {id: float_variant_flatten, sql: "select f.key, typeof(f.value), f.value::varchar, '#' || to_json(f.value) from (select object_construct('a', column1, 'b', 2) v from values (0.8921984195319782::float)) t, lateral flatten(input => t.v) f order by f.key"}
+- {id: float_variant_flatten_array, sql: "select f.index, typeof(f.value), '#' || to_json(f.value) from (select parse_json(column1) v from values ('[1e3, 2, 1.5, \"x\"]')) t, lateral flatten(input => t.v) f order by f.index"}
+- {id: float_variant_cast, sql: "select v::float, v::number(10,2), v::int, is_double(v), is_decimal(v), as_number(v), as_double(v), is_decimal(to_variant(1.5)), v + 1, v > 1 from (select to_variant(column1) v from values (1.5::float))"}
+- {id: float_variant_equal, sql: "select a.v = b.v, a.v <> b.v, a.w = b.w from (select to_variant(column1) v, object_construct('k', column1) w from values (1.5::float)) a, (select to_variant(column1) v, object_construct('k', column1) w from values (1.5::number(2,1))) b"}
+- {id: float_variant_join, sql: "select count(*) from (select to_variant(column1) v from values (1.5::float), (2::float)) a join (select to_variant(column1) v from values (1.5::number(2,1)), (2)) b on a.v = b.v"}
+- {id: float_variant_parse, sql: "select typeof(parse_json(column1)), '#' || parse_json(column1)::varchar, '#' || to_json(parse_json(column1)) from values ('1e3'), ('{\"a\": 2.5E-3, \"b\": 1.50}'), ('[1e3, 2]') order by 1"}
+- {id: float_variant_shown, sql: "select object_construct('a', column1), to_variant(column1), array_construct(column1), parse_json('{\"a\": 1e3}') from values (1.5::float)"}
+- {id: float_variant_get, sql: "select get(array_construct(x), 0)::varchar, typeof(get_path(object_construct('a', array_construct(x)), 'a[0]')), typeof(object_construct('a', x)['a']), typeof(get(object_construct('a', x), 'a')) from (select column1::float x from values (1.5))"}
+- {id: float_variant_special, sql: "select '#' || to_json(to_variant(x)), typeof(to_variant(x)) from (select column1::float x from values ('nan'), ('inf'), ('-inf'), ('-0')) order by 1"}
+- {id: flatten_inline_object, sql: "select f.key, f.value, typeof(f.value) from table(flatten(input => object_construct('a', 1, 'b', 'x', 'c', 2.5::float))) f order by f.key"}
