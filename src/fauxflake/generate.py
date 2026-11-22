@@ -747,7 +747,7 @@ def existing_view(name: str, columns: dict[str, str], replace: bool = False, tab
     """An empty relation standing for one that exists before the run (the spec's `existing:`).
     A table once its full shape is known, so an incremental model finds what it would in production."""
     name = quoted(name)
-    if table:
+    if table and columns:  # (one whose columns are not known yet stays a view: a table needs a column)
         return f"create table if not exists {name} ({', '.join(f'"{col}" {kind}' for col, kind in columns.items())})"
     cols = ", ".join(f'null::{kind} as "{col}"' for col, kind in columns.items()) or 'null::varchar as "_FX_EMPTY"'
     return f"create {'or replace view' if replace else 'view if not exists'} {name} as select {cols} where false"

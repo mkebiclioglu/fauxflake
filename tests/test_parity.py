@@ -213,3 +213,25 @@ def test_the_comparison_functions_outlive_the_cursor_that_first_read(emu):
         cur.close()
         del cur
         gc.collect()
+
+
+def test_times_written_from_the_clock_are_the_clock_on_both_engines():
+    from datetime import datetime
+
+    import duckdb
+
+    from fauxflake.parity import _clock_relative
+
+    duck = duckdb.connect()
+    # dateadd('day', -30, current_timestamp) and the like: each engine's clock, less the same amounts; an hour truncated
+    # to the same value on both sides is not evidence either way
+    duck.execute("create table m as select * from (values ('2026-10-23 01:58:27'::timestamp), ('2026-11-21 01:58:27'::timestamp), "
+                 "('2026-11-22 01:00:00'::timestamp)) t(c)")
+    duck.execute("create table t as select * from (values ('2026-10-23 01:58:39.367'::timestamp), ('2026-11-21 01:58:39.367'::timestamp), "
+                 "('2026-11-22 01:00:00'::timestamp)) t(c)")
+    frozen, built = datetime(2026, 11, 22, 1, 58, 27), (datetime(2026, 11, 22, 1, 58, 30), datetime(2026, 11, 22, 1, 58, 50))
+    assert _clock_relative(duck, "", '"c"', frozen, *built)
+    # the same values outside the Snowflake build, or a shift that is not the same for every row: an engine difference
+    assert not _clock_relative(duck, "", '"c"', frozen, datetime(2026, 11, 23), datetime(2026, 11, 24))
+    duck.execute("update t set c = c + interval 1 day where c < '2026-11-01'")
+    assert not _clock_relative(duck, "", '"c"', frozen, *built)

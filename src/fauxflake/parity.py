@@ -8,6 +8,7 @@ days pass on both, and every model is compared row for row.
 from __future__ import annotations
 
 import contextlib
+import json
 import re
 import tempfile
 from dataclasses import dataclass
@@ -350,18 +351,29 @@ def _databases_built_in(conn, remote: DbtProject, schema: str, extra: list[str])
             pass
 
 
-def _existing_on_snowflake(conn, wh: Warehouse, renamed: dict | None, log=print) -> None:  # noqa: ANN001
+def _existing_on_snowflake(conn, wh: Warehouse, renamed: dict | None, log=print, local: DbtProject | None = None) -> None:  # noqa: ANN001
     """The spec's `existing:` relations, which the emulator starts with (empty), made on Snowflake too where they are
-    missing: both builds start from the same warehouse (a model that reads one by name finds it on both)."""
+    missing: both builds start from the same warehouse (a model that reads one by name finds it on both). Each is of the
+    kind the model that builds it makes (a table for a table): dbt then replaces it in one statement, where a view in a
+    table's place is dropped first, and a model reading it by name at that moment finds nothing."""
     from .generate import existing_view
 
+    tables = set()
+    try:
+        nodes = json.loads((local.target_path / "manifest.json").read_text())["nodes"] if local is not None else {}
+        tables = {str(n.get("relation_name") or "").replace('"', "").upper() for n in nodes.values()
+                  if (n.get("config") or {}).get("materialized") in ("table", "incremental", "snapshot", "seed")
+                  or n.get("resource_type") in ("snapshot", "seed")}
+    except (OSError, ValueError, KeyError):
+        pass
     cur, made = conn.cursor(), 0
     for name, rel in wh.spec.existing.items():
         db, schema, table = name.split(".")
         db = (renamed or {}).get(db, db)
         try:
             cur.execute(f"create schema if not exists {_ident(db)}.{_ident(schema)}")
-            cur.execute(existing_view(f"{db}.{schema}.{table}", rel.get("columns") or {}, table=rel.get("as") == "table"))
+            cur.execute(existing_view(f"{db}.{schema}.{table}", rel.get("columns") or {},
+                                      table=rel.get("as") == "table" or name.upper() in tables))
             made += 1
         except Exception as e:  # noqa: BLE001 - one Snowflake will not make is left to the build, as before
             if getattr(e, "errno", None) in (1998, 2002):
@@ -733,7 +745,28 @@ def _is_clock(duck, both: str, column: str, kind: str, clock) -> bool:  # noqa: 
         mine = within(lo_m, hi_m, frozen, frozen, d) or ("local" in extra and within(lo_m, hi_m, *extra["local"], d))
         if mine and within(lo_t, hi_t, start, end, d):
             return True
-    return False
+    # (from the first Snowflake build of the run: a model that reads another by name, not through ref(), can run before
+    # that one is built again, and read what an earlier day's build wrote)
+    return _clock_relative(duck, both, q, frozen, min(start, extra.get("since") or start) - slack, end + slack)
+
+
+def _clock_relative(duck, both: str, q: str, frozen: datetime, lo: datetime, hi: datetime) -> bool:  # noqa: ANN001
+    """Times written from the clock (`dateadd('day', -30, current_timestamp)`): a statement reads the clock once, so each
+    engine's values are its own clock plus the same offsets. Sorted, every Snowflake value then lies one shift away from
+    the emulator's, and that shift puts the emulator's frozen clock inside the Snowflake build."""
+    # (only the values one side has and the other lacks: a row the two agree on, an hour truncated, say, is no evidence)
+    mine = [_instant(v) for (v,) in duck.execute(
+        both + f"select v from (select {q} v from m except all select {q} from t) order by 1 nulls last limit 10001").fetchall()]
+    theirs = [_instant(v) for (v,) in duck.execute(
+        both + f"select v from (select {q} v from t except all select {q} from m) order by 1 nulls last limit 10001").fetchall()]
+    if not mine or len(mine) != len(theirs) or len(mine) > 10000:
+        return False
+    if [v is None for v in mine] != [v is None for v in theirs]:
+        return False
+    shifts = [b - a for a, b in zip(mine, theirs) if a is not None]
+    if not shifts or max(shifts) - min(shifts) > timedelta(milliseconds=2):
+        return False
+    return lo <= frozen + min(shifts) <= hi
 
 
 def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datetime, days: int,
@@ -749,6 +782,7 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
 
     found: list[Difference] = []
     rows: list[Parity] = []
+    first_began = None  # when the first Snowflake build of the run began
     # both engines run as the same role: the one Snowflake's session has (masking policies show it what they show it)
     (role,) = conn.cursor().execute("select current_role()").fetchone()
     for i in range(days + 1):
@@ -766,7 +800,7 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
         if i == 0:
             with _environment(remote_env):
                 _databases_built_in(conn, remote, remote_schema, extra)
-            _existing_on_snowflake(conn, wh, renamed, log)
+            _existing_on_snowflake(conn, wh, renamed, log, local)
         os.environ["FAUXFLAKE_TESTS_DO_NOT_BLOCK"] = "1"  # (a failing test keeps nothing else from being built and compared)
         try:
             # the same schema name on both sides: some models embed their own relation names
@@ -787,7 +821,8 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
         from . import emulator
 
         ids = (_invocation(local), _invocation(remote))
-        clock = (emulator.FROZEN_NOW, began, ended, {"local": built_here, "ids": ids}) if emulator.FROZEN_NOW else None
+        first_began = first_began or began
+        clock = (emulator.FROZEN_NOW, began, ended, {"local": built_here, "ids": ids, "since": first_began}) if emulator.FROZEN_NOW else None
         stopped, rows = None, []
         try:
             rows = compare(conn, wh.emu, local, only=built, clock=clock)
