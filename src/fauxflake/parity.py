@@ -446,17 +446,36 @@ def _unavailable(e: Exception) -> bool:
     return getattr(e, "errno", None) == 90073 or "resource monitor" in str(e)
 
 
-def differences(local: dict, remote: dict, rows: list[Parity]) -> list[Difference]:
+def differences(local: dict, remote: dict, rows: list[Parity], depends: dict | None = None) -> list[Difference]:
     """Where the two engines did not do the same: a node that failed on one side only, a test whose result or
-    failure count differs, a model whose rows differ."""
+    failure count differs, a model whose rows differ. `depends`: each node's parents (the manifest's), so that a node
+    skipped on one side only for a parent whose failure the engines do not decide is not counted as a difference."""
     out = []
+    broke = lambda o: o[0] in ("error", "runtime error")  # noqa: E731
+    tagged = lambda o: broke(o) and "for parameter 'QUERY_TAG'" in o[1]  # noqa: E731
+    undecided = {uid for uid in set(local) & set(remote)
+                 if (tagged(local[uid]) and not broke(remote[uid])) or (tagged(remote[uid]) and not broke(local[uid]))}
+
+    def after_undecided(uid: str, seen: set[str]) -> str | None:
+        for parent in (depends or {}).get(uid, ()):
+            if parent in undecided:
+                return parent
+            if parent not in seen:
+                seen.add(parent)
+                if (hit := after_undecided(parent, seen)) is not None:
+                    return hit
+        return None
+
     for uid in sorted(set(local) | set(remote)):
         mine, theirs = local.get(uid), remote.get(uid)
         if mine is None or theirs is None:
             continue
-        broke = lambda o: o[0] in ("error", "runtime error")  # noqa: E731
-        tagged = lambda o: broke(o) and "for parameter 'QUERY_TAG'" in o[1]  # noqa: E731
-        if (tagged(mine) and not broke(theirs)) or (tagged(theirs) and not broke(mine)):
+        skipped_once = (mine[0] == "skipped") != (theirs[0] == "skipped")
+        if uid not in undecided and skipped_once and (parent := after_undecided(uid, set())) is not None:
+            out.append(Difference(uid, "undetermined", f"skipped on one side only, after {parent.split('.')[-1]} failed there on a "
+                                                       "query tag that grew past 2000 characters (the order dbt's threads run in)"))
+            continue
+        if uid in undecided:
             # a query tag that takes in the session's last one grows with each node a dbt thread runs: which node passes
             # Snowflake's 2000 characters first goes by the order the threads take them in, not by the engine
             out.append(Difference(uid, "undetermined", "fails on one side only on a query tag that grew past 2000 characters: "
@@ -864,7 +883,12 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
                                  f"Snowflake stopped answering after {len(rows)} model(s) were compared: {e}; the models "
                                  "not read are not compared, and the differences found are not all checked for ties")
             log(f"{now:%Y-%m-%d}  {stopped.detail}")
-        found = differences(mine, theirs, rows) + ([stopped] if stopped else [])
+        try:
+            graph = json.loads((local.target_path / "manifest.json").read_text())["nodes"]
+            depends = {uid: n.get("depends_on", {}).get("nodes", []) for uid, n in graph.items()}
+        except (OSError, ValueError, KeyError):
+            depends = {}
+        found = differences(mine, theirs, rows, depends) + ([stopped] if stopped else [])
         if stopped:
             break
     return rows, found

@@ -567,3 +567,14 @@ def test_text_of_an_alias_inside_macros_binds_at_once(emu):
     cur.execute(f"select e:outcome:status:Failure as failure, {reads} from outcomes")
     assert cur.fetchone()[0] is not None
     assert time.monotonic() - started < 10
+
+
+def test_flatten_numbers_each_element_by_its_place_over_a_large_table(emu):
+    emu.ensure_database("ANALYTICS", "CI")
+    cur = emu._fs.connect(database="ANALYTICS", schema="CI").cursor()
+    # enough rows that DuckDB runs in parallel: row_number() OVER () gave some elements another's INDEX
+    cur.execute("create or replace table big as select seq4() id, array_construct(seq4() * 10, seq4() * 10 + 1, seq4() * 10 + 2) arr "
+                "from table(generator(rowcount => 300000))")
+    cur.execute("select count(*), count_if(value::int <> id * 10 + index), count_if(path <> '[' || index || ']') "
+                "from big, lateral flatten(input => arr)")
+    assert cur.fetchone() == (900000, 0, 0)

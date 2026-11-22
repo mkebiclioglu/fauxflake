@@ -652,11 +652,26 @@ def _patch_fakesnow() -> None:
     import fakesnow.macros as _macros
 
     _macros.FS_TO_TIMESTAMP = _Template(_TO_TIMESTAMP)  # (fakesnow's casts a number to BIGINT first: 0.023 s became 0)
-    # FLATTEN skips an array's `undefined` elements and keeps the others' indexes: the rows are numbered, then left out
-    head, _, body = _macros.FS_FLATTEN.template.partition(" AS TABLE")
-    if "_fx_undefined" not in body:
-        _macros.FS_FLATTEN = _Template(f"{head} AS TABLE\n    SELECT * FROM ({body}) AS _fx_undefined\n"
-                                       f"    WHERE VALUE IS DISTINCT FROM {semantics._UNDEFINED_JSON}")
+    # FLATTEN numbers each element by its own place in the list (the lambda's second argument): fakesnow's
+    # row_number() OVER () keeps no order, and over a large table run in parallel an element took another's INDEX
+    # (Flipside's receipt ids `shard-INDEX` paired with other receipts). An array's `undefined` elements are skipped,
+    # and the others keep their indexes: the rows are numbered, then left out
+    head = _macros.FS_FLATTEN.template.partition(" AS TABLE")[0]
+    if "_fx_undefined" not in _macros.FS_FLATTEN.template:
+        _macros.FS_FLATTEN = _Template(f"""{head} AS TABLE
+    SELECT * FROM (
+        SELECT hash(TO_JSON(input))::UBIGINT AS SEQ, e.k AS KEY,
+               COALESCE(e.k, '[' || (e.i - 1) || ']') AS PATH,
+               CASE WHEN e.k IS NOT NULL THEN NULL ELSE (e.i - 1)::BIGINT END AS INDEX,
+               e.v AS VALUE, TO_JSON(input) AS THIS
+        FROM (SELECT UNNEST(CASE WHEN json_type(TO_JSON(input)) = 'OBJECT'
+                 THEN list_transform(json_keys(TO_JSON(input)),
+                                     lambda x, i: struct_pack(k := x, v := CAST(TO_JSON(input) -> x AS JSON), i := i))
+                 ELSE list_transform(CAST(TO_JSON(input) AS JSON[]), lambda x, i: struct_pack(k := NULL::VARCHAR, v := x, i := i))
+                 END, recursive := true)) AS e(k, v, i)
+        ORDER BY e.i
+    ) AS _fx_undefined
+    WHERE VALUE IS DISTINCT FROM {semantics._UNDEFINED_JSON}""")
     # generated SQL can nest thousands deep (a pivot over many values, a long OR chain): give the
     # parser and the rewrites room, in the threads started from here on
     sys.setrecursionlimit(max(sys.getrecursionlimit(), 50_000))

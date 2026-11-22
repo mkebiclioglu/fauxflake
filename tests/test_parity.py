@@ -243,3 +243,13 @@ def test_times_written_from_the_clock_are_the_clock_on_both_engines():
     assert _clock_relative(duck, "", '"c"', two_days)
     duck.execute("update t set c = c + interval 5 minute where c > '2026-11-22 04:05'")  # (fits no day's build)
     assert not _clock_relative(duck, "", '"c"', two_days)
+
+
+def test_a_node_skipped_after_a_query_tag_failure_on_one_side_is_not_a_difference():
+    from fauxflake.parity import differences
+
+    tag = "000904: invalid value [x] for parameter 'QUERY_TAG'"
+    local = {"model.p.a": ("error", tag, None), "test.p.not_null_a": ("skipped", "", None), "test.p.other": ("pass", "", 0)}
+    remote = {"model.p.a": ("success", "", None), "test.p.not_null_a": ("pass", "", 0), "test.p.other": ("fail", "", 3)}
+    found = {d.node: d.kind for d in differences(local, remote, [], {"test.p.not_null_a": ["model.p.a"], "test.p.other": ["model.p.b"]})}
+    assert found == {"model.p.a": "undetermined", "test.p.not_null_a": "undetermined", "test.p.other": "test_result"}
