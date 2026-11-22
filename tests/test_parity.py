@@ -253,3 +253,13 @@ def test_a_node_skipped_after_a_query_tag_failure_on_one_side_is_not_a_differenc
     remote = {"model.p.a": ("success", "", None), "test.p.not_null_a": ("pass", "", 0), "test.p.other": ("fail", "", 3)}
     found = {d.node: d.kind for d in differences(local, remote, [], {"test.p.not_null_a": ["model.p.a"], "test.p.other": ["model.p.b"]})}
     assert found == {"model.p.a": "undetermined", "test.p.not_null_a": "undetermined", "test.p.other": "test_result"}
+
+
+def test_a_test_of_rows_the_data_does_not_determine_is_not_a_difference():
+    from fauxflake.parity import Parity, differences
+
+    local = {"test.p.is_empty_fct": ("warn", "", 9), "test.p.plain": ("pass", "", 0)}
+    remote = {"test.p.is_empty_fct": ("warn", "", 11), "test.p.plain": ("fail", "", 2)}
+    rows = [Parity("fct", 9, 11, 0, 2, "", undetermined="ties in a window")]
+    found = {d.node: d.kind for d in differences(local, remote, rows, {"test.p.is_empty_fct": ["model.p.fct"], "test.p.plain": ["model.p.other"]})}
+    assert found == {"test.p.is_empty_fct": "undetermined", "test.p.plain": "test_result", "fct": "undetermined"}

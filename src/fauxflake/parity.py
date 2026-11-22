@@ -456,13 +456,15 @@ def differences(local: dict, remote: dict, rows: list[Parity], depends: dict | N
     undecided = {uid for uid in set(local) & set(remote)
                  if (tagged(local[uid]) and not broke(remote[uid])) or (tagged(remote[uid]) and not broke(local[uid]))}
 
-    def after_undecided(uid: str, seen: set[str]) -> str | None:
+    tied = {r.model for r in rows if not r.ok and r.undetermined}  # models whose rows the data does not determine
+
+    def after_undecided(uid: str, seen: set[str], ties: bool = False) -> str | None:
         for parent in (depends or {}).get(uid, ()):
-            if parent in undecided:
+            if parent in undecided or (ties and parent.startswith("model.") and parent.split(".")[-1] in tied):
                 return parent
             if parent not in seen:
                 seen.add(parent)
-                if (hit := after_undecided(parent, seen)) is not None:
+                if (hit := after_undecided(parent, seen, ties)) is not None:
                     return hit
         return None
 
@@ -485,7 +487,12 @@ def differences(local: dict, remote: dict, rows: list[Parity], depends: dict | N
         elif broke(theirs) and not broke(mine):
             out.append(Difference(uid, "snowflake_only_error", theirs[1]))
         elif uid.startswith("test.") and not broke(mine) and (mine[0], mine[2]) != (theirs[0], theirs[2]):
-            out.append(Difference(uid, "test_result", f"emulator {mine[0]} ({mine[2]}), snowflake {theirs[0]} ({theirs[2]})"))
+            if (parent := after_undecided(uid, set(), ties=True)) is not None and parent.split(".")[-1] in tied:
+                # (a test of rows the data does not determine: its count goes with them)
+                out.append(Difference(uid, "undetermined", f"tests {parent.split('.')[-1]}, whose rows the data does not determine "
+                                                           f"(emulator {mine[0]} ({mine[2]}), snowflake {theirs[0]} ({theirs[2]}))"))
+            else:
+                out.append(Difference(uid, "test_result", f"emulator {mine[0]} ({mine[2]}), snowflake {theirs[0]} ({theirs[2]})"))
     for r in rows:
         if not r.ok and r.undetermined:
             out.append(Difference(r.model, "undetermined", r.undetermined))
