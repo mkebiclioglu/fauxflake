@@ -553,3 +553,17 @@ def test_a_hash_key_of_text_functions_wraps_each_column_once_and_binds_at_once()
         # the same key as Snowflake makes it: MD5 of the text of each value
         assert cur.execute("select md5('\"0\"||\"x0\"||\"1.5\"||\"' || current_date()::varchar || '\"||\"true\"||^^')").fetchone()[0] \
             == cur.execute(f"select lower(hk) from ({sql.replace('from t', 'from t where a = 0')})").fetchone()[0]
+
+
+def test_text_of_an_alias_inside_macros_binds_at_once(emu):
+    import time
+
+    emu.ensure_database("ANALYTICS", "CI")
+    cur = emu._fs.connect(database="ANALYTICS", schema="CI").cursor()
+    cur.execute("""create or replace table outcomes as select parse_json('{"outcome": {"status": {"Failure": {"ActionError": {"kind": {"x": 1}}}}}}') e""")
+    # Flipside's receipts: an alias of a document, read through OBJECT_KEYS and GET many times, each made text
+    reads = ", ".join(f"to_varchar(get(failure, object_keys(failure)[{i % 2}]::string):kind) as k{i}" for i in range(16))
+    started = time.monotonic()
+    cur.execute(f"select e:outcome:status:Failure as failure, {reads} from outcomes")
+    assert cur.fetchone()[0] is not None
+    assert time.monotonic() - started < 10

@@ -719,6 +719,24 @@ MACROS = [
           else try_cast(x as boolean) = b end""",
 ]
 
+
+def _once(statement: str) -> str:
+    """`create macro f(a, b) as BODY` with each argument read once: BODY sees them through lambdas of the same names.
+    DuckDB writes a macro's argument out at each mention, so _sf_text (18 mentions) around _sf_element around
+    _sf_object_keys of an alias multiplied into a statement DuckDB took minutes and gigabytes to bind (Flipside's
+    FAILURE_MESSAGE, datavault4dbt's hash keys). The lambda costs a little per row; the binding is linear."""
+    m = re.match(r"(?s)(create or replace macro \S+?)\(([^()]*)\) as (.*)$", statement)
+    if m is None or ", (" in m.group(3)[:0]:
+        return statement
+    body = m.group(3)
+    for arg in reversed([a.strip() for a in m.group(2).split(",")]):
+        body = f"list_extract(list_transform([{arg}], lambda {arg}: {body}), 1)"
+    return f"{m.group(1)}({m.group(2)}) as {body}"
+
+
+_READ_ONCE = ("_sf_text", "_sf_element", "_sf_object_keys", "_sf_typeof", "_sf_jv")
+MACROS = [_once(m) if re.match(r"create or replace macro \S*\.(" + "|".join(_READ_ONCE) + r")\(", m) else m for m in MACROS]
+
 _RENAMED = {  # Snowflake function -> macro, same arguments
     "width_bucket": "_sf_width_bucket",
     "jarowinkler_similarity": "_sf_jarowinkler", "object_insert": "_sf_object_insert",
@@ -3604,10 +3622,23 @@ def refused_conversions(transformed: exp.Expression, conn) -> tuple[int, str] | 
         # (the copy's nodes are found again by their place in the same walk; the deepest are guarded first, so
         # that a conversion inside another is guarded inside the other's guard)
         pairs = list(zip(body.walk(), copy.walk()))
-        for original, copied in reversed(pairs):
+        for n_guard, (original, copied) in enumerate(reversed(pairs)):
             if id(original) in marks:
                 arg = argument(copied)[0]
-                replaced = exp.Case(ifs=[exp.If(this=exp.Anonymous(this=guard_of(copied), expressions=[arg.copy()]), true=copied.copy())])
+                if any(isinstance(x, (exp.AggFunc, exp.Window, exp.Subquery)) for x in arg.walk()):
+                    replaced = exp.Case(ifs=[exp.If(this=exp.Anonymous(this=guard_of(copied), expressions=[arg.copy()]),
+                                                    true=copied.copy())])
+                else:
+                    # the argument once, through a lambda: guarded conversions inside guarded conversions wrote each
+                    # argument out twice per level, and a deep one took DuckDB minutes and gigabytes to bind
+                    ident = exp.to_identifier(f"__fx_g{n_guard}")
+                    converted = copied.copy()
+                    argument(converted)[0].replace(exp.column(ident.name))
+                    case = exp.Case(ifs=[exp.If(this=exp.Anonymous(this=guard_of(copied), expressions=[exp.column(ident.name)]),
+                                                true=converted)])
+                    replaced = exp.Anonymous(this="list_extract", expressions=[exp.Transform(
+                        this=exp.Array(expressions=[arg.copy()]), expression=exp.Lambda(this=case, expressions=[ident], colon=True)),
+                        exp.Literal.number(1)])
                 if copied is copy:
                     copy = replaced
                 else:
@@ -3719,15 +3750,40 @@ def _kinds_past_aliases(select: exp.Select, calls: list, conn) -> tuple[list, li
     flat = [a for args in kept for a in args]
     if not flat:
         return [], []
-    probe = exp.Select(expressions=[e.copy() for e in needed.values()] + [exp.alias_(a.copy(), f"_k{i}") for i, a in enumerate(flat)])
-    probe.set("from_", select.args["from_"].copy())
-    if select.args.get("joins"):
-        probe.set("joins", [j.copy() for j in select.args["joins"]])
-    try:
-        rows = conn.execute("describe " + _cte_prefix(select) + probe.sql(dialect="duckdb")).fetchall()
-    except Exception:  # noqa: BLE001 - binds only in its place: left as it is
+
+    def described(expressions: list[exp.Expression]) -> list[str] | None:
+        probe = exp.Select(expressions=expressions)
+        probe.set("from_", select.args["from_"].copy())
+        if select.args.get("joins"):
+            probe.set("joins", [j.copy() for j in select.args["joins"]])
+        try:
+            return [str(row[1]).upper() for row in conn.execute("describe " + _cte_prefix(select) + probe.sql(dialect="duckdb")).fetchall()]
+        except Exception:  # noqa: BLE001 - binds only in its place: left as it is
+            return None
+
+    # each alias's kind is asked once, and the arguments read a NULL of that kind in its place: an argument that names
+    # an alias many times (FAILURE_MESSAGE, itself a long expression) had DuckDB write the alias out at every mention,
+    # and took minutes to bind
+    alias_kinds = described([e.copy() for e in needed.values()]) if needed else []
+    if alias_kinds is None:
         return [], []
-    return kept, [str(row[1]).upper() for row in rows][len(needed):]
+    typed = dict(zip(needed, alias_kinds))
+
+    def unaliased(a: exp.Expression) -> exp.Expression:
+        a = a.copy()
+        for c in list(a.find_all(exp.Column)):
+            if not c.table and c.name.upper() in typed and typed[c.name.upper()] not in ("NULL", '"NULL"'):
+                c.replace(exp.cast(exp.Null(), exp.DataType.build(typed[c.name.upper()], dialect="duckdb")))
+        return a
+
+    try:
+        args = [exp.alias_(unaliased(a), f"_k{i}") for i, a in enumerate(flat)]
+    except Exception:  # noqa: BLE001 - a kind sqlglot cannot write back: ask with the aliases as they are
+        args = [*(e.copy() for e in needed.values()), *(exp.alias_(a.copy(), f"_k{i}") for i, a in enumerate(flat))]
+        kinds = described(args)
+        return (kept, kinds[len(needed):]) if kinds is not None else ([], [])
+    kinds = described(args)
+    return (kept, kinds) if kinds is not None else ([], [])
 
 
 def mixed_kinds(transformed: exp.Expression, conn) -> exp.Expression:  # noqa: ANN001
