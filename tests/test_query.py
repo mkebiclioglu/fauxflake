@@ -192,6 +192,14 @@ def test_a_quoted_name_is_a_column_only_in_the_case_it_is_written():
         with pytest.raises(ProgrammingError, match="invalid identifier 'START'"):
             cur.execute("select start from u")
         assert cur.execute('select "start" from u').fetchall() == [("a",)]
+        # a name of a subquery under NOT IN (DuckDB's <> ALL) or IN is that subquery's; a UNION's ORDER BY reads its columns
+        cur.execute('create table k (account_id varchar, "Batch" varchar)')
+        cur.execute("insert into k values ('b', 'x')")
+        assert cur.execute('select metric_name from t where metric_name not in (select account_id from k where "Batch" = \'x\') '
+                           'and metric_name not in (select account_id from k)').fetchall() == [("a",)]
+        assert cur.execute('with p as (select metric_name as period, "Mixed" from t group by period, "Mixed" union all '
+                           'select account_id as period, 2 from k group by period order by period) select period from p').fetchall() \
+            == [("a",), ("b",)]
 
 
 def test_a_conversion_of_a_column_without_nulls_is_never_null_and_is_not_made():

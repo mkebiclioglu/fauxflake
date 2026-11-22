@@ -3133,8 +3133,12 @@ def misnamed_column(transformed: exp.Expression, conn, probe: bool = True) -> st
         for ref in scope.columns:
             if not isinstance(ref.this, exp.Identifier) or ref.this.this.lower().startswith(("_fs", "_fx", "_sf")):
                 continue
+            if isinstance(scope.expression, exp.Select) and ref.find_ancestor(exp.Select) is not scope.expression:
+                continue  # (sqlglot gives a scope the names of a subquery under IN or ALL too: they are that subquery's)
             wanted = target(ref.this)
-            if ref.table:
+            if isinstance(scope.expression, exp.SetOperation):
+                places = [outputs(scope.expression)]  # (a UNION's ORDER BY reads the columns it gives)
+            elif ref.table:
                 places = [sources.get(ref.table.upper())] if ref.table.upper() in sources else [None]
             else:
                 # (an expression does not read its own alias: `"current"::number as "current"` reads a column)
@@ -3790,6 +3794,42 @@ def _kinds_past_aliases(select: exp.Select, calls: list, conn) -> tuple[list, li
         kinds = described([*(e.copy() for e in needed.values()), *(exp.alias_(a.copy(), f"_k{i}") for i, a in enumerate(flat))])
         return (kept, kinds[len(needed):]) if kinds is not None else ([], [])
     return kept, kinds[len(along):]
+
+
+_EXACT_KINDS = ("TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT", "DECIMAL")
+
+
+def rounded_divisions(transformed: exp.Expression, conn) -> exp.Expression:  # noqa: ANN001
+    """`round(195 / 4127 * 100, 2)`: NUMBER / NUMBER is a NUMBER of max(s, min(s + 6, 12)) decimals (0.047250), and
+    what follows is exact: 4.725000, rounded 4.73. `_sf_div` gives the same digits in a DOUBLE, where 4.725 is
+    4.72499999...: rounded 4.72. Under ROUND, TRUNC, CEIL and FLOOR, where that shows, a division of exact numbers
+    is made a DECIMAL of Snowflake's scale; the kinds of its operands are asked of DuckDB, a SELECT at a time."""
+    outer = (exp.Round, exp.Trunc, exp.Ceil, exp.Floor)
+    by_select: dict[int, tuple[exp.Select | None, list[exp.Anonymous]]] = {}
+    for call in transformed.find_all(exp.Anonymous):
+        if not _is(call, "_sf_div") or len(call.expressions) != 2 or call.find_ancestor(*outer) is None:
+            continue
+        select = call.find_ancestor(exp.Select)
+        if select is None or (select.args.get("from_") is None and any(a.find(exp.Column) for a in call.expressions)):
+            continue
+        by_select.setdefault(id(select), (select, []))[1].append(call)
+    for select, calls in by_select.values():
+        probe = exp.Select(expressions=[exp.alias_(a.copy(), f"_k{i}") for i, a in enumerate(a for c in calls for a in c.expressions)])
+        if select.args.get("from_") is not None:
+            probe.set("from_", select.args["from_"].copy())
+            if select.args.get("joins"):
+                probe.set("joins", [j.copy() for j in select.args["joins"]])
+        try:
+            kinds = [str(row[1]).upper() for row in conn.execute("describe " + _cte_prefix(select) + probe.sql(dialect="duckdb")).fetchall()]
+        except Exception:  # noqa: BLE001, S112 - an operand that reads an alias of its SELECT: left a DOUBLE
+            continue
+        for call, (left, right) in zip(calls, zip(kinds[::2], kinds[1::2])):
+            if not (left.startswith(_EXACT_KINDS) and right.startswith(_EXACT_KINDS)):
+                continue
+            m = re.match(r"DECIMAL\(\d+,\s*(\d+)\)", left)
+            given = int(m.group(1)) if m else 0
+            call.replace(exp.cast(call.copy(), f"DECIMAL(38, {max(given, min(given + 6, 12))})"))
+    return transformed
 
 
 def mixed_kinds(transformed: exp.Expression, conn) -> exp.Expression:  # noqa: ANN001
