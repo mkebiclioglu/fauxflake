@@ -187,3 +187,29 @@ def test_a_snowflake_that_stops_answering_stops_the_comparison_instead_of_making
             compare(Spent(), emu, Project())
     with pytest.raises(SnowflakeUnavailable):  # (not "no ties": that would call a difference an engine's)
         _ties(Spent(), "select row_number() over (partition by u order by d) from t")
+
+
+def test_a_database_named_in_sql_is_read_from_its_copy_on_snowflake():
+    from fauxflake.parity import renamed_sql
+
+    moved = {"SNOWFLAKE": "FAUXFLAKE_SNOWFLAKE"}
+    assert renamed_sql("select * from snowflake.account_usage.roles", moved) == "select * from FAUXFLAKE_SNOWFLAKE.account_usage.roles"
+    assert renamed_sql('select * from "SNOWFLAKE"."ACCOUNT_USAGE"."X"', moved) == 'select * from FAUXFLAKE_SNOWFLAKE."ACCOUNT_USAGE"."X"'
+    # strings, comments, two-part names, other databases' schemas and a quoted lower-case name stay as written
+    for kept in ["select 'snowflake.account_usage.roles'", "select 1 /* snowflake.a.b */", "select snowflake.x from t",
+                 "select * from my.snowflake.a", 'select * from "snowflake".a.b']:
+        assert renamed_sql(kept, moved) == kept
+
+
+def test_the_comparison_functions_outlive_the_cursor_that_first_read(emu):
+    import gc
+
+    from fauxflake.parity import _canonical_functions
+
+    for _ in range(3):  # (each day's comparison reads through a cursor of its own)
+        cur = emu.cursor()
+        _canonical_functions(emu.duck)
+        assert cur.execute("""select _fx_canon_u('[2, 1.0, {"b": 1, "a": 2}]')""").fetchone() == ('[1,2,{"a":2,"b":1}]',)
+        cur.close()
+        del cur
+        gc.collect()

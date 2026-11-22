@@ -1,7 +1,7 @@
 """What Snowflake itself provides: the columns of its system views and table functions.
 
-`snowflake_views.json` was recorded from a real account's SNOWFLAKE database (ORGANIZATION_USAGE,
-READER_ACCOUNT_USAGE, INFORMATION_SCHEMA and others). The table functions below are written out
+`snowflake_views.json` was recorded from a real account's SNOWFLAKE database (ACCOUNT_USAGE,
+ORGANIZATION_USAGE, READER_ACCOUNT_USAGE, INFORMATION_SCHEMA and others), from SNOWFLAKE.INFORMATION_SCHEMA.COLUMNS. The table functions below are written out
 by hand from the documentation; locally they return no rows, with the right columns.
 """
 

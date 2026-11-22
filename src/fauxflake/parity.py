@@ -176,8 +176,14 @@ def _canonical(text: str | None, unordered: bool = False) -> str | None:
         return text
 
 
+_CANON: dict[str, object] = {}  # the callables behind _fx_canon and _fx_canon_u, alive as long as DuckDB may call them
+
+
 def _canonical_functions(duck) -> None:  # noqa: ANN001
-    """`_fx_canon(text)` and `_fx_canon_u(text)` (arrays sorted too) in DuckDB, a batch of values at a time."""
+    """`_fx_canon(text)` and `_fx_canon_u(text)` (arrays sorted too) in DuckDB, a batch of values at a time. Registered on
+    the emulator's own connection (`duck`), which outlives the cursors that read: DuckDB keeps a function for the life
+    of the database, and one registered from a cursor calls freed memory once that cursor is gone (a TypeError from
+    some other function, or a crash, on the second day's comparison)."""
     import pyarrow as pa
 
     def made(unordered: bool):  # noqa: ANN202 - (DuckDB wants a function of exactly one argument)
@@ -186,7 +192,8 @@ def _canonical_functions(duck) -> None:  # noqa: ANN001
     for name, unordered in (("_fx_canon", False), ("_fx_canon_u", True)):
         if duck.execute("select count(*) from duckdb_functions() where function_name = ?", [name]).fetchall()[0][0]:
             continue
-        duck.create_function(name, made(unordered), ["VARCHAR"], "VARCHAR", type="arrow")
+        _CANON[name] = made(unordered)
+        duck.create_function(name, _CANON[name], ["VARCHAR"], "VARCHAR", type="arrow")
 
 
 def _through_policies(emu, duck, database: str, schema: str, name: str, mine: str) -> str:  # noqa: ANN001
@@ -215,7 +222,7 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
     """Each model on the emulator against the same model on Snowflake, row for row. Without
     `schema`, each model is read from the schema dbt built it in (the same on both sides)."""
     duck, out = emu.cursor(), []
-    _canonical_functions(duck)
+    _canonical_functions(emu.duck)
 
     def pair(kinds: dict[str, str], unordered: bool = False) -> str:  # (the two sides, as CTEs t and m)
         return (f"with t as (select {', '.join(_comparable(c, ty, 'theirs', unordered) for c, ty in kinds.items())} from _theirs), "
@@ -341,6 +348,27 @@ def _databases_built_in(conn, remote: DbtProject, schema: str, extra: list[str])
             conn.cursor().execute(f"create database if not exists {name}")
         except Exception:  # noqa: BLE001, S110 - a role that may not create databases: the build says so if one is missing
             pass
+
+
+def _existing_on_snowflake(conn, wh: Warehouse, renamed: dict | None, log=print) -> None:  # noqa: ANN001
+    """The spec's `existing:` relations, which the emulator starts with (empty), made on Snowflake too where they are
+    missing: both builds start from the same warehouse (a model that reads one by name finds it on both)."""
+    from .generate import existing_view
+
+    cur, made = conn.cursor(), 0
+    for name, rel in wh.spec.existing.items():
+        db, schema, table = name.split(".")
+        db = (renamed or {}).get(db, db)
+        try:
+            cur.execute(f"create schema if not exists {_ident(db)}.{_ident(schema)}")
+            cur.execute(existing_view(f"{db}.{schema}.{table}", rel.get("columns") or {}, table=rel.get("as") == "table"))
+            made += 1
+        except Exception as e:  # noqa: BLE001 - one Snowflake will not make is left to the build, as before
+            if getattr(e, "errno", None) in (1998, 2002):
+                continue  # (there already, as a table where the stand-in is a view or the other way round)
+            log(f"  could not make {name} on Snowflake ({str(e).splitlines()[0][:120]})")
+    if made:
+        log(f"  {made} relation(s) the project reads by name made on Snowflake where missing, as the emulator has them")
 
 
 def _invocation(project: DbtProject) -> str | None:
@@ -616,6 +644,15 @@ def remote_session(renamed: dict | None = None):
         return relation.replace_path(database=target) if target else relation
 
     RuntimeSourceResolver.resolve = moved
+    from snowflake.connector.cursor import SnowflakeCursor
+
+    execute = SnowflakeCursor.execute
+
+    def named_moved(self, command, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        # (a model that names `snowflake.account_usage.x` itself, not through source(): read from the copy too)
+        return execute(self, renamed_sql(command, renamed) if renamed and isinstance(command, str) else command, *args, **kwargs)
+
+    SnowflakeCursor.execute = named_moved
 
     def in_utc(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
         kwargs["session_parameters"] = {**(kwargs.get("session_parameters") or {}), "TIMEZONE": "UTC"}
@@ -627,6 +664,21 @@ def remote_session(renamed: dict | None = None):
         yield
     finally:
         SnowflakeAdapter.pre_model_hook, snowflake.connector.connect, RuntimeSourceResolver.resolve = hook, connect, resolve
+        SnowflakeCursor.execute = execute
+
+
+def renamed_sql(sql: str, renamed: dict) -> str:
+    """`sql` with three-part names in the databases of `renamed` pointed at their copies (`snowflake.account_usage.x`
+    -> `FAUXFLAKE_SNOWFLAKE.account_usage.x`); text inside string literals and comments is left as it is."""
+    names = "|".join(re.escape(k) for k in renamed)
+    part = r'(?:"[^"]+"|[A-Za-z_][\w$]*)'
+    pattern = re.compile(r'(?<![\w$."])(?:"(' + names + r')"|(' + names + r'))(?=\s*\.\s*' + part + r'\s*\.\s*' + part + ')', re.I)
+    pieces = re.split(r"('(?:[^'\\]|\\.|'')*'|--[^\n]*|/\*.*?\*/)", sql, flags=re.S)
+    for i in range(0, len(pieces), 2):
+        pieces[i] = pattern.sub(lambda m: renamed[(m.group(1) or m.group(2)).upper()]
+                                if (m.group(1) or m.group(2)).upper() in renamed and (m.group(2) or m.group(1) == m.group(1).upper())
+                                else m.group(0), pieces[i])
+    return "".join(pieces)
 
 
 def _instant(v):  # noqa: ANN001, ANN202
@@ -714,6 +766,7 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
         if i == 0:
             with _environment(remote_env):
                 _databases_built_in(conn, remote, remote_schema, extra)
+            _existing_on_snowflake(conn, wh, renamed, log)
         os.environ["FAUXFLAKE_TESTS_DO_NOT_BLOCK"] = "1"  # (a failing test keeps nothing else from being built and compared)
         try:
             # the same schema name on both sides: some models embed their own relation names
