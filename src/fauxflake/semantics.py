@@ -13,7 +13,7 @@ import re
 import sqlglot
 from sqlglot import exp
 
-from . import account, catalog, jsondoc, xmldoc
+from . import account, catalog, constraints, jsondoc, xmldoc
 
 _NS = "_fs_global.main."
 _SCALE = r"coalesce(try_cast(nullif(regexp_extract(typeof(a), ',(\d+)\)', 1), '') as integer), 0)"
@@ -351,6 +351,7 @@ MACROS = [
     f"create table if not exists {_NS}_fx_session as select 'SYSADMIN' as role",
     f"create table if not exists {_NS}_fx_secure_views (database_name varchar, schema_name varchar, view_name varchar)",
     *account.SETUP,  # warehouses, resource monitors, network policies and parameters (account.py)
+    *constraints.SETUP,  # primary, unique and foreign keys, recorded and never enforced (constraints.py)
     f"create or replace macro {_NS}_sf_current_role() as (select role from {_NS}_fx_session)",
     # GET_DDL: the statement DuckDB keeps for the object (DuckDB types, not Snowflake's).
     f"""create or replace macro {_NS}_sf_get_ddl(kind, name) as (
@@ -1632,6 +1633,8 @@ def _fix(node: exp.Expression) -> exp.Expression:
     if session:
         value = exp.Literal.string(session)  # as a projection it keeps the name Snowflake gives it
         return exp.alias_(value, node.sql(dialect="snowflake").upper(), quoted=True) if isinstance(node.parent, exp.Select) else value
+    if isinstance(node, exp.Anonymous) and node.name.upper() == "IS_DATABASE_ROLE_IN_SESSION" and node.expressions:
+        return exp.false()  # (no database roles here)
     if isinstance(node, exp.Anonymous) and node.name.upper() == "IS_ROLE_IN_SESSION" and node.expressions:
         return exp.EQ(this=exp.Upper(this=node.expressions[0]), expression=_fn("_sf_current_role"))
     if isinstance(node, exp.Anonymous) and node.name.upper() == "GET_DDL" and len(node.expressions) >= 2:

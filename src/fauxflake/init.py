@@ -3503,13 +3503,41 @@ def udf_stubs(missing: dict[str, set[int]]) -> dict[str, str]:
             for name, arities in missing.items()}
 
 
+def seeded_sources(project, manifest: dict, emu) -> set[str]:  # noqa: ANN001
+    """Sources a project's own `dbt seed` makes (a seed's post-hook that copies it to `source_<name>`): the relations, as
+    the spec names tables, that exist once the seeds ran with a hook. Only asked when a seed has a hook."""
+    seeds = [n for n in manifest["nodes"].values() if n["resource_type"] == "seed"]
+    if emu is None or not any((n.get("config") or {}).get("post-hook") for n in seeds):
+        return set()
+    project.invoke(["seed"], silent=True)
+    made = set()
+    for source in manifest["sources"].values():
+        names = [str(source.get(k) or "").strip('"') for k in ("database", "schema", "identifier")]
+        try:
+            found = emu.duck.execute("select 1 from duckdb_tables() where upper(database_name) = upper(?) and "
+                                     "upper(schema_name) = upper(?) and upper(table_name) = upper(?)", names).fetchone()
+        except Exception:  # noqa: BLE001 - not a name it can look up
+            found = None
+        if found:
+            made.add(".".join(n.upper() for n in names))
+    return made
+
+
 def write_spec(project, path: Path, database: str, emu=None, fit: bool = True, log=print) -> list[str]:  # noqa: ANN001
     """`project` is a DbtProject pointed at a running emulator. With `fit`, the first spec is then
     tried out: models are run and the project is built, and what the failures teach goes into the spec."""
     env = provide_env(project)
     manifest = project.compile()  # best effort: models that fail to compile are skipped for now
+    made = seeded_sources(project, manifest, emu)
     analysis = analyse(manifest, database)
     spec, notes = analysis.spec, analysis.notes
+    if made:
+        for name in made:
+            spec["tables"].pop(name, None)
+        notes[:] = [n for n in notes if not any(name in n for name in made)]  # (what was said of their generated data)
+        spec["dbt"]["first"] = ["seed"]
+        notes.append(f"`dbt seed` makes {len(made)} source(s) itself ({', '.join(sorted(made)[:5])}): none generated for them, "
+                     "and `dbt.first: [seed]` seeds before each build")
     stubs = udf_stubs(unknown_functions(manifest, emu)) if emu is not None else {}
     if stubs:
         spec["udfs"] = stubs

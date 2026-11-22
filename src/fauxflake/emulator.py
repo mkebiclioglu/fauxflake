@@ -28,7 +28,7 @@ from typing import Iterator
 import duckdb
 from sqlglot import exp
 
-from . import account, objects, semantics
+from . import account, constraints, objects, semantics
 
 # Statements the emulator cannot run as-is, rewritten before they are parsed.
 # Every entry is a known difference from Snowflake: keep the list short and
@@ -643,6 +643,34 @@ CREATE OR REPLACE MACRO ${catalog}._fs_to_timestamp(val, scale) AS (
 """
 
 
+def _patch_information_schema() -> None:
+    """INFORMATION_SCHEMA.TABLE_CONSTRAINTS, REFERENTIAL_CONSTRAINTS and TABLE_PRIVILEGES (constraints.py), and SHOW
+    COLUMNS as Snowflake prints it: a NOT NULL column's `null?` is NOT_NULL (measured), its type says nullable false, and
+    there is a `write_default` column."""
+    import fakesnow.transforms as _transforms
+    import sqlglot
+    from fakesnow.transforms import show as _show
+
+    upstream = _transforms.information_schema_fs
+
+    def redirected(expression):  # noqa: ANN001, ANN202
+        if isinstance(expression, exp.Table) and str(expression.db).upper() == "INFORMATION_SCHEMA":
+            body = constraints.views(expression.name, expression.catalog or None)
+            if body is not None:
+                alias = expression.args.get("alias") or exp.TableAlias(this=exp.to_identifier(expression.name.upper()))
+                return exp.Subquery(this=sqlglot.parse_one(body, read="duckdb"), alias=alias)
+        return upstream(expression)
+
+    _transforms.information_schema_fs = redirected
+    view = _show.SQL_CREATE_VIEW_SHOW_COLUMNS
+    if "write_default" not in view:
+        view = view.replace("""CASE WHEN is_nullable = 'YES' THEN 'true' ELSE 'false' END as "null?",""",
+                            """CASE WHEN is_nullable = 'YES' THEN 'true' ELSE 'NOT_NULL' END as "null?",""")
+        view = view.replace('"nullable":true', '"nullable":' + "' || CASE WHEN is_nullable = 'YES' THEN 'true' ELSE 'false' END || '")
+        view = view.replace('NULL as "schema_evolution_record"', 'NULL as "schema_evolution_record", NULL as "write_default"')
+        _show.SQL_CREATE_VIEW_SHOW_COLUMNS = view
+
+
 def _patch_fakesnow() -> None:
     global _patched
     if _patched:
@@ -651,6 +679,7 @@ def _patch_fakesnow() -> None:
 
     import fakesnow.macros as _macros
 
+    _patch_information_schema()
     _macros.FS_TO_TIMESTAMP = _Template(_TO_TIMESTAMP)  # (fakesnow's casts a number to BIGINT first: 0.023 s became 0)
     # FLATTEN numbers each element by its own place in the list (the lambda's second argument): fakesnow's
     # row_number() OVER () keeps no order, and over a large table run in parallel an element took another's INDEX
@@ -714,7 +743,8 @@ def _patch_fakesnow() -> None:
             handled = _transaction(self, command, original)
             if handled is not None:
                 return handled
-            handled = account.intercept(self, command, original) or objects.intercept(self, command, original)
+            handled = account.intercept(self, command, original) or constraints.intercept(self, command, original) \
+                or objects.intercept(self, command, original)
             if handled is not None:  # (warehouses, monitors, parameters; functions, procedures, streams, tasks, policies)
                 objects.remember(self)
                 return handled

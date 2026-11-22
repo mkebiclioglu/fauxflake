@@ -279,6 +279,7 @@ production weekly and opens a pull request with what moved.
 | **Transactions** | `BEGIN`, `COMMIT`, `ROLLBACK`: DML and `MERGE` roll back, DDL commits the open transaction, and a statement that fails leaves it open |
 | **Tags** | `CREATE TAG` with allowed values, `SET TAG` and `UNSET TAG` on objects and columns, `SHOW TAGS`, `TAG_REFERENCES`, `TAG_REFERENCES_ALL_COLUMNS` and `SYSTEM$GET_TAG`, with inheritance from schema and database |
 | **The account** | `CREATE`, `ALTER` and `DROP` of warehouses, resource monitors, network policies and roles; a `GRANT` to a role the account lacks fails once its roles are described (`init` lists the ones the project grants to); `ALTER ACCOUNT SET`; `SHOW PARAMETERS` at every scope with Snowflake's defaults; every account-level `SHOW` with the columns a real account returns, listing what the spec's `account:` names and what the project created |
+| **Constraints** | `PRIMARY KEY`, `UNIQUE` and `FOREIGN KEY`, inline or added by `ALTER TABLE`, with `RELY`/`NORELY`, kept and never enforced (as on Snowflake: only `NOT NULL` is); `MODIFY`/`RENAME`/`DROP CONSTRAINT`; `SHOW PRIMARY`/`UNIQUE`/`IMPORTED`/`EXPORTED KEYS`; `INFORMATION_SCHEMA.TABLE_CONSTRAINTS`, `REFERENTIAL_CONSTRAINTS` and `TABLE_PRIVILEGES`; Snowflake's errors for each, as measured. Held for the run: a kept warehouse opened again has none |
 | **Accepted, with nothing to act on** | grants, comments, clustering keys, session settings |
 
 When the emulator does not know a statement it fails at once with a message that starts with
@@ -339,7 +340,7 @@ distributions with measurements from production, reading aggregates only.
 | `udfs` | stand-ins, in DuckDB SQL, for functions that exist only in your account |
 | `locations` | cloud storage prefixes that `COPY INTO` should read from a local directory instead |
 | `account` | what the account holds, as `SHOW` lists it: `warehouses`, `resource_monitors`, `network_policies`, `users`, `roles` and other kinds, each a list of objects in `CREATE`'s properties or `SHOW`'s column names (`{name: transforming, warehouse_size: medium, auto_suspend: 60}`), and `parameters` set on the account. A fresh account has only the session's warehouse, `LOCAL`. `parity` reads Snowflake's own instead |
-| `dbt` | `database`, `target` (the name `target.name` sees), `role`, `env` (placeholders for environment variables), `expected_failures` |
+| `dbt` | `database`, `target` (the name `target.name` sees), `role`, `env` (placeholders for environment variables), `expected_failures`, `first` (dbt commands run before each build: `[seed]` for a project whose seeds' hooks make its sources; `init` finds those) |
 
 How the data is made: the whole history is a deterministic function of
 `(seed, table, column, row number)`, and the warehouse at simulated time `T` is the rows with

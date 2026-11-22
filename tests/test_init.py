@@ -1503,3 +1503,26 @@ def test_a_placeholder_number_lined_up_with_a_reference_in_a_union_holds_the_key
               "A.S.BEFORE": {"columns": {"ACCOUNT_ID": {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000]}}}}
     _share_union_values(tables, [{("A.S.NOW", "ACCOUNT_ID"), ("A.S.BEFORE", "ACCOUNT_ID")}])
     assert tables["A.S.BEFORE"]["columns"]["ACCOUNT_ID"] == ref
+
+
+def test_dbt_first_runs_its_commands_before_each_build(tmp_path, monkeypatch):
+    """`dbt: {first: [seed]}`: a project whose `dbt seed` makes its own sources (a seed's post-hook) is seeded before
+    each build, on either engine."""
+    import dbt.cli.main
+
+    from fauxflake.dbt import DbtProject
+
+    (tmp_path / "dbt_project.yml").write_text("name: p\nprofile: p\nversion: '1'\nconfig-version: 2\n")
+    ran = []
+
+    class Runner:
+        def invoke(self, args):  # noqa: ANN001, ANN201
+            ran.append(next(a for a in args if not a.startswith("-") and a not in ("none",)))
+            return type("R", (), {"success": True, "exception": None})()
+
+    monkeypatch.setattr(dbt.cli.main, "dbtRunner", Runner)
+    monkeypatch.setenv("FAUXFLAKE_FIRST", "seed")
+    project = DbtProject(tmp_path, {"type": "snowflake", "host": "example"})
+    assert project.invoke(["build"]) and ran == ["seed", "build"]
+    ran.clear()
+    assert project.invoke(["test"]) and ran == ["test"]

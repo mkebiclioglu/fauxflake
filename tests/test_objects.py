@@ -859,3 +859,60 @@ def test_comments_after_a_long_statement_are_stripped_in_linear_time(run):
     run(sql)
     assert time.monotonic() - started < 5
     assert without_trailing_comments("show warehouses like 'a--b' -- note\n/* c */;") == "show warehouses like 'a--b'"
+
+
+def test_constraints_are_kept_and_shown_as_snowflake_keeps_them_and_never_enforced(run):
+    """Measured on Snowflake: primary, unique and foreign keys are recorded, not enforced; RELY is kept; a key added by
+    ALTER leaves its columns nullable, an inline one makes them NOT NULL; replacing the table drops them."""
+    run("create or replace table p (id int, k int, j int)")
+    run("create or replace table c (pid int, pk int)")
+    run("insert into p values (1, 1, 1), (1, 2, 2), (null, 3, 3)")
+    run("alter table p add constraint P_ID_PK primary key (id)")
+    run("alter table p add constraint P_K_UK unique (k) rely")
+    run("alter table p add unique (j) norely")
+    run("alter table c add constraint C_PID_FK foreign key (pid) references p (id) norely")
+    run("insert into p values (1, 1, 1)")  # (a duplicate of the key: Snowflake takes it)
+    keys = run("show primary keys in table p")
+    assert [(r[3], r[4], r[5], r[6], r[7]) for r in keys] == [("P", "ID", 1, "P_ID_PK", "false")]
+    unique = run("show unique keys in table p")
+    assert [(r[4], r[6][:15] if r[6].startswith("SYS_") else r[6], r[7]) for r in unique] == \
+        [("J", "SYS_CONSTRAINT_", "false"), ("K", "P_K_UK", "true")]
+    fk = run("show imported keys in table c")
+    assert [(r[3], r[4], r[7], r[8], r[12], r[13], r[14]) for r in fk] == [("P", "ID", "C", "PID", "C_PID_FK", "P_ID_PK", "NOT DEFERRABLE")]
+    assert run("show exported keys in table p") == fk
+    run('alter table p modify constraint "P_K_UK" norely')
+    run("alter table p modify constraint P_ID_PK rely")
+    assert run("show primary keys in table p")[0][7] == "true"
+    with pytest.raises(Exception, match="(?s)001451.*primary key already exists for table 'P'"):
+        run("alter table p add constraint P2 primary key (k)")
+    with pytest.raises(Exception, match="(?s)001455.*same signature"):
+        run("alter table p add constraint P_K2_UK unique (k)")
+    with pytest.raises(Exception, match="(?s)001456.*primary or unique key does not exist"):
+        run("alter table c add constraint C_PK_FK foreign key (pid, pk) references p (j, k)")
+    with pytest.raises(Exception, match="(?s)002001.*Object 'NOPE' does not exist"):
+        run("alter table p modify constraint NOPE rely")
+    with pytest.raises(Exception, match="(?s)001450.*constraint 'NOPE' does not exist"):
+        run("alter table p drop constraint NOPE")
+    with pytest.raises(Exception, match="(?s)001471.*contains null values"):
+        run("alter table p modify column id set not null")
+    run("alter table p modify column k set not null, column j set not null")
+    nulls = {r[2]: r[4] for r in run("show columns in table p")}
+    assert nulls == {"ID": "true", "K": "NOT_NULL", "J": "NOT_NULL"}
+    tc = run("select constraint_name, constraint_type, rely from information_schema.table_constraints "
+             "where table_name = 'P' order by constraint_name")
+    assert [(n if not n.startswith("SYS_") else "SYS", t, r) for n, t, r in tc] == \
+        [("P_ID_PK", "PRIMARY KEY", "YES"), ("P_K_UK", "UNIQUE", "NO"), ("SYS", "UNIQUE", "NO")]
+    assert run("select constraint_name, unique_constraint_name, match_option from information_schema.referential_constraints") \
+        == [("C_PID_FK", "P_ID_PK", "FULL")]
+    assert ("P", "OWNERSHIP") in run("select table_name, privilege_type from information_schema.table_privileges")
+    run("alter table p drop primary key")  # (and the foreign key that points at it)
+    assert run("show primary keys in table p") == [] and run("show imported keys in table c") == []
+    # inline: a column's PRIMARY KEY makes it NOT NULL; the table replaced has none
+    run("create or replace table t2 (a int primary key, b int unique, c int references p (k), constraint T2_AB_UK unique (a, b) rely)")
+    assert [r[4] for r in run("show primary keys in table t2")] == ["A"]
+    assert {r[2]: r[4] for r in run("show columns in table t2")}["A"] == "NOT_NULL"
+    assert [(r[4], r[6]) for r in run("show unique keys in table t2") if not r[6].startswith("SYS_")] == [("A", "T2_AB_UK"), ("B", "T2_AB_UK")]
+    assert [(r[3], r[4]) for r in run("show imported keys in table t2")] == [("P", "K")]
+    run("insert into t2 values (1, 1, 1), (1, 1, 1)")
+    run("create or replace table t2 (a int)")
+    assert run("show primary keys in table t2") == []

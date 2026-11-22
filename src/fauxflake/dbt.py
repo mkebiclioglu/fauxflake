@@ -142,6 +142,9 @@ class DbtProject:
             self._create_databases()
         os.environ.setdefault("DBT_SEND_ANONYMOUS_USAGE_STATS", "false")
         args = list(args)
+        if args and args[0] == "build":
+            for first in filter(None, os.environ.get("FAUXFLAKE_FIRST", "").splitlines()):
+                self.invoke(first.split(), schema=schema, quiet=quiet, silent=silent)  # (dbt.first in the spec)
         if args and args[0] in ("build", "run", "test") and self._default_selector \
                 and not any(a in ("-s", "--select", "--selector", "-m", "--models") for a in args):
             # the project's default selector assumes a warehouse that already holds part of the project

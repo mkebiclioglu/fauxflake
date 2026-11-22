@@ -207,6 +207,8 @@ class Spec:
         objects.LOCATIONS = {str(k): str((Path(path).parent / str(v)).resolve()) for k, v in (raw.get("locations") or {}).items()}
         # tests that state facts about production data the generated data does not share
         os.environ["FAUXFLAKE_EXPECTED_FAILURES"] = " ".join(spec.dbt.get("expected_failures") or [])
+        # dbt commands run before each build: a project whose `dbt seed` makes its own sources (a seed's post-hook)
+        os.environ["FAUXFLAKE_FIRST"] = "\n".join(str(c) for c in spec.dbt.get("first") or [])
         if (raw.get("dbt") or {}).get("target"):
             os.environ.setdefault("FAUXFLAKE_TARGET", str(raw["dbt"]["target"]))  # for `target.name` checks
         return spec
