@@ -2770,7 +2770,9 @@ def analyse(manifest: dict, database: str) -> Analysis:
             if held and held.get("epoch"):
                 held["scale"] = digits  # to_timestamp(x, 6): microseconds since 1970
         for col, habit in catalog.habits(name, out).items():
-            if out[col].get("gen") in ("event_time", "time_offset", "updated_at") and not out[col].get("format"):
+            if "gen" not in habit:
+                out[col] = {**out[col], **habit}
+            elif out[col].get("gen") in ("event_time", "time_offset", "updated_at") and not out[col].get("format"):
                 out[col] = {**habit, **({"type": out[col]["type"]} if out[col].get("type") else {})}
         # author_id + author_username: the name belongs to the id, so it must not vary between rows
         for col, d in out.items():

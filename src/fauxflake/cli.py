@@ -299,7 +299,8 @@ def conformance(connection):
     from .emulator import serve
 
     if connection:
-        recorded = c.record(snowflake.connector.connect(connection_name=connection))
+        # in UTC, the emulator's (and parity's) zone: what a TIMESTAMP_LTZ prints depends on the session's
+        recorded = c.record(snowflake.connector.connect(connection_name=connection, session_parameters={"TIMEZONE": "UTC"}))
         click.echo(f"recorded {len(recorded)} cases from Snowflake")
     expected, passed, failed = c.golden(), 0, []
     with serve() as emu:

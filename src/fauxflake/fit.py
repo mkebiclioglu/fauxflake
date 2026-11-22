@@ -71,6 +71,20 @@ _HINTS = {"INT8": "BIGINT", "INT16": "BIGINT", "INT32": "BIGINT", "INT64": "BIGI
           "UINT16": "BIGINT", "UINT32": "BIGINT", "UINT64": "BIGINT", "HUGEINT": "BIGINT", "BIGINT": "BIGINT", "INTEGER": "BIGINT",
           "DOUBLE": "DOUBLE", "FLOAT": "DOUBLE", "DECIMAL": "DOUBLE", "BOOL": "BOOLEAN", "BOOLEAN": "BOOLEAN", "DATE": "DATE",
           "TIMESTAMP": "TIMESTAMP", "TIME": "TIMESTAMP", "VARIANT": "VARIANT", "ARRAY": "ARRAY", "OBJECT": "VARIANT"}
+def system_columns(fq: str, read: list[str]) -> dict[str, dict]:
+    """Generators for a relation nobody declared: a Snowflake system view (SNOWFLAKE.ACCOUNT_USAGE...) has its real
+    columns and types, and fills some as Snowflake does (see catalog.habits); any other is guessed from the names read."""
+    from . import catalog
+
+    known = catalog.view(fq, tuple(read))
+    columns = {"_LOADED_AT": {"gen": "loaded_at"},
+               **{c: guess(c, known.get(c)) for c in dict.fromkeys([*known, *read]) if c != "_LOADED_AT"}}
+    for col, habit in catalog.habits(fq, columns).items():
+        columns[col] = {**columns[col], **habit} if "gen" not in habit else \
+            {**habit, **({"type": columns[col]["type"]} if columns[col].get("type") else {})}
+    return columns
+
+
 _FREE = ("template", "pool")  # generators that only make up text: safe to retype
 
 
@@ -411,8 +425,7 @@ class Fitter:
                 continue
             usual = max((float((x.get("volume") or {}).get("rows_per_day", 0)) for x in self.tables.values()), default=0) or 100_000
             read = [c for c in self.columns_read(t, tb) if c != "_LOADED_AT"]
-            known = catalog.view(fq, tuple(read))
-            columns = {"_LOADED_AT": {"gen": "loaded_at"}, **{c: guess(c, known.get(c)) for c in dict.fromkeys([*known, *read])}}
+            columns = system_columns(fq, read)
             self.tables[fq] = {"volume": {"rows_per_day": int(usual), "weekly": [1] * 7},
                                "lateness": {"p": [0, 0.5, 0.99, 1], "seconds": [1, 30, 3600, 86400]}, "columns": columns}
             self.retyped.add(fq)
@@ -469,7 +482,7 @@ class Fitter:
                 usual = max((float((t.get("volume") or {}).get("rows_per_day", 0)) for t in self.tables.values()), default=0) or 100_000
                 self.tables[fq] = {"volume": {"rows_per_day": int(usual), "weekly": [1] * 7},
                                    "lateness": {"p": [0, 0.5, 0.99, 1], "seconds": [1, 30, 3600, 86400]},
-                                   "columns": {"_LOADED_AT": {"gen": "loaded_at"}, **{c: guess(c, None) for c in read if c != "_LOADED_AT"}}}
+                                   "columns": system_columns(fq, [c for c in read if c != "_LOADED_AT"])}
                 cols = ", ".join(f'"{c}" {duck_type(g)}' for c, g in self.tables[fq]["columns"].items())
                 self.emu.duck.execute(f"create table if not exists {quoted(fq)} ({cols})")
                 self.learned.append(f"{fq}: read by {node['name']} but not declared as a source; now generated.")

@@ -106,14 +106,20 @@ def view(name: str, columns: tuple[str, ...] = ()) -> dict[str, str | None]:
 def habits(name: str, columns) -> dict[str, dict]:  # noqa: ANN001
     """How Snowflake fills some columns of its own usage views, as generator settings: the metering
     views report one row per hour (START_TIME on the hour, END_TIME an hour later), which is what a
-    project joins its own hourly spine to."""
+    project joins its own hourly spine to; an object's DELETED_ON is empty while it exists (a setting
+    without `gen` adds to the column's generator)."""
     if name.partition(".")[0] != "SNOWFLAKE":
         return {}
     columns = set(columns)
+    found: dict[str, dict] = {}
     if {"START_TIME", "END_TIME"} <= columns and any(c.startswith("CREDITS_USED") for c in columns):
-        return {"START_TIME": {"gen": "event_time", "trunc": "hour"},
-                "END_TIME": {"gen": "time_offset", "p": [0, 1], "seconds": [3600, 3600], "trunc": "hour"}}
-    return {}
+        found = {"START_TIME": {"gen": "event_time", "trunc": "hour"},
+                 "END_TIME": {"gen": "time_offset", "p": [0, 1], "seconds": [3600, 3600], "trunc": "hour"}}
+    # an object view (USERS, ROLES, TABLES, GRANTS_TO_...) lists the dropped ones too, with when: most are still there
+    for col in ("DELETED_ON", "DELETED", "DROPPED_ON"):
+        if col in columns:
+            found[col] = {"null_rate": 0.9}
+    return found
 
 
 def table_function(name: str) -> dict[str, str] | None:

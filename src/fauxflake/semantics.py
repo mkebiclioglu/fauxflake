@@ -415,8 +415,16 @@ MACROS = [
           when typeof(x) in ('TIMESTAMP', 'TIMESTAMP_NS', 'TIMESTAMP_MS', 'TIMESTAMP_S')
             then strftime(try_cast(x::varchar as timestamp), '%Y-%m-%d %H:%M:%S.%g')
           when typeof(x) = 'TIMESTAMP WITH TIME ZONE'
-            then strftime(timezone('UTC', try_cast(x::varchar as timestamptz)), '%Y-%m-%d %H:%M:%S.%g') || ' +0000'
+            then strftime(timezone('UTC', try_cast(x::varchar as timestamptz)), '%Y-%m-%d %H:%M:%S.%g') || ' Z'
           else x::varchar end""",
+    # A value put in a VARIANT (an array's element, an object's value, x::variant): JSON, a timestamp as Snowflake writes it
+    # (milliseconds; an offset of zero is Z: the emulator's clock runs in UTC, as parity's Snowflake session does)
+    f"""create or replace macro {_NS}_sf_jv(x) as case
+          when typeof(x) in ('TIMESTAMP', 'TIMESTAMP_NS', 'TIMESTAMP_MS', 'TIMESTAMP_S')
+            then to_json(strftime(try_cast(x::varchar as timestamp), '%Y-%m-%d %H:%M:%S.%g'))
+          when typeof(x) = 'TIMESTAMP WITH TIME ZONE'
+            then to_json(strftime(timezone('UTC', try_cast(x::varchar as timestamptz)), '%Y-%m-%d %H:%M:%S.%g') || ' Z')
+          else to_json(x) end""",
     # Text of a division: NUMBER / NUMBER prints every decimal of its scale ('1.500000').
     f"""create or replace macro {_NS}_sf_fixed(v, s) as
           rtrim(left(v::decimal(38, 12)::varchar, length(v::decimal(38, 12)::varchar) - (12 - s)), '.')""",
@@ -922,6 +930,17 @@ def _known_text(node: exp.Expression) -> bool:
     return False
 
 
+def _jv(node: exp.Expression) -> exp.Expression:
+    """A value about to go into a VARIANT, as JSON Snowflake would write (timestamps: see _sf_jv). What is JSON
+    already, or a literal, goes as it is (and nested arrays do not repeat their elements once per level)."""
+    inner = node.unnest()
+    if isinstance(inner, (exp.Array, exp.Struct, exp.JSONObject, exp.ToVariant, exp.ParseJSON, exp.Null, exp.Literal, exp.Boolean,
+                          exp.ArrayAgg, exp.ObjectAgg, exp.JSONExtract, exp.Bracket)) or _is(inner, "_sf_jv") \
+            or (isinstance(inner, exp.Anonymous) and inner.name.lower() in ("to_json", "json_object", "parse_json")):
+        return node
+    return _fn("_sf_jv", node)
+
+
 def _text(node: exp.Expression) -> exp.Expression:
     """The value as Snowflake prints it. A division carries its scale into the text."""
     inner = node.unnest()
@@ -1163,6 +1182,11 @@ def _fix(node: exp.Expression) -> exp.Expression:
             value = value.args["timestamp"]
         if not (isinstance(value, exp.Cast) and value.to.is_type("timestamptz", "timestampltz")):
             value = exp.cast(value.copy(), "timestamptz")
+        zone = node.args.get("target_tz")
+        if isinstance(zone, exp.Literal) and zone.is_string and zone.name.upper() in ("UTC", "ETC/UTC", "GMT", "ETC/GMT", "Z", "ZULU", "UCT"):
+            # a TIMESTAMP_TZ at offset zero: the instant itself (its text ends in Z); in parentheses, so that dropping its
+            # zone gives the wall clock in UTC, not the one a literal was written in
+            return exp.paren(value, copy=False)
         node.set("timestamp", value)
     if isinstance(node, exp.ConvertTimezone) and node.args.get("source_tz") is not None and _zoned(node.args.get("timestamp")):
         # CONVERT_TIMEZONE(from, to, x) takes a timestamp without a zone: a TIMESTAMP_TZ is refused when the statement
@@ -1206,7 +1230,7 @@ def _fix(node: exp.Expression) -> exp.Expression:
         if whole and not isinstance(inner, (*_VARIANT_ACCESS, exp.Literal, exp.Null, exp.Boolean)):
             return _fn("_sf_int", inner)
         if to.is_type("variant") and not isinstance(inner, exp.Null):
-            return exp.ToVariant(this=inner)  # 'a'::variant is the string a, not JSON text to parse
+            return exp.ToVariant(this=_jv(inner))  # 'a'::variant is the string a, not JSON text to parse
         if to.is_type("map", "object") and not isinstance(inner, exp.Null):
             # a MAP or OBJECT is held as JSON, like every semi-structured value; a VARIANT that holds something else
             # than an object is an error, JSON null is NULL
@@ -1272,11 +1296,17 @@ def _fix(node: exp.Expression) -> exp.Expression:
             gone = [x for key in args[1:] for x in (key, exp.Null())]
             return plain_fn("json_merge_patch", target, plain_fn("json_object", *gone))
         if name == "OBJECT_INSERT":
-            return plain_fn("json_merge_patch", target, plain_fn("json_object", args[1], exp.ToVariant(this=args[2])))
+            return plain_fn("json_merge_patch", target, plain_fn("json_object", args[1], exp.ToVariant(this=_jv(args[2]))))
         keys = args[1] if len(args) == 2 and not (isinstance(args[1], exp.Literal) and args[1].is_string) else plain_fn("list_value", *args[1:])
         return _fn("_sf_object_pick", target, keys)
     if isinstance(node, exp.Struct) and not node.expressions:
         return exp.cast(exp.Literal.string("{}"), "json")
+    if isinstance(node, (exp.Struct, exp.JSONObject)):  # an object's values: JSON as Snowflake writes it
+        for pair in node.expressions:
+            if isinstance(pair, (exp.PropertyEQ, exp.JSONKeyValue)) and pair.expression is not None:
+                pair.set("expression", _jv(pair.expression))
+    if isinstance(node, exp.ToVariant) and not isinstance(node.this, exp.Null):
+        node.set("this", _jv(node.this))
     if isinstance(node, exp.Struct) and node.expressions and all(isinstance(e, exp.PropertyEQ) for e in node.expressions):
         pairs = [x for e in node.expressions for x in (exp.Literal.string(e.this.name), e.expression)]
         return exp.func("OBJECT_CONSTRUCT", *pairs, dialect="snowflake")
@@ -1291,6 +1321,11 @@ def _fix(node: exp.Expression) -> exp.Expression:
         return exp.Count(this=exp.Case(ifs=[exp.If(this=present, true=exp.Literal.number(1))]))
     if isinstance(node, exp.ToChar) and not node.args.get("format"):
         return _text(node.this)
+    if isinstance(node, exp.ArrayAgg) and node.this is not None and not isinstance(node.this, exp.Distinct) \
+            and not _is(node.this, "_sf_jv"):
+        # each element as JSON Snowflake writes it (a timestamp's text). Not ARRAY_AGG(DISTINCT x) ... WITHIN GROUP
+        # (ORDER BY x): DuckDB wants the same x in both
+        node.set("this", _jv(node.this))
     if isinstance(node, (exp.ArrayAgg, exp.ObjectAgg)) or (isinstance(node, exp.WithinGroup) and isinstance(node.this, exp.ArrayAgg)):
         if not isinstance(node.parent, (exp.Window, exp.WithinGroup)):
             empty = "{}" if isinstance(node, exp.ObjectAgg) else "[]"  # no rows give an empty value, not NULL
@@ -1320,7 +1355,7 @@ def _fix(node: exp.Expression) -> exp.Expression:
     if isinstance(node, exp.Array) and not isinstance(node.parent, exp.Anonymous):
         # an ARRAY is a VARIANT value wherever it appears: build it as JSON, element by element,
         # so arrays from different branches of a CASE or UNION have one type
-        node.set("expressions", [e if isinstance(e, exp.Null) else exp.ToVariant(this=e) for e in node.expressions])
+        node.set("expressions", [e if isinstance(e, exp.Null) else exp.ToVariant(this=_jv(e)) for e in node.expressions])
         return exp.Anonymous(this="to_json", expressions=[node])
     if isinstance(node, (exp.ArrayFilter, exp.Transform, exp.Reduce)):
         node.set("this", _fn("_sf_list", node.this))  # lambdas walk a list; the array itself is JSON
@@ -1502,6 +1537,8 @@ def _fix(node: exp.Expression) -> exp.Expression:
     if isinstance(node, (exp.TimeToStr, exp.StrToTime, exp.StrToDate)) and isinstance(node.args.get("format"), exp.Literal):
         fmt = node.args["format"]
         fmt.set("this", fmt.name.replace("Mon", "%b").replace("Dy", "%a"))
+        if isinstance(node, exp.TimeToStr):  # TZH, TZHTZM, TZH:TZM write an offset of zero as Z (the clock runs in UTC)
+            fmt.set("this", re.sub(r"%[:-]?z", "Z", fmt.name))
     if isinstance(node, exp.Cast) and not isinstance(node, exp.TryCast) and node.to.is_type("varchar", "text") \
             and not node.to.expressions and not (isinstance(node.this, (exp.JSONExtract, exp.Bracket)) and not _computed_index(node.this)) \
             and not (isinstance(node.this, exp.Literal) and node.this.is_string):
@@ -1614,7 +1651,7 @@ def _fix(node: exp.Expression) -> exp.Expression:
 
             model = node.args["format"].name.replace("Mon", "MON").replace("Dy", "DY")
             fmt = format_time(model, Snowflake.TIME_MAPPING, Snowflake.TIME_TRIE)
-            return exp.TimeToStr(this=exp.cast(node.this, "timestamp"), format=exp.Literal.string(fmt))
+            return exp.TimeToStr(this=exp.cast(node.this, "timestamp"), format=exp.Literal.string(re.sub(r"%[:-]?z", "Z", fmt)))
     if isinstance(node, exp.Avg) and not (isinstance(node.parent, exp.Window) and node.parent.this is node):
         return _avg(node)
     if isinstance(node, exp.Window):
