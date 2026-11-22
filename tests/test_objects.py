@@ -822,3 +822,26 @@ def test_a_model_reads_show_output_through_result_scan_as_dbt_sends_it(run):
     # a column SHOW WAREHOUSES does not have is Snowflake's invalid identifier, not DuckDB's alias error
     with pytest.raises(Exception, match=r"""(?s)000904.*invalid identifier '"budget"'"""):
         run('create or replace table w as select "name" as name, "budget" as budget from table(result_scan(last_query_id()))')
+
+
+def test_a_grant_names_a_role_the_account_has_once_its_roles_are_described(emu):
+    from fauxflake import account
+
+    emu.ensure_database("ANALYTICS", "CI")
+    cur = emu._fs.connect(database="ANALYTICS", schema="CI").cursor()
+    cur.execute("grant select on table t to role reporter")  # a fresh emulator takes any role, as production has them
+    account.load(emu, {"roles": [{"name": "transformer"}]})
+    cur.execute("grant select on table t to role transformer")
+    cur.execute("grant role transformer to role sysadmin")
+    cur.execute("grant select on table t to share partners")
+    for refused in ("grant select on table t to role reporter", "grant usage on database analytics to analyst",
+                    "grant role nobody to user bob"):
+        with pytest.raises(Exception, match="(?s)002003.*does not exist or not authorized"):
+            cur.execute(refused)
+    cur.execute("create role reporter")
+    cur.execute("grant select on table t to role reporter")
+    cur.execute("show roles")
+    assert {"ACCOUNTADMIN", "SYSADMIN", "PUBLIC", "TRANSFORMER", "REPORTER"} <= {r[1] for r in cur.fetchall()}
+    cur.execute("drop role reporter")
+    with pytest.raises(Exception, match="does not exist"):
+        cur.execute("revoke select on table t from role reporter")

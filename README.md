@@ -278,7 +278,7 @@ production weekly and opens a pull request with what moved.
 | **System views and functions** | `INFORMATION_SCHEMA`; `ACCOUNT_USAGE` and `ORGANIZATION_USAGE` as generated sources with their real columns; table functions such as `TASK_HISTORY()` with the right columns and no rows |
 | **Transactions** | `BEGIN`, `COMMIT`, `ROLLBACK`: DML and `MERGE` roll back, DDL commits the open transaction, and a statement that fails leaves it open |
 | **Tags** | `CREATE TAG` with allowed values, `SET TAG` and `UNSET TAG` on objects and columns, `SHOW TAGS`, `TAG_REFERENCES`, `TAG_REFERENCES_ALL_COLUMNS` and `SYSTEM$GET_TAG`, with inheritance from schema and database |
-| **The account** | `CREATE`, `ALTER` and `DROP` of warehouses, resource monitors and network policies; `ALTER ACCOUNT SET`; `SHOW PARAMETERS` at every scope with Snowflake's defaults; every account-level `SHOW` with the columns a real account returns, listing what the spec's `account:` names and what the project created |
+| **The account** | `CREATE`, `ALTER` and `DROP` of warehouses, resource monitors, network policies and roles; a `GRANT` to a role the account lacks fails once its roles are described (`init` lists the ones the project grants to); `ALTER ACCOUNT SET`; `SHOW PARAMETERS` at every scope with Snowflake's defaults; every account-level `SHOW` with the columns a real account returns, listing what the spec's `account:` names and what the project created |
 | **Accepted, with nothing to act on** | grants, comments, clustering keys, session settings |
 
 When the emulator does not know a statement it fails at once with a message that starts with

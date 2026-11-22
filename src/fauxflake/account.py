@@ -239,6 +239,9 @@ def load(emu, account: dict | None) -> None:  # noqa: ANN001
         duck.execute(statement)
     duck.execute(f"delete from {ACCOUNT} where kind like '%' and fields->>'_from_spec' = 'true'")
     duck.execute(f"delete from {PARAMETERS} where object = '_spec'")
+    duck.execute(f"delete from {ACCOUNT} where kind = '_roles'")
+    if "roles" in {k.lower() for k in (account or {})}:  # the spec says which roles exist: one it does not name is refused
+        duck.execute(f"insert into {ACCOUNT} values ('_roles', '', '{{\"_from_spec\": true}}')")
     for kind, given in (account or {}).items():
         kind = kind.lower().replace("_", " ")
         if kind == "parameters":
@@ -260,6 +263,8 @@ def load(emu, account: dict | None) -> None:  # noqa: ANN001
                 row.update({k.lower(): v for k, v in item.items() if k.lower() in row and k.lower() not in ("credit_quota",)})
             elif kind == "network policies":
                 row = policy_row(name, item)
+            elif kind == "roles":
+                row = role_row(name, comment=str(item.get("COMMENT") or ""), now=datetime(1970, 1, 1))
             else:
                 row = {"name": name, **{k.lower(): v for k, v in item.items()}}
             row["_from_spec"] = True
@@ -276,7 +281,7 @@ def mirror(emu, conn, kinds: set[str]) -> None:  # noqa: ANN001
     duck.execute(f"delete from {ACCOUNT}")
     duck.execute(f"delete from {PARAMETERS}")
     duck.execute(f"insert into {ACCOUNT} values ('_mirrored', '', '{{}}')")
-    for kind in sorted(kinds | {"warehouses"}):
+    for kind in sorted(kinds | {"warehouses", "roles"}):  # (roles: a GRANT to one the account lacks is refused)
         try:
             cur.execute(f"show {kind}")
         except Exception:  # noqa: BLE001, S112
@@ -315,6 +320,12 @@ _SHOW_PARAMETERS = re.compile(_LEAD + r"show\s+parameters(?:\s+like\s+'(?P<like>
                               r"(?:\s+(?:in|for)\s+(?P<scope>account|session|warehouse|database|schema|table|task|user|function|procedure)"
                               r"(?:\s+(?P<name>" + _NAME + r"))?)?[\s;]*$")
 _TRAILING_COMMENT = re.compile(r"(?s)(?:\s*;)?\s*(?:/\*(?:(?!\*/).)*\*/\s*;?\s*|--[^\n]*\s*)+$")
+_ROLE = re.compile(_LEAD + r"(?P<verb>create|drop)\s+(?P<replace>or\s+replace\s+)?role\s+(?P<exists>if\s+(?:not\s+)?exists\s+)?"
+                   r"(?P<name>" + _NAME + r")(?P<rest>.*?)[\s;]*$")
+# the role a GRANT or REVOKE names: `... to role r`, `... to r` (a grantee is a role unless it says otherwise), `grant role r to ...`
+_GRANTEE = re.compile(r"(?is)\b(?:to|from)\s+(?!share\b|application\b|database\s+role\b|user\b|application\s+role\b)(?:role\s+)?(" + _NAME + r")")
+_GRANTED_ROLE = re.compile(r"(?is)^\s*(?:grant|revoke)\s+(?:grant\s+option\s+for\s+)?role\s+(" + _NAME + r")")
+SYSTEM_ROLES = ("ACCOUNTADMIN", "ORGADMIN", "PUBLIC", "SECURITYADMIN", "SYSADMIN", "USERADMIN")
 _KINDS = {"warehouse": "warehouses", "resource monitor": "resource monitors", "network policy": "network policies"}
 _STORED = set(_KINDS.values())
 
@@ -332,10 +343,14 @@ def _status(cursor, original, text: str):  # noqa: ANN001, ANN202
 def intercept(cursor, command: str, original):  # noqa: ANN001, ANN201
     """Handle a statement about the account. None for everything else."""
     head = re.match(_LEAD + r"(\w+)", command)
-    if not head or head.group(1).lower() not in ("create", "alter", "drop", "show"):
+    if not head or head.group(1).lower() not in ("create", "alter", "drop", "show", "grant", "revoke"):
         return None
     duck = cursor._duck_conn
     command = _TRAILING_COMMENT.sub("", command)  # (dbt appends its query comment after the statement)
+    if head.group(1).lower() in ("grant", "revoke"):
+        return _grant(cursor, original, command)
+    if m := _ROLE.match(command):
+        return _role_statement(cursor, original, m)
     if m := _SHOW_PARAMETERS.match(command):
         return _show_parameters(cursor, original, m)
     if m := _CREATE.match(command):
@@ -461,6 +476,66 @@ def _alter_account(cursor, original, m):  # noqa: ANN001, ANN202
     return _status(cursor, original, "Statement executed successfully.")
 
 
+# ---------------------------------------------------------------- roles
+
+def roles_known(duck) -> bool:  # noqa: ANN001
+    """Whether the account's roles are described (the spec's `account: roles:`, or parity's mirror of Snowflake's): only
+    then is a role nobody made refused. A fresh emulator takes a grant to any role, as a production account has them."""
+    return _mirrored(duck) or duck.execute(f"select count(*) from {ACCOUNT} where kind = '_roles'").fetchone()[0] > 0
+
+
+def _role_exists(cursor, name: str) -> bool:  # noqa: ANN001
+    return name in SYSTEM_ROLES or name == _role(cursor) or _get(cursor._duck_conn, "roles", name) is not None
+
+
+def _grant(cursor, original, command: str):  # noqa: ANN001, ANN202
+    if roles_known(cursor._duck_conn):
+        named = [m.group(1) for m in _GRANTEE.finditer(command)] + [m.group(1) for m in _GRANTED_ROLE.finditer(command)]
+        for name in named:
+            role = _bare(name)
+            if not _role_exists(cursor, role):
+                raise _error(f"SQL compilation error:\nRole '{role}' does not exist or not authorized.")
+    return _status(cursor, original, "Statement executed successfully.")
+
+
+def role_row(name: str, owner: str = "SYSADMIN", comment: str = "", now: datetime | None = None) -> dict:
+    return {"created_on": now or _now(), "name": name, "is_default": "N", "is_current": "N", "is_inherited": "N",
+            "assigned_to_users": 0, "granted_to_roles": 0, "granted_roles": 0, "owner": owner, "comment": comment,
+            "is_from_organization_user_group": "N"}
+
+
+def _role_statement(cursor, original, m):  # noqa: ANN001, ANN202
+    duck, name = cursor._duck_conn, _bare(m.group("name"))
+    if m.group("verb").lower() == "drop":
+        if not _drop(duck, "roles", name) and not m.group("exists"):
+            raise _error(f"SQL compilation error:\nRole '{name}' does not exist or not authorized.")
+        return _status(cursor, original, f"{name} successfully dropped.")
+    if _get(duck, "roles", name) is not None and not m.group("replace"):
+        if m.group("exists"):
+            return _status(cursor, original, f"{name} already exists, statement succeeded.")
+        raise _error(f"SQL compilation error:\nObject '{name}' already exists.", errno=2002, sqlstate="42710")
+    _put(duck, "roles", name, role_row(name, _role(cursor), str(properties(m.group("rest")).get("COMMENT") or "")))
+    return _status(cursor, original, f"Role {name} successfully created.")
+
+
+def granted_roles(project_dir, manifest: dict | None = None) -> set[str]:  # noqa: ANN001
+    """The roles a project grants to, which its production account has: `to role X` in its SQL and hooks, and the
+    grantees of `grants:` configs (as the manifest resolves them)."""
+    found: set[str] = set()
+    for path in Path(project_dir).rglob("*"):
+        if path.suffix not in (".sql", ".yml", ".yaml") or any(p in (".fauxflake", "target", "logs") for p in path.parts):
+            continue
+        try:
+            text = path.read_text(errors="ignore")
+        except OSError:
+            continue
+        found |= {_bare(n) for n in re.findall(r"(?is)\bgrant\s+[^;'\"]*?\bto\s+role\s+(" + _NAME + ")", text)}
+    for node in ((manifest or {}).get("nodes") or {}).values():
+        for grantees in ((node.get("config") or {}).get("grants") or {}).values():
+            found |= {_bare(str(g)) for g in (grantees if isinstance(grantees, list) else [grantees])}
+    return {r for r in found if r and "{" not in r and r not in SYSTEM_ROLES}
+
+
 # ---------------------------------------------------------------- SHOW
 
 # the SHOW commands answered from here: the account's objects (a fresh account has none but the session's warehouse)
@@ -499,6 +574,11 @@ def _session_warehouse(cursor) -> str | None:  # noqa: ANN001
 def rows_of(cursor, kind: str) -> list[dict]:  # noqa: ANN001
     duck = cursor._duck_conn
     rows = _rows(duck, kind)
+    if kind == "roles" and not _mirrored(duck):
+        named = {r["name"] for r in rows}
+        rows = [role_row(r, owner="", now=datetime(1970, 1, 1)) for r in SYSTEM_ROLES if r not in named] + rows
+        for r in rows:
+            r["is_current"] = "Y" if r["name"] == _role(cursor) else "N"
     if kind == "warehouses":
         current = _session_warehouse(cursor)
         if not _mirrored(duck) and current and not any(r["name"].upper() == current.upper() for r in rows):

@@ -3520,6 +3520,10 @@ def write_spec(project, path: Path, database: str, emu=None, fit: bool = True, l
 
     if shown := sorted(account.shown_by(project.dir)):  # SHOW WAREHOUSES and the like: a fresh account has little to show
         spec["account"] = {k.replace(" ", "_"): [] for k in shown if k != "parameters"}
+    if granted := sorted(account.granted_roles(project.dir, manifest)):  # the roles its grants name exist in production
+        spec.setdefault("account", {})["roles"] = [{"name": r} for r in granted]
+        notes.append(f"the project grants to {len(granted)} role(s) ({', '.join(granted[:5])}): listed under `account: roles:`, "
+                     "as production has them (a grant to a role not listed there fails, as on Snowflake)")
         notes.append(f"the project reads the account ({', '.join(f'SHOW {k.upper()}' for k in shown)}): a fresh one has only "
                      "the session's warehouse, LOCAL. List yours under `account:` in the spec (`fauxflake parity` reads "
                      "Snowflake's own)")
