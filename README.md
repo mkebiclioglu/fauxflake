@@ -289,7 +289,7 @@ When the emulator does not know a statement it fails at once with a message that
 Everything here was run; the commands are in this repo.
 
 **1. Answers recorded from Snowflake.** [`conformance/cases.yml`](conformance/cases.yml) holds
-1,068 small queries, among them one call of each signature of Snowflake's built-in functions,
+1,072 small queries, among them one call of each signature of Snowflake's built-in functions,
 recorded in UTC; 19 are marked as known gaps (sketch internals, a FLOAT or a timestamp held in a `VARIANT`, `TIMESTAMP_TZ` offsets other than zero). `fauxflake conformance --connection <name>` runs them on real Snowflake
 and stores the answers; CI replays them against the emulator with no Snowflake access. A case
 that stops matching fails CI.
