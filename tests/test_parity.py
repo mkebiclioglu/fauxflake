@@ -1,6 +1,7 @@
 from datetime import datetime
 
 import duckdb
+import pytest
 
 from fauxflake.parity import _is_clock
 
@@ -76,8 +77,12 @@ def test_arrays_that_differ_only_in_order_and_where_such_order_comes_from():
     assert _unordered_aggregate("select array_agg(v) within group (order by v) from t") is None
 
 
-def test_models_are_compared_row_for_row_with_documents_by_content():
+@pytest.mark.parametrize("wide", [200, 0])
+def test_models_are_compared_row_for_row_with_documents_by_content(wide, monkeypatch):
+    """(wide 0: every table compared by a hash of its rows, as one of a thousand columns is)"""
     import snowflake.connector
+
+    monkeypatch.setattr("fauxflake.parity.WIDE", wide)
 
     from fauxflake.emulator import serve
     from fauxflake.parity import compare

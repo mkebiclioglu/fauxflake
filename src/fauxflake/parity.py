@@ -195,6 +195,8 @@ def _canonical(text: str | None, unordered: bool = False) -> str | None:
         return text
 
 
+WIDE = 200  # columns past which rows are compared by their hash
+
 _CANON: dict[str, object] = {}  # the callables behind _fx_canon and _fx_canon_u, alive as long as DuckDB may call them
 
 
@@ -249,6 +251,11 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
 
     counted = "select (select count(*) from (select * from m except all select * from t)), " \
               "(select count(*) from (select * from t except all select * from m))"
+    # a table of a thousand columns is compared by a hash of each row: EXCEPT ALL over every column at once holds a
+    # block per column per side, and ran out of memory over 35 rows of Marketo's leads
+    hashed = "select (select count(*) from (select hash(m) from m except all select hash(t) from t)), " \
+             "(select count(*) from (select hash(t) from t except all select hash(m) from m))"
+    count = lambda kinds: hashed if len(kinds) > WIDE else counted  # noqa: E731
     for node in sorted(local.models(), key=lambda n: n["name"]):
         if only is not None and node["unique_id"] not in only:
             continue
@@ -290,11 +297,10 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
                     continue
                 # (JSON is compared by content: key order and 1 vs 1.0 are not differences)
                 documents = [c for c, ty in types.items() if ty == "JSON"]
-                both = pair(types)
-                a, b = duck.execute(both + counted).fetchone()
+                a, b = duck.execute(pair(types) + count(types)).fetchone()
                 note = ""
                 if (a or b) and (documents or 'VARCHAR' in types.values()):  # the same rows once array elements are sorted
-                    a2, b2 = duck.execute(pair(types, unordered=True) + counted).fetchone()
+                    a2, b2 = duck.execute(pair(types, unordered=True) + count(types)).fetchone()
                     if not a2 and not b2:
                         order_only = True
                 if a or b:
@@ -302,6 +308,7 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
                     differing, clocks = [], []
                     for c in types:
                         q = f'"{c}"'
+                        both = pair({c: types[c]})  # (that column alone: the others are not read)
                         got = duck.execute(both + f"""
                             select (select any_value({q}::varchar) from (select {q} from m except all select {q} from t)),
                                    (select any_value({q}::varchar) from (select {q} from t except all select {q} from m)),
@@ -313,7 +320,7 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
                     note = "differ in " + "; ".join(differing[:6]) if differing else ""
                     if clocks:  # the rows compared without them
                         rest = {c: ty for c, ty in types.items() if c not in clocks}
-                        a, b = duck.execute(pair(rest) + counted).fetchone() if rest else (0, 0)
+                        a, b = duck.execute(pair(rest) + count(rest)).fetchone() if rest else (0, 0)
             mine_n = duck.execute(f"select count(*) from {mine}").fetchone()[0]
             out.append(Parity(node["name"], mine_n, theirs_n, a, b, note if theirs_n and (a or b) else "", order_only=order_only))
         except Exception as e:  # noqa: BLE001
