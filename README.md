@@ -249,9 +249,9 @@ new-column        survived         builds passed, incrementals match a full refr
 ```yaml
 - uses: actions/checkout@v7
   with: {fetch-depth: 0}
-- uses: mkebiclioglu/fauxflake@v0.3.0
+- uses: mkebiclioglu/fauxflake@v0.4.0
   with: {command: build}
-- uses: mkebiclioglu/fauxflake@v0.3.0
+- uses: mkebiclioglu/fauxflake@v0.4.0
   with: {command: simulate, args: --days 14}
 ```
 
