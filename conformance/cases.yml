@@ -336,7 +336,7 @@
 - {id: fn_any_value, sql: "select ANY_VALUE(column1) from values (7), (2), (7)"}
 - {id: fn_approximate_count_distinct, sql: "select APPROXIMATE_COUNT_DISTINCT(column1) from values (7), (2), (7)"}
 - {id: fn_approx_count_distinct, sql: "select APPROX_COUNT_DISTINCT(column1) from values (7), (2), (7)"}
-- {id: fn_approx_percentile_accumulate, sql: "select APPROX_PERCENTILE_ACCUMULATE(column1) from values (2.5::float), (0.5::float), (2.5::float)", gap: "not in the emulator"}
+- {id: fn_approx_percentile_accumulate, sql: "select APPROX_PERCENTILE_ACCUMULATE(column1) from values (2.5::float), (0.5::float), (2.5::float)"}
 - {id: fn_arrayagg, sql: "select ARRAYAGG(column1) from values (7), (2), (7)"}
 - {id: fn_arrays_overlap, sql: "select ARRAYS_OVERLAP(array_construct(3, 1, 2), array_construct(2, 9))"}
 - {id: fn_array_agg, sql: "select ARRAY_AGG(column1) from values (7), (2), (7)"}
@@ -474,7 +474,7 @@
 - {id: fn_exp, sql: "select EXP(2.5::float)"}
 - {id: fn_exp_2, sql: "select EXP(2.5)"}
 - {id: fn_factorial, sql: "select FACTORIAL(7)"}
-- {id: fn_fuzzy_subsequence_score, sql: "select FUZZY_SUBSEQUENCE_SCORE('abc', 'b')", gap: "not in the emulator"}
+- {id: fn_fuzzy_subsequence_score, sql: "select FUZZY_SUBSEQUENCE_SCORE('abc', 'b')"}
 - {id: fn_get, sql: "select GET(parse_json('{\"a\": 1, \"b\": [1, 2]}'), 'abc')"}
 - {id: fn_get_2, sql: "select GET(parse_json('{\"a\": 1, \"b\": [1, 2]}'), 7)"}
 - {id: fn_get_3, sql: "select GET(object_construct('a', 1, 'b', 'x'), 'abc')"}
@@ -488,8 +488,8 @@
 - {id: fn_greatest, sql: "select GREATEST(7)"}
 - {id: fn_greatest_ignore_nulls, sql: "select GREATEST_IGNORE_NULLS(7)"}
 - {id: fn_hll, sql: "select HLL(column1) from values (7), (2), (7)"}
-- {id: fn_hll_accumulate, sql: "select HLL_ACCUMULATE(column1) from values (7), (2), (7)", gap: "not in the emulator"}
-- {id: fn_hll_export, sql: "select HLL_EXPORT(to_binary('616263', 'hex'))", gap: "not in the emulator"}
+- {id: fn_hll_accumulate, sql: "select HLL_ACCUMULATE(column1) from values (7), (2), (7)", gap: "an HLL state holds registers of Snowflake's 64-bit hash, which it does not publish (HASH() differs too)"}
+- {id: fn_hll_export, sql: "select HLL_EXPORT(to_binary('616263', 'hex'))"}
 - {id: fn_iff, sql: "select IFF(true, 7, 2)"}
 - {id: fn_ifnull, sql: "select IFNULL(7, 2)"}
 - {id: fn_insert, sql: "select INSERT('abc', 7, 2, 'b')"}
@@ -607,8 +607,8 @@
 - {id: fn_sinh, sql: "select SINH(2.5::float)"}
 - {id: fn_skew, sql: "select SKEW(column1) from values (7), (2), (7)"}
 - {id: fn_skew_2, sql: "select SKEW(column1) from values (2.5::float), (0.5::float), (2.5::float)"}
-- {id: fn_snowpark_conv, sql: "select SNOWPARK_CONV('abc', 7, 2)", gap: "not in the emulator"}
-- {id: fn_snowpark_conv_2, sql: "select SNOWPARK_CONV(7, 2, 2)", gap: "not in the emulator"}
+- {id: fn_snowpark_conv, sql: "select SNOWPARK_CONV('abc', 7, 2)"}
+- {id: fn_snowpark_conv_2, sql: "select SNOWPARK_CONV(7, 2, 2)"}
 - {id: fn_soundex, sql: "select SOUNDEX('abc')"}
 - {id: fn_soundex_p123, sql: "select SOUNDEX_P123('abc')"}
 - {id: fn_space, sql: "select SPACE(7)"}
@@ -631,8 +631,8 @@
 - {id: fn_sum, sql: "select SUM(column1) from values (7), (2), (7)"}
 - {id: fn_sum_2, sql: "select SUM(column1) from values (2.5::float), (0.5::float), (2.5::float)"}
 - {id: fn_sum_3, sql: "select SUM(column1) from values (2.5), (0.5), (2.5)"}
-- {id: fn_sum_real, sql: "select SUM_REAL(column1) from values (7), (2), (7)", gap: "not in the emulator"}
-- {id: fn_sum_real_2, sql: "select SUM_REAL(column1) from values (2.5::float), (0.5::float), (2.5::float)", gap: "not in the emulator"}
+- {id: fn_sum_real, sql: "select SUM_REAL(column1) from values (7), (2), (7)"}
+- {id: fn_sum_real_2, sql: "select SUM_REAL(column1) from values (2.5::float), (0.5::float), (2.5::float)"}
 - {id: fn_tan, sql: "select TAN(2.5::float)"}
 - {id: fn_tanh, sql: "select TANH(2.5::float)"}
 - {id: fn_time, sql: "select TIME('2024-03-15 10:20:30'::timestamp_ltz)"}
@@ -642,7 +642,7 @@
 - {id: fn_timestampntzfromparts, sql: "select TIMESTAMPNTZFROMPARTS('2024-03-15'::date, '10:20:30'::time)"}
 - {id: fn_timestamp_from_parts, sql: "select TIMESTAMP_FROM_PARTS('2024-03-15'::date, '10:20:30'::time)"}
 - {id: fn_timestamp_ntz_from_parts, sql: "select TIMESTAMP_NTZ_FROM_PARTS('2024-03-15'::date, '10:20:30'::time)"}
-- {id: fn_top_k_sketch_object_construct, sql: "select TOP_K_SKETCH_OBJECT_CONSTRUCT('abc', 7, 'b', 2)", gap: "not in the emulator"}
+- {id: fn_top_k_sketch_object_construct, sql: "select TOP_K_SKETCH_OBJECT_CONSTRUCT('abc', 7, 'b', 2)"}
 - {id: fn_to_json, sql: "select TO_JSON(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
 - {id: fn_to_xml, sql: "select TO_XML(parse_json('{\"a\": 1, \"b\": [1, 2]}'))"}
 - {id: fn_translate, sql: "select TRANSLATE('abc', 'b', 'b')"}
@@ -1144,3 +1144,34 @@
 - {id: float_variant_get, sql: "select get(array_construct(x), 0)::varchar, typeof(get_path(object_construct('a', array_construct(x)), 'a[0]')), typeof(object_construct('a', x)['a']), typeof(get(object_construct('a', x), 'a')) from (select column1::float x from values (1.5))"}
 - {id: float_variant_special, sql: "select '#' || to_json(to_variant(x)), typeof(to_variant(x)) from (select column1::float x from values ('nan'), ('inf'), ('-inf'), ('-0')) order by 1"}
 - {id: flatten_inline_object, sql: "select f.key, f.value, typeof(f.value) from table(flatten(input => object_construct('a', 1, 'b', 'x', 'c', 2.5::float))) f order by f.key"}
+# Recorded 2026-11-23. The sketches: APPROX_PERCENTILE interpolates as PERCENTILE_CONT up to 1400 values (the t-digest
+# keeps each one); APPROX_TOP_K counts with space-saving counters; an HLL state is 3 bytes a register, its estimate HLL++.
+- {id: sketch_percentile, sql: "select approx_percentile(column1, 0), approx_percentile(column1, 0.1), approx_percentile(column1, 0.25), approx_percentile(column1, 0.5), approx_percentile(column1, 0.7), approx_percentile(column1, 0.875), approx_percentile(column1, 1) from values (1), (10), (100), (1), (5)"}
+- {id: sketch_percentile_many, sql: "select approx_percentile(seq4() * 7 % 1000, 0.3), approx_percentile(seq4() * 7 % 1000, 0.99) from table(generator(rowcount => 1300))"}
+- {id: sketch_percentile_state, sql: "select approx_percentile_accumulate(column1), approx_percentile_estimate(approx_percentile_accumulate(column1), 0.6) from values (3), (1), (null), ('2')"}
+- {id: sketch_percentile_combine, sql: "select approx_percentile_combine(s), approx_percentile_estimate(approx_percentile_combine(s), 0.25) from (select approx_percentile_accumulate(column2) s from values (1, 5), (1, 2), (2, 9) group by column1)"}
+- {id: sketch_percentile_estimate, sql: "select approx_percentile_estimate(parse_json('{\"state\": [1.0, 1.0, 3.0, 1.0, 5.0, 1.0], \"type\": \"tdigest\", \"version\": 1}'), 0.5), approx_percentile_estimate(parse_json('{\"state\": [], \"type\": \"tdigest\", \"version\": 1}'), 0.5)"}
+- {id: sketch_top_k, sql: "select approx_top_k(column1), approx_top_k(column1, 3), approx_top_k(column1, 2, 2) from values ('b'), ('a'), ('c'), ('a'), ('c'), ('d'), ('d'), ('d')"}
+- {id: sketch_top_k_numbers, sql: "select approx_top_k_accumulate(column1, 5), approx_top_k(column1, 2) from values (3), (1), (3), (2.5)"}
+- {id: sketch_top_k_state, sql: "select approx_top_k_estimate(any_value(s), 2), approx_top_k_combine(s) from (select approx_top_k_accumulate(column1, 3) s from values ('a'), ('b'), ('a'))"}
+- {id: sketch_top_k_construct, sql: "select top_k_sketch_object_construct(1, 7, 2, 3), top_k_sketch_object_construct('a', 2, 'b', 7), top_k_sketch_object_construct('a', 7, 'b', 2.5), top_k_sketch_object_construct(null, 2, 'b', 7)"}
+- {id: sketch_hll_export, sql: "select hll_export(to_binary('', 'hex')), hll_export(to_binary('2b0001b60e03', 'hex')), hll_export(to_binary('6162636465', 'hex'))"}
+- {id: sketch_hll_import, sql: "select hll_import(parse_json('{\"precision\": 12, \"sparse\": {\"indices\": [5, 1], \"maxLzCounts\": [2, 3]}, \"version\": 4}')), hll_estimate(hll_import(parse_json('{\"precision\": 12, \"sparse\": {\"indices\": [5, 1], \"maxLzCounts\": [2, 3]}, \"version\": 4}')))"}
+- {id: sketch_hll_estimate, sql: "select hll_estimate(hll_import(object_construct('precision', 12, 'sparse', object_construct('indices', array_agg(i), 'maxLzCounts', array_agg(1)), 'version', 4))) from (select seq4() i from table(generator(rowcount => 1000)))"}
+- {id: sketch_hll_combine, sql: "select hll_combine(s), hll_estimate(hll_combine(s)) from (select to_binary(column1, 'hex') s from values ('2b0001b60e03'), ('2b00026e0c02'))"}
+- {id: sketch_count_small, sql: "select approx_count_distinct(column1), hll(column1), hll_estimate(hll_accumulate(column1)) from values (1), (2), (2), (null), (3)"}
+- {id: fuzzy_score, sql: "select fuzzy_subsequence_score('abcd', 'abd'), fuzzy_subsequence_score('abcd', 'abxd'), fuzzy_subsequence_score('abc', 'xa'), fuzzy_subsequence_score('abxab', 'abab'), fuzzy_subsequence_score('ABC', 'a'), fuzzy_subsequence_score('héllo', 'hé'), fuzzy_subsequence_score(null, 'a'), fuzzy_subsequence_score('', '')"}
+- {id: snowpark_conv_bases, sql: "select snowpark_conv('100', 2, 10), snowpark_conv('ff', 16, 10), snowpark_conv(255, 10, 16), snowpark_conv('-1', 10, 16), snowpark_conv('-1', 10, -16), snowpark_conv(' 12', 10, 2), snowpark_conv('12abc', 10, 2), snowpark_conv('ffffffffffffffffff', 16, 10), snowpark_conv('-10', 10, -2), snowpark_conv('10', 37, 10), snowpark_conv('-ff', 16, 10), snowpark_conv(null, 10, 2)"}
+- {id: sum_real_fixed, sql: "select sum_real(x) from (select column1 x from values (1.5), (1), (2.5), (0.5), (10000000000))"}
+- {id: sum_real_float, sql: "select sum_real(x) from (select column1 x from values (1.5::float), (1::float), (null::float))"}
+- {id: object_construct_aggregate, sql: "select object_construct('n', count(*), 'm', object_construct('s', sum(column1))), object_construct_keep_null('a', max(column1), 'b', null) from values (1), (2)"}
+# Recorded 2026-11-23. VARIANTs are equal, grouped and counted by value: a FLOAT and a NUMBER, 1 and 1.0 inside an
+# array, an object's keys in any order; a string is not a number, and an exact number keeps all its digits.
+- {id: variant_value_distinct, sql: "select count(distinct v), count(*) from (select to_variant(1.5::float) v union all select to_variant(1.5::number(2,1)) union all select parse_json('1.50') union all select parse_json('\"1.5\"'))"}
+- {id: variant_value_group, sql: "select v::varchar, count(*) from (select to_variant(1.5::float) v union all select to_variant(1.5::number(2,1)) union all select to_variant(2)) group by v order by 2"}
+- {id: variant_value_nested, sql: "select count(distinct v) from (select parse_json('{\"a\": 1, \"b\": [2]}') v union all select parse_json('{\"b\": [2.0], \"a\": 1e0}') union all select parse_json('{\"a\": 1, \"b\": [2, 3]}'))"}
+- {id: variant_value_equal, sql: "select parse_json('{\"a\": 1}') = parse_json('{\"a\": 1.0}'), parse_json('[1]') = parse_json('[1e0]'), parse_json('{\"a\": 1, \"b\": 2}') = parse_json('{\"b\": 2, \"a\": 1}'), parse_json('[1, 2]') = parse_json('[2, 1]'), parse_json('\"1\"') = parse_json('1')"}
+- {id: variant_value_digits, sql: "select count(distinct v) from (select parse_json('12345678901234567890') v union all select parse_json('12345678901234567891') union all select parse_json('0.1') union all select to_variant(0.1::float))"}
+- {id: variant_value_partition, sql: "select v::varchar, count(*) over (partition by v) from (select to_variant(1.5::float) v union all select to_variant(1.5::number(2,1)) union all select to_variant(3)) order by 1, 2"}
+- {id: variant_value_group_ordinal, sql: "select v:k::varchar k, count(*) n from (select object_construct('k', column1) v from values (1.5::float), (1.5), (2)) group by 1 order by 2, 1"}
+- {id: variant_value_join_object, sql: "select count(*) from (select parse_json('{\"a\": 1, \"b\": [1.0]}') v) a join (select parse_json('{\"b\": [1], \"a\": 1.0}') v) b on a.v = b.v"}

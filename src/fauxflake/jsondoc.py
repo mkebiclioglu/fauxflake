@@ -8,6 +8,7 @@ own words for what is wrong and where (`missing colon, pos 6`). Empty or blank t
 from __future__ import annotations
 
 import json
+from decimal import Decimal, InvalidOperation
 
 UNDEFINED = "﷐undefined"  # (semantics.UNDEFINED: an undefined element of an array)
 
@@ -368,3 +369,40 @@ def check(text: str | None) -> str | None:
     except JSONError as e:
         return str(e)
     return None
+
+
+def _number_key(text: str) -> str:
+    """A number by its value: a FLOAT and a NUMBER that are equal give the same text (1, 1.0, 1e0 and
+    1.0000000000000000e+00 are all `1`), an exact number keeps all its digits."""
+    if text in ("NaN", "Infinity", "-Infinity"):
+        return text
+    if "e" in text or "E" in text or "." in text:
+        try:
+            d = Decimal(text)
+        except InvalidOperation:
+            return text
+        if d == d.to_integral_value():
+            return str(int(d))
+        return repr(float(d))
+    return str(int(text))
+
+
+def _key_of(v) -> str:  # noqa: ANN001
+    if isinstance(v, _Kept):
+        return _number_key(str(v))
+    if isinstance(v, dict):  # (an OBJECT is equal whatever order its keys were written in)
+        return "{" + ",".join(json.dumps(k, ensure_ascii=False) + ":" + _key_of(v[k]) for k in sorted(v)) + "}"
+    if isinstance(v, list):
+        return "[" + ",".join(_key_of(x) for x in v) + "]"
+    return json.dumps(v, ensure_ascii=False)
+
+
+def key(text: str | None) -> str | None:
+    """A VARIANT as what Snowflake compares, groups and counts it by: its value. Two VARIANTs that are equal in
+    Snowflake give the same text."""
+    if text is None:
+        return None
+    try:
+        return _key_of(_kept(text))
+    except ValueError:
+        return text

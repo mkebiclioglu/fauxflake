@@ -703,10 +703,14 @@ def _patch_fakesnow() -> None:
     ) AS _fx_undefined
     WHERE VALUE IS DISTINCT FROM {semantics._UNDEFINED_JSON}""")
     # OBJECT_CONSTRUCT writes each value's own text (DuckDB's json_group_object writes a FLOAT anew, as a NUMBER)
-    _macros.FS_OBJECT_CONSTRUCT = _Template(_macros.FS_OBJECT_CONSTRUCT.template.replace(
-        "list_extract(vals, idx) AS value", "list_extract(vals, idx) AS value, idx").replace(
-        "COALESCE(json_group_object(key, value), '{}'::JSON)",
-        "COALESCE(('{' || string_agg(to_json(key)::VARCHAR || ':' || COALESCE(value::VARCHAR, 'null'), ',' ORDER BY idx) || '}')::JSON, '{}'::JSON)"))
+    # and is an expression, not a subquery: a subquery would take an aggregate among the values (`object_construct('n',
+    # count(*))` without GROUP BY) as its own
+    _macros.FS_OBJECT_CONSTRUCT = _Template("""CREATE OR REPLACE MACRO ${catalog}._fs_object_construct(keys, vals, keep_nulls) AS (
+    ('{' || array_to_string(list_filter(list_transform(list_zip(keys, vals), lambda p: CASE WHEN p[1] IS NOT NULL
+        AND (keep_nulls OR p[2] IS NOT NULL) THEN to_json(p[1])::VARCHAR || ':' || COALESCE(p[2]::VARCHAR, 'null') END),
+        lambda e: e IS NOT NULL), ',') || '}')::JSON
+);
+""")
     _macros.FS_OBJECT_CONSTRUCT_STAR = _Template(_macros.FS_OBJECT_CONSTRUCT_STAR.template.replace(
         "COALESCE(json_group_object(key, value::JSON), '{}'::JSON)",
         "COALESCE(('{' || string_agg(to_json(key)::VARCHAR || ':' || value::VARCHAR, ',') || '}')::JSON, '{}'::JSON)").replace(
@@ -1192,9 +1196,10 @@ def _patch_fakesnow() -> None:
                 transformed = kept[1].copy()
             else:
                 for adjust in (semantics.coerce_union_literals, semantics.resolve_equalities, semantics.mixed_kinds, semantics.union_text_kinds,
-                               semantics.days_added_to_aggregates, semantics.rounded_divisions, semantics.shared_aliases, semantics.kept_floats):
+                               semantics.days_added_to_aggregates, semantics.rounded_divisions, semantics.shared_aliases,
+                               semantics.variants_by_value, semantics.kept_floats):
                     if adjust in (semantics.mixed_kinds, semantics.union_text_kinds, semantics.days_added_to_aggregates,
-                                  semantics.rounded_divisions) and (
+                                  semantics.rounded_divisions, semantics.variants_by_value) and (
                             getattr(self._conn, "_fauxflake_txn", False) or not isinstance(
                             transformed, (exp.Select, exp.Create, exp.Insert, exp.Union))):
                         continue  # (a probe that fails inside a transaction would abort it; MERGE and the like are left alone)

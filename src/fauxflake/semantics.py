@@ -13,7 +13,7 @@ import re
 import sqlglot
 from sqlglot import exp
 
-from . import account, catalog, constraints, jsondoc, xmldoc
+from . import account, catalog, constraints, jsondoc, sketches, xmldoc
 
 _NS = "_fs_global.main."
 _SCALE = r"coalesce(try_cast(nullif(regexp_extract(typeof(a), ',(\d+)\)', 1), '') as integer), 0)"
@@ -32,9 +32,13 @@ def python_functions(duck) -> None:  # noqa: ANN001
     def sorted_json(values):  # noqa: ANN001, ANN202 - a batch at a time
         return pa.array([json_sorted(v) for v in values.to_pylist()], pa.string())
 
+    def json_keys_of(values):  # noqa: ANN001, ANN202
+        return pa.array([jsondoc.key(v) for v in values.to_pylist()], pa.string())
+
     for name, fn, args, out, kind in (
             ("_fxpy_sha2", sha2, ["VARCHAR", "INTEGER"], "VARCHAR", None),
             ("_fxpy_json_sorted", sorted_json, ["VARCHAR"], "VARCHAR", "arrow"),
+            ("_fxpy_json_key", json_keys_of, ["VARCHAR"], "VARCHAR", "arrow"),
             ("_fxpy_encrypt_raw", encrypt_raw, ["BLOB", "BLOB", "BLOB", "BLOB", "VARCHAR"], "VARCHAR", None),
             ("_fxpy_randstr", randstr, ["BIGINT", "HUGEINT"], "VARCHAR", None),
             ("_fxpy_parse_xml", parse_xml, ["VARCHAR"], "VARCHAR", None),
@@ -49,7 +53,26 @@ def python_functions(duck) -> None:  # noqa: ANN001
             ("_fxpy_decrypt_raw", decrypt_raw, ["BLOB", "BLOB", "BLOB", "BLOB", "VARCHAR", "BLOB", "BOOLEAN"], "BLOB", None),
             ("_fxpy_elements", jsondoc.elements, ["VARCHAR"], "VARCHAR[]", None),
             ("_fxpy_get", jsondoc.get, ["VARCHAR", "VARCHAR"], "VARCHAR", None),
-            ("_fxpy_merged", jsondoc.merged, ["VARCHAR", "VARCHAR", "VARCHAR"], "VARCHAR", None)):
+            ("_fxpy_merged", jsondoc.merged, ["VARCHAR", "VARCHAR", "VARCHAR"], "VARCHAR", None),
+            ("_fxpy_tdigest_accumulate", sketches.tdigest_accumulate, ["DOUBLE[]"], "VARCHAR", None),
+            ("_fxpy_tdigest_combine", sketches.tdigest_combine, ["VARCHAR[]"], "VARCHAR", None),
+            ("_fxpy_tdigest_estimate", sketches.tdigest_estimate, ["VARCHAR", "DOUBLE"], "DOUBLE", None),
+            ("_fxpy_tdigest_quantile", sketches.tdigest_quantile, ["DOUBLE[]", "DOUBLE"], "DOUBLE", None),
+            ("_fxpy_hll_accumulate", sketches.hll_accumulate, ["UBIGINT[]"], "BLOB", None),
+            ("_fxpy_hll_combine", sketches.hll_combine, ["BLOB[]"], "BLOB", None),
+            ("_fxpy_hll_estimate", sketches.hll_estimate, ["BLOB"], "BIGINT", None),
+            ("_fxpy_hll_count", sketches.hll_count, ["UBIGINT[]"], "BIGINT", None),
+            ("_fxpy_hll_export", sketches.hll_export, ["BLOB"], "VARCHAR", None),
+            ("_fxpy_hll_import", sketches.hll_import, ["VARCHAR"], "BLOB", None),
+            ("_fxpy_topk", sketches.topk, ["VARCHAR[]", "BIGINT", "BIGINT", "VARCHAR"], "VARCHAR", None),
+            ("_fxpy_topk_accumulate", sketches.topk_accumulate, ["VARCHAR[]", "BIGINT", "VARCHAR"], "VARCHAR", None),
+            ("_fxpy_topk_combine", sketches.topk_combine, ["VARCHAR[]", "BIGINT"], "VARCHAR", None),
+            ("_fxpy_topk_estimate", sketches.topk_estimate, ["VARCHAR", "BIGINT"], "VARCHAR", None),
+            ("_fxpy_topk_construct", sketches.topk_construct, ["VARCHAR", "DOUBLE", "VARCHAR", "DOUBLE"], "VARCHAR", None),
+            ("_fxpy_fuzzy", sketches.fuzzy_subsequence_score, ["VARCHAR", "VARCHAR"], "INTEGER", None),
+            ("_fxpy_conv", sketches.snowpark_conv, ["VARCHAR", "BIGINT", "BIGINT"], "VARCHAR", None),
+            ("_fxpy_sum_real_fixed", sketches.sum_real_fixed, ["DOUBLE[]"], "BIGINT", None),
+            ("_fxpy_sum_real_float", sketches.sum_real_float, ["DOUBLE[]"], "BIGINT", None)):
         try:
             duck.create_function(name, fn, args, out, null_handling="special",
                                  side_effects=name in ("_fxpy_encrypt_raw", "_fxpy_seeded_random"),
@@ -499,7 +522,30 @@ MACROS = [
     f"create or replace macro {_NS}_sf_binary_as_string(b) as decode(b::blob)",
     f"create or replace macro {_NS}_sf_string_as_binary(s) as encode(s::varchar)",
     f"create or replace macro {_NS}_sf_jaccard(a, b) as jaccard(a::varchar, b::varchar)",
-    f"create or replace macro {_NS}_sf_approx_count(x) as approx_count_distinct(x)",
+    # the sketches (see sketches.py): each takes its group's values as a list
+    f"create or replace macro {_NS}_sf_approx_count(x) as _fxpy_hll_count(list(distinct hash(x)) filter (where x is not null))",
+    f"create or replace macro {_NS}_sf_hll_accumulate(x) as _fxpy_hll_accumulate(list(distinct hash(x)) filter (where x is not null))",
+    f"create or replace macro {_NS}_sf_hll_combine(s) as _fxpy_hll_combine(list(s::blob))",
+    f"create or replace macro {_NS}_sf_hll_estimate(s) as _fxpy_hll_estimate(s::blob)",
+    f"create or replace macro {_NS}_sf_hll_export(s) as _fxpy_hll_export(s::blob)::json",
+    f"create or replace macro {_NS}_sf_hll_import(o) as _fxpy_hll_import(o::varchar)",
+    f"create or replace macro {_NS}_sf_approx_percentile(x, p) as _fxpy_tdigest_quantile(list(try_cast(x as double)), p::double)",
+    f"create or replace macro {_NS}_sf_approx_percentile_accumulate(x) as _fxpy_tdigest_accumulate(list(try_cast(x as double)))::json",
+    f"create or replace macro {_NS}_sf_approx_percentile_combine(s) as _fxpy_tdigest_combine(list(s::varchar))::json",
+    f"create or replace macro {_NS}_sf_approx_percentile_estimate(s, p) as _fxpy_tdigest_estimate(s::varchar, p::double)",
+    f"""create or replace macro {_NS}_sf_approx_top_k (x) as _fxpy_topk(list(x::varchar), 1, null, typeof(any_value(x)))::json,
+          (x, k) as _fxpy_topk(list(x::varchar), k, null, typeof(any_value(x)))::json,
+          (x, k, c) as _fxpy_topk(list(x::varchar), k, c, typeof(any_value(x)))::json""",
+    f"create or replace macro {_NS}_sf_approx_top_k_accumulate(x, c) as _fxpy_topk_accumulate(list(x::varchar), c, typeof(any_value(x)))::json",
+    f"""create or replace macro {_NS}_sf_approx_top_k_combine (s) as _fxpy_topk_combine(list(s::varchar), null)::json,
+          (s, c) as _fxpy_topk_combine(list(s::varchar), c)::json""",
+    f"""create or replace macro {_NS}_sf_approx_top_k_estimate (s) as _fxpy_topk_estimate(s::varchar, 1)::json,
+          (s, k) as _fxpy_topk_estimate(s::varchar, k)::json""",
+    f"create or replace macro {_NS}_sf_top_k_sketch(a, b, c, d) as _fxpy_topk_construct(a::varchar, b::double, c::varchar, d::double)::json",
+    f"""create or replace macro {_NS}_sf_sum_real(x) as case when typeof(any_value(x)) in ('DOUBLE', 'FLOAT')
+          then _fxpy_sum_real_float(list(x::double)) else _fxpy_sum_real_fixed(list(x::double)) end""",
+    f"create or replace macro {_NS}_sf_fuzzy_subsequence_score(a, b) as _fxpy_fuzzy(a::varchar, b::varchar)",
+    f"create or replace macro {_NS}_sf_snowpark_conv(v, f, t) as _fxpy_conv(v::varchar, f::bigint, t::bigint)",
     f"""create or replace macro {_NS}_sf_try_hex_binary(s) as case
           when length(s::varchar) % 2 = 0 and regexp_full_match(s::varchar, '[0-9A-Fa-f]*') then unhex(s::varchar) end""",
     f"create or replace macro {_NS}_sf_is_binary(v) as case when v is not null then false end",
@@ -753,8 +799,16 @@ MACROS = [
     # typeof() is known when the query is planned: for ordinary columns this is exactly `a = b`.
     # two VARIANTs are equal by value: a FLOAT and a NUMBER of the same value (1.5000000000000000e+00 and 1.5) too
     # (try_cast: DuckDB folds a constant even in a branch not taken, and `status = 'returned'` reaches here as text)
-    f"""create or replace macro {_NS}_sf_json_key(v) as case
-          when json_type(try_cast(v::varchar as json)) in ('UBIGINT', 'BIGINT', 'DOUBLE') then try_cast(v as double)::varchar
+    # (an exact number keeps its digits, a whole one has none past the point; an ARRAY or OBJECT is read whole: its
+    # numbers by value, an object's keys in order)
+    f"""create or replace macro {_NS}_sf_json_key(v) as case json_type(try_cast(v::varchar as json))
+          when 'UBIGINT' then try_cast(v::varchar as json)::varchar
+          when 'BIGINT' then try_cast(v::varchar as json)::varchar
+          when 'DOUBLE' then case when isfinite(try_cast(v as double)) and try_cast(v as double) = trunc(try_cast(v as double))
+              and abs(try_cast(v as double)) < 1e18 then try_cast(try_cast(v as double) as hugeint)::varchar
+            else try_cast(v as double)::varchar end
+          when 'OBJECT' then _fxpy_json_key(v::varchar)
+          when 'ARRAY' then _fxpy_json_key(v::varchar)
           else json(try_cast(v::varchar as json)) end""",
     f"create or replace macro {_NS}_sf_same_json(a, b) as {_NS}_sf_json_key(a) = {_NS}_sf_json_key(b)",
     f"""create or replace macro {_NS}_sf_eq(a, b) as case
@@ -811,6 +865,14 @@ _RENAMED = {  # Snowflake function -> macro, same arguments
     "negate": "_sf_negate", "bitcount": "_sf_bitcount", "getbit": "_sf_getbit", "array_repeat": "_sf_array_repeat",
     "binary_as_string": "_sf_binary_as_string", "string_as_binary": "_sf_string_as_binary", "jaccard_similarity": "_sf_jaccard",
     "approximate_count_distinct": "_sf_approx_count", "hll": "_sf_approx_count", "soundex_p123": "_sf_soundex",
+    "approx_count_distinct": "_sf_approx_count", "approx_distinct": "_sf_approx_count",
+    **{f"hll_{k}": f"_sf_hll_{k}" for k in ("accumulate", "combine", "estimate", "export", "import")},
+    "approx_quantile": "_sf_approx_percentile", "approx_percentile": "_sf_approx_percentile",
+    **{f"approx_percentile_{k}": f"_sf_approx_percentile_{k}" for k in ("accumulate", "combine", "estimate")},
+    "approx_top_k": "_sf_approx_top_k",
+    **{f"approx_top_k_{k}": f"_sf_approx_top_k_{k}" for k in ("accumulate", "combine", "estimate")},
+    "top_k_sketch_object_construct": "_sf_top_k_sketch", "sum_real": "_sf_sum_real",
+    "fuzzy_subsequence_score": "_sf_fuzzy_subsequence_score", "snowpark_conv": "_sf_snowpark_conv",
     "try_hex_decode_binary": "_sf_try_hex_binary", "is_date_value": "_sf_is_date",
     "is_binary": "_sf_is_binary", "is_vector": "_sf_is_binary", "as_binary": "_sf_as_binary",
     "bitmap_absolute_position": "_sf_bitmap_position", "try_validate_utf8": "_sf_try_validate_utf8",
@@ -1543,7 +1605,8 @@ def _fix(node: exp.Expression) -> exp.Expression:
         fixed = (exp.Boolean, exp.Null)  # sides that cannot be a VARIANT and need no care
         skip = any(isinstance(x, fixed) or (isinstance(x, exp.Literal) and not x.is_string) or x.find(exp.Select) is not None
                    for x in (left, right))
-        if (isinstance(left, exp.Column) or isinstance(right, exp.Column)) and not skip and not asof:
+        made = (exp.Column, exp.ParseJSON, exp.ToVariant, *_VARIANT_ACCESS)  # (a VARIANT made in place compares by value too)
+        if (isinstance(left, made) or isinstance(right, made)) and not skip and not asof:
             same = _fn("_sf_eq", node.this, node.expression)
             return same if isinstance(node, exp.EQ) else exp.Not(this=same)
     if isinstance(node, exp.Nullif) and isinstance(node.this, exp.Column) and isinstance(node.expression, exp.Literal) \
@@ -4548,4 +4611,117 @@ def kept_floats(transformed: exp.Expression, conn=None) -> exp.Expression:  # no
             if node is transformed:
                 return made
             node.replace(made)
+    return transformed
+
+
+_NOT_VARIANT = (exp.Literal, exp.Null, exp.Boolean, exp.Binary, exp.Predicate, exp.Not, exp.Neg, exp.Paren, exp.Interval)
+
+
+def _maybe_variant(node: exp.Expression) -> bool:
+    if isinstance(node, _NOT_VARIANT) and not isinstance(node, exp.Paren):
+        return False
+    if isinstance(node, exp.Paren):
+        return _maybe_variant(node.this)
+    if isinstance(node, (exp.Cast, exp.TryCast)):
+        return node.to.is_type("json", "variant", "object", "array")
+    return True
+
+
+def _json_tables(conn) -> set[str]:  # noqa: ANN001
+    try:
+        return {str(r[0]).upper() for r in conn.execute(
+            "select distinct table_name from duckdb_columns() where data_type = 'JSON'").fetchall()}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+_MAKES_JSON = re.compile(r"json|_sf_jv|_fs_object_construct|_sf_json_list|_sf_json_map|_sf_to_object|_sf_get", re.I)
+
+
+def variants_by_value(transformed: exp.Expression, conn) -> exp.Expression:  # noqa: ANN001
+    """Snowflake groups, counts and partitions VARIANTs by value: a FLOAT and a NUMBER that are equal (1.5 and
+    1.5000000000000000e+00 here), 1 and 1.0 inside an array, an object's keys in any order. DuckDB compares their
+    text. Where DuckDB says a GROUP BY, DISTINCT, PARTITION BY or COUNT(DISTINCT) expression is JSON, it goes by
+    _sf_json_key instead, and the select list takes one of the group's values (as Snowflake shows the first)."""
+    if not any(isinstance(n, (exp.Group, exp.Window, exp.Distinct)) for n in transformed.walk()):
+        return transformed
+    tables = None
+    if not _MAKES_JSON.search(transformed.sql(dialect="duckdb")):
+        tables = _json_tables(conn)
+        if not any(t.name.upper() in tables for t in transformed.find_all(exp.Table)):
+            return transformed
+    for select in list(transformed.find_all(exp.Select)):
+        if select.args.get("from_") is None:
+            continue
+        aliases = {e.alias.upper(): e.this for e in select.expressions if isinstance(e, exp.Alias)}
+
+        def resolved(e: exp.Expression) -> exp.Expression:
+            if isinstance(e, exp.Literal) and e.is_int and 0 < int(e.name) <= len(select.expressions):
+                item = select.expressions[int(e.name) - 1]
+                return item.this if isinstance(item, exp.Alias) else item
+            if isinstance(e, exp.Column) and not e.table and e.name.upper() in aliases:
+                return aliases[e.name.upper()]
+            return e
+
+        group = select.args.get("group")
+        grouped = [(g, resolved(g)) for g in (group.expressions if group else [])]
+        distinct = select.args.get("distinct")
+        distinct_items = [] if group or not distinct or distinct.args.get("on") or any(
+            isinstance(e, exp.Star) or e.find(exp.AggFunc, exp.Window) for e in select.expressions) else list(select.expressions)
+        mine = lambda n: n.find_ancestor(exp.Select) is select  # noqa: E731
+        partitions = [p for w in select.find_all(exp.Window) if mine(w) for p in w.args.get("partition_by") or []]
+        counted = [d for c in select.find_all(exp.Count) if mine(c) and isinstance(c.this, exp.Distinct) for d in c.this.expressions]
+        candidates = [r for _, r in grouped] + [e.this if isinstance(e, exp.Alias) else e for e in distinct_items] + partitions + counted
+        if not any(_maybe_variant(c) for c in candidates):
+            continue
+        probe = exp.Select(expressions=[exp.alias_(c.copy(), f"_k{i}") for i, c in enumerate(candidates)])
+        probe.set("from_", select.args["from_"].copy())
+        if select.args.get("joins"):
+            probe.set("joins", [j.copy() for j in select.args["joins"]])
+        try:
+            kinds = [str(r[1]).upper() for r in conn.execute("describe " + _cte_prefix(select) + probe.sql(dialect="duckdb")).fetchall()]
+        except Exception:  # noqa: BLE001, S112 - binds only in its place (a correlated subquery)
+            continue
+        if len(kinds) != len(candidates) or "JSON" not in kinds:
+            continue
+        is_json = iter(k == "JSON" for k in kinds)
+        keyed = [(g, r) for (g, r), j in zip(grouped, is_json) if j]
+        listed = [e for e, j in zip(distinct_items, is_json) if j]
+        for p, j in zip(partitions, is_json):
+            if j:
+                p.replace(_fn("_sf_json_key", p.copy()))
+        for d, j in zip(counted, is_json):
+            if j:
+                d.replace(_fn("_sf_json_key", d.copy()))
+        if listed:
+            # DISTINCT over a VARIANT: a GROUP BY of every column, the VARIANT by its value
+            items = [e.this if isinstance(e, exp.Alias) else e for e in distinct_items]
+            select.set("distinct", None)
+            select.set("group", exp.Group(expressions=[_fn("_sf_json_key", i.copy()) if e in listed else i.copy()
+                                                       for e, i in zip(distinct_items, items)]))
+            keyed = [(None, i) for e, i in zip(distinct_items, items) if e in listed]
+        elif keyed:
+            for g, r in keyed:
+                g.replace(_fn("_sf_json_key", r.copy()))
+        if not keyed:
+            continue
+        values = [r for _, r in keyed]
+
+        def one_of(node: exp.Expression) -> exp.Expression:
+            if any(node == v for v in values) and not node.find_ancestor(exp.AggFunc, exp.Window) \
+                    and not (isinstance(node.parent, exp.Anonymous) and _is(node.parent, "_sf_json_key")):
+                return exp.Anonymous(this="any_value", expressions=[node.copy()])
+            return node
+
+        for i, item in enumerate(list(select.expressions)):
+            name = item.alias_or_name if not isinstance(item, exp.Alias) else None
+            changed = item.transform(one_of, copy=True)
+            if name and changed is not item and not isinstance(item, exp.Alias) and changed != item:
+                changed = exp.alias_(changed, exp.to_identifier(name, quoted=isinstance(item, exp.Column) and item.this.quoted))
+            select.expressions[i] = changed
+            changed.parent = select
+        for key in ("having", "qualify", "order"):
+            part = select.args.get(key)
+            if part is not None:
+                select.set(key, part.transform(one_of, copy=True))
     return transformed
