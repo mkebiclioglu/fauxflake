@@ -931,3 +931,31 @@ def test_constraints_are_kept_and_shown_as_snowflake_keeps_them_and_never_enforc
     run("insert into t2 values (1, 1, 1), (1, 1, 1)")
     run("create or replace table t2 (a int)")
     assert run("show primary keys in table t2") == []
+
+
+def test_time_travel_reads_a_kept_state(run):
+    run("select * from t at(offset => -1)")  # (read back in time once: its states are kept from here on)
+    assert run("select count(*) from t at(offset => -1)") == [(2,)]
+    run("insert into t values (3, 'c', 30)")
+    qid = run("select last_query_id()")[0][0]
+    assert run("select count(*) from t") == [(3,)]
+    assert run(f"select count(*) from t before(statement => '{qid}')") == [(2,)]
+    assert run(f"select count(*) from t at(statement => '{qid}')") == [(3,)]
+    import time
+    time.sleep(1.2)
+    run("delete from t where id = 1")
+    assert run("select count(*) from t") == [(2,)]
+    assert run("select count(*), max(t.id) from t at(offset => -1)") == [(3, 3)]
+
+
+def test_a_transaction_across_databases_rolls_back_whole(run):
+    run.emu.ensure_database("OTHER", "CI")
+    run("create or replace table other.ci.u (id int)")
+    run("insert into other.ci.u values (1)")
+    for end, rows in (("rollback", ([(2,)], [(1,)])), ("commit", ([(3,)], [(2,)]))):
+        run("begin")
+        run("insert into t values (9, 'z', 90)")
+        run("insert into other.ci.u values (2)")
+        assert run("select count(*) from other.ci.u") == [(2,)]  # (its own writes, before it ends)
+        run(end)
+        assert (run("select count(*) from t"), run("select count(*) from other.ci.u")) == rows

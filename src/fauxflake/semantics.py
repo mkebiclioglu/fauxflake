@@ -39,6 +39,7 @@ def python_functions(duck) -> None:  # noqa: ANN001
             ("_fxpy_sha2", sha2, ["VARCHAR", "INTEGER"], "VARCHAR", None),
             ("_fxpy_json_sorted", sorted_json, ["VARCHAR"], "VARCHAR", "arrow"),
             ("_fxpy_json_key", json_keys_of, ["VARCHAR"], "VARCHAR", "arrow"),
+            ("_fxpy_java_double", jsondoc.java_double, ["DOUBLE"], "VARCHAR", None),
             ("_fxpy_encrypt_raw", encrypt_raw, ["BLOB", "BLOB", "BLOB", "BLOB", "VARCHAR"], "VARCHAR", None),
             ("_fxpy_randstr", randstr, ["BIGINT", "HUGEINT"], "VARCHAR", None),
             ("_fxpy_parse_xml", parse_xml, ["VARCHAR"], "VARCHAR", None),
@@ -385,7 +386,7 @@ MACROS = zoned.MACROS + [
           when typeof(x) in ('TIMESTAMP', 'TIMESTAMP_NS', 'TIMESTAMP_MS', 'TIMESTAMP_S')
             then {_NS}_sf_kept_kind(strftime(try_cast(x::varchar as timestamp), '%Y-%m-%d %H:%M:%S.%g'), 3)
           when typeof(x) = 'TIMESTAMP WITH TIME ZONE'
-            then {_NS}_sf_kept_kind(strftime(timezone('UTC', try_cast(x::varchar as timestamptz)), '%Y-%m-%d %H:%M:%S.%g') || ' Z', 2)
+            then {_NS}_sf_kept_kind({_NS}_tz_text_s({_NS}_tz_local(try_cast(x::varchar as timestamptz))), 2)
           when typeof(x) = '{zoned.SHOWN}' then {_NS}_sf_kept_kind({_NS}_tz_text_s(try_cast(try_cast(x as varchar) as {zoned.STRUCT})), 1)
           when typeof(x) = 'DATE' then {_NS}_sf_kept_kind(try_cast(x as varchar), 4)
           when typeof(x) = 'TIME' then {_NS}_sf_kept_kind(try_cast(x as varchar), 5)
@@ -424,6 +425,7 @@ MACROS = zoned.MACROS + [
     # DATE_TRUNC keeps the input type. DuckDB turns a DATE into a TIMESTAMP.
     f"""create or replace macro {_NS}_sf_date_trunc
           (p varchar, x date) as date_trunc(p, x)::date,
+          (p varchar, x timestamptz) as date_trunc(p, x),
           (p, x) as date_trunc(p, x::timestamp)""",
     f"create table if not exists {_NS}_fx_session as select 'SYSADMIN' as role",
     f"create table if not exists {_NS}_fx_secure_views (database_name varchar, schema_name varchar, view_name varchar)",
@@ -499,7 +501,8 @@ MACROS = zoned.MACROS + [
           when typeof(x) in ('TIMESTAMP', 'TIMESTAMP_NS', 'TIMESTAMP_MS', 'TIMESTAMP_S')
             then strftime(try_cast(x::varchar as timestamp), '%Y-%m-%d %H:%M:%S.%g')
           when typeof(x) = 'TIMESTAMP WITH TIME ZONE'
-            then strftime(timezone('UTC', try_cast(x::varchar as timestamptz)), '%Y-%m-%d %H:%M:%S.%g') || ' Z'
+            then {_NS}_tz_text_s({_NS}_tz_local(try_cast(x::varchar as timestamptz)))
+          when typeof(x) = '{zoned.SHOWN}' then {_NS}_tz_text_s(try_cast(try_cast(x as varchar) as {zoned.STRUCT}))
           else x::varchar end""",
     # Text of a division: NUMBER / NUMBER prints every decimal of its scale ('1.500000').
     f"""create or replace macro {_NS}_sf_fixed(v, s) as
@@ -898,6 +901,7 @@ _RENAMED = {  # Snowflake function -> macro, same arguments
 _DATE_TOKENS = re.compile(r"YYYY|YY|MM|DD|HH|MI|SS|MON|DY|AM|PM", re.IGNORECASE)
 _HASHES = (exp.MD5, exp.SHA, exp.SHA2, exp.MD5Digest)
 UDFS: dict[str, str] = {}  # user-defined functions from the spec: name -> macro name
+SESSION_ZONE = ["UTC"]  # the time zone of the session whose statement is being rewritten (ALTER SESSION SET TIMEZONE)
 # What the session context functions answer. The role is the exception: it lives in a table
 # (`USE ROLE x`, or `dbt: {role: ...}` in the spec), so policies can be exercised as different roles.
 SESSION = {
@@ -1729,8 +1733,13 @@ def _fix(node: exp.Expression) -> exp.Expression:
     if isinstance(node, (exp.TimeToStr, exp.StrToTime, exp.StrToDate)) and isinstance(node.args.get("format"), exp.Literal):
         fmt = node.args["format"]
         fmt.set("this", fmt.name.replace("Mon", "%b").replace("Dy", "%a"))
-        if isinstance(node, exp.TimeToStr):  # TZH, TZHTZM, TZH:TZM write an offset of zero as Z (the clock runs in UTC)
-            fmt.set("this", re.sub(r"%[:-]?z", "Z", fmt.name))
+        if isinstance(node, exp.TimeToStr) and SESSION_ZONE[0].upper() in ("UTC", "ETC/UTC", "GMT", "Z"):
+            fmt.set("this", re.sub(r"%[:-]?z", "Z", fmt.name))  # TZH, TZHTZM, TZH:TZM write an offset of zero as Z
+    if isinstance(node, exp.Cast) and node.to.is_type("varchar", "text") and isinstance(node.this, exp.ToVariant) \
+            and not node.this.find(exp.Column, exp.Select, exp.AggFunc) and any(
+            isinstance(c, (exp.Cast, exp.TryCast)) and c.to.is_type("float", "double") for c in node.this.find_all(exp.Cast, exp.TryCast)):
+        # to_variant(1e20::float)::varchar: folded when it compiles, and written as Java writes a double (1.0E20)
+        return exp.Anonymous(this="_fxpy_java_double", expressions=[exp.cast(node.this.this.copy(), "double")])
     if isinstance(node, exp.Cast) and not isinstance(node, exp.TryCast) and node.to.is_type("varchar", "text") \
             and not node.to.expressions and not (isinstance(node.this, (exp.JSONExtract, exp.Bracket)) and not _computed_index(node.this)) \
             and not (isinstance(node.this, exp.Literal) and node.this.is_string):

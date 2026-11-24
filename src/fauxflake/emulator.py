@@ -28,7 +28,7 @@ from typing import Iterator
 import duckdb
 from sqlglot import exp
 
-from . import account, constraints, objects, semantics, zoned
+from . import account, constraints, history, objects, semantics, zoned
 
 # Statements the emulator cannot run as-is, rewritten before they are parsed.
 # Every entry is a known difference from Snowflake: keep the list short and
@@ -125,10 +125,16 @@ def _transaction(cursor, command: str, original):  # noqa: ANN001, ANN202
     if _TXN_BEGIN.match(trailing):
         if is_open:  # one left open (a failed run that never said ROLLBACK): Snowflake would carry on in it
             _end_transaction(cursor)
+        if getattr(conn, "_fauxflake_undo", None) is not None:
+            _undo(cursor, restore=False)
         cursor._duck_conn.execute("begin transaction")
         conn._fauxflake_txn, conn._fauxflake_journal = True, []
         return original(cursor, "select 'Statement executed successfully.' as \"status\"")
     end = _TXN_END.match(trailing)
+    if end and getattr(conn, "_fauxflake_undo", None) is not None:  # (a transaction across databases: see _undo)
+        _undo(cursor, restore=end.group(1).lower() == "rollback")
+        _drop_scratch(cursor)
+        return original(cursor, "select 'Statement executed successfully.' as \"status\"")
     if end:
         _drop_scratch(cursor)
         if is_open:
@@ -141,7 +147,57 @@ def _transaction(cursor, command: str, original):  # noqa: ANN001, ANN202
         return original(cursor, "select 'Statement executed successfully.' as \"status\"")
     if is_open and not _TXN_KEEPS.match(trailing):
         _end_transaction(cursor)  # DDL commits
+    if getattr(conn, "_fauxflake_undo", None) is not None and not _TXN_KEEPS.match(trailing):
+        _undo(cursor, restore=False)
     return None
+
+
+UNDO = "_fs_global._fx_undo"
+
+
+def _undo_copy(cursor, tree) -> None:  # noqa: ANN001
+    """Before a statement of a transaction that spans databases writes to a table: its rows as they were, once."""
+    from . import history
+
+    undo = getattr(cursor._conn, "_fauxflake_undo", None)
+    target = history._target(tree) if undo is not None and isinstance(tree, exp.Expression) else None
+    if target is None:
+        return
+    conn = cursor._conn
+    fq = ((target.catalog or conn.database or "").upper(), (target.db or conn.schema or "").upper(), target.name.upper())
+    if fq in undo:
+        return
+    source = ".".join('"' + p.replace('"', '""') + '"' for p in fq)
+    copy = '"' + ".".join(fq).replace('"', '""') + f'#{len(undo)}"'
+    try:
+        cursor._duck_conn.execute(f"create schema if not exists {UNDO}")
+        cursor._duck_conn.execute(f"create or replace table {UNDO}.{copy} as select * from {source}")
+        undo[fq] = copy
+    except Exception:  # noqa: BLE001 - not there yet: ROLLBACK drops it
+        undo[fq] = None
+
+
+def _undo(cursor, restore: bool) -> None:  # noqa: ANN001, FBT001
+    """The end of a transaction that spans databases: COMMIT keeps what it did, ROLLBACK puts each table back."""
+    conn, duck = cursor._conn, cursor._duck_conn
+    undo, conn._fauxflake_undo = conn._fauxflake_undo or {}, None
+    for fq, copy in undo.items():
+        source = ".".join('"' + p.replace('"', '""') + '"' for p in fq)
+        try:
+            if restore and copy is None:
+                duck.execute(f"drop table if exists {source}")
+            elif restore:
+                exists = duck.execute("select count(*) from duckdb_tables() where upper(database_name) = ? and upper(schema_name) = ? "
+                                      "and upper(table_name) = ?", list(fq)).fetchone()[0]
+                if exists:
+                    duck.execute(f"delete from {source}")
+                    duck.execute(f"insert into {source} select * from {UNDO}.{copy}")
+                else:
+                    duck.execute(f"create table {source} as select * from {UNDO}.{copy}")
+            if copy is not None:
+                duck.execute(f"drop table if exists {UNDO}.{copy}")
+        except Exception as e:  # noqa: BLE001
+            print(f"fauxflake: could not put {'.'.join(fq)} back as the transaction found it: {e}", file=sys.stderr)
 
 
 EMPTY_LOOKUPS: list[str] = []  # INFORMATION_SCHEMA queries that found nothing: what a project's macros looked for
@@ -200,6 +256,61 @@ _CLOCK = re.compile(
 )
 
 
+_ZONE_SET = re.compile(r"(?is)^\s*alter\s+session\s+(?:set\s+.*?\btimezone\s*=\s*'([^']*)'|unset\s+.*?\btimezone\b)")
+_ZONES: dict[int, str] = {}  # DuckDB connection -> the TimeZone it was last set to
+
+
+def _session_zone(cursor, command) -> None:  # noqa: ANN001
+    """ALTER SESSION SET TIMEZONE: the session's clock, for TIMESTAMP_LTZ and for a TIMESTAMP_TZ made without an offset.
+    Kept on the connection and given to DuckDB before each of its statements."""
+    if isinstance(command, str):
+        m = _ZONE_SET.match(command)
+        if m:
+            zone = m.group(1) or "UTC"
+            try:
+                cursor._duck_conn.execute("select current_setting('TimeZone')")  # (still usable)
+                cursor._duck_conn.execute(f"set TimeZone = '{zone}'")
+            except Exception as e:  # noqa: BLE001
+                from snowflake.connector.errors import ProgrammingError
+                raise ProgrammingError(msg=f"Invalid value [{zone}] for parameter 'TIMEZONE'", errno=1008, sqlstate="22023") from e
+            cursor._conn._fx_timezone = zone
+    zone = getattr(cursor._conn, "_fx_timezone", "UTC")
+    semantics.SESSION_ZONE[0] = zone
+    if _ZONES.get(id(cursor._duck_conn), "UTC") != zone:
+        try:
+            cursor._duck_conn.execute(f"set TimeZone = '{zone}'")
+            _ZONES[id(cursor._duck_conn)] = zone
+        except Exception:  # noqa: BLE001, S110
+            pass
+
+
+def _local_out(table):  # noqa: ANN001, ANN202
+    """Outside UTC, each TIMESTAMP_LTZ as Snowflake's client shows it: the instant at the session's offset."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    zone = semantics.SESSION_ZONE[0]
+    if zone.upper() in ("UTC", "ETC/UTC", "GMT", "Z"):
+        return table
+    for i, field in enumerate(table.schema):
+        if not (pa.types.is_timestamp(field.type) and field.type.tz):
+            continue
+        col = table.column(i).combine_chunks()
+        utc = pc.cast(col, pa.timestamp("us", tz="UTC"))
+        local = pc.local_timestamp(pc.cast(col, pa.timestamp("us", tz=zone)))
+        minutes = pc.divide(pc.subtract(local.cast(pa.int64()), utc.cast(pa.timestamp("us")).cast(pa.int64())), 60_000_000)
+        seconds = pc.floor_temporal(utc, unit="second")
+        epoch = pc.divide(seconds.cast(pa.int64()), 1_000_000)
+        fraction = pc.multiply(pc.subtract(utc.cast(pa.int64()), seconds.cast(pa.int64())), 1000).cast(pa.int32())
+        offset = pc.add(minutes.cast(pa.int32()), pa.scalar(1440, pa.int32()))
+        value = pa.StructArray.from_arrays(
+            [pc.fill_null(epoch, 0), pc.fill_null(fraction, 0), pc.fill_null(offset, 1440)],
+            fields=[pa.field("epoch", pa.int64(), nullable=False), pa.field("fraction", pa.int32(), nullable=False),
+                    pa.field("timezone", pa.int32(), nullable=False)], mask=pc.is_null(col))
+        table = table.set_column(i, pa.field(field.name, value.type), value)
+    return table
+
+
 def _zoned_out(table):  # noqa: ANN001, ANN202
     """Each (instant, offset) column as Snowflake sends a TIMESTAMP_TZ: seconds, nanoseconds, and the offset in
     minutes plus 1440."""
@@ -231,8 +342,8 @@ _QUOTED_TEXT = re.compile(r"""('(?:[^'\\]|''|\\.)*'|"(?:[^"]|"")*"|\$\$.*?\$\$)"
 
 def _freeze_clock(sql: str) -> str:
     def sub(m: re.Match[str]) -> str:
-        if m.group(0).lower().startswith("current_date"):
-            return f"'{FROZEN_NOW:%Y-%m-%d}'::date"
+        if m.group(0).lower().startswith("current_date"):  # (the date in the session's time zone)
+            return f"cast('{FROZEN_NOW:%Y-%m-%d %H:%M:%S} +00:00'::timestamp_ltz as date)"
         if m.group(0).lower().startswith("sysdate"):
             return f"'{FROZEN_NOW:%Y-%m-%d %H:%M:%S}'::timestamp"  # (SYSDATE is a TIMESTAMP_NTZ, in UTC)
         # CURRENT_TIMESTAMP() is an instant (TIMESTAMP_LTZ), as the live clock: CONVERT_TIMEZONE('America/Los_Angeles',
@@ -788,6 +899,8 @@ def _patch_fakesnow() -> None:
 
     def timed_execute(self, command, *args, **kwargs):  # noqa: ANN001
         semantics.reset_seeded()
+        _session_zone(self, command)
+        self._fx_history_seen = False
         try:
             self._fauxflake_outer = semantics.outer_flattens(command)
             self._fauxflake_recursive = semantics.outer_flattens(command, "recursive")
@@ -936,7 +1049,7 @@ def _patch_fakesnow() -> None:
     upstream_to_sf = server.to_sf
 
     def to_sf(table, rowtype):  # noqa: ANN001, ANN202
-        return upstream_to_sf(_zoned_out(table), rowtype)
+        return upstream_to_sf(_local_out(_zoned_out(table)), rowtype)
 
     server.to_sf = to_sf
 
@@ -1089,6 +1202,10 @@ def _patch_fakesnow() -> None:
                 clock["transforms"] += 1
 
     def _transform_once(self, expression, params):  # noqa: ANN001
+        if not getattr(self, "_fx_history_seen", False):  # (once a statement: a retry transforms it again)
+            self._fx_history_seen = True
+            history.before(self, expression)
+        expression = history.rewrite(expression, self)
         expression = objects.apply_policies(objects.tag_scans(objects.result_scans(expression, self), self), self)
         if getattr(self, "_fauxflake_qualify", False) and self._conn.database:
             expression = semantics.qualify_schemas(expression, self._conn.database)
@@ -1224,6 +1341,8 @@ def _patch_fakesnow() -> None:
             replaced = _over_a_stand_in(self, tree) if STANDINS and isinstance(tree, exp.Create) else None
             if isinstance(tree, (exp.Insert, exp.Update)):
                 _variant_takes_text(self, tree)
+            if getattr(self._conn, "_fauxflake_undo", None) is not None:
+                _undo_copy(self, tree)
             try:
                 original_execute(self, tree, params)
                 if merging:
@@ -1240,17 +1359,20 @@ def _patch_fakesnow() -> None:
                     # DuckDB keeps a transaction to one database, and this statement needs a second
                     # (MERGE works through a temporary table): what the transaction did so far is
                     # committed here, and the rest of it runs in autocommit
+                    # (MERGE works through a temporary table): the transaction goes on in autocommit, each table it
+                    # writes copied first, so that ROLLBACK can put them back (see _undo)
                     conn = self._conn
-                    print("fauxflake: a transaction wrote to a second database; it was committed at that point and "
-                          "the rest of it runs in autocommit.", file=sys.stderr)
                     conn._fauxflake_txn, conn._fauxflake_healing = False, True
+                    conn._fauxflake_undo = {}
                     try:
                         self._duck_conn.execute("rollback")
                         for done, values in list(getattr(conn, "_fauxflake_journal", [])):
+                            _undo_copy(self, done)
                             original_execute(self, done.copy(), values)
                     finally:
                         conn._fauxflake_healing = False
                     conn._fauxflake_journal = []
+                    _undo_copy(self, kept)
                     original_execute(self, kept, params)
                     return
                 _heal(self)

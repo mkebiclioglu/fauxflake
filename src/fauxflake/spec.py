@@ -205,6 +205,9 @@ class Spec:
 
         # cloud storage read by COPY INTO, served from local directories: `locations: {"s3://bucket/x": ./fixtures/x}`
         objects.LOCATIONS = {str(k): str((Path(path).parent / str(v)).resolve()) for k, v in (raw.get("locations") or {}).items()}
+        # tables read back in time (AT, BEFORE) whose earlier states are kept from the first statement: `time_travel: [DB.S.T]`
+        from . import history
+        history.keep([str(t) for t in raw.get("time_travel") or []])
         # tests that state facts about production data the generated data does not share
         os.environ["FAUXFLAKE_EXPECTED_FAILURES"] = " ".join(spec.dbt.get("expected_failures") or [])
         # dbt commands run before each build: a project whose `dbt seed` makes its own sources (a seed's post-hook)

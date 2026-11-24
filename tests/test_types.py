@@ -40,3 +40,29 @@ def test_a_timestamp_tz_keeps_its_offset(cur):
     assert [r[1] for r in cur.fetchall()] == ["TIMESTAMP_TZ(9)", "TIMESTAMP_LTZ"]
     cur.execute("select count(*) from zoned where t > '2025-01-01 11:00:00'")
     assert cur.fetchall() == [(1,)]
+
+
+def test_the_session_time_zone(cur):
+    """Measured on Snowflake with ALTER SESSION SET TIMEZONE = 'America/Los_Angeles' (2026-11-23)."""
+    cur.execute("alter session set timezone = 'America/Los_Angeles'")
+    try:
+        cur.execute("select '2025-01-01 12:00:00 +00:00'::timestamp_ltz::varchar, '2025-01-01 12:00:00'::timestamp_ntz::timestamp_ltz::varchar, "
+                    "'2025-01-01 12:00:00'::timestamp_tz::varchar, '2025-07-01 12:00:00'::timestamp_ntz::timestamp_tz::varchar, "
+                    "'2025-01-01 12:00:00 +00:00'::timestamp_ltz::timestamp_ntz, '2025-01-01 02:00:00 +00:00'::timestamp_ltz::date, "
+                    "hour('2025-01-01 12:00:00 +00:00'::timestamp_ltz), date_trunc('day', '2025-01-01 02:00:00 +00:00'::timestamp_ltz)::varchar, "
+                    "convert_timezone('UTC', '2025-01-01 12:00:00'::timestamp_ntz)::varchar, "
+                    "to_char('2025-01-01 12:00:00 +00:00'::timestamp_ltz, 'YYYY-MM-DD HH24:MI TZH:TZM')")
+        assert cur.fetchall() == [("2025-01-01 04:00:00.000 -0800", "2025-01-01 12:00:00.000 -0800", "2025-01-01 12:00:00.000 -0800",
+                                   "2025-07-01 12:00:00.000 -0700", datetime(2025, 1, 1, 4, 0), datetime(2024, 12, 31).date(), 4,
+                                   "2024-12-31 00:00:00.000 -0800", "2025-01-01 20:00:00.000 Z", "2025-01-01 04:00 -08:00")]
+        cur.execute("select '2025-01-01 12:00:00 +00:00'::timestamp_ltz, to_json(object_construct('t', '2025-01-01 12:00:00 +00:00'::timestamp_ltz)), "
+                    "datediff(hour, '2025-01-01 00:00:00'::timestamp_ntz, '2025-01-01 12:00:00 +00:00'::timestamp_ltz)")
+        value, text, hours = cur.fetchone()
+        assert value.utcoffset() == timedelta(hours=-8) and value.hour == 4
+        assert (text, hours) == ('{"t":"2025-01-01 04:00:00.000 -0800"}', 4)
+        cur.execute("show parameters like 'TIMEZONE' in session")
+        assert cur.fetchone()[1] == "America/Los_Angeles"
+    finally:
+        cur.execute("alter session unset timezone")
+    cur.execute("select '2025-01-01 12:00:00'::timestamp_ntz::timestamp_ltz::varchar")
+    assert cur.fetchall() == [("2025-01-01 12:00:00.000 Z",)]

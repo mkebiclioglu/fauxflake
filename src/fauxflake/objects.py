@@ -1000,6 +1000,8 @@ def result_scans(tree: exp.Expression, cursor) -> exp.Expression:  # noqa: ANN00
 
 def remember(cursor) -> None:  # noqa: ANN001
     cursor._conn._fauxflake_last_query = cursor.sfqid
+    from . import history
+    history.after(cursor)
 
 
 _VIEW_MADE = re.compile(_LEAD + r"create\s+(?:or\s+replace\s+)?(?P<secure>secure\s+)?(?:recursive\s+)?view\s+(?:if\s+not\s+exists\s+)?(?P<name>" + _NAME + r")")

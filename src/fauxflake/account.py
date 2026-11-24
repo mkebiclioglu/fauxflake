@@ -681,7 +681,7 @@ def _show_parameters(cursor, original, m):  # noqa: ANN001, ANN202
 
 def _session_values(cursor) -> dict:  # noqa: ANN001
     """The parameters this session has set (the emulator's own clock runs in UTC, as `fauxflake parity` has Snowflake's)."""
-    values = {"TIMEZONE": "UTC"}
+    values = {"TIMEZONE": getattr(cursor._conn, "_fx_timezone", "UTC")}
     tag = getattr(cursor._conn, "_fx_query_tag", "")
     if tag:
         values["QUERY_TAG"] = tag

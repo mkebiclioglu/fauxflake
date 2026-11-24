@@ -34,15 +34,23 @@ _SPLIT_SQL = r"^(.*\d:\d\d(?::\d\d(?:\.\d*)?)?)\s*(Z|[+-]\d\d(?::?\d\d)?)\s*$"
 MACROS = [
     f"create or replace macro {_NS}_tz_is(x) as typeof(x) = '{SHOWN}'",
     f"create or replace macro {_NS}_tz_make(i, o) as struct_pack(\"I\" := i::timestamptz, \"O\" := o::bigint)",
+    f"""create or replace macro {_NS}_tz_zoned(zone, t) as list_transform([t::timestamptz],
+          lambda v: {_NS}_tz_make(v, ((epoch(timezone(zone, v)) - epoch(v)) / 60)::bigint))[1]""",
+    # an instant at the session's time zone (UTC unless ALTER SESSION SET TIMEZONE said otherwise)
+    f"create or replace macro {_NS}_tz_local(t) as {_NS}_tz_zoned(current_setting('TimeZone'), t)",
     f"""create or replace macro {_NS}_tz_minutes(z) as case when z is null or z = '' or z = 'Z' then 0
           else (case when z[1] = '-' then -1 else 1 end) * (try_cast(regexp_replace(z, '[^0-9]', '', 'g')[1:2] as integer) * 60
             + coalesce(try_cast(nullif(regexp_replace(z, '[^0-9]', '', 'g')[3:4], '') as integer), 0)) end""",
     f"""create or replace macro {_NS}_tz_parse(s) as list_transform([regexp_extract(s::varchar, '{_SPLIT_SQL}', ['w', 'z'])],
-          lambda p: {_NS}_tz_make(timezone('UTC', cast(coalesce(nullif(p.w, ''), s::varchar) as timestamp)
-            - to_minutes({_NS}_tz_minutes(p.z)::bigint)), {_NS}_tz_minutes(p.z)))[1]""",
+          lambda p: case when p.z = '' and s is not null
+            then {_NS}_tz_local(timezone(current_setting('TimeZone'), cast(s::varchar as timestamp)))
+            else {_NS}_tz_make(timezone('UTC', cast(coalesce(nullif(p.w, ''), s::varchar) as timestamp)
+              - to_minutes({_NS}_tz_minutes(p.z)::bigint)), {_NS}_tz_minutes(p.z)) end)[1]""",
     f"""create or replace macro {_NS}_tz_try_parse(s) as list_transform([regexp_extract(s::varchar, '{_SPLIT_SQL}', ['w', 'z'])],
-          lambda p: {_NS}_tz_make(timezone('UTC', try_cast(coalesce(nullif(p.w, ''), s::varchar) as timestamp)
-            - to_minutes({_NS}_tz_minutes(p.z)::bigint)), {_NS}_tz_minutes(p.z)))[1]""",
+          lambda p: case when p.z = '' and s is not null
+            then {_NS}_tz_local(timezone(current_setting('TimeZone'), try_cast(s::varchar as timestamp)))
+            else {_NS}_tz_make(timezone('UTC', try_cast(coalesce(nullif(p.w, ''), s::varchar) as timestamp)
+              - to_minutes({_NS}_tz_minutes(p.z)::bigint)), {_NS}_tz_minutes(p.z)) end)[1]""",
     f"create or replace macro {_NS}_tz_wall_in(s) as coalesce(nullif(regexp_extract(s::varchar, '{_SPLIT_SQL}', 1), ''), s::varchar)",
     f"create or replace macro {_NS}_tz_offset_in(s) as {_NS}_tz_minutes(regexp_extract(s::varchar, '{_SPLIT_SQL}', 2))",
     # a value of a type not known when the statement is written: dispatched on its type when it binds (through text
@@ -51,14 +59,12 @@ MACROS = [
           when {_NS}_tz_is(x) then try_cast(try_cast(x as varchar) as {STRUCT})
           when typeof(x) = 'VARCHAR' then {_NS}_tz_try_parse(try_cast(x as varchar))
           when typeof(x) = 'JSON' then {_NS}_tz_try_parse(try_cast(x as json) ->> '$')
-          else {_NS}_tz_make(try_cast(x as timestamptz), 0) end""",
+          else {_NS}_tz_local(try_cast(x as timestamptz)) end""",
     f"create or replace macro {_NS}_tz_instant(x) as {_NS}_tz_of(x).i",
     f"create or replace macro {_NS}_tz_instant_of(x) as try_cast(x as timestamptz)",
     f"create or replace macro {_NS}_tz_wall_s(s) as list_transform([s], lambda v: timezone('UTC', v.i) + to_minutes(v.o::bigint))[1]",
     f"create or replace macro {_NS}_tz_wall(x) as {_NS}_tz_wall_s({_NS}_tz_of(x))",
     f"create or replace macro {_NS}_tz_rewall_o(w, o) as list_transform([o], lambda v: {_NS}_tz_make(timezone('UTC', w::timestamp - to_minutes(v::bigint)), v))[1]",
-    f"""create or replace macro {_NS}_tz_zoned(zone, t) as list_transform([t::timestamptz],
-          lambda v: {_NS}_tz_make(v, ((epoch(timezone(zone, v)) - epoch(v)) / 60)::bigint))[1]""",
     f"""create or replace macro {_NS}_tz_sign(o) as case when o < 0 then '-' else '+' end
           || lpad((abs(o) // 60)::varchar, 2, '0')""",
     f"""create or replace macro {_NS}_tz_offset_text(o, colon) as case when o = 0 then 'Z'
@@ -141,6 +147,16 @@ def _mentions_tz(expression: exp.Expression) -> bool:
     return False
 
 
+def _mentions_ltz(expression: exp.Expression) -> bool:
+    """TO_CHAR of an instant, which shows the session's offset."""
+    return any(isinstance(n, (exp.ToChar, exp.TimeToStr)) for n in expression.walk())
+
+
+def _local() -> bool:
+    from . import semantics
+    return semantics.SESSION_ZONE[0].upper() not in ("UTC", "ETC/UTC", "GMT", "Z")
+
+
 # -- the rewrite -----------------------------------------------------------------------------------------------------
 _PASS = (exp.AggFunc, exp.Coalesce, exp.If, exp.Case, exp.Greatest, exp.Least, exp.Nullif, exp.Window, exp.Paren,
          exp.Alias, exp.Column, exp.Subquery, exp.Select, exp.Ordered, exp.Order, exp.Group, exp.Distinct, exp.Tuple,
@@ -162,7 +178,7 @@ def _unit(node: exp.Expression) -> str:
     return (unit.name if unit is not None else "DAY").upper()
 
 
-_MAKERS = {"_tz_parse", "_tz_try_parse", "_tz_make", "_tz_rewall_o", "_tz_zoned", "_tz_of"}
+_MAKERS = {"_tz_parse", "_tz_try_parse", "_tz_make", "_tz_rewall_o", "_tz_zoned", "_tz_of", "_tz_local"}
 _INSTANTS = {"_tz_instant", "_tz_instant_of"}
 _WALLS = {"_tz_wall", "_tz_wall_s"}
 _TEXTS = {"_tz_text", "_tz_text_s"}
@@ -253,9 +269,9 @@ class _Pass:
         if k == "text":
             return _fn("_tz_parse" if isinstance(x, exp.Literal) else "_tz_try_parse", x)
         if k in ("ntz", "ltz", "date"):
-            return _fn("_tz_make", _fn("_tz_instant_of", x), exp.Literal.number(0))
+            return _fn("_tz_local", _fn("_tz_instant_of", x))
         if k == "number":
-            return _fn("_tz_make", _fn("_tz_instant_of", exp.cast(x, "timestamp_ntz")), exp.Literal.number(0))
+            return _fn("_tz_local", _fn("_tz_instant_of", exp.cast(x, "timestamp_ntz")))
         return _fn("_tz_of", x)
 
     def instant(self, x: exp.Expression) -> exp.Expression:
@@ -317,7 +333,7 @@ class _Pass:
         if isinstance(node, exp.UnixToTime) and node.args.get("target_type") is not None \
                 and node.args["target_type"].is_type(exp.DataType.Type.TIMESTAMPTZ):
             node.set("target_type", None)
-            return _fn("_tz_make", _fn("_tz_instant_of", node), exp.Literal.number(0))
+            return _fn("_tz_local", _fn("_tz_instant_of", node))
         if isinstance(node, exp.ConvertTimezone) and node.args.get("source_tz") is None and node.args.get("timestamp") is not None:
             return _fn("_tz_zoned", node.args["target_tz"], self.instant(node.args["timestamp"]))
         if isinstance(node, exp.ConvertTimezone) and node.args.get("source_tz") is not None and tz(node.args.get("timestamp")):
@@ -377,6 +393,17 @@ class _Pass:
                 return node
             node.set("this", self.wall(node.this))
             return node
+        if isinstance(node, exp.TimeToStr) and isinstance(node.args.get("format"), exp.Literal) \
+                and (tz(node.this) or (self.kind(node.this) == "ltz" and _local())):
+            # TO_CHAR of a typed value: the format already strftime's; its offsets from the value's own
+            value = node.this if tz(node.this) else _fn("_tz_local", node.this)
+            if not re.search(r"%[:-]?z", node.args["format"].name):
+                node.set("this", self.wall(value))
+                return node
+            return self.formatted_strftime(value, node.args["format"].name)
+        if isinstance(node, exp.ToChar) and self.kind(node.this) == "ltz" and isinstance(node.args.get("format"), exp.Literal) \
+                and _TZ_FORMAT.search(node.args["format"].name):
+            return self.formatted_text(_fn("_tz_local", node.this), node.args["format"].name)
         if isinstance(node, exp.ToChar) and tz(node.this):
             fmt = node.args.get("format")
             if fmt is None:
@@ -478,7 +505,7 @@ class _Pass:
                                  safe=node.args.get("safe"), target_type=exp.DataType.build("TIMESTAMP_NTZ", dialect="snowflake"))
             return _fn("_tz_rewall_o", wall, _fn("_tz_offset_in", text.copy()))
         node.set("target_type", exp.DataType.build("TIMESTAMP_NTZ", dialect="snowflake"))
-        return _fn("_tz_make", _fn("_tz_instant_of", node), exp.Literal.number(0))
+        return _fn("_tz_local", _fn("_tz_instant_of", node))
 
     def formatted_text(self, value: exp.Expression, fmt: str) -> exp.Expression:
         """TO_CHAR(tz, format): the format's offset tokens from the value's own offset, the rest from its wall clock."""
@@ -493,6 +520,21 @@ class _Pass:
             pieces.append(exp.ToChar(this=self.wall(value.copy()), format=exp.Literal.string(fmt[at:])))
         if not pieces:
             return exp.Literal.string("")
+        out = pieces[0]
+        for p in pieces[1:]:
+            out = exp.DPipe(this=out, expression=p, safe=True)
+        return out
+
+    def formatted_strftime(self, value: exp.Expression, fmt: str) -> exp.Expression:
+        pieces: list[exp.Expression] = []
+        at = 0
+        for m in re.finditer(r"%[:-]?z", fmt):
+            if m.start() > at:
+                pieces.append(exp.TimeToStr(this=self.wall(value.copy()), format=exp.Literal.string(fmt[at:m.start()])))
+            pieces.append(_fn("_tz_part_o", self.offset(value.copy()), exp.Literal.string("TZH:TZM" if m.group(0) == "%:z" else "TZHTZM")))
+            at = m.end()
+        if at < len(fmt):
+            pieces.append(exp.TimeToStr(this=self.wall(value.copy()), format=exp.Literal.string(fmt[at:])))
         out = pieces[0]
         for p in pieces[1:]:
             out = exp.DPipe(this=out, expression=p, safe=True)
@@ -590,7 +632,9 @@ def rewrite(expression: exp.Expression, conn, database: str | None, schema: str 
         catalog, stored = _catalog(conn, names)
     except Exception:  # noqa: BLE001
         catalog, stored = {}, False
-    if not stored and not _mentions_tz(expression):
+    from . import semantics
+    local = semantics.SESSION_ZONE[0].upper() not in ("UTC", "ETC/UTC", "GMT", "Z")
+    if not stored and not _mentions_tz(expression) and not (local and _mentions_ltz(expression)):
         return expression
     db, sch = (database.upper() if database else None), (schema.upper() if schema else None)
     if db and sch and catalog:  # a table found elsewhere (a temporary one) is read where the statement names it

@@ -406,3 +406,24 @@ def key(text: str | None) -> str | None:
         return _key_of(_kept(text))
     except ValueError:
         return text
+
+
+def java_double(v: float | None) -> str | None:
+    """A FLOAT as Java writes it (Double.toString): what Snowflake shows for `to_variant(<constant>)::varchar`, folded
+    when it compiles. Plain from 0.001 up to 10 million, else d.dddE±n; at least one digit after the point."""
+    if v is None:
+        return None
+    if v != v:
+        return "NaN"
+    if v in (float("inf"), float("-inf")):
+        return "Infinity" if v > 0 else "-Infinity"
+    if v == 0:
+        return "-0.0" if str(v).startswith("-") else "0.0"
+    if 1e-3 <= abs(v) < 1e7:
+        text = repr(v)
+        return text if "." in text else text + ".0"
+    d = Decimal(repr(v)).normalize()
+    sign, digits, exponent = d.as_tuple()
+    mantissa = "".join(map(str, digits))
+    power = exponent + len(digits) - 1
+    return ("-" if sign else "") + mantissa[0] + "." + (mantissa[1:] or "0") + "E" + str(power)

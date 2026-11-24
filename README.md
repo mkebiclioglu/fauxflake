@@ -36,7 +36,7 @@ them, and every other test is enforced.
 
 | measured | result |
 | --- | --- |
-| 1,086 queries whose answers were recorded on real Snowflake | 1,074 match; 12 are known gaps, listed in the file |
+| 1,138 queries whose answers were recorded on real Snowflake | 1,137 match; 1 is a known gap (`HLL_ACCUMULATE`'s bytes come from Snowflake's unpublished hash) |
 | 14 third-party packages (973 models) built here and on Snowflake, compared row for row | 944 identical, 22 differ only because they read the clock, 7 differ in an order Snowflake leaves undefined or hold `RANDOM()` values |
 | dbt-utils, dbt-expectations, dbt-date, dbt_artifacts, Snowplow and The Tuva Project run against their own test suites | all 2,098 models and tests pass |
 
@@ -290,8 +290,8 @@ When the emulator does not know a statement it fails at once with a message that
 Everything here was run; the commands are in this repo.
 
 **1. Answers recorded from Snowflake.** [`conformance/cases.yml`](conformance/cases.yml) holds
-1,086 small queries, among them one call of each signature of Snowflake's built-in functions,
-recorded in UTC; 12 are marked as known gaps (sketch internals, a timestamp held in a `VARIANT`, `TIMESTAMP_TZ` offsets other than zero). `fauxflake conformance --connection <name>` runs them on real Snowflake
+1,138 small queries, among them one call of each signature of Snowflake's built-in functions,
+recorded in UTC; 1 is marked as a known gap (the registers of an `HLL_ACCUMULATE` state, which come from Snowflake's own hash). `fauxflake conformance --connection <name>` runs them on real Snowflake
 and stores the answers; CI replays them against the emulator with no Snowflake access. A case
 that stops matching fails CI.
 
@@ -339,6 +339,7 @@ distributions with measurements from production, reading aggregates only.
 | `existing` | relations the project reads before it builds them; they start each run empty. `keeps` lists columns a snapshot table still has from an earlier version of its model |
 | `udfs` | stand-ins, in DuckDB SQL, for functions that exist only in your account |
 | `locations` | cloud storage prefixes that `COPY INTO` should read from a local directory instead |
+| `time_travel` | tables (`DB.SCHEMA.TABLE`) whose earlier states are kept from the first statement, for `AT` and `BEFORE` |
 | `account` | what the account holds, as `SHOW` lists it: `warehouses`, `resource_monitors`, `network_policies`, `users`, `roles` and other kinds, each a list of objects in `CREATE`'s properties or `SHOW`'s column names (`{name: transforming, warehouse_size: medium, auto_suspend: 60}`), and `parameters` set on the account. A fresh account has only the session's warehouse, `LOCAL`. `parity` reads Snowflake's own instead |
 | `dbt` | `database`, `target` (the name `target.name` sees), `role`, `env` (placeholders for environment variables), `expected_failures`, `first` (dbt commands run before each build: `[seed]` for a project whose seeds' hooks make its sources; `init` finds those) |
 
@@ -350,22 +351,27 @@ from at-least-once loaders and out-of-order updates appear without being scripte
 
 ## Limits
 
-- **`HASH()` returns different numbers.** The algorithm is Snowflake's own. The values are
-  stable and well distributed, which is what joins and sampling need.
-- **Division and `AVG` results are typed `DOUBLE`**, with Snowflake's value and scale.
-- **A column made by a query is described as `VARIANT`** where Snowflake says `ARRAY` or `OBJECT`.
-- **The session time zone is UTC**, and a `TIMESTAMP_TZ` does not remember its original offset.
+- **`HASH()` returns different numbers.** The algorithm is Snowflake's own and unpublished. The
+  values are stable and well distributed, which is what joins and sampling need. An
+  `HLL_ACCUMULATE` state holds registers of that hash, so its bytes differ too; its layout, and the
+  estimates `HLL_ESTIMATE` and `APPROX_COUNT_DISTINCT` make from it, are Snowflake's.
+- **`APPROX_PERCENTILE` over tens of thousands of values** is close to Snowflake's rather than
+  equal: Snowflake builds parts of its t-digest in parallel and merges them. Below that the state
+  and the answers are Snowflake's to the last bit.
+- **The account's time zone is UTC** (Snowflake's default is `America/Los_Angeles`);
+  `ALTER SESSION SET TIMEZONE` changes it for the session as on Snowflake.
 - **Where Snowflake leaves an order undefined** (`LISTAGG` without `ORDER BY`, ties in a
   window) the two engines pick differently.
-- **A stream reports an update as a delete and an insert** with `METADATA$ISUPDATE` false.
-- **Time travel reads current data.** `AT` and `BEFORE` are accepted; there is no history.
-- **A transaction that writes to two databases commits at that point** and continues in
-  autocommit, with a message. Within one database it behaves as Snowflake's does.
+- **Time travel keeps history only for tables read with `AT` or `BEFORE`** (from that statement
+  on), or listed under `time_travel` in the spec (from the start). Other tables read their current rows.
+- **A transaction that writes to two databases is not isolated** from other sessions until it
+  ends. `COMMIT` and `ROLLBACK` treat it as one, as Snowflake does.
 - **External functions, and Java or Scala handlers, return NULL** with a warning: they call
   services or runtimes that are not here. A Python function whose packages are not installed
   does the same. Give them a stand-in under `udfs`.
-- **It is more lenient in a few places.** `DATE_TRUNC` and `YEAR` accept a text column here
-  and are rejected by Snowflake. A cheap stage on Snowflake closes this:
+- **It may accept SQL Snowflake refuses when it compiles.** Text given to `DATE_TRUNC`,
+  `EXTRACT` and `LAST_DAY` is refused as on Snowflake; other type checks may be missing. A cheap
+  stage on Snowflake closes this:
   `dbt build --empty --select state:modified+` type-checks changed models and scans no rows.
 - **It says nothing about performance or cost.** Query plans, pruning and warehouse sizing
   cannot be learned from DuckDB.

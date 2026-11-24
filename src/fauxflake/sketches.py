@@ -11,10 +11,10 @@ import math
 import struct
 
 # -- t-digest (APPROX_PERCENTILE_ACCUMULATE / _COMBINE / _ESTIMATE, APPROX_PERCENTILE) --------------------------
-# measured: up to 1400 values the state is every value with weight 1, sorted; past that, neighbours near the median
-# merge first, by the size bound 4 n q (1 - q) / 700 of the original t-digest
-RAW = 1400
-COMPRESSION = 700
+# measured: a merging t-digest with the arcsine scale k(q) = d / 2pi * asin(2q - 1), d = 2200: neighbours merge while
+# k at the right edge of the merged centroid less k at its left edge is at most 1. Up to 1400 values nothing merges,
+# and the state is every value with weight 1; a merged mean is m * (W / (W + w)) + x * (w / (W + w)), to the last bit
+COMPRESSION = 2200.0
 
 
 def _float(v: float) -> str:
@@ -25,25 +25,28 @@ def _float(v: float) -> str:
     return "%.16e" % v  # (a FLOAT held in a VARIANT; see jsondoc.float_text)
 
 
+def _k(q: float) -> float:
+    return COMPRESSION / (2 * math.pi) * math.asin(max(-1.0, min(1.0, 2 * q - 1)))
+
+
 def _compressed(centroids: list[tuple[float, float]]) -> list[tuple[float, float]]:
-    total = sum(w for _, w in centroids)
-    if len(centroids) <= RAW:
+    if len(centroids) < 2:
         return centroids
-    out: list[list[float]] = []
-    seen = 0.0
-    for mean, weight in centroids:
-        if out:
-            last = out[-1]
-            q = (seen - last[1] + (last[1] + weight) / 2) / total
-            if last[1] + weight <= 4 * total * q * (1 - q) / COMPRESSION:
-                merged = last[1] + weight
-                last[0] += (mean - last[0]) * weight / merged
-                last[1] = merged
-                seen += weight
-                continue
-        out.append([mean, weight])
-        seen += weight
-    return [(m, w) for m, w in out]
+    total = sum(w for _, w in centroids)
+    out: list[tuple[float, float]] = []
+    so_far = 0.0
+    mean, weight = centroids[0]
+    for m, w in centroids[1:]:
+        if _k((so_far + weight + w) / total) - _k(so_far / total) <= 1:
+            merged = weight + w
+            mean = mean * (weight / merged) + m * (w / merged)
+            weight = merged
+        else:
+            out.append((mean, weight))
+            so_far += weight
+            mean, weight = m, w
+    out.append((mean, weight))
+    return out
 
 
 def _digest(centroids: list[tuple[float, float]]) -> str:
@@ -78,13 +81,26 @@ def _quantile(centroids: list[tuple[float, float]], p: float) -> float | None:
     if not centroids:
         return None
     if all(w == 1.0 for _, w in centroids):
-        v = [m for m, _ in centroids]  # measured: the linear interpolation of PERCENTILE_CONT, to the last bit
-    else:
-        v = [m for m, w in centroids for _ in range(max(1, round(w)))]
-    pos = p * (len(v) - 1)
-    lo = math.floor(pos)
-    hi = min(lo + 1, len(v) - 1)
-    return v[lo] + (v[hi] - v[lo]) * (pos - lo)
+        # every value kept: the linear interpolation of PERCENTILE_CONT, to the last bit (measured)
+        v = [m for m, _ in centroids]
+        pos = p * (len(v) - 1)
+        lo = math.floor(pos)
+        hi = min(lo + 1, len(v) - 1)
+        return v[lo] + (v[hi] - v[lo]) * (pos - lo)
+    if len(centroids) == 1:
+        return centroids[0][0]
+    # merged: between the centres of the two centroids around p * n, each centred on its weight (measured), and
+    # beyond the first or last centre along the line through the two outermost
+    index = p * sum(w for _, w in centroids)
+    centers, so_far = [], 0.0
+    for _, w in centroids:
+        centers.append(so_far + w / 2)
+        so_far += w
+    i = 0
+    while i < len(centroids) - 2 and centers[i + 1] <= index:
+        i += 1
+    t = (index - centers[i]) / (centers[i + 1] - centers[i])
+    return centroids[i][0] + t * (centroids[i + 1][0] - centroids[i][0])
 
 
 def tdigest_estimate(state: str | None, p: float | None) -> float | None:
