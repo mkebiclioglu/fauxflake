@@ -13,7 +13,7 @@ import re
 import sqlglot
 from sqlglot import exp
 
-from . import account, catalog, constraints, jsondoc, sketches, xmldoc
+from . import account, catalog, constraints, jsondoc, sketches, xmldoc, zoned
 
 _NS = "_fs_global.main."
 _SCALE = r"coalesce(try_cast(nullif(regexp_extract(typeof(a), ',(\d+)\)', 1), '') as integer), 0)"
@@ -314,6 +314,8 @@ def json_sorted(text: str | None) -> str | None:
     comes back as it is."""
     import json
 
+    if text is not None and "\\u00" in text:  # (a date or time's kept type: see _sf_kept_kind)
+        text = _KEPT_KIND.sub(lambda m: chr(int(m.group(1), 16)), text)
     if text is None or not text.lstrip().startswith(("{", "[")):
         return jsondoc.shown(text) if text is not None and jsondoc.FLOAT.search(text) else text
     if xmldoc.MARK in text or "\\ufdd0xml" in text:  # an XML element (its mark as written, or as DuckDB escapes it): as XML
@@ -347,7 +349,7 @@ def json_sorted(text: str | None) -> str | None:
         return text
 
 
-MACROS = [
+MACROS = zoned.MACROS + [
     # A FLOAT in a VARIANT is written with its exponent (jsondoc.FLOAT); a document that holds one is read and written
     # in Python, where each number keeps its text, instead of by DuckDB's JSON functions, which write numbers anew
     # (the substrings first: a regular expression over every document costs five times the extraction it guards)
@@ -368,15 +370,25 @@ MACROS = [
     f"create or replace macro {_NS}_sf_json_doc(t) as case when {_NS}_sf_floats(t) then t::json else json(t) end",
     # A value put in a VARIANT (an array's element, an object's value, x::variant): JSON, a timestamp as Snowflake writes it
     # (milliseconds; an offset of zero is Z: the emulator's clock runs in UTC, as parity's Snowflake session does)
+    # A date or time in a VARIANT keeps its type: its text, with the character at the type's place (TIMESTAMP_TZ 1,
+    # _LTZ 2, _NTZ 3, DATE 4, TIME 5) written as a JSON escape. Every reader decodes it to the same text; TYPEOF reads it
+    # DATE_TRUNC, EXTRACT (YEAR, HOUR, DAYOFWEEK, ...) and LAST_DAY refuse text, as Snowflake does when it compiles
+    f"""create or replace macro {_NS}_sf_not_text(x, f) as case when typeof(x) = 'VARCHAR'
+          then error('SQL compilation error: Function ' || f || ' does not support VARCHAR argument type') else x end""",
+    f"""create or replace macro {_NS}_sf_kept_kind(t, k) as case when t is not null then ('"' || t[1:k - 1]
+          || printf('\\u%04x', unicode(t[k])) || t[k + 1:] || '"')::json end""",
     f"""create or replace macro {_NS}_sf_jv(x) as case
           when typeof(x) = 'JSON' then x::json
           when typeof(x) in ('DOUBLE', 'FLOAT') then (case when isnan(x::double) then 'NaN'
             when isinf(x::double) then case when x::double > 0 then 'Infinity' else '-Infinity' end
             else printf('%.16e', x::double) end)::json
           when typeof(x) in ('TIMESTAMP', 'TIMESTAMP_NS', 'TIMESTAMP_MS', 'TIMESTAMP_S')
-            then to_json(strftime(try_cast(x::varchar as timestamp), '%Y-%m-%d %H:%M:%S.%g'))
+            then {_NS}_sf_kept_kind(strftime(try_cast(x::varchar as timestamp), '%Y-%m-%d %H:%M:%S.%g'), 3)
           when typeof(x) = 'TIMESTAMP WITH TIME ZONE'
-            then to_json(strftime(timezone('UTC', try_cast(x::varchar as timestamptz)), '%Y-%m-%d %H:%M:%S.%g') || ' Z')
+            then {_NS}_sf_kept_kind(strftime(timezone('UTC', try_cast(x::varchar as timestamptz)), '%Y-%m-%d %H:%M:%S.%g') || ' Z', 2)
+          when typeof(x) = '{zoned.SHOWN}' then {_NS}_sf_kept_kind({_NS}_tz_text_s(try_cast(try_cast(x as varchar) as {zoned.STRUCT})), 1)
+          when typeof(x) = 'DATE' then {_NS}_sf_kept_kind(try_cast(x as varchar), 4)
+          when typeof(x) = 'TIME' then {_NS}_sf_kept_kind(try_cast(x as varchar), 5)
           else to_json(x) end""",
     f"""create or replace macro {_NS}_sf_list(x) as case
           when typeof(x) = 'JSON[]' then x::json[]
@@ -431,7 +443,12 @@ MACROS = [
             when 'UBIGINT' then 'INTEGER' when 'BIGINT' then 'INTEGER'
             when 'DOUBLE' then case when regexp_matches(v::varchar, '[eE]|NaN|Infinity') then 'DOUBLE' else 'DECIMAL' end
             when 'OBJECT' then case when list_contains(json_keys(v::json), chr(64976) || 'xml') then 'XML' else 'OBJECT' end
-            when 'NULL' then 'NULL_VALUE' else json_type(v::varchar) end end""",
+            when 'NULL' then 'NULL_VALUE'
+            when 'VARCHAR' then case when strpos(v::varchar, '\\u00') between 2 and 6
+                and regexp_matches(v::json ->> '$', '^(\\d{{4}}-\\d\\d-\\d\\d|\\d\\d:\\d\\d)')
+              then ['TIMESTAMP_TZ', 'TIMESTAMP_LTZ', 'TIMESTAMP_NTZ', 'DATE', 'TIME'][strpos(v::varchar, '\\u00') - 1]
+              else 'VARCHAR' end
+            else json_type(v::varchar) end end""",
     # A windowed AVG keeps three extra decimals, not six.
     f"""create or replace macro {_NS}_sf_div3(a, b) as case
           when typeof(a) in ('DOUBLE', 'FLOAT', 'VARCHAR') then a::double / b::double
@@ -1265,7 +1282,49 @@ def _unfenced(body: exp.Expression | None) -> exp.Expression | None:
 _NUMERIC_KIND = re.compile(r"(?:U?(?:TINY|SMALL|BIG|HUGE)?INT(?:EGER)?|DECIMAL.*|DOUBLE|FLOAT|REAL)", re.I)
 
 
+def _exact_literal(text: str) -> str | None:
+    """1e0, 1.5e2, 1e-2 written out (1, 150, 0.01): a number with an exponent is a NUMBER in Snowflake's SQL (a DOUBLE in
+    DuckDB's). None when it would not fit one (38 digits)."""
+    from decimal import Decimal, InvalidOperation
+
+    try:
+        d = Decimal(text)
+    except InvalidOperation:
+        return None
+    plain = format(d, "f")
+    digits = plain.replace("-", "").replace(".", "").lstrip("0")
+    return plain if len(digits) <= 38 and len(plain.split(".")[-1] if "." in plain else "") <= 37 else None
+
+
+_EXTRACTS = (exp.Year, exp.Month, exp.Day, exp.Hour, exp.Minute, exp.Second, exp.DayOfWeek, exp.DayOfWeekIso,
+             exp.DayOfYear, exp.DayOfMonth, exp.Week, exp.WeekOfYear, exp.YearOfWeek, exp.Quarter)
+
+
+def _refuse_text(node: exp.Expression) -> None:
+    """The argument of DATE_TRUNC, EXTRACT and the like: refused when it is text (see _sf_not_text)."""
+    if isinstance(node, (exp.TimestampTrunc, exp.DateTrunc)):
+        slot, name = "this", "DATE_TRUNC"
+    elif isinstance(node, exp.Extract):
+        slot, name = "expression", "EXTRACT"
+    elif isinstance(node, _EXTRACTS):
+        slot, name = "this", "EXTRACT"
+    elif isinstance(node, exp.LastDay):
+        slot, name = "this", "LAST_DAY"
+    else:
+        return
+    arg = node.args.get(slot)
+    if arg is None or _is(arg, "_sf_not_text") or isinstance(arg, (exp.Cast, exp.TryCast, exp.Null)) \
+            or (isinstance(arg, exp.Anonymous) and str(arg.name).startswith(_NS + "_tz_")):
+        return
+    node.set(slot, _fn("_sf_not_text", arg, exp.Literal.string(name)))
+
+
 def _fix(node: exp.Expression) -> exp.Expression:
+    _refuse_text(node)
+    if isinstance(node, exp.Literal) and not node.is_string and ("e" in node.name or "E" in node.name):
+        exact = _exact_literal(node.name)
+        if exact is not None:
+            return exp.Literal.number(exact)
     if type(node) in _CLOCK_CALLS and not (isinstance(node, exp.CurrentDate) and node.this is not None):
         # as calls: `select current_date` is named CURRENT_DATE, and DuckDB reads the bare keyword as that name
         # (macros, which sqlglot does not turn back into the keyword when the statement is parsed again)
@@ -2353,8 +2412,11 @@ def rewrite(node: exp.Expression) -> exp.Expression:
 
 _AS_BIGINT = {"TINYINT", "SMALLINT", "UTINYINT", "USMALLINT", "UINTEGER"}
 _SUPPORTED = {"BIGINT", "BLOB", "BOOLEAN", "DATE", "DOUBLE", "INTEGER", "JSON", "TIME", "TIMESTAMP",
-              "TIMESTAMP WITH TIME ZONE", "TIMESTAMP_NS", "VARCHAR", '"NULL"'}
+              "TIMESTAMP WITH TIME ZONE", "TIMESTAMP_NS", "VARCHAR", '"NULL"', zoned.SHOWN.upper()}
 _AS_NUMBER = {"UBIGINT", "HUGEINT", "UHUGEINT"}  # beyond a signed 64-bit integer: Snowflake's NUMBER(38,0)
+
+
+_KEPT_KIND = re.compile(r"\\u00(3[0-9a-f]|2[013-9a-f]|4[0-9a-f]|5[0-9abd-f]|6[0-9a-f]|7[0-9a-e])")  # (an ASCII character other than a quote or backslash)
 
 
 def _undefined_out(cursor) -> None:  # noqa: ANN001
@@ -2371,6 +2433,12 @@ def _undefined_out(cursor) -> None:  # noqa: ANN001
                 and pc.any(pc.match_substring_regex(table.column(i), jsondoc.FLOAT_SQL)).as_py():
             shown = pa.array([None if v is None else jsondoc.shown(v) for v in table.column(i).to_pylist()], pa.string())
             table = table.set_column(i, table.field(i), shown)  # (a FLOAT with the 16 digits Snowflake shows)
+        if str(kind).upper() == "JSON" and i < table.num_columns and pa.types.is_string(table.column(i).type) \
+                and pc.any(pc.match_substring(table.column(i), "\\u00")).as_py():
+            # a date or time's type is kept in its text as an escaped character (see _sf_kept_kind): shown as itself
+            plain = pa.array([None if v is None else _KEPT_KIND.sub(lambda m: chr(int(m.group(1), 16)), v)
+                              for v in table.column(i).to_pylist()], pa.string())
+            table = table.set_column(i, table.field(i), plain)
     cursor._arrow_table = table
 
 
@@ -3926,11 +3994,11 @@ def rounded_divisions(transformed: exp.Expression, conn) -> exp.Expression:  # n
     """`round(195 / 4127 * 100, 2)`: NUMBER / NUMBER is a NUMBER of max(s, min(s + 6, 12)) decimals (0.047250), and
     what follows is exact: 4.725000, rounded 4.73. `_sf_div` gives the same digits in a DOUBLE, where 4.725 is
     4.72499999...: rounded 4.72. Under ROUND, TRUNC, CEIL and FLOOR, where that shows, a division of exact numbers
-    is made a DECIMAL of Snowflake's scale; the kinds of its operands are asked of DuckDB, a SELECT at a time."""
-    outer = (exp.Round, exp.Trunc, exp.Ceil, exp.Floor)
+    is made a DECIMAL of Snowflake's scale; the kinds of its operands are asked of DuckDB, a SELECT at a time. The
+    same everywhere else: the answer is a NUMBER (an AVG too), as the client receives it and a table built from it holds."""
     by_select: dict[int, tuple[exp.Select | None, list[exp.Anonymous]]] = {}
     for call in transformed.find_all(exp.Anonymous):
-        if not _is(call, "_sf_div") or len(call.expressions) != 2 or call.find_ancestor(*outer) is None:
+        if not _is(call, "_sf_div") or len(call.expressions) != 2 or call.find_ancestor(exp.Lambda) is not None:
             continue
         select = call.find_ancestor(exp.Select)
         if select is None or (select.args.get("from_") is None and any(a.find(exp.Column) for a in call.expressions)):
@@ -3942,9 +4010,16 @@ def rounded_divisions(transformed: exp.Expression, conn) -> exp.Expression:  # n
             probe.set("from_", select.args["from_"].copy())
             if select.args.get("joins"):
                 probe.set("joins", [j.copy() for j in select.args["joins"]])
-        try:
-            kinds = [str(row[1]).upper() for row in conn.execute("describe " + _cte_prefix(select) + probe.sql(dialect="duckdb")).fetchall()]
-        except Exception:  # noqa: BLE001, S112 - an operand that reads an alias of its SELECT: left a DOUBLE
+        kinds = None
+        for grouped in ([select.args["group"]] if select.args.get("group") else []) + [None]:
+            # (with the statement's GROUP BY, where an operand is a grouped column beside an aggregate)
+            probe.set("group", grouped.copy() if grouped is not None else None)
+            try:
+                kinds = [str(row[1]).upper() for row in conn.execute("describe " + _cte_prefix(select) + probe.sql(dialect="duckdb")).fetchall()]
+                break
+            except Exception:  # noqa: BLE001, S112 - an operand that reads an alias of its SELECT: left a DOUBLE
+                continue
+        if kinds is None:
             continue
         for call, (left, right) in zip(calls, zip(kinds[::2], kinds[1::2])):
             if not (left.startswith(_EXACT_KINDS) and right.startswith(_EXACT_KINDS)):
@@ -4202,7 +4277,8 @@ _ARRAY_MAKERS = {
 _OBJECT_MAKERS = {"OBJECT_CONSTRUCT", "OBJECT_CONSTRUCT_KEEP_NULL", "OBJECT_AGG", "OBJECT_INSERT", "OBJECT_DELETE", "OBJECT_PICK",
                   "TO_OBJECT", "STRUCT", "OBJECT", "PARSE_URL", "PARSE_IP", "MAP"}
 _KEEPS_KIND = (exp.Coalesce, exp.If, exp.Case, exp.Max, exp.Min, exp.AnyValue, exp.FirstValue, exp.LastValue, exp.Lag, exp.Lead,
-               exp.Nullif, exp.Window, exp.IgnoreNulls, exp.RespectNulls, exp.Paren, exp.Alias, exp.WithinGroup, exp.Subquery)
+               exp.Nullif, exp.Window, exp.IgnoreNulls, exp.RespectNulls, exp.Paren, exp.Alias, exp.WithinGroup, exp.Subquery,
+               exp.Filter)
 
 
 def _made_kind(node: exp.Expression) -> str | None:

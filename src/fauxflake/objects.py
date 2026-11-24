@@ -505,14 +505,44 @@ def _create_stream(cursor, original, state: State, m: re.Match):  # noqa: ANN001
     initial = bool(re.search(r"(?i)\bshow_initial_rows\s*=\s*true", options))
     base = _sql_name((fq[0], fq[1], f"__FX_STREAM_{fq[2]}"))
     duck = cursor._duck_conn
-    duck.execute(f"create or replace table {base} as select * from {source}" + (" where false" if initial else ""))
-    meta = "false as \"METADATA$ISUPDATE\", md5(cast(t as varchar)) as \"METADATA$ROW_ID\""
-    view = f"select t.*, 'INSERT' as \"METADATA$ACTION\", {meta} from (select * from {source} except all select * from {base}) t"
-    if not append_only:
-        view += f" union all select t.*, 'DELETE' as \"METADATA$ACTION\", {meta} from (select * from {base} except all select * from {source}) t"
-    duck.execute(f"create or replace view {_sql_name(fq)} as {view}")
-    state.streams[fq] = {"source": source, "base": base, "mode": "APPEND_ONLY" if append_only else "DEFAULT"}
+    try:  # a table: its rows have an identity, so an UPDATE is told apart from a DELETE and an INSERT
+        duck.execute(f"select rowid from {source} limit 0")
+        rows = True
+    except Exception:  # noqa: BLE001 - a view
+        rows = False
+    duck.execute(f"create or replace table {base} as select {_ROW_OF if rows else '*'} from {source}" + (" where false" if initial else ""))
+    duck.execute(f"create or replace view {_sql_name(fq)} as {_changes(source, base, append_only, rows)}")
+    state.streams[fq] = {"source": source, "base": base, "mode": "APPEND_ONLY" if append_only else "DEFAULT", "rows": rows}
     return _status(cursor, original, f"Stream {fq[2]} successfully created.")
+
+
+_ROW_OF = 'rowid as "_FX_ROWID", *'
+
+
+def _changes(source: str, base: str, append_only: bool, rows: bool) -> str:  # noqa: FBT001
+    """The rows that changed since the offset (held in `base`), as Snowflake's stream shows them: an inserted row as an
+    INSERT, a deleted one as a DELETE, and an updated one as both, with METADATA$ISUPDATE true."""
+    def meta(action: str, update: str, alias: str) -> str:
+        row_id = f'md5({alias}."_FX_ROWID"::varchar)' if rows else f"md5(cast({alias} as varchar))"
+        return f'\'{action}\' as "METADATA$ACTION", {update} as "METADATA$ISUPDATE", {row_id} as "METADATA$ROW_ID"'
+    if not rows:
+        view = f"select t.*, {meta('INSERT', 'false', 't')} from (select * from {source} except all select * from {base}) t"
+        if not append_only:
+            view += f" union all select t.*, {meta('DELETE', 'false', 't')} from (select * from {base} except all select * from {source}) t"
+        return view
+    now = f"(select {_ROW_OF} from {source})"
+    plain = 'exclude ("_FX_ROWID")'
+    view = (f'select c.* {plain}, {meta("INSERT", "false", "c")} from {now} c '
+            f'where not exists (select 1 from {base} b where b."_FX_ROWID" = c."_FX_ROWID")')
+    if append_only:
+        return view
+    return (view
+            + f' union all select b.* {plain}, {meta("DELETE", "false", "b")} from {base} b '
+              f'where not exists (select 1 from {now} c where c."_FX_ROWID" = b."_FX_ROWID")'
+            + f' union all select c.* {plain}, {meta("INSERT", "true", "c")} from {now} c join {base} b on b."_FX_ROWID" = c."_FX_ROWID" '
+              f'where c is distinct from b'
+            + f' union all select b.* {plain}, {meta("DELETE", "true", "b")} from {base} b join {now} c on b."_FX_ROWID" = c."_FX_ROWID" '
+              f'where c is distinct from b')
 
 
 def consume_streams(cursor, command: str) -> None:  # noqa: ANN001
@@ -522,7 +552,8 @@ def consume_streams(cursor, command: str) -> None:  # noqa: ANN001
         return
     for fq, stream in state.streams.items():
         if re.search(r'(?i)(?<![\w$])"?' + re.escape(fq[2]) + r'"?(?![\w$])', command):
-            cursor._duck_conn.execute(f"create or replace table {stream['base']} as select * from {stream['source']}")
+            cursor._duck_conn.execute(f"create or replace table {stream['base']} as select {_ROW_OF if stream.get('rows') else '*'} "
+                                      f"from {stream['source']}")
 
 
 # ---------------------------------------------------------------- COPY INTO from cloud storage

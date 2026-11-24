@@ -151,6 +151,21 @@ def test_stream_shows_changes_until_a_dml_consumes_it(run):
         run("select * from s")
 
 
+def test_stream_shows_an_update_as_one(run):
+    run("create or replace stream s on table t")
+    run("update t set amt = 99 where id = 1")
+    run("insert into t values (4, 'd', 40)")
+    run("update t set amt = 41 where id = 4")  # (inserted and changed since the offset: one INSERT)
+    assert run("select id, amt, metadata$action, metadata$isupdate from s order by id, metadata$action") == [
+        (1, 10, "DELETE", True), (1, 99, "INSERT", True), (4, 41, "INSERT", False)]
+    assert len({r[0] for r in run("select metadata$row_id from s where id = 1")}) == 1
+    run("create or replace stream a on table t append_only = true")
+    run("update t set amt = 5 where id = 1")
+    assert run("select count(*) from a") == [(0,)]
+    run("drop stream s")
+    run("drop stream a")
+
+
 def test_tasks_run_on_demand_with_their_resumed_children(run):
     run("create or replace stream s on table t append_only = true")
     run("create or replace task root_task warehouse = wh schedule = 'USING CRON 0 * * * * UTC' as insert into t values (600, 'root', 0)")

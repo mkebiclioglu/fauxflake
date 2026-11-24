@@ -28,7 +28,7 @@ from typing import Iterator
 import duckdb
 from sqlglot import exp
 
-from . import account, constraints, objects, semantics
+from . import account, constraints, objects, semantics, zoned
 
 # Statements the emulator cannot run as-is, rewritten before they are parsed.
 # Every entry is a known difference from Snowflake: keep the list short and
@@ -200,6 +200,32 @@ _CLOCK = re.compile(
 )
 
 
+def _zoned_out(table):  # noqa: ANN001, ANN202
+    """Each (instant, offset) column as Snowflake sends a TIMESTAMP_TZ: seconds, nanoseconds, and the offset in
+    minutes plus 1440."""
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    for i, field in enumerate(table.schema):
+        t = field.type
+        if not (pa.types.is_struct(t) and t.num_fields == 2 and t.field(0).name.lower() == "i" and t.field(1).name.lower() == "o"
+                and pa.types.is_timestamp(t.field(0).type)):
+            continue
+        col = table.column(i).combine_chunks()
+        instant = col.field(0)
+        seconds = pc.floor_temporal(instant, unit="second")
+        epoch = pc.divide(seconds.cast(pa.int64()), 1_000_000)
+        fraction = pc.multiply(pc.subtract(instant.cast(pa.int64()), seconds.cast(pa.int64())), 1000).cast(pa.int32())
+        offset = pc.add(col.field(1).cast(pa.int32()), pa.scalar(1440, pa.int32()))
+        mask = pc.is_null(col)
+        value = pa.StructArray.from_arrays(
+            [pc.fill_null(epoch, 0), pc.fill_null(fraction, 0), pc.fill_null(offset, 1440)],
+            fields=[pa.field("epoch", pa.int64(), nullable=False), pa.field("fraction", pa.int32(), nullable=False),
+                    pa.field("timezone", pa.int32(), nullable=False)], mask=mask)
+        table = table.set_column(i, pa.field(field.name, value.type), value)
+    return table
+
+
 _QUOTED_TEXT = re.compile(r"""('(?:[^'\\]|''|\\.)*'|"(?:[^"]|"")*"|\$\$.*?\$\$)""", re.DOTALL)
 
 
@@ -211,7 +237,7 @@ def _freeze_clock(sql: str) -> str:
             return f"'{FROZEN_NOW:%Y-%m-%d %H:%M:%S}'::timestamp"  # (SYSDATE is a TIMESTAMP_NTZ, in UTC)
         # CURRENT_TIMESTAMP() is an instant (TIMESTAMP_LTZ), as the live clock: CONVERT_TIMEZONE('America/Los_Angeles',
         # CURRENT_TIMESTAMP()) gives that zone's wall clock, not the frozen time read as one of that zone's
-        return f"'{FROZEN_NOW:%Y-%m-%d %H:%M:%S} +00:00'::timestamp_tz"
+        return f"'{FROZEN_NOW:%Y-%m-%d %H:%M:%S} +00:00'::timestamp_ltz"
 
     if "'" not in sql and '"' not in sql and "$$" not in sql:
         return _CLOCK.sub(sub, sql)
@@ -377,6 +403,25 @@ def _note_semi_types(cursor, tree: exp.Create) -> None:  # noqa: ANN001
         cursor._fauxflake_semi = (where, semantics.semi_kinds(tree.copy(), known))
     except Exception:  # noqa: BLE001 - typing is a description, never a reason to fail the statement
         cursor._fauxflake_semi = (where, {})
+
+
+_RESULT = type("Result", (), {"kinds": {}})()  # what the statement last answered says of its columns (shared across the server's threads): {NAME: 'ARRAY' | 'OBJECT'}
+
+
+def _note_result_types(cursor, tree: exp.Expression) -> None:  # noqa: ANN001
+    """A query's ARRAY and OBJECT columns, described to the client as such (Snowflake's type codes 10 and 9)."""
+    if not isinstance(tree, exp.Query):
+        return  # (the DESCRIBE of the statement answered runs through here too: it keeps what that one said)
+    duck, conn = cursor._duck_conn, cursor._conn
+
+    def known(table: exp.Table) -> dict[str, str]:
+        place = [(table.catalog or conn.database or "").upper(), (table.db or conn.schema or "").upper(), table.name.upper()]
+        return dict(duck.execute(f"select col, kind from {_SEMI_TABLE} where c = ? and s = ? and t = ?", place).fetchall())
+
+    try:
+        _RESULT.kinds = semantics.semi_kinds(exp.Create(this=exp.to_table("_fx_result"), kind="TABLE", expression=tree.copy()), known)
+    except Exception:  # noqa: BLE001 - a description, never a reason to fail the statement
+        _RESULT.kinds = {}
 
 
 def _record_semi_types(cursor) -> None:  # noqa: ANN001
@@ -867,12 +912,33 @@ def _patch_fakesnow() -> None:
 
     def describe_as_rowtype(described):  # noqa: ANN001
         try:
-            return describe(described)
+            # a TIMESTAMP_TZ is held as (instant, offset): described as one (see zoned.py and _zoned_out)
+            zoned_at = {i for i, row in enumerate(described) if str(row[1]).upper() == zoned.SHOWN.upper()}
+            if zoned_at:
+                described = [(row[0], "TIMESTAMP WITH TIME ZONE", *row[2:]) if i in zoned_at else row for i, row in enumerate(described)]
+            info = describe(described)
+            kinds = getattr(_RESULT, "kinds", None)
+            kinds = {} if kinds is None else kinds  # (an empty Lazily still answers when asked)
+            for row, column in zip(described, info):
+                if str(row[1]).upper() == "JSON":
+                    try:
+                        kind = kinds[str(row[0]).upper()]  # (looked up when asked: see semi_kinds)
+                    except Exception:  # noqa: BLE001
+                        kind = None
+                    if kind in ("ARRAY", "OBJECT"):
+                        column["type"] = kind.lower()
+            return info
         except Exception as e:  # noqa: BLE001
             raise ProgrammingError(msg=f"fauxflake emulator: unsupported result type: {e}",
                                    errno=9997, sqlstate="XX000") from e
 
     server.describe_as_rowtype = describe_as_rowtype
+    upstream_to_sf = server.to_sf
+
+    def to_sf(table, rowtype):  # noqa: ANN001, ANN202
+        return upstream_to_sf(_zoned_out(table), rowtype)
+
+    server.to_sf = to_sf
 
     # The endpoint parses a statement to classify it before running it. Statements handled in
     # objects.py (anonymous procedures, Snowflake Scripting blocks) are not SQL sqlglot reads:
@@ -951,6 +1017,9 @@ def _patch_fakesnow() -> None:
 
     whole = "('BIGINT', 'HUGEINT', 'INTEGER', 'SMALLINT', 'TINYINT', 'UBIGINT', 'UINTEGER', 'USMALLINT', 'UTINYINT', 'UHUGEINT')"
     info.SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW = info.SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW \
+        .replace("when columns.data_type='TIMESTAMP WITH TIME ZONE' then 'TIMESTAMP_TZ'",
+                 f"when columns.data_type='TIMESTAMP WITH TIME ZONE' then 'TIMESTAMP_LTZ' when columns.data_type='{zoned.SHOWN}' then 'TIMESTAMP_TZ'") \
+        .replace("columns.data_type like 'TIME%'", f"(columns.data_type like 'TIME%' or columns.data_type = '{zoned.SHOWN}')") \
         .replace("columns.data_type='BIGINT'", f"columns.data_type in {whole}").replace("columns.data_type='DOUBLE'", "columns.data_type in ('DOUBLE', 'FLOAT')") \
         .replace("then NULL else columns.numeric_scale end", f"then NULL when columns.data_type in {whole} then 0 else columns.numeric_scale end")
 
@@ -960,7 +1029,7 @@ def _patch_fakesnow() -> None:
              "DOMAIN_CATALOG", "DOMAIN_SCHEMA", "DOMAIN_NAME", "UDT_CATALOG", "UDT_SCHEMA", "UDT_NAME", "SCOPE_CATALOG",
              "SCOPE_SCHEMA", "SCOPE_NAME", "MAXIMUM_CARDINALITY", "DTD_IDENTIFIER", "INTERVAL_TYPE", "INTERVAL_PRECISION",
              "IDENTITY_MAXIMUM", "IDENTITY_MINIMUM", "EXPRESSION", "SCHEMA_EVOLUTION_RECORD"]
-    more = (",\n    case when columns.data_type like 'TIME%' then least(coalesce(columns.datetime_precision, 9), 9) end as DATETIME_PRECISION,"
+    more = (f",\n    case when columns.data_type like 'TIME%' then least(coalesce(columns.datetime_precision, 9), 9) when columns.data_type = '{zoned.SHOWN}' then 9 end as DATETIME_PRECISION,"
             "\n    'COLUMN' as KIND, 'NO' as IS_SELF_REFERENCING, " + ", ".join(f"null::VARCHAR as {c}" for c in nulls))
     if "as DATETIME_PRECISION" not in info.SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW:
         info.SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW = info.SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW.replace(
@@ -1031,6 +1100,13 @@ def _patch_fakesnow() -> None:
             expression = semantics.layer_windows(expression)
         if isinstance(expression, exp.Create):
             _note_semi_types(self, expression)
+        _note_result_types(self, expression)
+        try:
+            expression = zoned.rewrite(expression, self._duck_conn, self._conn.database, self._conn.schema)
+        except Exception as e:  # noqa: BLE001 - the statement goes on as written
+            if os.environ.get("FAUXFLAKE_DEBUG_ZONED"):
+                raise
+            print(f"fauxflake: TIMESTAMP_TZ rewrite skipped: {e}", file=sys.stderr) if os.environ.get("FAUXFLAKE_SHOW_SQL") else None
         out = original_transform(self, semantics.rewrite(expression), params)
         out = semantics.finish(semantics.parenthesize_arrows(out))
         out = semantics.keep_outer_rows(out, getattr(self, "_fauxflake_outer", []), getattr(self, "_fauxflake_recursive", []),
