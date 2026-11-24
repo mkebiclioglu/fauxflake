@@ -100,7 +100,15 @@ def main() -> None:
             return bool(clock.search((node.get("compiled_code") or "") + (node.get("raw_code") or ""))) or any(reads_clock(d, seen) for d in (node.get("depends_on") or {}).get("nodes") or [])
 
         differing = [p for p in parity if not p.ok]
-        timed = [p for p in differing if not p.note and p.emulator_rows == p.snowflake_rows and reads_clock(by_name.get(p.model, ""), set())]
+        def apart(p) -> bool:  # noqa: ANN001 - the columns that differ hold times a few seconds apart (each build's clock)
+            found = re.findall(r"(\w+): emulator '(\d{4}-\d\d-\d\d[ T][\d:.]+)' snowflake '(\d{4}-\d\d-\d\d[ T][\d:.]+)'", p.note or "")
+            if not found or len(found) != (p.note or "").count(": emulator "):
+                return False
+            from datetime import datetime
+            return all(abs((datetime.fromisoformat(a) - datetime.fromisoformat(b)).total_seconds()) < 600 for _, a, b in found)
+
+        timed = [p for p in differing if (not p.note or apart(p)) and p.emulator_rows == p.snowflake_rows
+                 and reads_clock(by_name.get(p.model, ""), set())]
         filled = sum(p.emulator_rows > 0 or p.snowflake_rows > 0 for p in parity)
         print(f"  row for row against Snowflake: {len(parity) - len(differing)} of {len(parity)} models identical "
               f"({filled} have rows); {len(timed)} more differ only where they read the current time")

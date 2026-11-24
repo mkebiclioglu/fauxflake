@@ -101,7 +101,8 @@ def _fetch_into(conn, sql: str, duck, types: dict[str, str]) -> tuple[list[str],
         query = "select " + ", ".join(exact(n) + ("::timestamp_ntz " + exact(n) if d[1] in (6, 7) else "")
                                       for n, d in zip(names, cur.description)) + f" from ({sql})"
         cur.execute(query)
-    kinds = {n: ("VARCHAR" if types.get(n.upper()) == "JSON" else types.get(n.upper(), "VARCHAR")) for n in names}
+    kinds = {n: ("VARCHAR" if types.get(n.upper()) == "JSON" else WALL if types.get(n.upper()) == ZONED
+                 else types.get(n.upper(), "VARCHAR")) for n in names}
 
     def chunks():  # noqa: ANN202 - rows as Python values, a chunk at a time
         while rows := cur.fetchmany(100_000):
@@ -153,10 +154,17 @@ class Parity:
             not self.note or self.note.startswith(("differ in", "both engines fail to read")))
 
 
+ZONED = "STRUCT(I TIMESTAMP WITH TIME ZONE, O BIGINT)"  # (a TIMESTAMP_TZ in the emulator: zoned.SHOWN)
+WALL = "TIMESTAMP"  # what a TIMESTAMP_TZ is compared as: its wall clock, as Snowflake's is read (see _fetch_into)
+
+
 def _comparable(column: str, kind: str, source: str, unordered: bool = False) -> str:
     """One column in a form both engines agree on: Snowflake's values arrive as Python objects
     (pretty-printed JSON text, floats that differ in the last bit)."""
     quoted = f'"{column}"'
+    if kind == ZONED:  # the emulator's (instant, offset): its wall clock
+        return f"{quoted}::{WALL} as {quoted}" if source == "theirs" else \
+            f"(timezone('UTC', {quoted}.i) + to_minutes({quoted}.o)) as {quoted}"
     if kind == "JSON":  # canonical text (see _canonical), on both sides
         return f"{'_fx_canon_u' if unordered else '_fx_canon'}({quoted}::varchar) as {quoted}"
     if kind in ("DOUBLE", "FLOAT"):
@@ -313,7 +321,7 @@ def compare(conn, emu, local: DbtProject, schema: str | None = None, remote_sche
                             select (select any_value({q}::varchar) from (select {q} from m except all select {q} from t)),
                                    (select any_value({q}::varchar) from (select {q} from t except all select {q} from m)),
                                    (select count(*) from (select {q} from m except all select {q} from t))""").fetchone()
-                        if got[2] and _is_clock(duck, both, c, types[c], seen):
+                        if got[2] and _is_clock(duck, both, c, WALL if types[c] == ZONED else types[c], seen):
                             clocks.append(c)
                         elif got[2]:
                             differing.append(f"{c}: emulator {str(got[0])[:60]!r} snowflake {str(got[1])[:60]!r}")
