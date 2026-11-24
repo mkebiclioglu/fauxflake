@@ -376,6 +376,9 @@ MACROS = zoned.MACROS + [
     # DATE_TRUNC, EXTRACT (YEAR, HOUR, DAYOFWEEK, ...) and LAST_DAY refuse text, as Snowflake does when it compiles
     f"""create or replace macro {_NS}_sf_not_text(x, f) as case when typeof(x) = 'VARCHAR'
           then error('SQL compilation error: Function ' || f || ' does not support VARCHAR argument type') else x end""",
+    # an instant as text in the session's time zone: DuckDB's +00 / -08 / +05:30 written as Snowflake does (Z, -0800, +0530)
+    f"""create or replace macro {_NS}_sf_ltz_text(t) as regexp_replace(regexp_replace(regexp_replace(
+          strftime(t, '%Y-%m-%d %H:%M:%S.%g %z'), ' ([+-]\\d\\d)$', ' \\100'), ' ([+-]\\d\\d):(\\d\\d)$', ' \\1\\2'), ' \\+0000$', ' Z')""",
     f"""create or replace macro {_NS}_sf_kept_kind(t, k) as case when t is not null then ('"' || t[1:k - 1]
           || printf('\\u%04x', unicode(t[k])) || t[k + 1:] || '"')::json end""",
     f"""create or replace macro {_NS}_sf_jv(x) as case
@@ -386,7 +389,7 @@ MACROS = zoned.MACROS + [
           when typeof(x) in ('TIMESTAMP', 'TIMESTAMP_NS', 'TIMESTAMP_MS', 'TIMESTAMP_S')
             then {_NS}_sf_kept_kind(strftime(try_cast(x::varchar as timestamp), '%Y-%m-%d %H:%M:%S.%g'), 3)
           when typeof(x) = 'TIMESTAMP WITH TIME ZONE'
-            then {_NS}_sf_kept_kind({_NS}_tz_text_s({_NS}_tz_local(try_cast(x::varchar as timestamptz))), 2)
+            then {_NS}_sf_kept_kind({_NS}_sf_ltz_text(try_cast(x::varchar as timestamptz)), 2)
           when typeof(x) = '{zoned.SHOWN}' then {_NS}_sf_kept_kind({_NS}_tz_text_s(try_cast(try_cast(x as varchar) as {zoned.STRUCT})), 1)
           when typeof(x) = 'DATE' then {_NS}_sf_kept_kind(try_cast(x as varchar), 4)
           when typeof(x) = 'TIME' then {_NS}_sf_kept_kind(try_cast(x as varchar), 5)
@@ -501,8 +504,7 @@ MACROS = zoned.MACROS + [
           when typeof(x) in ('TIMESTAMP', 'TIMESTAMP_NS', 'TIMESTAMP_MS', 'TIMESTAMP_S')
             then strftime(try_cast(x::varchar as timestamp), '%Y-%m-%d %H:%M:%S.%g')
           when typeof(x) = 'TIMESTAMP WITH TIME ZONE'
-            then {_NS}_tz_text_s({_NS}_tz_local(try_cast(x::varchar as timestamptz)))
-          when typeof(x) = '{zoned.SHOWN}' then {_NS}_tz_text_s(try_cast(try_cast(x as varchar) as {zoned.STRUCT}))
+            then {_NS}_sf_ltz_text(try_cast(x::varchar as timestamptz))
           else x::varchar end""",
     # Text of a division: NUMBER / NUMBER prints every decimal of its scale ('1.500000').
     f"""create or replace macro {_NS}_sf_fixed(v, s) as
