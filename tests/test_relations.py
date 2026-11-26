@@ -154,3 +154,10 @@ def test_the_role_a_client_logs_in_with_is_the_sessions():
         cur.execute("create table t (a int)")
         assert cur.execute("select table_owner from information_schema.tables where table_name = 'T'").fetchall() == [("TRANSFORMER",)]
         conn.close()
+
+
+def test_view_column_comments_as_dbt_writes_them(run):
+    # persist_docs: quoted names, $$-quoted text holding quotes, -- and /* */ (dbt-snowflake's own test)
+    text = "id \"with double quotes\" and 'single quotes'; '''abc''' -- /* comment */ [$]lbl[$]"
+    run('create or replace view vc ( "ID" COMMENT $$' + text + '$$, "V" COMMENT $$$$ ) as ( select id, v from base )')
+    assert run("select column_name, comment from information_schema.columns where table_name = 'VC' order by 1") == [("ID", text), ("V", None)]

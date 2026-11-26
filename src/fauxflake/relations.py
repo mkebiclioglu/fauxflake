@@ -86,13 +86,17 @@ def _text(literal: str | None) -> str | None:
 
 
 def _close(text: str, at: int) -> int:
-    """The index after the parenthesis that closes the one at `at`."""
+    """The index after the parenthesis that closes the one at `at` (skipping what is quoted, $$ ... $$ too)."""
     depth, i, quote = 0, at, None
     while i < len(text):
         c = text[i]
         if quote:
             if c == quote:
                 quote = None
+        elif text.startswith("$$", i):
+            end = text.find("$$", i + 2)
+            i = len(text) if end < 0 else end + 2
+            continue
         elif c in "'\"":
             quote = c
         elif c == "(":
@@ -199,7 +203,7 @@ def _split_top(text: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
-_COLUMN_COMMENT = re.compile(r"(?is)^(?P<name>\"(?:[^\"]|\"\")+\"|[\w$]+)\b.*?\bcomment\s+(?P<text>" + _STRING + r")")
+_COLUMN_COMMENT = re.compile(r"(?is)^(?P<name>\"(?:[^\"]|\"\")+\"|[\w$]+)\s.*?\bcomment\s+(?P<text>" + _STRING + r")")
 
 
 def _comment_columns(cursor, fq, pairs) -> None:  # noqa: ANN001
@@ -295,9 +299,10 @@ def _note(cursor, duck, text: str, verb: str) -> None:  # noqa: ANN001, C901
                       cluster_by=_clustering(options), comment=comment, change_tracking=bool(_flag(_option(options, "change_tracking"))),
                       retention=int(_option(options, "data_retention_time_in_days") or (0 if kind == "TEMPORARY TABLE" else 1)),
                       secure="secure" in mods, text=text if kind in ("VIEW", "MATERIALIZED VIEW") else None, dynamic=None)
-        if source is not None:  # CLONE: what the source had, made now
-            for k in ("transient", "cluster_by", "comment", "change_tracking", "retention"):
+        if source is not None:  # CLONE: what the source had, made now (and transient if the statement says so)
+            for k in ("cluster_by", "comment", "change_tracking", "retention"):
                 values[k] = source.get(k)
+            values["transient"] = "transient" in mods or bool(source.get("transient"))
         if kind not in ("VIEW", "MATERIALIZED VIEW"):
             values["row_count"] = _count(duck, fq)
         if not re.search(r"(?is)\bcopy\s+grants\b", options):
@@ -437,6 +442,8 @@ def intercept(cursor, command, original):  # noqa: ANN001, ANN201
             return done
     if word == "create" and (m := _CREATE_SPECIAL.match(text)):
         return _create(cursor, original, m, text)
+    if word == "create" and (m := _CLONE.match(text)):
+        return _clone(cursor, original, m, text)
     if word == "create" and _CTAS_COLUMNS.match(text):
         done = _ctas_with_columns(cursor, original, text)
         if done is not None:
@@ -1203,4 +1210,42 @@ def _ctas_with_columns(cursor, original, text: str):  # noqa: ANN001, ANN202
     finally:
         cur.close()
     note(cursor, text)  # (what Snowflake keeps about it: made now, by this role)
+    return _status(original, cursor, f"Table {fq[2]} successfully created.")
+
+
+
+# ---------------------------------------------------------------- CREATE TABLE t CLONE s
+
+_CLONE = re.compile(_LEAD + r"create\s+(?P<replace>or\s+replace\s+)?(?:(?P<kind>transient|temporary|temp)\s+)?table\s+(?P<exists>if\s+not\s+exists\s+)?"
+                    r"(?P<name>" + _NAME + r")\s+clone\s+(?P<source>" + _NAME + r")(?P<rest>(?:\s+copy\s+(?:grants|tags))*)\s*;?\s*$")
+
+
+def _clone(cursor, original, m: re.Match, text: str):  # noqa: ANN001, ANN202
+    """A table's clone: its definition (columns, defaults, NOT NULL) and rows as they are now. (AT / BEFORE clones go through
+    time travel: history.py.) COPY GRANTS keeps what was granted on the table it replaces."""
+    fq, source = qualified(cursor, m.group("name")), qualified(cursor, m.group("source"))
+    duck = cursor._duck_conn
+    made = duck.execute("select sql from duckdb_tables() where database_name = ? and schema_name = ? and table_name = ?", list(source)).fetchone()
+    if made is None:
+        raise _error(f"SQL compilation error:\nObject '{'.'.join(source)}' does not exist or not authorized.", 2003, "02000")
+    exists = duck.execute("select count(*) from duckdb_tables() where database_name = ? and schema_name = ? and table_name = ?",
+                          list(fq)).fetchone()[0] > 0
+    if exists and m.group("exists"):
+        return _status(original, cursor, f"{fq[2]} already exists, statement succeeded.")
+    if exists and not m.group("replace"):
+        raise _error(f"SQL compilation error:\nObject '{fq[2]}' already exists.", 2002, "42710")
+    kept_grants = duck.execute(f"select * from {GRANTS} where database_name = ? and schema_name = ? and name = ?", list(fq)).fetchall() \
+        if exists and re.search(r"(?i)copy\s+grants", m.group("rest") or "") else []
+    scratch = (fq[0], fq[1], fq[2] + "__FX_CLONE")
+    # DuckDB's own statement for the source, made under the scratch name: CREATE TABLE <name>(<columns>);
+    ddl = re.sub(r"(?is)^\s*create\s+table\s+(?:\S+?)\s*\(", f"create table {_sql_name(scratch)}(", made[0], count=1)
+    duck.execute(f"drop table if exists {_sql_name(scratch)}")
+    duck.execute(ddl)
+    duck.execute(f"insert into {_sql_name(scratch)} select * from {_sql_name(source)}")
+    if exists:
+        duck.execute(f"drop table {_sql_name(fq)}")
+    duck.execute(f"alter table {_sql_name(scratch)} rename to {_sql_name((fq[2],))}")
+    note(cursor, text.replace(m.group("rest") or "", "") if m.group("rest") else text)  # (made now; what the source had: see _note)
+    if kept_grants:
+        duck.executemany(f"insert into {GRANTS} values (?, ?, ?, ?, ?, ?, ?, ?)", [list(g) for g in kept_grants])
     return _status(original, cursor, f"Table {fq[2]} successfully created.")
