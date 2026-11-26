@@ -1212,9 +1212,13 @@ def _patch_fakesnow() -> None:
         try:
             # a TIMESTAMP_TZ is held as (instant, offset): described as one (see zoned.py and _zoned_out)
             zoned_at = {i for i, row in enumerate(described) if str(row[1]).upper() == zoned.SHOWN.upper()}
+            # DuckDB's own TIMESTAMPTZ is a TIMESTAMP_LTZ here (a TIMESTAMP_TZ is the struct of zoned.py): described as one
+            local_at = {i for i, row in enumerate(described) if str(row[1]).upper() == "TIMESTAMP WITH TIME ZONE"}
             if zoned_at:
                 described = [(row[0], "TIMESTAMP WITH TIME ZONE", *row[2:]) if i in zoned_at else row for i, row in enumerate(described)]
             info = describe(described)
+            for i in local_at:
+                info[i]["type"] = "timestamp_ltz"
             kinds = getattr(_RESULT, "kinds", None)
             kinds = {} if kinds is None else kinds  # (an empty Lazily still answers when asked)
             for row, column in zip(described, info):
@@ -1235,6 +1239,19 @@ def _patch_fakesnow() -> None:
 
     def to_sf(table, rowtype):  # noqa: ANN001, ANN202
         done = upstream_to_sf(_geo_out(_local_out(_zoned_out(table))), rowtype)
+        if any(c.get("type") == "timestamp_ltz" for c in rowtype):
+            # a TIMESTAMP_LTZ travels as (epoch, fraction), as Snowflake sends one: only a TIMESTAMP_TZ carries its offset
+            import pyarrow as pa
+
+            arrays, fields = list(done.columns), list(done.schema)
+            for i, c in enumerate(rowtype):
+                if c.get("type") == "timestamp_ltz" and pa.types.is_struct(fields[i].type) and fields[i].type.num_fields == 3:
+                    col = pa.concat_arrays([chunk for chunk in arrays[i].chunks]) if arrays[i].num_chunks else \
+                        pa.array([], fields[i].type)
+                    two = pa.StructArray.from_arrays([col.field(0), col.field(1)], fields=[fields[i].type.field(0), fields[i].type.field(1)],
+                                                     mask=col.is_null())
+                    arrays[i], fields[i] = two, fields[i].with_type(two.type)
+            done = pa.Table.from_arrays(arrays, schema=pa.schema(fields))
         if any(c.get("type") in ("geography", "geometry") for c in rowtype):
             # the column is described as GEOGRAPHY / GEOMETRY; its values travel as text, as Snowflake sends GeoJSON (the
             # connector reads Arrow by `logicalType`, and has no reader of its own for these)
@@ -1283,14 +1300,17 @@ def _patch_fakesnow() -> None:
         """A DML statement's counts, in the reply as Snowflake gives them (`stats`: the connector's cursor.stats)."""
         try:
             conn = server.sessions.get(server.to_token(request))
-            stats = getattr(conn, "_fx_stats", None)
-            if not stats:
+            stats, zone = getattr(conn, "_fx_stats", None), getattr(conn, "_fx_timezone", None)
+            if not stats and not zone:
                 return response
             body = json.loads(response.body)
             if not body.get("success") or not isinstance(body.get("data"), dict):
                 return response
-            body["data"]["stats"] = stats
-            conn._fx_stats = None
+            if stats:
+                body["data"]["stats"] = stats
+                conn._fx_stats = None
+            if zone:  # the session's time zone, as Snowflake returns it once set: the client shows a TIMESTAMP_LTZ in it
+                body["data"].setdefault("parameters", []).append({"name": "TIMEZONE", "value": zone})
             return JSONResponse(body, status_code=response.status_code)
         except Exception:  # noqa: BLE001 - the reply as it was
             return response

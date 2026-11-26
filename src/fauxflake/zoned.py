@@ -264,7 +264,9 @@ class _Pass:
     # a value as one of the forms, by what it is known to be
     def to_tz(self, x: exp.Expression) -> exp.Expression:
         k = self.kind(x)
-        if k in ("tz", "null"):
+        if k == "null":  # (a NULL of the type: CAST(NULL AS TIMESTAMP_TZ) is described as one, dbt's contracts read it so)
+            return exp.Cast(this=exp.null(), to=exp.DataType(this=exp.DataType.Type.USERDEFINED, kind=STRUCT))
+        if k == "tz":
             return x
         if k == "text":
             return _fn("_tz_parse" if isinstance(x, exp.Literal) else "_tz_try_parse", x)

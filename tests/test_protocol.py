@@ -44,3 +44,30 @@ def test_dml_statistics_as_snowflake_reports_them():
             seen.append((cur.stats.num_rows_inserted, cur.stats.num_rows_updated, cur.stats.num_rows_deleted))
         conn.close()
     assert seen == [(None, None, None), (2, 0, 0), (0, 1, 0), (1, 1, 0), (0, 0, 1), (None, None, None), (2, 0, 0), (0, 0, 2)]
+
+
+def test_result_types_as_snowflake_describes_them():
+    """The type each value is described as (dbt's contracts compare these), measured on Snowflake."""
+    import snowflake.connector
+    from snowflake.connector.constants import FIELD_ID_TO_NAME
+
+    from fauxflake.emulator import serve
+
+    expected = {"'2020-01-01'::timestamp_ltz": "TIMESTAMP_LTZ", "current_timestamp()": "TIMESTAMP_LTZ", "sysdate()": "TIMESTAMP_NTZ",
+                "'2020-01-01 00:00:00 +02:00'::timestamp_tz": "TIMESTAMP_TZ", "cast(null as timestamp_tz)": "TIMESTAMP_TZ",
+                "cast(null as timestamp_ltz)": "TIMESTAMP_LTZ", "to_geography('POINT(1 2)')": "GEOGRAPHY",
+                "to_geometry('POINT(1 2)')": "GEOMETRY", "[1, 2]::vector(int, 2)": "VECTOR"}
+    with serve() as emu:
+        emu.ensure_database("P", "PUBLIC")
+        conn = snowflake.connector.connect(**emu.connect_kwargs(database="P", schema="PUBLIC"))
+        cur = conn.cursor()
+        seen = {}
+        for expr in expected:
+            cur.execute(f"select {expr} as x")
+            cur.fetchall()
+            seen[expr] = FIELD_ID_TO_NAME[cur.description[0].type_code]
+        cur.execute("alter session set timezone = 'America/New_York'")
+        (shown,) = cur.execute("select '2020-01-01 12:00:00'::timestamp_ltz").fetchone()
+        conn.close()
+    assert seen == expected
+    assert (shown.hour, str(shown.tzinfo)) == (12, "America/New_York")

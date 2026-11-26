@@ -472,6 +472,7 @@ MACROS = zoned.MACROS + [
           / pow(trunc((m2 + n * d * d) / (n - 1) * pow(10, kv)) / pow(10, kv) * (n - 1), 1.5)""",
     f"create or replace macro {_NS}_fx_current_date() as today()",
     f"create or replace macro {_NS}_fx_current_timestamp() as get_current_timestamp()",
+    f"create or replace macro {_NS}_fx_sysdate() as timezone('UTC', get_current_timestamp())",
     f"create or replace macro {_NS}_fx_current_time() as get_current_time()",
     f"create or replace macro {_NS}_fx_localtime() as current_localtime()",
     f"create or replace macro {_NS}_fx_localtimestamp() as current_localtimestamp()",
@@ -1470,6 +1471,8 @@ def _fix(node: exp.Expression) -> exp.Expression:
         exact = _exact_literal(node.name)
         if exact is not None:
             return exp.Literal.number(exact)
+    if isinstance(node, exp.CurrentTimestamp) and node.args.get("sysdate"):
+        return _fn("_fx_sysdate")  # SYSDATE() is a TIMESTAMP_NTZ, the wall clock in UTC (CURRENT_TIMESTAMP an instant)
     if type(node) in _CLOCK_CALLS and not (isinstance(node, exp.CurrentDate) and node.this is not None):
         # as calls: `select current_date` is named CURRENT_DATE, and DuckDB reads the bare keyword as that name
         # (macros, which sqlglot does not turn back into the keyword when the statement is parsed again)
