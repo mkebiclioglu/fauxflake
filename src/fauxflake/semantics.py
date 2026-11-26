@@ -18,6 +18,15 @@ from . import account, catalog, constraints, jsondoc, sketches, xmldoc, zoned
 _NS = "_fs_global.main."
 _SCALE = r"coalesce(try_cast(nullif(regexp_extract(typeof(a), ',(\d+)\)', 1), '') as integer), 0)"
 
+def refuse(condition, message):  # noqa: ANN001, ANN201
+    """Raise Snowflake's error `message` (fxerr:CODE:STATE:text) when `condition` holds. A Python function, not
+    error(): DuckDB treats error() as volatile, which keeps the expression out of a window's ORDER BY, and a failing
+    cast forces its branch's type on the others (a TIME argument cast to DATE)."""
+    if condition:
+        raise ValueError(f"\x1f{message}\x1f")
+    return False
+
+
 def first_duplicate(values):  # noqa: ANN001, ANN201
     seen = set()
     for v in values or []:
@@ -46,6 +55,7 @@ def python_functions(duck) -> None:  # noqa: ANN001
 
     for name, fn, args, out, kind in (
             ("_fxpy_sha2", sha2, ["VARCHAR", "INTEGER"], "VARCHAR", None),
+            ("_fxpy_refuse", refuse, ["BOOLEAN", "VARCHAR"], "BOOLEAN", None),
             ("_fxpy_collation_spec", collation_spec, ["VARCHAR", "VARCHAR"], "VARCHAR", None),
             ("_fxpy_first_duplicate", first_duplicate, ["VARCHAR[]"], "VARCHAR", None),
             ("_fxpy_json_sorted", sorted_json, ["VARCHAR"], "VARCHAR", "arrow"),
@@ -389,9 +399,8 @@ MACROS = zoned.MACROS + [
     # _LTZ 2, _NTZ 3, DATE 4, TIME 5) written as a JSON escape. Every reader decodes it to the same text; TYPEOF reads it
     # DATE_TRUNC, EXTRACT (YEAR, HOUR, DAYOFWEEK, ...) and LAST_DAY refuse text, as Snowflake does when it compiles
     # (raised by a failing cast, which leaves the expression non-volatile: error() would keep it out of a window's ORDER BY)
-    f"""create or replace macro {_NS}_sf_not_text(x, f) as case when typeof(x) = 'VARCHAR'
-          then cast(chr(31) || 'fxerr:2016:22000:SQL compilation error: Function ' || f || ' does not support VARCHAR argument type'
-                    || chr(31) as date) else x end""",
+    f"""create or replace macro {_NS}_sf_not_text(x, f) as case when _fxpy_refuse(typeof(x) = 'VARCHAR',
+          'fxerr:2016:22000:SQL compilation error: Function ' || f || ' does not support VARCHAR argument type') then null else x end""",
     # an instant as text in the session's time zone: DuckDB's +00 / -08 / +05:30 written as Snowflake does (Z, -0800, +0530)
     f"""create or replace macro {_NS}_sf_ltz_text(t) as regexp_replace(regexp_replace(regexp_replace(
           strftime(t, '%Y-%m-%d %H:%M:%S.%g %z'), ' ([+-]\\d\\d)$', ' \\100'), ' ([+-]\\d\\d):(\\d\\d)$', ' \\1\\2'), ' \\+0000$', ' Z')""",
@@ -484,14 +493,20 @@ MACROS = zoned.MACROS + [
           * (g * pow(m2, 1.5) * (n - 2) / (n * sqrt(n - 1)) + 3 * d * m2 + n * d * d * d)
           / pow(trunc((m2 + n * d * d) / (n - 1) * pow(10, kv)) / pow(10, kv) * (n - 1), 1.5)""",
     f"create or replace macro {_NS}_fx_current_date() as today()",
-    f"create or replace macro {_NS}_fx_current_timestamp() as get_current_timestamp()",
-    f"create or replace macro {_NS}_fx_sysdate() as timezone('UTC', get_current_timestamp())",
+    # Snowflake's clock gives milliseconds (measured: CURRENT_TIMESTAMP, SYSDATE, CURRENT_TIME all end in 000000 ns);
+    # CURRENT_TIMESTAMP(0) whole seconds. Cut by subtracting the rest, which works for a TIME as for a timestamp
+    f"""create or replace macro {_NS}_sf_fraction(x, p) as x - to_microseconds(cast(microsecond(x) % cast(pow(10, 6 - least(p, 3)) as bigint)
+          as bigint))""",
+    f"create or replace macro {_NS}_fx_current_timestamp() as {_NS}_sf_fraction(get_current_timestamp(), 3)",
+    f"create or replace macro {_NS}_fx_sysdate() as {_NS}_sf_fraction(timezone('UTC', get_current_timestamp()), 3)",
     # the first value of a list met before in it (OBJECT_AGG's duplicate key), or NULL (in Python: a lambda over an aggregate's
     # list is an internal error of DuckDB's)
     f"create or replace macro {_NS}_sf_first_duplicate(l) as _fxpy_first_duplicate(l)",
-    f"create or replace macro {_NS}_fx_current_time() as get_current_time()",
-    f"create or replace macro {_NS}_fx_localtime() as current_localtime()",
-    f"create or replace macro {_NS}_fx_localtimestamp() as current_localtimestamp()",
+    f"create or replace macro {_NS}_fx_current_time() as {_NS}_sf_fraction(get_current_time(), 3)",
+    f"create or replace macro {_NS}_fx_localtime() as {_NS}_sf_fraction(current_localtime(), 3)",
+    f"create or replace macro {_NS}_fx_localtimestamp() as {_NS}_sf_fraction(current_localtimestamp(), 3)",
+    # the nanoseconds within the second, of a TIME as of a timestamp (DuckDB's MICROSECOND counts the seconds too)
+    f"create or replace macro {_NS}_sf_nanosecond(x) as (microsecond(x) % 1000000) * 1000",
     # RANDOM(): a 64-bit integer, any of them (fakesnow's rewrite of it is made again in each SELECT a CTE is part of)
     f"""create or replace macro {_NS}_fx_random() as cast(cast(floor(random() * 4294967296) as hugeint) * 4294967296
           + cast(floor(random() * 4294967296) as hugeint) - 9223372036854775808 as bigint)""",
@@ -1589,6 +1604,15 @@ def _refuse_text(node: exp.Expression) -> None:
 
 
 def _fix(node: exp.Expression) -> exp.Expression:
+    if isinstance(node, exp.Extract) and isinstance(node.this, (exp.Var, exp.Literal, exp.Identifier)):
+        part = node.this.name.upper()
+        if part in ("NANOSECOND", "NANOSECONDS", "NS", "NSEC", "NANOSEC", "NSECOND", "NSECONDS", "NANOSECS"):
+            return _fn("_sf_nanosecond", node.expression)
+        if part in ("MICROSECOND", "MICROSECONDS", "US", "USEC", "MILLISECOND", "MILLISECONDS", "MS", "MSEC"):
+            # (measured: 001008 "invalid value [microsecond] for parameter 'EXTRACT date/time part'")
+            message = f"fxerr:1008:22023:SQL compilation error:\ninvalid value [{node.this.name.lower()}] for parameter 'EXTRACT date/time part'"
+            refused = exp.Anonymous(this="_fxpy_refuse", expressions=[exp.true(), exp.Literal.string(message)])
+            return exp.cast(exp.Case(ifs=[exp.If(this=refused, true=exp.null())]), "bigint")
     if isinstance(node, exp.DataType) and node.this == exp.DataType.Type.VECTOR:
         return _vector_type(node)
     if isinstance(node, exp.Cast) and node.to.meta.get("fx_vector"):
@@ -1639,7 +1663,11 @@ def _fix(node: exp.Expression) -> exp.Expression:
     if type(node) in _CLOCK_CALLS and not (isinstance(node, exp.CurrentDate) and node.this is not None):
         # as calls: `select current_date` is named CURRENT_DATE, and DuckDB reads the bare keyword as that name
         # (macros, which sqlglot does not turn back into the keyword when the statement is parsed again)
-        return _fn(_CLOCK_CALLS[type(node)])
+        clock = _fn(_CLOCK_CALLS[type(node)])
+        digits = node.this if not isinstance(node, exp.CurrentDate) else None
+        if isinstance(digits, exp.Literal) and digits.is_int and int(digits.name) < 3:  # CURRENT_TIMESTAMP(0): whole seconds
+            return _fn("_sf_fraction", clock, exp.Literal.number(int(digits.name)))
+        return clock
     if isinstance(node, exp.Rand) and node.this is None:
         return _fn("_fx_random")
     if isinstance(node, exp.Rand):

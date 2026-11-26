@@ -1273,3 +1273,9 @@
 - {id: hash_agg_of_nothing, sql: "select hash_agg(a) from (select 1 a where false)"}
 - {id: hash_agg_counts_duplicates, sql: "select hash_agg(a) = hash_agg(distinct a) from (select 1 a union all select 1)"}
 - {id: hash_agg_any_order, sql: "select count(distinct h) from (select hash_agg(a) h from (select 1 a union all select 2) union all select hash_agg(a) from (select 2 a union all select 1))"}
+- {id: clock_in_milliseconds, sql: "select extract(nanosecond from current_timestamp()) % 1000000 = 0, extract(nanosecond from sysdate()) % 1000000 = 0, extract(nanosecond from localtimestamp()) % 1000000 = 0, extract(nanosecond from getdate()) % 1000000 = 0"}
+- {id: current_time_in_milliseconds, sql: "select extract(nanosecond from current_time()) % 1000000 = 0, hour(current_time()) = hour(current_timestamp())"}
+- {id: clock_precision_argument, sql: "select extract(nanosecond from current_timestamp(0)) = 0, extract(nanosecond from current_timestamp(2)) % 10000000 = 0"}
+- {id: nanosecond_of_time, sql: "select extract(nanosecond from '12:00:01.5'::time), date_part(nanosecond, '12:00:01.25'::time), extract(nanosecond from '2020-01-01 12:00:01.5'::timestamp)"}
+- {id: microsecond_part_refused, sql: "select extract(microsecond from '2020-01-01 12:00:01.5'::timestamp)"}
+- {id: hour_minute_of_time, sql: "select hour(t), minute('12:34:00'::time) from (select '08:15:00'::time t)"}

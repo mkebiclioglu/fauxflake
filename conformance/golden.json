@@ -1070,6 +1070,24 @@
    ]
   ]
  },
+ "clock_in_milliseconds": {
+  "rows": [
+   [
+    true,
+    true,
+    true,
+    true
+   ]
+  ]
+ },
+ "clock_precision_argument": {
+  "rows": [
+   [
+    true,
+    true
+   ]
+  ]
+ },
  "coalesce_variant_with_text": {
   "rows": [
    [
@@ -1443,6 +1461,14 @@
     null,
     null,
     "3"
+   ]
+  ]
+ },
+ "current_time_in_milliseconds": {
+  "rows": [
+   [
+    true,
+    true
    ]
   ]
  },
@@ -6202,6 +6228,14 @@
    ]
   ]
  },
+ "hour_minute_of_time": {
+  "rows": [
+   [
+    "8",
+    "34"
+   ]
+  ]
+ },
  "hw_agg_misc": {
   "rows": [
    [
@@ -7312,6 +7346,9 @@
    ]
   ]
  },
+ "microsecond_part_refused": {
+  "error": "001008 (22023): SQL compilation error:"
+ },
  "min_max_by": {
   "rows": [
    [
@@ -7513,6 +7550,15 @@
    [
     "1",
     "2025-02-28"
+   ]
+  ]
+ },
+ "nanosecond_of_time": {
+  "rows": [
+   [
+    "500000000",
+    "250000000",
+    "500000000"
    ]
   ]
  },
