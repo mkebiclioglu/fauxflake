@@ -12377,5 +12377,19 @@
     true
    ]
   ]
+ },
+ "zoned_coalesce_column_read_by_next_cte": {
+  "rows": [
+   [
+    true
+   ]
+  ]
+ },
+ "zoned_coalesce_of_null_in_cte": {
+  "rows": [
+   [
+    "10"
+   ]
+  ]
  }
 }

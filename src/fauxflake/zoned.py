@@ -629,6 +629,17 @@ def _annotated(expression: exp.Expression, catalog: dict, database: str | None, 
         copy = annotate_types(copy, schema=catalog or None, dialect="snowflake")
     except Exception:  # noqa: BLE001
         return {}
+    # `coalesce(lead(ts) over (...), convert_timezone(...))` is a TIMESTAMP_TZ once rewritten (see Zoned.fix); sqlglot types
+    # it by its first value. Typed so, a CTE column made of it is a TIMESTAMP_TZ where the next CTE reads it
+    branches = [n for n in copy.find_all(exp.Coalesce, exp.If, exp.Case, exp.Greatest, exp.Least)
+                if not _is_tz_type(n.type) and any(_is_tz_type(v.type) for v in _Pass._values(n) if isinstance(v, exp.Expression))]
+    if branches:
+        for n in branches:
+            n.replace(exp.Cast(this=n.copy(), to=exp.DataType.build("TIMESTAMPTZ")))
+        try:
+            copy = annotate_types(copy, schema=catalog or None, dialect="snowflake")
+        except Exception:  # noqa: BLE001, S110 - the first typing stands
+            pass
     return {n.meta["fx"]: n.type for n in copy.walk() if "fx" in n.meta and n.type is not None}
 
 
