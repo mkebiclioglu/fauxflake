@@ -10801,6 +10801,201 @@
    ]
   ]
  },
+ "vector_aggregate_of_nothing": {
+  "rows": [
+   [
+    null,
+    null
+   ]
+  ]
+ },
+ "vector_aggregates": {
+  "rows": [
+   [
+    [
+     4.0,
+     2.0,
+     8.0
+    ],
+    [
+     3.0,
+     2.0,
+     5.0
+    ],
+    [
+     1.0,
+     0.0,
+     3.0
+    ],
+    [
+     2.0,
+     1.0,
+     4.0
+    ]
+   ]
+  ]
+ },
+ "vector_aggregates_int": {
+  "rows": [
+   [
+    [
+     4,
+     6,
+     9
+    ],
+    [
+     3,
+     4,
+     6
+    ],
+    [
+     2.0,
+     3.0,
+     4.5
+    ]
+   ]
+  ]
+ },
+ "vector_as_array": {
+  "rows": [
+   [
+    [
+     0.1000000014901161,
+     0.2000000029802322
+    ],
+    [
+     0.1000000014901161,
+     0.2000000029802322
+    ],
+    [
+     1,
+     2
+    ],
+    "3"
+   ]
+  ]
+ },
+ "vector_avg_in_double": {
+  "rows": [
+   [
+    [
+     2.3333332538604736,
+     0.23333333432674408
+    ]
+   ]
+  ]
+ },
+ "vector_cast_float": {
+  "rows": [
+   [
+    [
+     0.10000000149011612,
+     0.20000000298023224,
+     0.30000001192092896
+    ],
+    [
+     1.0000000150474662e+30,
+     -1.5,
+     0.33333298563957214
+    ],
+    [
+     1.0,
+     2.5
+    ]
+   ]
+  ]
+ },
+ "vector_cast_int": {
+  "rows": [
+   [
+    [
+     1,
+     2,
+     3
+    ],
+    [
+     1,
+     2
+    ],
+    [
+     -2147483648,
+     2147483647
+    ],
+    null
+   ]
+  ]
+ },
+ "vector_compare_group": {
+  "rows": [
+   [
+    [
+     1,
+     2
+    ],
+    true,
+    true,
+    "2"
+   ]
+  ]
+ },
+ "vector_cosine_of_zero": {
+  "rows": [
+   [
+    "NaN"
+   ]
+  ]
+ },
+ "vector_functions_float": {
+  "rows": [
+   [
+    "0.7142857142857",
+    "0.282842727226",
+    "0.1000000044703",
+    "4"
+   ]
+  ]
+ },
+ "vector_functions_int": {
+  "rows": [
+   [
+    "0.7142857142857",
+    "10",
+    "2.828427124746"
+   ]
+  ]
+ },
+ "vector_missing_element": {
+  "error": "220000 (22000): Cannot convert an array with missing elements to a vector. Compact the array to a dense representation f"
+ },
+ "vector_mixed_arguments": {
+  "error": "001044 (42P13): SQL compilation error: error line 1 at position 7"
+ },
+ "vector_not_integers": {
+  "error": "220000 (22000): Array-like value being cast to an integer vector has elements that are not integers"
+ },
+ "vector_overflow": {
+  "error": "220000 (22000): Array-like value being cast to an integer vector has elements that overflow"
+ },
+ "vector_sum_in_32_bits": {
+  "rows": [
+   [
+    [
+     1.0000001192092896,
+     1000000000.0
+    ],
+    [
+     0.10000000149011612,
+     100000000.0
+    ]
+   ]
+  ]
+ },
+ "vector_text_elements": {
+  "error": "220000 (22000): Array-like value being cast to a float vector has elements that are not real numbers"
+ },
+ "vector_wrong_dimension": {
+  "error": "220000 (22000): Vector value being cast to a vector is not an array or vector, or has incorrect dimension or element typ"
+ },
  "where_alias": {
   "rows": [
    [

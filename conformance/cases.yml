@@ -1207,3 +1207,21 @@
 - {id: float_variant_column_text, sql: "select to_variant(column1)::varchar, object_construct('a', 1e20::float):a::varchar, array_construct(1e20::float)[0]::varchar, parse_json('1e20')::varchar from values (1e20::float), (1.5::float)"}
 - {id: sketch_percentile_merged, sql: "select approx_percentile(seq4(), 0), approx_percentile(seq4(), 0.001), approx_percentile(seq4(), 0.333), approx_percentile(seq4(), 0.5), approx_percentile(seq4(), 0.9), approx_percentile(seq4(), 0.999), approx_percentile(seq4(), 1), array_size(approx_percentile_accumulate(seq4()):state) from table(generator(rowcount => 5000))"}
 - {id: sketch_percentile_random, sql: "select approx_percentile(x, 0.25), approx_percentile(x, 0.5), approx_percentile(x, 0.97) from (select (seq4() * 7919) % 100003 x from table(generator(rowcount => 3000)))"}
+- {id: vector_cast_float, sql: "select [0.1, 0.2, 0.3]::vector(float, 3), [1e30, -1.5, 1/3]::vector(float, 3), parse_json('[1, 2.5]')::vector(float, 2)"}
+- {id: vector_cast_int, sql: "select [1, 2, 3]::vector(int, 3), [1.0, 2.0]::vector(int, 2), [-2147483648, 2147483647]::vector(int, 2), null::vector(int, 3)"}
+- {id: vector_functions_float, sql: "select vector_cosine_similarity([1,2,3]::vector(float,3), [3,2,1]::vector(float,3)), vector_l2_distance([0.1,0.2,0.3]::vector(float,3), [0.3,0.2,0.1]::vector(float,3)), vector_inner_product([0.1,0.2,0.3]::vector(float,3), [0.3,0.2,0.1]::vector(float,3)), vector_l1_distance([1,2,3]::vector(float,3), [3,2,1]::vector(float,3))"}
+- {id: vector_functions_int, sql: "select vector_cosine_similarity([1,2,3]::vector(int,3), [3,2,1]::vector(int,3)), vector_inner_product([1,2,3]::vector(int,3), [3,2,1]::vector(int,3)), vector_l2_distance([1,2,3]::vector(int,3), [3,2,1]::vector(int,3))"}
+- {id: vector_cosine_of_zero, sql: "select vector_cosine_similarity([0,0,0]::vector(float,3), [3,2,1]::vector(float,3))"}
+- {id: vector_wrong_dimension, sql: "select [1,2]::vector(float, 3)"}
+- {id: vector_not_integers, sql: "select [1.5, 2.5]::vector(int, 2)"}
+- {id: vector_text_elements, sql: "select ['1.5', '2']::vector(float, 2)"}
+- {id: vector_missing_element, sql: "select [1, null, 3]::vector(int, 3)"}
+- {id: vector_overflow, sql: "select [2147483648, 1]::vector(int, 2)"}
+- {id: vector_mixed_arguments, sql: "select vector_cosine_similarity([1,2,3]::vector(int,3), [3,2,1]::vector(float,3))"}
+- {id: vector_as_array, sql: "select ([0.1, 0.2]::vector(float, 2))::array, ([0.1, 0.2]::vector(float, 2))::variant, ([1, 2]::vector(int, 2))::array, array_size([1,2,3]::vector(int,3)::array)"}
+- {id: vector_compare_group, sql: "select v, v = [1,2]::vector(int,2), v < [1,3]::vector(int,2), count(*) from (select [1,2]::vector(int,2) v union all select [1,2]::vector(int,2)) group by v"}
+- {id: vector_aggregates, sql: "select vector_sum(v), vector_max(v), vector_min(v), vector_avg(v) from (select [1,2,3]::vector(float,3) v union all select [3,0,5]::vector(float,3))"}
+- {id: vector_aggregates_int, sql: "select vector_sum(v), vector_max(v), vector_avg(v) from (select [1,2,3]::vector(int,3) v union all select [3,4,6]::vector(int,3))"}
+- {id: vector_sum_in_32_bits, sql: "select vector_sum(v), vector_avg(v) from (select [0.1, 1e8]::vector(float,2) v from table(generator(rowcount=>10)))"}
+- {id: vector_avg_in_double, sql: "select vector_avg(v) from (select [1, 0.1]::vector(float,2) v union all select [2, 0.2]::vector(float,2) union all select [4, 0.4]::vector(float,2))"}
+- {id: vector_aggregate_of_nothing, sql: "select vector_sum(v), vector_avg(v) from (select [1,2,3]::vector(int,3) v where 1 = 0)"}

@@ -393,6 +393,7 @@ MACROS = zoned.MACROS + [
           when typeof(x) = '{zoned.SHOWN}' then {_NS}_sf_kept_kind({_NS}_tz_text_s(try_cast(try_cast(x as varchar) as {zoned.STRUCT})), 1)
           when typeof(x) = 'DATE' then {_NS}_sf_kept_kind(try_cast(x as varchar), 4)
           when typeof(x) = 'TIME' then {_NS}_sf_kept_kind(try_cast(x as varchar), 5)
+          when regexp_full_match(typeof(x), 'FLOAT\\[\\d+\\]') then ('[' || array_to_string(list_transform(from_json(to_json(x), '["DOUBLE"]'), lambda e: printf('%.16e', e)), ',') || ']')::json
           else to_json(x) end""",
     f"""create or replace macro {_NS}_sf_list(x) as case
           when typeof(x) = 'JSON[]' then x::json[]
@@ -814,6 +815,7 @@ MACROS = zoned.MACROS + [
           else error(chr(31) || 'fxerr:100071:22000:Failed to cast variant value ' || x::varchar || ' to OBJECT' || chr(31))::json end""",
     f"""create or replace macro {_NS}_sf_to_array(x) as case
           when x is null then null
+          when regexp_full_match(typeof(x), 'FLOAT\\[\\d+\\]') then ('[' || array_to_string(list_transform(from_json(to_json(x), '["DOUBLE"]'), lambda e: printf('%.16e', e)), ',') || ']')::json
           when typeof(x) like '%]' then to_json(x)
           when typeof(x) = 'JSON' and json_type(to_json(x)) = 'ARRAY' then to_json(x)
           else to_json([x]) end""",
@@ -848,6 +850,81 @@ MACROS = zoned.MACROS + [
 ]
 
 
+def _raised(errno: int, sqlstate: str, message: str, kind: str) -> str:
+    """SQL that raises Snowflake's error (see emulator: the marker becomes errno, state and message), typed `kind`."""
+    return f"error(chr(31) || 'fxerr:{errno}:{sqlstate}:' || {message} || chr(31))::{kind}"
+
+
+# VECTOR(FLOAT, n) is held as DuckDB's FLOAT[n] (32-bit elements, as Snowflake's), VECTOR(INT, n) as INTEGER[n]. Measured:
+# a cast takes an ARRAY (or a VARIANT holding one) of exactly n numbers, integral ones for INT (1.0 is), no missing
+# elements; the distances are computed in double over the 32-bit values; VECTOR_AVG is a FLOAT vector, SUM/MIN/MAX keep INT
+_VECTOR_CAST = "'Vector value being cast to a vector is not an array or vector, or has incorrect dimension or element type.'"
+MACROS += [
+    f"""create or replace macro {_NS}_sf_vector_in(j, n, k) as case
+          when j is null then null
+          when json_type(j) <> 'ARRAY' or json_array_length(j) <> n then {_raised(220000, '22000', _VECTOR_CAST, 'double[]')}
+          when list_bool_or(list_transform(j::json[], lambda e: e is null or json_type(e) = 'NULL'
+                                           or (json_type(e) = 'VARCHAR' and e::varchar like '"' || chr(64976) || '%')))
+            then {_raised(220000, '22000', "'Cannot convert an array with missing elements to a vector. Compact the array to a dense representation first.'", 'double[]')}
+          when k = 'INT' and not list_bool_and(list_transform(j::json[], lambda e: json_type(e) in ('BIGINT', 'UBIGINT')
+                                                                     or (json_type(e) = 'DOUBLE' and e::double = round(e::double))))
+            then {_raised(220000, '22000', "'Array-like value being cast to an integer vector has elements that are not integers'", 'double[]')}
+          when k = 'INT' and not list_bool_and(list_transform(j::json[], lambda e: e::double between -2147483648 and 2147483647))
+            then {_raised(220000, '22000', "'Array-like value being cast to an integer vector has elements that overflow'", 'double[]')}
+          when k = 'FLOAT' and not list_bool_and(list_transform(j::json[], lambda e: json_type(e) in ('BIGINT', 'UBIGINT', 'DOUBLE')))
+            then {_raised(220000, '22000', "'Array-like value being cast to a float vector has elements that are not real numbers'", 'double[]')}
+          else list_transform(j::json[], lambda e: e::double) end""",
+    # the two arguments of a VECTOR function must be vectors of one type and dimension (a compilation error)
+    f"""create or replace macro {_NS}_sf_vector_pair(a, b, f) as case
+          when typeof(a) <> typeof(b) or not regexp_full_match(typeof(a), '(FLOAT|INTEGER)\\[\\d+\\]')
+            then {_raised(1044, '42P13', "'SQL compilation error:\\nInvalid argument types for function ''' || f || ''''", 'boolean')}
+          else true end""",
+    f"""create or replace macro {_NS}_sf_vector_cosine(a, b) as case when {_NS}_sf_vector_pair(a, b, 'VECTOR_COSINE_SIMILARITY')
+          then list_cosine_similarity(a::double[], b::double[]) end""",
+    f"""create or replace macro {_NS}_sf_vector_l2(a, b) as case when {_NS}_sf_vector_pair(a, b, 'VECTOR_L2_DISTANCE')
+          then list_distance(a::double[], b::double[]) end""",
+    f"""create or replace macro {_NS}_sf_vector_inner(a, b) as case when {_NS}_sf_vector_pair(a, b, 'VECTOR_INNER_PRODUCT')
+          then list_inner_product(a::double[], b::double[]) end""",
+    f"""create or replace macro {_NS}_sf_vector_l1(a, b) as case when {_NS}_sf_vector_pair(a, b, 'VECTOR_L1_DISTANCE')
+          then list_sum(list_transform(range(1, len(a) + 1), lambda i: abs(a[i]::double - b[i]::double))) end""",
+    # VECTOR_SUM/MIN/MAX over the vectors of a group (`l`, from array_agg), pairwise: the reduction keeps the vectors' own type
+    # (and dimension), and a FLOAT vector's sum is accumulated in 32 bits, as Snowflake's is (measured: ten 0.1 make
+    # 1.0000001192092896)
+    f"""create or replace macro {_NS}_sf_vector_reduce(l, how) as case when len(list_filter(l, lambda v: v is not null)) > 0 then
+          list_reduce(list_filter(l, lambda v: v is not null), lambda a, b: list_transform(range(1, len(a) + 1), lambda i:
+            case how when 'SUM' then a[i] + b[i] when 'MIN' then least(a[i], b[i]) else greatest(a[i], b[i]) end)) end""",
+    # VECTOR_AVG: accumulated in double, as Snowflake does (0.1, 0.2, 0.4 average to 0.23333333432674408, not ...4922790527)
+    f"""create or replace macro {_NS}_sf_vector_avg(l) as case when len(list_filter(l, lambda v: v is not null)) > 0 then
+          list_transform(range(1, len(list_filter(l, lambda v: v is not null)[1]) + 1), lambda i:
+            list_avg(list_transform(list_filter(l, lambda v: v is not null), lambda v: v[i]::double))) end""",
+]
+VECTOR_FUNCTIONS = {exp.CosineDistance: "_sf_vector_cosine", exp.EuclideanDistance: "_sf_vector_l2",
+                    exp.DotProduct: "_sf_vector_inner", exp.ManhattanDistance: "_sf_vector_l1"}
+_VECTOR_AGGREGATES = {"VECTOR_AVG": "AVG", "VECTOR_SUM": "SUM", "VECTOR_MIN": "MIN", "VECTOR_MAX": "MAX"}
+VECTOR_KIND = re.compile(r"(FLOAT|INTEGER)\[(\d*)\]")  # a result column of this DuckDB type is a VECTOR (FLOAT[]: by its values)
+
+
+def _vector_type(node: exp.DataType) -> exp.DataType:
+    """VECTOR(FLOAT, n) / VECTOR(INT, n) as DuckDB's fixed-size FLOAT[n] / INTEGER[n]."""
+    element, size = (node.expressions + [None, None])[:2]
+    real = element is None or element.is_type(*exp.DataType.REAL_TYPES)
+    n = size.this.name if isinstance(size, exp.DataTypeParam) else size.name if size is not None else "0"
+    # as a user-defined type, written as it is: the passes after this one map ARRAY to JSON and INTEGER to BIGINT
+    built = exp.DataType(this=exp.DataType.Type.USERDEFINED, kind=f"{'FLOAT' if real else 'INTEGER'}[{n}]")
+    built.meta["fx_vector"] = ("FLOAT" if real else "INT", int(n))
+    return built
+
+
+def _vector_aggregate(node: exp.Anonymous) -> exp.Expression:
+    """VECTOR_SUM/MIN/MAX(x): element by element, typed as x. VECTOR_AVG is always FLOAT, of a dimension DuckDB cannot be
+    told when x is an INT vector: a FLOAT[] list, which coerce_result sends as a VECTOR of the dimension its values have."""
+    how, x = _VECTOR_AGGREGATES[node.name.upper()], node.expressions[0]
+    group = exp.Anonymous(this="array_agg", expressions=[x.copy()])
+    if how == "AVG":
+        return exp.Cast(this=_fn("_sf_vector_avg", group), to=exp.DataType(this=exp.DataType.Type.USERDEFINED, kind="FLOAT[]"))
+    return _fn("_sf_vector_reduce", group, exp.Literal.string(how))
+
+
 def _once(statement: str) -> str:
     """`create macro f(a, b) as BODY` with each argument read once: BODY sees them through lambdas of the same names.
     DuckDB writes a macro's argument out at each mention, so _sf_text (18 mentions) around _sf_element around
@@ -862,7 +939,8 @@ def _once(statement: str) -> str:
     return f"{m.group(1)}({m.group(2)}) as {body}"
 
 
-_READ_ONCE = ("_sf_text", "_sf_element", "_sf_object_keys", "_sf_typeof", "_sf_jv")
+_READ_ONCE = ("_sf_text", "_sf_element", "_sf_object_keys", "_sf_typeof", "_sf_jv", "_sf_vector_in", "_sf_vector_reduce", "_sf_vector_avg", "_sf_vector_pair",
+              "_sf_vector_cosine", "_sf_vector_l2", "_sf_vector_inner", "_sf_vector_l1")
 MACROS = [_once(m) if re.match(r"create or replace macro \S*\.(" + "|".join(_READ_ONCE) + r")\(", m) else m for m in MACROS]
 
 _RENAMED = {  # Snowflake function -> macro, same arguments
@@ -1326,6 +1404,18 @@ def _refuse_text(node: exp.Expression) -> None:
 
 
 def _fix(node: exp.Expression) -> exp.Expression:
+    if isinstance(node, exp.DataType) and node.this == exp.DataType.Type.VECTOR:
+        return _vector_type(node)
+    if isinstance(node, exp.Cast) and node.to.meta.get("fx_vector"):
+        kind, n = node.to.meta["fx_vector"]
+        if isinstance(node.this, exp.Null):
+            return node
+        checked = _fn("_sf_vector_in", _fn("_sf_doc", node.this), exp.Literal.number(n), exp.Literal.string(kind))
+        return exp.Cast(this=checked, to=node.to)
+    if type(node) in VECTOR_FUNCTIONS:
+        return _fn(VECTOR_FUNCTIONS[type(node)], node.this, node.expression)
+    if isinstance(node, exp.Anonymous) and node.name.upper() in _VECTOR_AGGREGATES and len(node.expressions) == 1:
+        return _vector_aggregate(node)
     _refuse_text(node)
     if isinstance(node, exp.Literal) and not node.is_string and ("e" in node.name or "E" in node.name):
         exact = _exact_literal(node.name)
@@ -2458,14 +2548,18 @@ def coerce_result(cursor) -> None:  # noqa: ANN001
     ARRAY and OBJECT values travel as JSON, small integers as BIGINT, everything else as text."""
     if cursor._arrow_table is None or not cursor._last_sql or not cursor._duck_conn.description:
         return
-    _undefined_out(cursor)
     casts, changed = [], False
     for i, (name, kind, *_rest) in enumerate(cursor._duck_conn.description):
         kind, alias = str(kind).upper(), '"' + name.replace('"', '""') + '"'
-        if kind in _SUPPORTED or kind.startswith("DECIMAL"):
+        if kind in _SUPPORTED or kind.startswith("DECIMAL") or (VECTOR_KIND.fullmatch(kind) and not kind.endswith("[]")):
             casts.append(f"_c{i} as {alias}")
             continue
         changed = True
+        if kind == "FLOAT[]":  # a FLOAT vector whose dimension DuckDB does not know (VECTOR_AVG): its values have it
+            size = cursor._arrow_table.column(i).drop_null()
+            size = len(size[0].as_py()) if len(size) else 1
+            casts.append(f"_c{i}::FLOAT[{size}] as {alias}")
+            continue
         if kind.endswith("]") or kind.startswith(("STRUCT", "MAP", "UNION")):
             casts.append(f"to_json(_c{i})::JSON as {alias}")
         elif kind in _AS_BIGINT:
@@ -2476,13 +2570,13 @@ def coerce_result(cursor) -> None:  # noqa: ANN001
             casts.append(f"_c{i}::DOUBLE as {alias}")
         else:
             casts.append(f"_c{i}::VARCHAR as {alias}")
-    if not changed:
-        return
-    names = ", ".join(f"_c{i}" for i in range(len(casts)))
-    sql = f"SELECT {', '.join(casts)} FROM ({cursor._last_sql.rstrip().rstrip(';')}) AS _r({names})"
-    cursor._duck_conn.execute(sql, cursor._last_params)
-    cursor._arrow_table = cursor._duck_conn.to_arrow_table()
-    cursor._last_sql = sql
+    if changed:
+        names = ", ".join(f"_c{i}" for i in range(len(casts)))
+        sql = f"SELECT {', '.join(casts)} FROM ({cursor._last_sql.rstrip().rstrip(';')}) AS _r({names})"
+        cursor._duck_conn.execute(sql, cursor._last_params)
+        cursor._arrow_table = cursor._duck_conn.to_arrow_table()
+        cursor._last_sql = sql
+    _undefined_out(cursor)  # (last: the columns re-selected above are shown the same way)
 
 
 _FLATTEN_CALL = re.compile(r"\bflatten\s*\(", re.IGNORECASE)

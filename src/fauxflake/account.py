@@ -568,7 +568,7 @@ SHOWN = {"warehouses", "roles", "users", "shares", "integrations", "api integrat
          "failover groups", "password policies", "session policies", "packages policies", "external functions",
          "compute pools", "services", "image repositories", "streamlits", "notebooks", "models", "datasets",
          "git repositories", "cortex search services", "semantic views", "grants", "connections", "application packages",
-         "applications", "dynamic tables", "materialized views", "external tables", "event tables", "iceberg tables",
+         "applications", "materialized views", "external tables", "event tables", "iceberg tables",
          "future grants"}
 _CAST = {"NUMBER": "number(38, 0)", "TEXT": "varchar", "TIMESTAMP_LTZ": "timestamp_ltz", "BOOLEAN": "boolean", "REAL": "double",
          "VARIANT": "variant", "DATE": "date"}

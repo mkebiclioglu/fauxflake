@@ -28,7 +28,7 @@ from typing import Iterator
 import duckdb
 from sqlglot import exp
 
-from . import account, constraints, history, objects, semantics, zoned
+from . import account, constraints, history, objects, relations, semantics, zoned
 
 # Statements the emulator cannot run as-is, rewritten before they are parsed.
 # Every entry is a known difference from Snowflake: keep the list short and
@@ -109,6 +109,7 @@ _TXN_BEGIN = re.compile(r"(?is)^(?:\s|--[^\n]*\n|/\*.*?\*/)*(?:begin(?:\s+(?:wor
 _TXN_END = re.compile(r"(?is)^(?:\s|--[^\n]*\n|/\*.*?\*/)*(commit|rollback)(?:\s+work)?\s*;?\s*$")
 _TXN_KEEPS = re.compile(r"(?is)^(?:\s|--[^\n]*\n|/\*.*?\*/)*(insert|update|delete|merge|select|with|call|show|desc|describe|set|unset|use|copy|execute|explain|\()\b")
 _TWO_DATABASES = "a single transaction can only write to a single attached database"
+_NO_SUCH_COLUMN = re.compile(r'Binder Error: (?:Values list "[^"]*" does not have a column named|Referenced column|Table "[^"]*" does not have a column named) "([^"]+)"')
 # failures that are not of the data a statement reads (whose answer an empty side of a join could change)
 _NOT_DATA_ERRORS = ("Binder Error", "Parser Error", "Catalog Error", "does not exist", "syntax error", "Not implemented",
                     "SQL compilation error", "INTERRUPT", "Interrupt", "timed out", "Duplicate row detected", _TWO_DATABASES)
@@ -144,6 +145,8 @@ def _transaction(cursor, command: str, original):  # noqa: ANN001, ANN202
             except Exception:  # noqa: BLE001 - DuckDB already ended it (a failed statement aborts its transaction)
                 if end.group(1).lower() == "commit":
                     raise
+        # (after the transaction: the registry is in another database, which a transaction that wrote here cannot touch)
+        (relations.committed if end.group(1).lower() == "commit" else relations.rolled_back)(cursor)
         return original(cursor, "select 'Statement executed successfully.' as \"status\"")
     if is_open and not _TXN_KEEPS.match(trailing):
         _end_transaction(cursor)  # DDL commits
@@ -234,6 +237,7 @@ def _end_transaction(cursor) -> None:  # noqa: ANN001
         cursor._duck_conn.execute("commit")
     except Exception:  # noqa: BLE001, S110 - nothing open any more
         pass
+    relations.committed(cursor)
 NOPS = [
     _LEAD + r"(begin|commit|rollback|start\s+transaction)\b",
     # documentation, access control and warehouse settings have nothing to act on locally
@@ -452,7 +456,16 @@ def _drop_temporary(duck, key: str) -> None:  # noqa: ANN001
 
 
 def end_session(conn=None, duck=None) -> None:  # noqa: ANN001
-    """Drop the temporary relations of one session, or of all of them."""
+    """Drop the temporary relations of one session, or of all of them. A session that ends rolls back the transaction
+    it left open, as in Snowflake (dbt does not end a transaction whose statement failed): the temporary relations are
+    dropped after that, for good, and nothing the session began is left for other sessions to collide with."""
+    if conn is not None:
+        if getattr(conn, "_fauxflake_undo", None) is not None:
+            with contextlib.suppress(Exception):
+                _undo(conn.cursor(), restore=True)
+        conn._fauxflake_txn, conn._fauxflake_journal = False, []
+        with contextlib.suppress(Exception):
+            conn._duck_conn.execute("rollback")
     for key in [k for k, held in TEMPORARY.items() if conn is None or held[0] == id(conn)]:
         _drop_temporary(duck if duck is not None else conn._duck_conn, key)
 
@@ -577,9 +590,9 @@ def _hide_stand_ins(duck) -> None:  # noqa: ANN001
 
     STANDINS.clear()
     duck.execute(f"create or replace table {_STANDINS_TABLE} (name varchar)")
-    hidden = f"(table_catalog || '.' || table_schema || '.' || table_name) not in (select name from {_STANDINS_TABLE})"
-    for view in (show.SQL_CREATE_VIEW_SHOW_OBJECTS, show.SQL_CREATE_VIEW_SHOW_TABLES, show.SQL_CREATE_VIEW_SHOW_VIEWS):
-        duck.execute(view.replace("create view if not exists", "create or replace view").rstrip() + f"\nand {hidden}")
+    relations.ensure(duck)
+    for view in (relations.SHOW_OBJECTS, relations.SHOW_TABLES, relations.SHOW_VIEWS):  # (they leave stand-ins out themselves)
+        duck.execute(view)
 
 
 def _over_a_stand_in(cursor, tree: exp.Create):  # noqa: ANN001, ANN202
@@ -818,6 +831,51 @@ def _patch_information_schema() -> None:
         return upstream(expression)
 
     _transforms.information_schema_fs = redirected
+
+    # a table's comment is written into fakesnow's own table as a literal: a quote in it broke the CREATE
+    import fakesnow.info_schema as _info
+
+    if not hasattr(_info.insert_table_comment_sql, "__wrapped__"):
+        upstream_comment = _info.insert_table_comment_sql
+
+        def insert_table_comment_sql(catalog, schema, table, comment):  # noqa: ANN001, ANN202
+            quote = lambda v: str(v).replace("'", "''")  # noqa: E731
+            return upstream_comment(quote(catalog), quote(schema), quote(table), quote(comment))
+
+        insert_table_comment_sql.__wrapped__ = upstream_comment
+        _info.insert_table_comment_sql = insert_table_comment_sql
+
+    # a VECTOR is a DuckDB FLOAT[n] / INTEGER[n] (semantics._vector_type), not an ARRAY to be held as JSON
+    semi = getattr(_transforms.semi_structured_types, "__wrapped__", _transforms.semi_structured_types)
+
+    def semi_structured_types(expression):  # noqa: ANN001, ANN202
+        if isinstance(expression, exp.DataType) and expression.meta.get("fx_vector"):
+            return expression
+        return semi(expression)
+
+    semi_structured_types.__wrapped__ = semi
+    _transforms.semi_structured_types = semi_structured_types
+
+    # SHOW TABLES / OBJECTS / VIEWS in name order, with STARTS WITH and LIMIT .. FROM (dbt pages through SHOW OBJECTS so)
+    listing = getattr(_transforms.show_tables_etc, "__wrapped__", _transforms.show_tables_etc)
+
+    def show_tables_etc(expression, current_database=None, current_schema=None):  # noqa: ANN001, ANN202
+        done = listing(expression, current_database, current_schema)
+        if done is expression or not isinstance(done, exp.Select):
+            return done
+        conditions = []
+        starts = expression.args.get("starts_with")
+        if isinstance(starts, exp.Expression):
+            conditions.append(exp.Anonymous(this="starts_with", expressions=[exp.column("name"), starts.copy()]))
+        after = expression.args.get("from_")
+        if isinstance(after, exp.Expression):
+            conditions.append(exp.GT(this=exp.column("name"), expression=after.copy()))
+        for condition in conditions:
+            done = done.where(condition, copy=False)
+        return done.order_by(exp.column("name"), copy=False) if not done.args.get("order") else done
+
+    show_tables_etc.__wrapped__ = listing
+    _transforms.show_tables_etc = show_tables_etc
     view = _show.SQL_CREATE_VIEW_SHOW_COLUMNS
     if "write_default" not in view:
         view = view.replace("""CASE WHEN is_nullable = 'YES' THEN 'true' ELSE 'false' END as "null?",""",
@@ -825,6 +883,28 @@ def _patch_information_schema() -> None:
         view = view.replace('"nullable":true', '"nullable":' + "' || CASE WHEN is_nullable = 'YES' THEN 'true' ELSE 'false' END || '")
         view = view.replace('NULL as "schema_evolution_record"', 'NULL as "schema_evolution_record", NULL as "write_default"')
         _show.SQL_CREATE_VIEW_SHOW_COLUMNS = view
+
+
+def _vectors_described(describe):  # noqa: ANN001, ANN202
+    """fakesnow's describe_as_rowtype, also for a VECTOR: a FLOAT[n] or INTEGER[n] column (see semantics._vector_type),
+    described as Snowflake describes one: type vector, its dimension, and one field for the element."""
+
+    def described_with_vectors(described):  # noqa: ANN001, ANN202
+        vectors = {i: semantics.VECTOR_KIND.fullmatch(str(row[1]).upper()) for i, row in enumerate(described)}
+        vectors = {i: m for i, m in vectors.items() if m and m[2]}
+        if not vectors:
+            return describe(described)
+        info = describe([(row[0], "BLOB", *row[2:]) if i in vectors else row for i, row in enumerate(described)])
+        for i, m in vectors.items():
+            element = {"type": "real", "precision": None, "scale": None} if m[1] == "FLOAT" else \
+                {"type": "fixed", "precision": 38, "scale": 0}
+            info[i].update(type="vector", byteLength=None, length=None, precision=None, scale=None,
+                           vectorDimension=int(m[2]), fields=[{"name": None, "nullable": False, "byteLength": None,
+                                                                "length": None, "collation": None, **element}])
+        return info
+
+    described_with_vectors.__wrapped__ = describe
+    return described_with_vectors
 
 
 def _patch_fakesnow() -> None:
@@ -915,8 +995,8 @@ def _patch_fakesnow() -> None:
             handled = _transaction(self, command, original)
             if handled is not None:
                 return handled
-            handled = account.intercept(self, command, original) or constraints.intercept(self, command, original) \
-                or objects.intercept(self, command, original)
+            handled = relations.intercept(self, command, original) or account.intercept(self, command, original) \
+                or constraints.intercept(self, command, original) or objects.intercept(self, command, original)
             if handled is not None:  # (warehouses, monitors, parameters; functions, procedures, streams, tasks, policies)
                 objects.remember(self)
                 return handled
@@ -930,6 +1010,7 @@ def _patch_fakesnow() -> None:
                     objects.consume_streams(self, command)
                     objects.remember(self)
                     objects.note_secure_view(self, command)
+                    relations.note(self, command)
                     _note_empty_lookup(self, command)
                     return done
                 except ProgrammingError as e:
@@ -956,6 +1037,7 @@ def _patch_fakesnow() -> None:
             objects.consume_streams(self, command)
             objects.remember(self)
             objects.note_secure_view(self, command)
+            relations.note(self, command)
             return done
         except ProgrammingError as e:
             if "_fx_refused_conversion" in str(e.msg):  # (the check of what a TRY_ function is given, in a window)
@@ -1021,7 +1103,11 @@ def _patch_fakesnow() -> None:
             server.app.router.routes[i] = Route(route.path, login_request, methods=list(route.methods or ["POST"]))
     from starlette.responses import JSONResponse
 
-    describe = server.describe_as_rowtype
+    import fakesnow.rowtype as rowtype
+
+    if not hasattr(rowtype.describe_as_rowtype, "__wrapped__"):  # (in-process cursors describe through this one)
+        rowtype.describe_as_rowtype = _vectors_described(rowtype.describe_as_rowtype)
+    describe = _vectors_described(getattr(server.describe_as_rowtype, "__wrapped__", server.describe_as_rowtype))
 
     def describe_as_rowtype(described):  # noqa: ANN001
         try:
@@ -1135,6 +1221,11 @@ def _patch_fakesnow() -> None:
         .replace("columns.data_type like 'TIME%'", f"(columns.data_type like 'TIME%' or columns.data_type = '{zoned.SHOWN}')") \
         .replace("columns.data_type='BIGINT'", f"columns.data_type in {whole}").replace("columns.data_type='DOUBLE'", "columns.data_type in ('DOUBLE', 'FLOAT')") \
         .replace("then NULL else columns.numeric_scale end", f"then NULL when columns.data_type in {whole} then 0 else columns.numeric_scale end")
+    # a VECTOR (semantics._vector_type) is listed as VECTOR; DESCRIBE gives its element type and dimension
+    if "'VECTOR'" not in info.SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW:
+        info.SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW = info.SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW.replace(
+            "when columns.data_type='BLOB' then 'BINARY'",
+            "when columns.data_type='BLOB' then 'BINARY' when regexp_full_match(columns.data_type, '(FLOAT|INTEGER)\\[\\d+\\]') then 'VECTOR'")
 
     # the columns Snowflake's views have beyond those: precision of times, and the rest as Snowflake
     # reports them for an ordinary column
@@ -1147,12 +1238,13 @@ def _patch_fakesnow() -> None:
     if "as DATETIME_PRECISION" not in info.SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW:
         info.SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW = info.SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW.replace(
             "null::VARCHAR as DATA_TYPE_ALIAS", "null::VARCHAR as DATA_TYPE_ALIAS" + more)
+    info.SQL_CREATE_INFORMATION_SCHEMA_TABLES_VIEW = Template(relations.INFORMATION_SCHEMA_TABLES)
     tables_view = info.SQL_CREATE_INFORMATION_SCHEMA_TABLES_VIEW.template
     if '"ERROR_LOGGING"' not in tables_view:
         info.SQL_CREATE_INFORMATION_SCHEMA_TABLES_VIEW = Template(tables_view.replace(
             "'NO' AS \"IS_HYBRID\"", "'NO' AS \"IS_HYBRID\", 'NO' AS \"ERROR_LOGGING\", 'NO' AS \"IS_INTERACTIVE\", 'NO' AS \"ROW_TIMESTAMP_ON\""))
     tables_view = info.SQL_CREATE_INFORMATION_SCHEMA_TABLES_VIEW.template
-    if "'VIEW' AS kind" not in tables_view:
+    if "'VIEW' AS kind" not in tables_view and "_fx_relations" not in tables_view:
         # Snowflake lists views here too (TABLE_TYPE 'VIEW', no row count, size or retention): a project that reads a
         # model's columns through it (GitLab's masking post-hook, on every view model) finds them
         for old, new in [
@@ -1180,6 +1272,28 @@ def _patch_fakesnow() -> None:
     if "_fs_global._fs_information_schema._fs_columns" not in upstream.SQL_DESCRIBE_TABLE.template:
         upstream.SQL_DESCRIBE_TABLE = Template(upstream.SQL_DESCRIBE_TABLE.template.replace(
             "FROM _fs_information_schema._fs_columns", "FROM _fs_global._fs_information_schema._fs_columns"))
+    if '"write default"' not in upstream.SQL_DESCRIBE_TABLE.template:
+        # DESCRIBE as Snowflake's (measured): the column's comment, whether a primary or unique key names it, `write default`
+        def key(kind: str) -> str:
+            return ("CASE WHEN EXISTS (SELECT 1 FROM _fs_global.main._fx_live_constraints k WHERE k.database_name = _fs_columns.table_catalog "
+                    "AND k.schema_name = _fs_columns.table_schema AND k.table_name = _fs_columns.table_name "
+                    f"AND k.kind = '{kind}' AND list_contains(k.columns, _fs_columns.column_name)) THEN 'Y' ELSE 'N' END")
+        template = upstream.SQL_DESCRIBE_TABLE.template
+        for old, new in [("""NULL::VARCHAR AS "comment",""", """_fs_columns.comment AS "comment","""),
+                         ("""'N' AS "primary key",""", f"""{key('PRIMARY KEY')} AS "primary key","""),
+                         ("""'N' AS "unique key",""", f"""{key('UNIQUE')} AS "unique key","""),
+                         ("""NULL::JSON AS "privacy domain",""", """NULL::JSON AS "privacy domain", NULL::VARCHAR AS "write default",""")]:
+            assert old in template, old
+            template = template.replace(old, new)
+        upstream.SQL_DESCRIBE_TABLE = Template(template)
+    if "VECTOR(" not in upstream.SQL_DESCRIBE_TABLE.template:
+        upstream.SQL_DESCRIBE_TABLE = Template(upstream.SQL_DESCRIBE_TABLE.template.replace(
+            "        ELSE data_type END AS \"type\",",
+            "         WHEN data_type = 'VECTOR' THEN (SELECT 'VECTOR(' || CASE WHEN d.data_type LIKE 'FLOAT%' THEN 'FLOAT' ELSE 'INT' END"
+            " || ', ' || regexp_extract(d.data_type, '\\[(\\d+)\\]', 1) || ')' FROM duckdb_columns() d"
+            " WHERE d.database_name = _fs_columns.table_catalog AND d.schema_name = _fs_columns.table_schema"
+            " AND d.table_name = _fs_columns.table_name AND d.column_name = _fs_columns.column_name)\n"
+            "        ELSE data_type END AS \"type\","))
 
     semantics.patch_upstream()
     import fakesnow.cursor as cursor_module
@@ -1255,17 +1369,20 @@ def _patch_fakesnow() -> None:
 
     original_execute = FakeSnowflakeCursor._execute
 
-    def _heal(self) -> None:  # noqa: ANN001
+    def _heal(self, force: bool = False) -> None:  # noqa: ANN001, FBT001, FBT002
         """In Snowflake a statement that fails leaves its transaction open. DuckDB aborts the whole
-        transaction, so start another and repeat what the transaction had done so far."""
+        transaction, so start another and repeat what the transaction had done so far. With `force`, also when DuckDB
+        kept it (a binder error): what the failed statement began (the emulator's own steps for it) is undone, as on
+        Snowflake, where a failed statement leaves nothing behind for other sessions to wait on."""
         conn = self._conn
         if not getattr(conn, "_fauxflake_txn", False) or getattr(conn, "_fauxflake_healing", False):
             return
-        try:
-            self._duck_conn.execute("select 1")
-            return
-        except Exception:  # noqa: BLE001, S110 - aborted
-            pass
+        if not force:
+            try:
+                self._duck_conn.execute("select 1")
+                return
+            except Exception:  # noqa: BLE001, S110 - aborted
+                pass
         conn._fauxflake_healing = True
         try:
             self._duck_conn.execute("rollback")
@@ -1486,6 +1603,13 @@ def _patch_fakesnow() -> None:
             if os.environ.get("FAUXFLAKE_FIT_DEBUG"):  # for working on the emulator: what DuckDB refused
                 if len(FAILED_STATEMENTS) < 500:
                     FAILED_STATEMENTS[str(e)[:160]] = transformed.sql(dialect="duckdb")[:4000]
+            _heal(self, force=True)
+            missing = _NO_SUCH_COLUMN.search(str(e))
+            if missing and getattr(e, "errno", None) in (None, 9998, 2043, 1003):
+                # Snowflake's words for a name that is no column (dbt shows them; tests look for the name in them)
+                # (DuckDB's words kept after Snowflake's: the retries above read them, an alias used in a JOIN for one)
+                raise ProgrammingError(msg=f"SQL compilation error: error line 1 at position 0\ninvalid identifier '{missing.group(1)}'"
+                                           f"\n{getattr(e, 'msg', None) or e}", errno=904, sqlstate="42000") from e
             raise
         semantics.coerce_result(self)
 

@@ -65,6 +65,8 @@ _BAD_CAST = re.compile(r"Unimplemented type for cast \((?P<from>[\w ]+?) -> (?P<
 _NO_FUNCTION = re.compile(r"No function matches the given name and argument types '(?P<name>\w+)\((?P<types>[^']*)\)'")
 _TEMPORAL = {"epoch", "epoch_ms", "date_part", "datepart", "extract", "year", "month", "day", "hour", "minute", "second",
              "dayofweek", "dayofyear", "week", "quarter", "last_day", "dayname", "monthname"}
+# `invalid type [_FS_GLOBAL.MAIN._SF_INT(UPDATED)] for parameter 'TO_NUMBER'` (semantics.refused_conversions): the column
+_REFUSED_TYPE = re.compile(r"invalid type \[(?:[\w$.]*\()*(?:\w+\.)*(?P<col>\"[^\"]+\"|[A-Za-z_][\w$]*)\)*\] for parameter '(?P<fn>\w+)'")
 _NUMERIC = {"abs", "round", "floor", "ceil", "sqrt", "ln", "log", "exp", "power", "sign"}
 _NOT_STRUCT = re.compile(r"""Cannot extract field '(?P<field>[^']+)' from expression "(?P<col>[^"]+)" because it is not a struct""")
 _HINTS = {"INT8": "BIGINT", "INT16": "BIGINT", "INT32": "BIGINT", "INT64": "BIGINT", "INT128": "BIGINT", "UINT8": "BIGINT",
@@ -2763,6 +2765,17 @@ class Fitter:
                 or self.missing_column(sql_key, message) or self.missing_relation(sql_key, message) \
                 or self.union_widths(sql_key, message):
             return True
+        refused = _REFUSED_TYPE.search(message)
+        if refused:
+            # Snowflake refuses a conversion of a column's type when it compiles (the emulator says so before DuckDB
+            # runs it): `updated::int` read as a time means epoch numbers; `x::date` of a number means a time
+            column = refused.group("col").strip('"').upper()
+            if refused.group("fn") in ("TO_NUMBER", "TO_DOUBLE", "TO_DECIMAL", "TO_NUMERIC") and self.retype_column(sql_key, column, "EPOCH"):
+                return True
+            if refused.group("fn") in ("TO_TIMESTAMP", "TO_DATE", "TO_TIME") and self.retype_column(sql_key, column, "TIMESTAMP"):
+                return True
+            if refused.group("fn") == "TO_BOOLEAN" and self.retype_column(sql_key, column, "BOOLEAN"):
+                return True
         named = _FROM_COLUMN.search(message)
         bad = _BAD_CAST.search(message)
         if bad and named and bad.group("from").startswith(("TIMESTAMP", "DATE")) and re.match(r"DECIMAL|DOUBLE|BIGINT|INTEGER|HUGEINT", bad.group("to")):
@@ -3256,8 +3269,8 @@ class Fitter:
                     continue
                 fq = ".".join([(tb.catalog or node["database"]).upper(), (tb.db or node["schema"]).upper(), name])
                 owner = self.relation_owner.get(fq)
-                if owner is None or fq in self.existing or self.nodes[owner]["resource_type"] not in ("model", "snapshot"):
-                    continue
+                if owner is None or owner == uid or fq in self.existing or self.nodes[owner]["resource_type"] not in ("model", "snapshot"):
+                    continue  # (a model that reads its own relation, `{{ this }}` in an incremental one, needs no stand-in)
                 ancestors = self._ancestors(uid) if ancestors is None else ancestors
                 if owner in ancestors:
                     continue
@@ -4434,6 +4447,21 @@ class Fitter:
             return self.together(node["attached_node"], [str(c) for c in kwargs.get("combination_of_columns") or []], analysis, node["name"])
         column = node.get("column_name") or kwargs.get("column_name") or meta["kwargs"].get("column_name")
         here = analysis.place(node["attached_node"], column) if column and re.fullmatch(r"\w+", str(column)) else None
+        if (not here or here[0] not in self.tables or here[1] not in self.tables[here[0]].get("columns", {})) \
+                and meta["name"] == "not_null" and column and re.fullmatch(r"\w+", str(column)):
+            # a column no one source column is behind (the branches of a UNION, a COALESCE): none of the source columns
+            # it comes from is null
+            changed = False
+            for origin in dict.fromkeys(self.origins(node["attached_node"], str(column).upper(), strict=True)):
+                for t in self.sources_of(node["attached_node"]):
+                    held = (self.tables[t].get("columns") or {}).get(origin)
+                    if held and held.get("null_rate"):
+                        held.pop("null_rate")
+                        self.retyped.add(t)
+                        self.learned.append(f"{t}.{origin}: behind {column}, which a `not_null` test checks; never null now.")
+                        changed = True
+            self.dirty |= changed
+            return changed
         if not here or here[0] not in self.tables or here[1] not in self.tables[here[0]].get("columns", {}):
             return False
         table, col, path = here
