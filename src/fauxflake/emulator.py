@@ -1009,13 +1009,14 @@ def _patch_fakesnow() -> None:
         ORDER BY e.i
     ) AS _fx_undefined
     WHERE VALUE IS DISTINCT FROM {semantics._UNDEFINED_JSON}""")
-    # OBJECT_CONSTRUCT writes each value's own text (DuckDB's json_group_object writes a FLOAT anew, as a NUMBER)
+    # OBJECT_CONSTRUCT keeps its keys sorted, as Snowflake does (so objects with the same pairs are equal, hash alike, and
+    # UNION into one), writes each value's own text (DuckDB's json_group_object writes a FLOAT anew, as a NUMBER)
     # and is an expression, not a subquery: a subquery would take an aggregate among the values (`object_construct('n',
     # count(*))` without GROUP BY) as its own
     _macros.FS_OBJECT_CONSTRUCT = _Template("""CREATE OR REPLACE MACRO ${catalog}._fs_object_construct(keys, vals, keep_nulls) AS (
-    ('{' || array_to_string(list_filter(list_transform(list_zip(keys, vals), lambda p: CASE WHEN p[1] IS NOT NULL
-        AND (keep_nulls OR p[2] IS NOT NULL) THEN to_json(p[1])::VARCHAR || ':' || COALESCE(p[2]::VARCHAR, 'null') END),
-        lambda e: e IS NOT NULL), ',') || '}')::JSON
+    ('{' || array_to_string(list_transform(list_sort(list_filter(list_transform(list_zip(keys, vals), lambda p: CASE WHEN p[1] IS NOT NULL
+        AND (keep_nulls OR p[2] IS NOT NULL) THEN struct_pack(k := p[1]::VARCHAR, e := to_json(p[1])::VARCHAR || ':' || COALESCE(p[2]::VARCHAR, 'null')) END),
+        lambda e: e IS NOT NULL)), lambda e: e.e), ',') || '}')::JSON
 );
 """)
     _macros.FS_OBJECT_CONSTRUCT_STAR = _Template(_macros.FS_OBJECT_CONSTRUCT_STAR.template.replace(

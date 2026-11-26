@@ -730,7 +730,11 @@ MACROS = zoned.MACROS + [
     f"""create or replace macro {_NS}_sf_object_keys(o) as to_json(list_sort(json_keys(case when o is null then null
           when typeof(o) <> 'JSON' or json_type(o::json) = 'OBJECT' then o::json when json_type(o::json) = 'NULL' then null
           else error(chr(31) || 'fxerr:100071:22000:Failed to cast variant value ' || o::varchar || ' to OBJECT' || chr(31))::json end)))""",
-    f"create or replace macro {_NS}_sf_hash_agg(x) as bit_xor(hash(x))",
+    # HASH is a signed 64-bit NUMBER(19,0) in Snowflake (DuckDB's hash is unsigned); HASH_AGG is order-independent, counts
+    # duplicate rows and is 0 for no rows (measured). The values are not Snowflake's, the equalities between them are.
+    f"""create or replace macro {_NS}_sf_signed(h) as (h::hugeint - case when h >= 9223372036854775808
+          then 18446744073709551616 else 0 end)::bigint""",
+    f"create or replace macro {_NS}_sf_hash_total(s) as coalesce({_NS}_sf_signed((s % 18446744073709551616)::ubigint), 0)",
     # FLATTEN(..., RECURSIVE => TRUE) walks every level.
     # what FLATTEN is given, when it is a list or an object; a string or a number held in a VARIANT gives no rows,
     # as in Snowflake, instead of an error
@@ -1042,7 +1046,7 @@ _RENAMED = {  # Snowflake function -> macro, same arguments
     "object_delete": "_sf_object_delete", "object_pick": "_sf_object_pick",
     "current_account_name": "_sf_current_account_name", "try_base64_decode_string": "_sf_try_base64", "base64_decode_string": "_sf_base64",
     "soundex": "_sf_soundex", "parse_url": "_sf_parse_url", "parse_ip": "_sf_parse_ip",
-    "get_ignore_case": "_sf_get_ignore_case", "object_keys": "_sf_object_keys", "hash_agg": "_sf_hash_agg",
+    "get_ignore_case": "_sf_get_ignore_case", "object_keys": "_sf_object_keys", 
     "try_hex_decode_string": "_sf_try_hex", "encrypt_raw": "_sf_encrypt_raw",
     "decrypt_raw": "_sf_decrypt_raw", "try_decrypt_raw": "_sf_try_decrypt_raw",
     "parse_xml": "_sf_parse_xml", "check_xml": "_sf_check_xml", "to_xml": "_sf_to_xml", "xmlget": "_sf_xmlget",
@@ -1337,6 +1341,20 @@ def _operand(node: exp.Expression) -> exp.Expression:
 
 
 _VARIANT_ACCESS = (exp.JSONExtract, exp.Bracket)
+
+
+def _hash(node: exp.Expression) -> exp.Expression:
+    """HASH(...) and HASH_AGG([DISTINCT] ...), with * for every column: see _sf_signed."""
+    args = [node.this, *node.expressions] if isinstance(node, exp.HashAgg) else list(node.expressions)
+    distinct = len(args) == 1 and isinstance(args[0], exp.Distinct)
+    if distinct:
+        args = list(args[0].expressions)
+    args = [exp.Var(this="*COLUMNS(*)") if isinstance(a, exp.Star) else rewrite(a) for a in args]
+    hashed = exp.Anonymous(this="hash", expressions=args)
+    if isinstance(node, exp.Anonymous):
+        return _fn("_sf_signed", hashed)
+    total = exp.Sum(this=exp.Distinct(expressions=[hashed]) if distinct else hashed)
+    return _fn("_sf_hash_total", total)
 
 
 def _variant_like(e: exp.Expression) -> bool:
@@ -2643,6 +2661,8 @@ def _format_chosen_at_run_time(node: exp.Expression) -> exp.Expression | None:
 
 def rewrite(node: exp.Expression) -> exp.Expression:
     """Apply the fixes bottom-up, so nested cases (a ratio of averages) all get rewritten."""
+    if isinstance(node, exp.HashAgg) or (isinstance(node, exp.Anonymous) and node.name.upper() == "HASH"):
+        return _hash(node)
     _text_beside_variant_branches(node)
     if isinstance(node, exp.TryCast) and (
             (node.to.is_type("object", "map") and (isinstance(node.this, exp.Struct) or (

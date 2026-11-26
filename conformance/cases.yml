@@ -1265,3 +1265,11 @@
 - {id: case_number_variant_beside_text, sql: "select case when true then parse_json('5') else 'a' end, case when true then 'a' else parse_json('5') end"}
 - {id: case_json_path_beside_text, sql: "select case when e in ('a') then try_parse_json(m)['schema'] else cast(null as varchar) end from (select 'a' e, '{\"schema\": \"instagram_business\"}' m)"}
 - {id: date_trunc_in_a_window_order, sql: "select d, row_number() over (order by date_trunc('year', d)) from (select '2020-03-04'::date d)"}
+- {id: object_equal_whatever_key_order, sql: "select object_construct('b',2,'a',1) = object_construct('a',1,'b',2), hash(object_construct('a',1,'b',2)) = hash(object_construct('b',2,'a',1))"}
+- {id: object_union_whatever_key_order, sql: "select count(*) from (select object_construct('a',1,'b',2) o union select object_construct('b',2,'a',1))"}
+- {id: object_keys_sorted_bytewise, sql: "select object_construct('a b', 1, 'a', 2, 'B', 3, 'b', 4, 'é', 5, 'z', null)"}
+- {id: hash_agg_many_and_star, sql: "select hash_agg(a, b) = hash_agg(a, b), hash_agg(*) = hash_agg(a, b) from (select 1 a, 'x' b)"}
+- {id: hash_star_is_hash_of_columns, sql: "select hash(*) = hash(a, b), hash(1) < 0 or hash(1) >= 0 from (select 1 a, 'x' b)"}
+- {id: hash_agg_of_nothing, sql: "select hash_agg(a) from (select 1 a where false)"}
+- {id: hash_agg_counts_duplicates, sql: "select hash_agg(a) = hash_agg(distinct a) from (select 1 a union all select 1)"}
+- {id: hash_agg_any_order, sql: "select count(distinct h) from (select hash_agg(a) h from (select 1 a union all select 2) union all select hash_agg(a) from (select 2 a union all select 1))"}
