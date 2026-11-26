@@ -272,6 +272,25 @@
    ]
   ]
  },
+ "alias_shadows_source_column_from_cte": {
+  "rows": [
+   [
+    "2020-01-01",
+    "1"
+   ]
+  ]
+ },
+ "alias_shadows_source_column_in_aggregate": {
+  "rows": [
+   [
+    "1",
+    "2020-01-01",
+    "2020-01-02",
+    null,
+    "2"
+   ]
+  ]
+ },
  "ambiguous_1": {
   "error": "002028 (42601): SQL compilation error:"
  },

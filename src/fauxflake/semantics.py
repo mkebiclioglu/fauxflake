@@ -2293,8 +2293,6 @@ def _layer_joined_windows(select: exp.Select, everywhere: bool = False) -> bool:
 
     outside = {i for i, p in enumerate(projections) if isinstance(p, exp.Alias) and (everywhere or p.find(exp.Window))
                and reads(p.this, windowed - {p.alias.lower()}, not everywhere)}
-    if grouped and any(projections[i].find(exp.AggFunc) and not projections[i].find(exp.Window) for i in outside):
-        return False  # (an aggregate of the outside part cannot be computed over the grouped rows)
     if not outside:
         return False
     for _ in range(len(projections)):  # and whatever reads those in turn
@@ -2303,6 +2301,10 @@ def _layer_joined_windows(select: exp.Select, everywhere: bool = False) -> bool:
         if not more:
             break
         outside |= more
+    if grouped and any(projections[i].find(exp.AggFunc) and not projections[i].find(exp.Window) for i in outside):
+        # (an aggregate of the outside part cannot be computed over the grouped rows; checked after the spread: a name an
+        # alias shadows, `min(issued_at) ..., case ... end as issued_at`, pulls the aggregate along)
+        return False
     group = select.args.get("group")
     positions = [int(e.name) for e in (group.expressions if group else []) if isinstance(e, exp.Literal) and e.is_int]
     if positions and min(outside) < max(positions):
@@ -2469,6 +2471,26 @@ def lateral_aliases(sql: str) -> set[str]:
                 if owner is not None and owner is not proj and not col.table and col.find_ancestor(exp.Select) is select:
                     out.add(col.name.upper())
     return out
+
+
+def source_columns_first(tree: exp.Expression, names: set[str]) -> exp.Expression:
+    """`min(issued_at) as m, case ... end as issued_at from t`: a name a SELECT also gives an alias is the source's column
+    where Snowflake reads it (DuckDB refuses a name read before the alias that shadows it). Qualify it with the one
+    relation the SELECT reads."""
+    for select in tree.find_all(exp.Select):
+        source = select.args.get("from_")
+        if source is None or select.args.get("joins"):
+            continue
+        relation = source.this
+        qualifier = relation.alias_or_name if isinstance(relation, (exp.Table, exp.Subquery)) else None
+        if not qualifier:
+            continue
+        aliased = {p.alias.upper() for p in select.expressions if isinstance(p, exp.Alias)} & names
+        for col in list(select.find_all(exp.Column)):
+            if col.table or col.name.upper() not in aliased or col.find_ancestor(exp.Select) is not select:
+                continue
+            col.set("table", exp.to_identifier(qualifier, quoted=isinstance(relation, exp.Table) and relation.this.quoted))
+    return tree
 
 
 def inline_aliases(tree: exp.Expression, names: set[str]) -> exp.Expression:

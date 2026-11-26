@@ -571,6 +571,7 @@ def end_session(conn=None, duck=None) -> None:  # noqa: ANN001
         _drop_temporary(duck if duck is not None else conn._duck_conn, key)
 
 
+_ALIAS_LATER = re.compile(r'Column "([^"]+)" referenced that exists in the SELECT clause - but this column cannot be referenced before it is defined')
 _ALIAS_ERROR = re.compile(r'Alias (?:with name )?"+([^"]+)"+ (?:exists, but aliases cannot be used|referenced(?: in a SELECT clause)? - but the expression has (?:side effects|a subquery))')
 _MISSING_COLUMN = re.compile(r'Referenced column "([^"]+)" not found in FROM clause')
 _AMBIGUOUS_ERROR = re.compile(r"""Ambiguous reference to column name "+([^"]+)"+ \(use: '"?([^'".]+)"?\.""")
@@ -1110,6 +1111,7 @@ def _patch_fakesnow() -> None:
             self._fauxflake_paths = semantics.flatten_paths(command)
             self._fx_command = command if isinstance(command, str) else None
             self._fauxflake_layer, self._fauxflake_inline, self._fauxflake_owners = False, set(), {}
+            self._fauxflake_sources = set()
             self._fauxflake_qualify = False
             command = objects.session_functions(self, command)
             command = staged.rewrite(self, command)
@@ -1157,6 +1159,9 @@ def _patch_fakesnow() -> None:
                     ambiguous = _AMBIGUOUS_ERROR.search(message)
                     if "Ambiguous reference to catalog or schema" in message and not self._fauxflake_qualify:
                         self._fauxflake_qualify = True  # schema.table when a database has the schema's name
+                    elif (early := _ALIAS_LATER.search(message)) and early.group(1).upper() not in self._fauxflake_sources:
+                        # `min(issued_at) ..., case ... end as issued_at`: Snowflake reads the source's column first
+                        self._fauxflake_sources.add(early.group(1).upper())
                     elif "window function calls cannot be nested" in message and not self._fauxflake_layer:
                         self._fauxflake_layer = True  # an aliased window used inside another window
                     elif alias and alias.group(1).upper() not in self._fauxflake_inline:
@@ -1564,6 +1569,8 @@ def _patch_fakesnow() -> None:
             expression = semantics.qualify_schemas(expression, self._conn.database)
         if getattr(self, "_fauxflake_owners", None):
             expression = semantics.qualify_using(expression, self._fauxflake_owners)
+        if getattr(self, "_fauxflake_sources", None):
+            expression = semantics.source_columns_first(expression, self._fauxflake_sources)
         if getattr(self, "_fauxflake_inline", None):
             expression = semantics.inline_aliases(expression, self._fauxflake_inline)
         if getattr(self, "_fauxflake_layer", False):
