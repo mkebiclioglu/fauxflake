@@ -1771,6 +1771,8 @@ def _patch_fakesnow() -> None:
                         ADJUSTED[written] = (_types_read(self, transformed), transformed.copy())
                     except Exception:  # noqa: BLE001, S110
                         pass
+            if os.environ.get("FAUXFLAKE_SHOW_RUN_SQL") and isinstance(transformed, exp.Expression):
+                print(f"fauxflake run: {transformed.sql(dialect='duckdb')}", file=sys.stderr)  # after the adjustments
             if clock is not None:
                 clock["adjust"] += time.monotonic() - began
             _heal(self)  # a probe that failed inside a transaction aborted it

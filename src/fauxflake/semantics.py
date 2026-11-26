@@ -8,7 +8,9 @@ return different values or types. Each fix here exists because a case in
 from __future__ import annotations
 
 import itertools
+import os
 import re
+import sys
 
 import sqlglot
 from sqlglot import exp
@@ -3501,7 +3503,9 @@ def resolve_equalities(transformed: exp.Expression, conn) -> exp.Expression:  # 
             probe.set("joins", [j.copy() for j in select.args["joins"]])
         try:
             described = conn.execute("describe " + _cte_prefix(select) + probe.sql(dialect="duckdb")).fetchall()
-        except Exception:  # noqa: BLE001 - binds only in its context (a correlated subquery): leave it as it is
+        except Exception as e:  # noqa: BLE001 - binds only in its context (a correlated subquery): leave it as it is
+            if os.environ.get("FAUXFLAKE_DEBUG_EQ"):
+                print(f"fauxflake: equalities left as they are: {str(e)[:300]}", file=sys.stderr)
             continue
         if len(described) != 2 * len(calls):
             continue
@@ -4266,6 +4270,11 @@ def refused_conversions(transformed: exp.Expression, conn) -> tuple[int, str] | 
     candidates = [(n, *a) for n in body.find_all(*kinds)
                   if (a := argument(n)) is not None and not isinstance(a[0], (exp.Literal, exp.Null))]
     if not candidates:
+        return None
+    ctes = sum(1 for _ in body.find_all(exp.CTE))
+    if len(candidates) > 40 or ctes * len(candidates) > 400:
+        # binding the guarded copy of a statement with many conversions over many CTEs took DuckDB's binder (which
+        # its memory limit does not cover) past 10 GB on Mattermost's models: such a statement is not checked
         return None
 
     def guarded(only=None) -> str:  # noqa: ANN001
