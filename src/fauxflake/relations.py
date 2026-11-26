@@ -437,6 +437,10 @@ def intercept(cursor, command, original):  # noqa: ANN001, ANN201
             return done
     if word == "create" and (m := _CREATE_SPECIAL.match(text)):
         return _create(cursor, original, m, text)
+    if word == "create" and _CTAS_COLUMNS.match(text):
+        done = _ctas_with_columns(cursor, original, text)
+        if done is not None:
+            return done
     if word == "alter" and (m := _ALTER_SPECIAL.match(text)):
         return _alter(cursor, original, m)
     if word == "show" and (m := _SHOW.match(text)):
@@ -1132,3 +1136,60 @@ def _grants_follow(duck, fq, *, dropped: bool = False, to=None) -> None:  # noqa
                      [*to, *fq])
     elif dropped:
         duck.execute(f"delete from {GRANTS} where database_name = ? and schema_name = ? and name = ?", list(fq))
+
+
+
+# ---------------------------------------------------------------- CREATE TABLE t (columns) AS query
+
+_CTAS_COLUMNS = re.compile(_LEAD + r"create\s+(?:or\s+replace\s+)?(?:(?:local|global)\s+)?(?:(?:transient|temporary|temp)\s+)?table\s+"
+                           r"(?:if\s+not\s+exists\s+)?" + _NAME + r"\s*\(")
+
+
+def _ctas_with_columns(cursor, original, text: str):  # noqa: ANN001, ANN202
+    """A table made with its columns declared and filled from a query (dbt's contracts): as Snowflake does it, the table
+    as declared (NOT NULL enforced: 100072 for a NULL), filled with the query's rows by position, and put in place only
+    when that worked; a CREATE OR REPLACE that fails leaves the table there was."""
+    from sqlglot import exp, parse_one
+
+    try:
+        tree = parse_one(text, read="snowflake")
+    except Exception:  # noqa: BLE001
+        return None
+    if not (isinstance(tree, exp.Create) and str(tree.args.get("kind") or "").upper() == "TABLE" and isinstance(tree.this, exp.Schema)
+            and tree.expression is not None and any(isinstance(c, exp.ColumnDef) for c in tree.this.expressions)):
+        return None
+    target = tree.this.this
+    fq = qualified(cursor, ".".join(p for p in (target.catalog, target.db, target.name) if p))
+    duck = cursor._duck_conn
+    exists = duck.execute("select count(*) from duckdb_tables() where database_name = ? and schema_name = ? and table_name = ?",
+                          list(fq)).fetchone()[0] > 0
+    if exists and tree.args.get("exists"):
+        return _status(original, cursor, f"{fq[2]} already exists, statement succeeded.")
+    if exists and not tree.args.get("replace"):
+        raise _error(f"SQL compilation error:\nObject '{fq[2]}' already exists.", 2002, "42710")
+    scratch = (fq[0], fq[1], fq[2] + "__FX_CTAS")
+    query = tree.expression.copy()
+    declared = tree.copy()
+    declared.set("expression", None)
+    declared.set("replace", True)
+    declared.set("exists", False)
+    declared.this.set("this", exp.to_table(_sql_name(scratch), dialect="duckdb"))
+    names = [c.this.copy() for c in tree.this.expressions if isinstance(c, exp.ColumnDef)]
+    cur = cursor._conn.cursor()
+    try:
+        cur.execute(declared.sql(dialect="snowflake"))
+        try:
+            columns = exp.Tuple(expressions=[exp.column(n) for n in names])
+            cur.execute(f"insert into {_sql_name(scratch)} {columns.sql(dialect='snowflake')} {query.sql(dialect='snowflake')}")
+        except Exception as e:
+            cur.execute(f"drop table if exists {_sql_name(scratch)}")
+            if getattr(e, "errno", None) == 100072:  # (named as Snowflake names it: the table the statement makes, in full)
+                raise _error(re.sub(r"to table \S+ failed", f"to table {'.'.join(fq)} failed", str(e.msg)), 100072, "22000") from e
+            raise
+        if exists:
+            cur.execute(f"drop table {_sql_name(fq)}")
+        duck.execute(f"alter table {_sql_name(scratch)} rename to {_sql_name((fq[2],))}")
+    finally:
+        cur.close()
+    note(cursor, text)  # (what Snowflake keeps about it: made now, by this role)
+    return _status(original, cursor, f"Table {fq[2]} successfully created.")

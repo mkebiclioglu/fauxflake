@@ -1248,3 +1248,5 @@
 - {id: date_text_day_first_refused, sql: "select '13/01/2023'::date"}
 - {id: ts_text_refused, sql: "select 'nope'::timestamp"}
 - {id: double_limit_refused, sql: "select 1 as id\nlimit 1\nlimit 1"}
+- {id: date_functions_read_us_dates, sql: "select datediff(day, '09/01/2023', '09/12/2023'), datediff(day, '09/01/2023'::date, '09/12/2023'::date), dateadd(day, 1, '09/01/2023'), date_trunc('month', '09/15/2023'::date)"}
+- {id: date_functions_read_short_offsets, sql: "select datediff(day, '2023-09-01 10:00:00-0', '2023-09-12')"}

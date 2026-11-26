@@ -107,6 +107,7 @@ _NOT_DATA_ERRORS = ("Binder Error", "Parser Error", "Catalog Error", "does not e
                     "SQL compilation error", "INTERRUPT", "Interrupt", "timed out", "Duplicate row detected", _TWO_DATABASES)
 # DuckDB's word for text that is no number, and Snowflake's (fakesnow answers 100035, Snowflake's for a timestamp)
 _NOT_A_TIME = re.compile(r'invalid (date|timestamp) field format: "([^"]*)"')
+_NOT_NULL = re.compile(r"NOT NULL constraint failed: (?:[\w$\"]+\.)*?([\w$\"]+)\.([\w$\"]+)")
 _MANY_CLAUSES = re.compile(r"Found multiple '(\w+)' clauses\. Line (\d+), Col: (\d+)")
 _NOT_A_NUMBER = re.compile(r"Could not convert string (['\"])(.*?)\1 to (?:U?(?:TINY|SMALL|BIG|HUGE)?INT(?:EGER|8|16|32|64|128)?|DECIMAL[^ ]*|DOUBLE|FLOAT)\b", re.S)
 
@@ -1137,6 +1138,11 @@ def _patch_fakesnow() -> None:
                 kind = "Date" if when[1] == "date" else "Timestamp"
                 raise ProgrammingError(msg=f"{kind} '{when[2]}' is not recognized\n{e.msg}", errno=100040 if kind == "Date" else 100035,
                                        sqlstate="22007") from e
+            null = _NOT_NULL.search(str(e.msg))
+            if null:  # Snowflake's words for a NULL in a NOT NULL column (measured: 100072)
+                self._sqlstate = "22000"
+                raise ProgrammingError(msg=f"DML operation to table {null[1]} failed on column {null[2]} with error: NULL result in a "
+                                           "non-nullable column", errno=100072, sqlstate="22000") from e
             many = _MANY_CLAUSES.search(str(e.msg)) if e.errno == 1003 else None
             if many:  # Snowflake's parser stops at the second keyword: its line and 0-based position
                 self._sqlstate = "42000"
@@ -1148,6 +1154,11 @@ def _patch_fakesnow() -> None:
             if tried:  # (the emulator's check of what a TRY_ function is given)
                 self._sqlstate = "22023"
                 raise ProgrammingError(msg=f"SQL compilation error:\n{tried[0]}", errno=1065, sqlstate="22023") from e
+            null = _NOT_NULL.search(str(e))
+            if null:  # Snowflake's words for a NULL in a NOT NULL column (measured: 100072)
+                self._sqlstate = "22000"
+                raise ProgrammingError(msg=f"DML operation to table {null[1]} failed on column {null[2]} with error: NULL result in a "
+                                           "non-nullable column", errno=100072, sqlstate="22000") from e
             said = re.search(r"\x1ffxerr:(\d+):(\w+):(.*?)\x1f", str(e), re.S)
             if said:  # an error of Snowflake's, raised by one of the emulator's functions
                 self._sqlstate = said[2]

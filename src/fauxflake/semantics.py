@@ -1370,6 +1370,9 @@ def zoned_argument(transformed: exp.Expression) -> tuple[int, str] | None:
     return None
 
 
+_DATE_ARITHMETIC = (exp.DateDiff, exp.DateAdd, exp.DateSub, exp.TimestampDiff, exp.TimestampAdd, exp.TimestampSub, exp.DateTrunc,
+                    exp.TimestampTrunc, exp.TsOrDsAdd, exp.TsOrDsDiff)  # (not the conversions: those may name a format of their own)
+_US_OR_SHORT_OFFSET = re.compile(r"^\s*(\d{1,2}/\d{1,2}/\d{4}(\s+\d{1,2}:\d\d(:\d\d(\.\d*)?)?)?|.*\d:\d\d(:\d\d(\.\d*)?)?\s*[+-]\d(:?\d\d)?)\s*$")
 _CLOCK_CALLS = {exp.CurrentDate: "_fx_current_date", exp.CurrentTimestamp: "_fx_current_timestamp",
                 exp.CurrentTime: "_fx_current_time", exp.Localtime: "_fx_localtime", exp.Localtimestamp: "_fx_localtimestamp"}
 
@@ -1471,6 +1474,12 @@ def _fix(node: exp.Expression) -> exp.Expression:
         exact = _exact_literal(node.name)
         if exact is not None:
             return exp.Literal.number(exact)
+    if isinstance(node, _DATE_ARITHMETIC):
+        # a time written as text that DuckDB would not read (a US date, an offset of one digit), handed to a date function:
+        # read as Snowflake's AUTO reads it (DATEDIFF(day, '09/01/2023', '09/12/2023') is 11)
+        for key, child in list(node.args.items()):
+            if isinstance(child, exp.Literal) and child.is_string and _US_OR_SHORT_OFFSET.match(child.name):
+                node.set(key, _fn("_sf_cast_ntz", child.copy()))
     if isinstance(node, exp.CurrentTimestamp) and node.args.get("sysdate"):
         return _fn("_fx_sysdate")  # SYSDATE() is a TIMESTAMP_NTZ, the wall clock in UTC (CURRENT_TIMESTAMP an instant)
     if type(node) in _CLOCK_CALLS and not (isinstance(node, exp.CurrentDate) and node.this is not None):
