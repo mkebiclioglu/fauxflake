@@ -3443,7 +3443,7 @@ class Fitter:
                 error = self.run_model(conn, uid, fq)
                 if error:
                     failures[uid] = error
-            conn.close()
+            emulator.close_duck(conn)  # (a model given up on may still be running on it: see close_duck)
             self.push_pending()
             roots = sum(1 for m in failures.values() if not m.startswith("upstream failed"))
             self.log(f"  pass {n_pass}: {len(order) - len(failures)}/{len(order)} models run ({roots} fail on their own), "

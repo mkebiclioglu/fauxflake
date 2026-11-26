@@ -1978,6 +1978,46 @@ def _spill_directory(duck: duckdb.DuckDBPyConnection) -> str:
     return path
 
 
+def _log_memory(duck, path: str) -> None:  # noqa: ANN001
+    """Append DuckDB's own accounting (duckdb_memory(), by tag) and the process's resident size to `path`."""
+    import resource
+
+    probe = duck.cursor()
+
+    def loop() -> None:
+        while True:
+            try:
+                rows = probe.execute("select tag, memory_usage_bytes // 1048576, temporary_storage_bytes // 1048576 "
+                                     "from duckdb_memory() where memory_usage_bytes > 50 * 1048576 or temporary_storage_bytes > 0 "
+                                     "order by 2 desc").fetchall()
+                peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // (1024 if sys.platform != "darwin" else 1048576)
+                with open(path, "a") as out:
+                    out.write(f"{time.strftime('%H:%M:%S')} peak_rss={peak}MB duckdb={sum(r[1] for r in rows)}MB "
+                              + " ".join(f"{t}={m}MB/{d}MB" for t, m, d in rows) + "\n")
+            except Exception as e:  # noqa: BLE001
+                with open(path, "a") as out:
+                    out.write(f"{time.strftime('%H:%M:%S')} probe failed: {e}\n")
+            time.sleep(10)
+
+    threading.Thread(target=loop, name="fauxflake-memory-log", daemon=True).start()
+
+
+def close_duck(duck, tries: int = 20) -> None:  # noqa: ANN001
+    """Close a DuckDB connection that a statement given up on (a model past its time limit) may still be running on.
+    DuckDB 2 refuses to close a busy connection rather than wait: interrupt what runs, then close, a few times."""
+    for _ in range(tries):
+        try:
+            duck.close()
+            return
+        except duckdb.Error as e:
+            if "busy" not in str(e).lower():
+                raise
+            with contextlib.suppress(Exception):
+                getattr(duck, "_duck_conn", duck).interrupt()  # (fakesnow's connection holds DuckDB's)
+            time.sleep(0.5)
+    print("fauxflake: a DuckDB connection was still busy; left open", file=sys.stderr)
+
+
 def _bound_memory(duck: duckdb.DuckDBPyConnection) -> None:
     """DuckDB takes up to 80% of the machine's memory before it spills to disk. dbt, the generator and
     the rest of the machine live in what is left: on an 8 GB laptop or a small CI runner that starves
@@ -2077,6 +2117,8 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
         time.sleep(0.02)
     if not server.started:
         raise RuntimeError(f"emulator failed to start on port {port}")
+    if os.environ.get("FAUXFLAKE_MEMORY_LOG"):  # for working on the emulator: where memory goes, every 10 s
+        _log_memory(fs.duck_conn, os.environ["FAUXFLAKE_MEMORY_LOG"])
     global CURRENT
     emu = Emulator(port=port, duck=fs.duck_conn, _fs=fs, db_path=db_path)
     outer, CURRENT = CURRENT, emu
@@ -2091,5 +2133,5 @@ def serve(port: int | None = None, db_path: str | Path | None = None, verbose: b
         server.should_exit = True
         thread.join(timeout=5)
         fakesnow.server.shared_fs = previous
-        fs.duck_conn.close()
+        close_duck(fs.duck_conn)
         shutil.rmtree(spill, ignore_errors=True)
