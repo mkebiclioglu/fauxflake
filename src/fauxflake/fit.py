@@ -416,7 +416,10 @@ class Fitter:
         removed = False
         for select in t.find_all(exp.Select):
             stars = [e for e in select.expressions if isinstance(e, exp.Star) or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star))]
-            if not stars or not any(e.alias_or_name.upper() == col for e in select.expressions if e not in stars):
+            named = [e for e in select.expressions if e not in stars and e.alias_or_name.upper() == col]
+            # `dbt_utils.star(source)` writes the source's columns out: a plain `type` beside a computed `... as type`
+            listed = [e for e in named if isinstance(e, exp.Column)]
+            if not (stars and named) and not (listed and len(named) > len(listed)):
                 continue
             for owner in self.real_tables(select, ctes):
                 columns = (self.tables.get(owner) or {}).get("columns") or {}
