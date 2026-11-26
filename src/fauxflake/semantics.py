@@ -454,6 +454,7 @@ MACROS = zoned.MACROS + [
     # DATE_TRUNC keeps the input type. DuckDB turns a DATE into a TIMESTAMP.
     f"""create or replace macro {_NS}_sf_date_trunc
           (p varchar, x date) as date_trunc(p, x)::date,
+          (p varchar, x timestamp) as date_trunc(p, x),
           (p varchar, x timestamptz) as date_trunc(p, x),
           (p, x) as date_trunc(p, x::timestamp)""",
     f"create table if not exists {_NS}_fx_session as select 'SYSADMIN' as role",
@@ -2238,7 +2239,7 @@ def _self_referencing(cte: exp.CTE) -> bool:
     return any(not t.db and t.name.lower() == cte.alias.lower() for t in cte.this.find_all(exp.Table))
 
 
-def _layer_joined_windows(select: exp.Select) -> bool:
+def _layer_joined_windows(select: exp.Select, everywhere: bool = False) -> bool:
     """The same for a SELECT with joins. Its FROM cannot be folded into `select *`, so the split goes
     the other way: the query as written, minus the projections that use an aliased window, becomes
     the inner query, and those projections are computed outside from its output columns."""
@@ -2258,8 +2259,8 @@ def _layer_joined_windows(select: exp.Select) -> bool:
                 return True
         return False
 
-    outside = {i for i, p in enumerate(projections) if isinstance(p, exp.Alias) and p.find(exp.Window)
-               and reads(p.this, windowed - {p.alias.lower()}, True)}
+    outside = {i for i, p in enumerate(projections) if isinstance(p, exp.Alias) and (everywhere or p.find(exp.Window))
+               and reads(p.this, windowed - {p.alias.lower()}, not everywhere)}
     if not outside:
         return False
     for _ in range(len(projections)):  # and whatever reads those in turn
@@ -2312,15 +2313,17 @@ def _layer_joined_windows(select: exp.Select) -> bool:
     return True
 
 
-def layer_windows(tree: exp.Expression) -> exp.Expression:
+def layer_windows(tree: exp.Expression, everywhere: bool = False) -> exp.Expression:
     """`lag(x) over (...) as prev, sum(prev) over (...)`: Snowflake computes the first window, then
-    the second. DuckDB will not nest them, so compute the aliased windows in a subquery first."""
+    the second. DuckDB will not nest them, so compute the aliased windows in a subquery first. `everywhere`: also an
+    aliased window read outside a window (`last_value(d) over (...) as l, date_trunc('month', l)`: DuckDB cannot
+    type a window given to an overloaded macro)."""
     for _ in range(6):
         changed = False
         for select in list(tree.find_all(exp.Select)):
             source = select.args.get("from_")
             if source is not None and select.args.get("joins") and not select.args.get("group"):
-                changed |= _layer_joined_windows(select)
+                changed |= _layer_joined_windows(select, everywhere)
                 continue
             if source is None or select.args.get("group") or select.args.get("joins") or select.args.get("laterals"):
                 continue
@@ -2333,6 +2336,12 @@ def layer_windows(tree: exp.Expression) -> exp.Expression:
                     owner = windowed.get(col.name.lower())
                     if owner is not None and not col.table and col.find_ancestor(exp.Alias) is not owner:
                         nested.add(col.name.lower())
+            if everywhere:
+                for proj in select.expressions:
+                    for col in proj.find_all(exp.Column):
+                        owner = windowed.get(col.name.lower())
+                        if owner is not None and owner is not proj and not col.table and col.find_ancestor(exp.Select) is select:
+                            nested.add(col.name.lower())
             if not nested:
                 continue
             hidden = {name: f"_la_{i}_{name}" for i, name in enumerate(sorted(nested))}
@@ -2367,7 +2376,9 @@ def layer_windows(tree: exp.Expression) -> exp.Expression:
                     continue
                 if col.table and col.table.lower() == qualifier:
                     col.set("table", None)
-                if not col.table and col.name.lower() in hidden and isinstance(col.find_ancestor(exp.Window), exp.Window):
+                if not col.table and col.name.lower() in hidden and (
+                        isinstance(col.find_ancestor(exp.Window), exp.Window)
+                        or (everywhere and col.find_ancestor(exp.Alias) is not windowed[col.name.lower()])):
                     col.replace(exp.column(hidden[col.name.lower()]))
             for name in nested:
                 windowed[name].set("this", exp.column(hidden[name]))
@@ -2378,6 +2389,23 @@ def layer_windows(tree: exp.Expression) -> exp.Expression:
         if not changed:
             break
     return tree
+
+
+def lateral_aliases(sql: str) -> set[str]:
+    """The SELECT aliases a statement reads again in the same SELECT (`last_value(d) over () as l, date_trunc('month', l)`)."""
+    try:
+        tree = sqlglot.parse_one(sql, read="snowflake")
+    except Exception:  # noqa: BLE001
+        return set()
+    out: set[str] = set()
+    for select in tree.find_all(exp.Select):
+        named = {p.alias.upper(): p for p in select.expressions if isinstance(p, exp.Alias)}
+        for proj in select.expressions:
+            for col in proj.find_all(exp.Column):
+                owner = named.get(col.name.upper())
+                if owner is not None and owner is not proj and not col.table and col.find_ancestor(exp.Select) is select:
+                    out.add(col.name.upper())
+    return out
 
 
 def inline_aliases(tree: exp.Expression, names: set[str]) -> exp.Expression:

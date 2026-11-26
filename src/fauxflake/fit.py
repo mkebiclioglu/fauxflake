@@ -48,6 +48,8 @@ _MISSING = [
     re.compile(r'Column "(?P<col>[^"]+)" referenced that exists in the SELECT clause'),
     re.compile(r'Alias with name "+(?P<col>[^"]+)"+ exists, but aliases cannot be used'),
     re.compile(r'Column "(?P<col>[^"]+)" in EXCLUDE list not found'),
+    # Snowflake's words, which the emulator gives for a name no relation of the query has (semantics: `where`)
+    re.compile(r"invalid identifier '\"?(?P<col>[^'\"]+)\"?'"),
     re.compile(r'Referenced table "(?P<table>[^"]+)" not found!?\s+Candidate tables: (?P<cands>[^\n]+)\n\n?LINE \d+:[^\n]*?(?P=table)\.(?P<col>\w+)', re.S),
 ]
 _CONVERT = [
@@ -1470,6 +1472,20 @@ class Fitter:
         # (`select email, optedout as opted_out from t`) is a projection, whatever `select *` follows it
         return self._star_owner(t, ctes)
 
+    def defines(self, fq: str, col: str) -> bool:
+        """The model writes `col` out itself (`select o.id as sfid, o.* from source o`): it is not one its star passes
+        on, and the source must not get one (the star would then give the model two: Snowflake refuses that)."""
+        uid = self.by_rel.get(fq) or self.relation_owner.get(fq)
+        t = self.tree(uid) if uid else None
+        if t is None:
+            return False
+        top = t.unnest()
+        while isinstance(top, exp.SetOperation):
+            top = top.left.unnest()
+        return isinstance(top, exp.Select) and any(
+            e.alias_or_name.upper() == col.upper() for e in top.expressions
+            if not (isinstance(e, exp.Star) or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star))))
+
     def _star_owner(self, node: exp.Expression, ctes: dict[str, exp.Expression]) -> str | None:
         """`select s.*, p.sku from a s join b p ...`: the columns nobody lists are those of `s`."""
         for _ in range(8):
@@ -1641,7 +1657,7 @@ class Fitter:
                 columns[col] = duck_type(guess(col, None))
                 self.create_existing(fq)
             # the stand-in is replaced when the model builds: what the model selects from needs it too
-            parent = self.passthrough(fq) if depth <= 8 else None
+            parent = self.passthrough(fq) if depth <= 8 and not self.defines(fq, col) else None
             if parent and parent != fq and self.blameable(parent, depth + 1) and self.blame(parent, col, depth + 1):
                 added = True
             elif not parent and self.through_listed_columns(fq, col, depth):
@@ -1649,7 +1665,7 @@ class Fitter:
             return added
         if self.lists_columns(fq) and self.through_listed_columns(fq, col):
             return True
-        parent = self.passthrough(fq) if depth <= 8 else None
+        parent = self.passthrough(fq) if depth <= 8 and not self.defines(fq, col) else None
         if self._is_snapshot(fq) and not (parent and self.blameable(parent, depth + 1)):
             return self.kept_by_snapshot(fq, col)
         if parent and self.blame(parent, col, depth + 1):

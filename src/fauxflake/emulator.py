@@ -1161,6 +1161,14 @@ def _patch_fakesnow() -> None:
                         self._fauxflake_layer = True  # an aliased window used inside another window
                     elif alias and alias.group(1).upper() not in self._fauxflake_inline:
                         self._fauxflake_inline.add(alias.group(1).upper())  # an alias built from another alias
+                    elif "has multiple overloads that match the supplied arguments" in message and not self._fauxflake_layer \
+                            and re.search(r"(?i)\bover\s*\(", command):
+                        self._fauxflake_layer = "everywhere"  # a window given to an overloaded macro: computed in a layer below
+                    elif "has multiple overloads that match the supplied arguments" in message \
+                            and (reused := semantics.lateral_aliases(command) - self._fauxflake_inline):
+                        # an overloaded macro given a SELECT alias of the same SELECT: DuckDB picks the overload
+                        # before it knows the alias's type. Written out, the expression's type is known
+                        self._fauxflake_inline |= reused
                     elif ambiguous and ambiguous.group(1).upper() not in self._fauxflake_owners and " using" in command.lower():
                         self._fauxflake_owners[ambiguous.group(1).upper()] = ambiguous.group(2)  # shared column of a USING join
                     else:
@@ -1559,7 +1567,7 @@ def _patch_fakesnow() -> None:
         if getattr(self, "_fauxflake_inline", None):
             expression = semantics.inline_aliases(expression, self._fauxflake_inline)
         if getattr(self, "_fauxflake_layer", False):
-            expression = semantics.layer_windows(expression)
+            expression = semantics.layer_windows(expression, everywhere=self._fauxflake_layer == "everywhere")
         if isinstance(expression, exp.Create):
             _note_semi_types(self, expression)
         _note_result_types(self, expression)

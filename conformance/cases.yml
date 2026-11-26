@@ -1279,3 +1279,6 @@
 - {id: nanosecond_of_time, sql: "select extract(nanosecond from '12:00:01.5'::time), date_part(nanosecond, '12:00:01.25'::time), extract(nanosecond from '2020-01-01 12:00:01.5'::timestamp)"}
 - {id: microsecond_part_refused, sql: "select extract(microsecond from '2020-01-01 12:00:01.5'::timestamp)"}
 - {id: hour_minute_of_time, sql: "select hour(t), minute('12:34:00'::time) from (select '08:15:00'::time t)"}
+- {id: window_alias_given_to_date_trunc, sql: "select last_value(d) over (order by d) as l, date_trunc('month', l) from (select '2020-01-15'::date d)"}
+- {id: lateral_alias_given_to_date_trunc, sql: "select d + 1 as l, date_trunc('month', l) as m, dateadd(day, 1, m) from (select '2020-01-15'::date d)"}
+- {id: joined_window_alias_given_to_date_trunc, sql: "select t.d, last_value(t.d) over (order by t.d) as l, date_trunc('month', l) as m, u.x from (select '2020-01-15'::date d) t left join (select 1 x) u on true"}
