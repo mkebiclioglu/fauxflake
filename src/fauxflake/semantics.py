@@ -4275,7 +4275,9 @@ def refused_conversions(transformed: exp.Expression, conn) -> tuple[int, str] | 
     if not candidates:
         return None
     ctes = sum(1 for _ in body.find_all(exp.CTE))
-    if len(candidates) > 40 or ctes * len(candidates) > 400:
+    if os.environ.get("FAUXFLAKE_DEBUG_CONV"):
+        print(f"fauxflake: conversion check: {len(candidates)} conversions, {ctes} CTEs, {len(body.sql())} characters", file=sys.stderr)
+    if len(candidates) > 20 or ctes > 12 or ctes * len(candidates) > 120:
         # binding the guarded copy of a statement with many conversions over many CTEs took DuckDB's binder (which
         # its memory limit does not cover) past 10 GB on Mattermost's models: such a statement is not checked
         return None
