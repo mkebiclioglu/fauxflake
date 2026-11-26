@@ -29,7 +29,7 @@ from typing import Iterator
 import duckdb
 from sqlglot import exp
 
-from . import account, constraints, history, lengths, objects, relations, semantics, zoned
+from . import account, constraints, history, lengths, objects, relations, semantics, staged, zoned
 
 # Statements the emulator cannot run as-is, rewritten before they are parsed.
 # Every entry is a known difference from Snowflake: keep the list short and
@@ -45,6 +45,13 @@ REWRITES: list[tuple[re.Pattern[str], str, str]] = [
         ),
         r"create\1\2 \3 ",
         "qualified temporary relation -> regular relation",
+    ),
+    (
+        # Snowpark's `CREATE SCOPED TEMPORARY FILE FORMAT / STAGE / TABLE`: temporary for the session that made it, as
+        # SCOPED is for the procedure; here a session's temporary object
+        re.compile(r"(?is)^((?:\s|--[^\n]*\n|/\*.*?\*/)*create(?:\s+or\s+replace)?)\s+scoped\s+(temp|temporary)\b"),
+        r"\1 \2",
+        "SCOPED TEMPORARY -> TEMPORARY",
     ),
     (
         # dbt reads the session's query tag before setting its own (`query_tag` config)
@@ -1105,6 +1112,7 @@ def _patch_fakesnow() -> None:
             self._fauxflake_layer, self._fauxflake_inline, self._fauxflake_owners = False, set(), {}
             self._fauxflake_qualify = False
             command = objects.session_functions(self, command)
+            command = staged.rewrite(self, command)
             handled = _query_tag(self, command, original)
             if handled is not None:
                 return handled

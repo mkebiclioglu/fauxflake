@@ -450,6 +450,8 @@ def intercept(cursor, command, original):  # noqa: ANN001, ANN201
             return done
     if word == "alter" and (m := _ALTER_SPECIAL.match(text)):
         return _alter(cursor, original, m)
+    if word == "drop" and (m := _DROP_FILE_FORMAT.match(text)):
+        return _drop_file_format(cursor, original, m)
     if word == "alter" and (m := _ALTER_TYPE.match(text)):
         _check_type_change(cursor, m)
     if word == "show" and (m := _SHOW.match(text)):
@@ -472,6 +474,25 @@ def intercept(cursor, command, original):  # noqa: ANN001, ANN201
 _ALTER_TYPE = re.compile(_LEAD + r"alter\s+table\s+(?:if\s+exists\s+)?(?P<name>" + _NAME + r")\s+(?:alter|modify)\s+(?:column\s+)?"
                          r"(?P<column>\"(?:[^\"]|\"\")+\"|[\w$]+)\s+(?:set\s+data\s+)?type\s+(?P<type>[\w ]+?(?:\(\s*\d+\s*(?:,\s*\d+\s*)?\))?)"
                          r"(?:\s+collate\s+'(?P<collate>[^']*)')?\s*;?\s*$")
+
+
+_DROP_FILE_FORMAT = re.compile(_LEAD + r"drop\s+file\s+format\s+(?P<exists>if\s+exists\s+)?(?P<name>" + _NAME + r")\s*;?\s*$")
+
+
+def _drop_file_format(cursor, original, m):  # noqa: ANN001, ANN202
+    """DROP FILE FORMAT [IF EXISTS] (Snowpark drops the temporary one it read a staged file with), worded as Snowflake's."""
+    fq = qualified(cursor, m.group("name"))
+    duck = cursor._duck_conn
+    where = "upper(database_name) = ? and upper(schema_name) = ? and upper(name) = ?"
+    found = duck.execute(f"select count(*) from _fs_global._fs_information_schema._fs_file_formats where {where}",
+                         [p.upper() for p in fq]).fetchone()[0]
+    shown = ".".join(fq)
+    if not found:
+        if m.group("exists"):
+            return original(cursor, f"select 'Drop statement executed successfully ({fq[2]} already dropped).' as \"status\"")
+        raise _error(f"SQL compilation error:\nFile format '{shown}' does not exist or not authorized.", 2003, "02000")
+    duck.execute(f"delete from _fs_global._fs_information_schema._fs_file_formats where {where}", [p.upper() for p in fq])
+    return original(cursor, f"select '{fq[2]} successfully dropped.' as \"status\"")
 
 
 def _snowflake_type(text: str) -> str:
