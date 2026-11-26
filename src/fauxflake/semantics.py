@@ -1057,8 +1057,31 @@ def _once(statement: str) -> str:
     return f"{m.group(1)}({m.group(2)}) as {body}"
 
 
-_READ_ONCE = ("_sf_text", "_sf_element", "_sf_object_keys", "_sf_typeof", "_sf_jv", "_sf_vector_in", "_sf_vector_reduce", "_sf_vector_avg", "_sf_vector_pair",
+# (_sf_list and the float-keeping readers name their argument up to eight times: ARRAY_SIZE(ARRAY_DISTINCT(ARRAY_CAT(...,
+# ARRAY_CAT(...)))) over three columns took Mattermost's spined model past 30 GB to bind)
+_READ_ONCE = ("_sf_text", "_sf_element", "_sf_object_keys", "_sf_typeof", "_sf_jv", "_sf_list", "_sf_floats", "_sf_get", "_sf_get_text",
+              "_sf_scalar_text", "_sf_json_doc", "_sf_array_distinct", "_sf_vector_in", "_sf_vector_reduce", "_sf_vector_avg", "_sf_vector_pair",
               "_sf_vector_cosine", "_sf_vector_l2", "_sf_vector_inner", "_sf_vector_l1")
+_AGGREGATES = re.compile(r"(?i)\b(sum|count|min|max|avg|list|array_agg|string_agg|bit_xor|bit_or|bit_and|first|last|any_value|approx_\w+|"
+                         r"hll\w*|reservoir_quantile|quantile\w*|mode|median|stddev\w*|var_\w+|variance|corr|covar\w*|regr_\w+|"
+                         r"kurtosis\w*|skewness|bool_and|bool_or|arg_max|arg_min|max_by|min_by|histogram|entropy|product|fsum|"
+                         r"sumkahan|kahan_sum|listagg|group_concat|_fxpy_\w*agg\w*)\s*\(")
+
+
+def _mentions_twice(statement: str) -> bool:
+    """A single-signature macro whose body names one of its arguments more than once (see _once)."""
+    m = re.match(r"(?s)create or replace macro \S+?\(([^()]*)\) as (.*)$", statement)
+    if m is None or not m.group(1).strip():
+        return False
+    body = m.group(2)
+    if re.match(r"(?is)\s*table\b", body) or re.search(r"(?i)\bselect\b", body) or "_tzg_" in statement.split(" as ", 1)[0] \
+            or _AGGREGATES.search(body):
+        return False  # (a table macro; a subquery or an aggregate, which a lambda may not hold; the grouped TIMESTAMP_TZ forms)
+    return any(len(re.findall(r"(?<![\w.'])" + re.escape(a.strip()) + r"(?![\w'])", body)) > 1 for a in m.group(1).split(","))
+
+
+# every macro reads each argument once: DuckDB writes an argument out at each mention, so a macro nested in itself (or
+# in another that names its argument twice) grows exponentially as it binds, outside DuckDB's memory limit
 MACROS = [_once(m) if re.match(r"create or replace macro \S*\.(" + "|".join(_READ_ONCE) + r")\(", m) else m for m in MACROS]
 
 _RENAMED = {  # Snowflake function -> macro, same arguments
