@@ -1568,6 +1568,8 @@ def _patch_fakesnow() -> None:
             expression = semantics.inline_aliases(expression, self._fauxflake_inline)
         if getattr(self, "_fauxflake_layer", False):
             expression = semantics.layer_windows(expression, everywhere=self._fauxflake_layer == "everywhere")
+        elif semantics.reads_window_aliases(expression):
+            expression = semantics.layer_windows(expression, everywhere=True)
         if isinstance(expression, exp.Create):
             _note_semi_types(self, expression)
         _note_result_types(self, expression)

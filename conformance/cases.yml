@@ -1282,3 +1282,8 @@
 - {id: window_alias_given_to_date_trunc, sql: "select last_value(d) over (order by d) as l, date_trunc('month', l) from (select '2020-01-15'::date d)"}
 - {id: lateral_alias_given_to_date_trunc, sql: "select d + 1 as l, date_trunc('month', l) as m, dateadd(day, 1, m) from (select '2020-01-15'::date d)"}
 - {id: joined_window_alias_given_to_date_trunc, sql: "select t.d, last_value(t.d) over (order by t.d) as l, date_trunc('month', l) as m, u.x from (select '2020-01-15'::date d) t left join (select 1 x) u on true"}
+- {id: window_alias_given_to_dateadd_timestamp, sql: "select last_value(d) over (order by d) as l, dateadd(day, 1, l) from (select '2020-01-15 10:00'::timestamp_ntz d)"}
+- {id: grouped_window_alias_given_to_date_trunc, sql: "select m as mo, max(m) as m, last_value(m) over (order by m) lv, date_trunc('month', lv) from (select '2020-01-15'::date m) where mo <= '2021-01-01'::date group by 1"}
+- {id: grouped_window_alias_in_arithmetic, sql: "select k, sum(v) s, sum(s) over () tot, s / tot share from (select 1 k, 2 v union all select 2, 6) group by k order by k"}
+- {id: aggregate_alias_given_to_dateadd, sql: "select k, min(d) as m, dateadd(month, 1, m) n, date_trunc('quarter', m) q from (select 1 k, '2020-05-15 10:00'::timestamp_ntz d) group by k"}
+- {id: aggregate_alias_in_fiscal_quarter, sql: "select k, last_day(min(d)) as cm, last_day(dateadd('month', 1, date_trunc('quarter', dateadd('month', -1, cm)))) as fq from (select 1 k, '2020-05-15'::date d) group by 1"}

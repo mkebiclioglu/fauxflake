@@ -18,6 +18,7 @@ Nothing here hides a failure: what cannot be fixed by editing the spec is report
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import graphlib
 import json
@@ -402,6 +403,33 @@ class Fitter:
         there = {".".join(r) for r in self.emu.duck.execute(
             "select table_catalog, table_schema, table_name from information_schema.tables where table_type = 'BASE TABLE'").fetchall()}
         return {name for name in spec.tables if prints.get(name) != held[1].get(name) or name not in there}
+
+    def doubled_by_a_star(self, sql_key: str, message: str) -> bool:
+        """`select o.id as sfid, o.* from source o`, refused (`duplicate column name 'SFID'`): the model writes the
+        column out itself, so the source behind the star must not have one. Take it out of the generated table."""
+        m = re.search(r"duplicate column name '\"?([^'\"]+)\"?'", message)
+        t = self.tree(sql_key) if m else None
+        if t is None:
+            return False
+        col = m.group(1).upper()
+        ctes = {c.alias.upper(): c.this for c in t.find_all(exp.CTE)}
+        removed = False
+        for select in t.find_all(exp.Select):
+            stars = [e for e in select.expressions if isinstance(e, exp.Star) or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star))]
+            if not stars or not any(e.alias_or_name.upper() == col for e in select.expressions if e not in stars):
+                continue
+            for owner in self.real_tables(select, ctes):
+                columns = (self.tables.get(owner) or {}).get("columns") or {}
+                if col in columns:
+                    del columns[col]
+                    with contextlib.suppress(Exception):
+                        self.emu.duck.execute(f'alter table {quoted(owner)} drop column if exists "{col}"')
+                    self.learned.append(f"{owner}.{col}: written out by a model beside `*` of it, so not the table's own; taken out.")
+                    self.retyped.add(owner)
+                    removed = True
+        if removed:
+            self.dirty = True
+        return removed
 
     def add_column(self, table: str, col: str) -> bool:
         columns = self.tables[table].setdefault("columns", {})
@@ -2779,7 +2807,7 @@ class Fitter:
             return True
         if self.udf_input(sql_key, message) or self.pivot_values(sql_key, message) or self.pivoted_upstream(sql_key, message) \
                 or self.missing_column(sql_key, message) or self.missing_relation(sql_key, message) \
-                or self.union_widths(sql_key, message):
+                or self.union_widths(sql_key, message) or self.doubled_by_a_star(sql_key, message):
             return True
         refused = _REFUSED_TYPE.search(message)
         if refused:

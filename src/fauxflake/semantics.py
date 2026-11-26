@@ -1598,7 +1598,9 @@ def _refuse_text(node: exp.Expression) -> None:
     else:
         return
     arg = node.args.get(slot)
-    if arg is None or _is(arg, "_sf_not_text") or isinstance(arg, (exp.Cast, exp.TryCast, exp.Null)) \
+    if isinstance(arg, exp.Paren):
+        arg = arg.unnest()
+    if arg is None or _is(arg, "_sf_not_text") or isinstance(arg, (exp.Cast, exp.TryCast, exp.Null, exp.Window)) \
             or (isinstance(arg, exp.Anonymous) and str(arg.name).startswith(_NS + "_tz_")):
         return
     node.set(slot, _fn("_sf_not_text", arg, exp.Literal.string(name)))
@@ -2249,7 +2251,9 @@ def _layer_joined_windows(select: exp.Select, everywhere: bool = False) -> bool:
     if any(not isinstance(p, (exp.Alias, exp.Column)) for p in projections):
         return False  # an unnamed expression has no name to carry it outside
     names = [p.alias_or_name.lower() for p in projections]
-    windowed = {p.alias.lower() for p in projections if isinstance(p, exp.Alias) and p.find(exp.Window)}
+    grouped = everywhere and select.args.get("group") is not None  # (an aggregate's alias read in its SELECT: the same)
+    windowed = {p.alias.lower() for p in projections if isinstance(p, exp.Alias) and (p.find(exp.Window) or (grouped and p.find(exp.AggFunc)))
+                and not _self_named(p)}
 
     def reads(expr: exp.Expression, aliases: set[str], inside_window: bool) -> bool:
         for col in expr.find_all(exp.Column):
@@ -2261,6 +2265,8 @@ def _layer_joined_windows(select: exp.Select, everywhere: bool = False) -> bool:
 
     outside = {i for i, p in enumerate(projections) if isinstance(p, exp.Alias) and (everywhere or p.find(exp.Window))
                and reads(p.this, windowed - {p.alias.lower()}, not everywhere)}
+    if grouped and any(projections[i].find(exp.AggFunc) and not projections[i].find(exp.Window) for i in outside):
+        return False  # (an aggregate of the outside part cannot be computed over the grouped rows)
     if not outside:
         return False
     for _ in range(len(projections)):  # and whatever reads those in turn
@@ -2269,6 +2275,10 @@ def _layer_joined_windows(select: exp.Select, everywhere: bool = False) -> bool:
         if not more:
             break
         outside |= more
+    group = select.args.get("group")
+    positions = [int(e.name) for e in (group.expressions if group else []) if isinstance(e, exp.Literal) and e.is_int]
+    if positions and min(outside) < max(positions):
+        return False  # (GROUP BY 1, 2: the inner query must keep those projections where they are)
     inner = select.copy()
     kept = [p for i, p in enumerate(inner.expressions) if i not in outside]
     inner_names = {names[i] for i in range(len(projections)) if i not in outside}
@@ -2322,7 +2332,8 @@ def layer_windows(tree: exp.Expression, everywhere: bool = False) -> exp.Express
         changed = False
         for select in list(tree.find_all(exp.Select)):
             source = select.args.get("from_")
-            if source is not None and select.args.get("joins") and not select.args.get("group"):
+            if source is not None and ((select.args.get("joins") and not select.args.get("group"))
+                                       or (everywhere and select.args.get("group"))):
                 changed |= _layer_joined_windows(select, everywhere)
                 continue
             if source is None or select.args.get("group") or select.args.get("joins") or select.args.get("laterals"):
@@ -2391,6 +2402,30 @@ def layer_windows(tree: exp.Expression, everywhere: bool = False) -> exp.Express
     return tree
 
 
+def _self_named(projection: exp.Alias) -> bool:
+    """`max(x) as x`: an alias made from a column of its own name, which the source therefore has."""
+    return any(not c.table and c.name.upper() == projection.alias.upper() for c in projection.this.find_all(exp.Column))
+
+
+def reads_window_aliases(tree: exp.Expression) -> bool:
+    """A SELECT reads one of its own window aliases outside a window (`last_value(d) over (...) as l, dateadd(day, 1, l)`).
+    DuckDB does not know the type of such a reference when it picks a macro's overload: DATEADD of a TIMESTAMP came back
+    a DATE, DATE_TRUNC could not choose. layer_windows(everywhere=True) computes the window a level below instead."""
+    for select in tree.find_all(exp.Select):
+        grouped = select.args.get("group") is not None
+        windowed = {p.alias.upper(): p for p in select.expressions
+                    if isinstance(p, exp.Alias) and (p.find(exp.Window) or (grouped and p.find(exp.AggFunc))) and not _self_named(p)}
+        if not windowed:
+            continue
+        for proj in select.expressions:
+            for col in proj.find_all(exp.Column):
+                owner = windowed.get(col.name.upper())
+                if owner is not None and owner is not proj and not col.table and col.find_ancestor(exp.Select) is select \
+                        and col.find_ancestor(exp.Window) is None:
+                    return True
+    return False
+
+
 def lateral_aliases(sql: str) -> set[str]:
     """The SELECT aliases a statement reads again in the same SELECT (`last_value(d) over () as l, date_trunc('month', l)`)."""
     try:
@@ -2399,7 +2434,7 @@ def lateral_aliases(sql: str) -> set[str]:
         return set()
     out: set[str] = set()
     for select in tree.find_all(exp.Select):
-        named = {p.alias.upper(): p for p in select.expressions if isinstance(p, exp.Alias)}
+        named = {p.alias.upper(): p for p in select.expressions if isinstance(p, exp.Alias) and not _self_named(p)}
         for proj in select.expressions:
             for col in proj.find_all(exp.Column):
                 owner = named.get(col.name.upper())
@@ -2414,7 +2449,10 @@ def inline_aliases(tree: exp.Expression, names: set[str]) -> exp.Expression:
     for _ in range(4):
         changed = False
         for select in tree.find_all(exp.Select):
-            defined = {p.alias.upper(): p for p in select.expressions if isinstance(p, exp.Alias) and p.alias.upper() in names}
+            # (not `max(closing_month) as closing_month`: elsewhere in the SELECT that name is the source's column, as
+            # Snowflake reads it, and writing the alias out would nest the aggregate in itself)
+            defined = {p.alias.upper(): p for p in select.expressions if isinstance(p, exp.Alias) and p.alias.upper() in names
+                       and not _self_named(p)}
             # the other projections, and the JOIN conditions: Snowflake lets `on` use a SELECT alias
             users = [*select.expressions, *[j.args["on"] for j in select.args.get("joins") or [] if j.args.get("on")],
                      # and WHERE, QUALIFY, HAVING: `f(x) as links ... where array_size(links) != 0` with a function DuckDB
@@ -3741,7 +3779,7 @@ def misnamed_column(transformed: exp.Expression, conn, probe: bool = True) -> st
                         and ref.find_ancestor(exp.Select) is scope.expression and given.count(target(ref.this)) > 1:
                     return f"SQL compilation error: ambiguous column name '{target(ref.this)}'"
         for ref in scope.columns:
-            if not isinstance(ref.this, exp.Identifier) or ref.this.this.lower().startswith(("_fs", "_fx", "_sf")):
+            if not isinstance(ref.this, exp.Identifier) or ref.this.this.lower().startswith(("_fs", "_fx", "_sf", "__fx", "_la_", "_lw_")):
                 continue
             if isinstance(scope.expression, exp.Select) and ref.find_ancestor(exp.Select) is not scope.expression:
                 continue  # (sqlglot gives a scope the names of a subquery under IN or ALL too: they are that subquery's)
