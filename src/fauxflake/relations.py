@@ -548,6 +548,8 @@ def _dynamic_options(options: str) -> dict:
 def _dynamic_text(name: str, transient: bool, options: dict, cluster: str | None, query: str) -> str:  # noqa: FBT001
     """The definition as SHOW DYNAMIC TABLES gives it (measured): Snowflake writes the options again in its own order."""
     parts = [f"create or replace {'transient ' if transient else ''}dynamic table {name}"]
+    if (options.get("scheduler") or "").upper() == "DISABLE":
+        parts.append("SCHEDULER = DISABLE")  # (measured: right after the name, in capitals)
     if cluster:
         parts.append(f"cluster by ({cluster})")
     if options.get("target_lag"):
@@ -692,6 +694,11 @@ def _alter(cursor, original, m: re.Match):  # noqa: ANN001, ANN202
         dynamic["immutable_where"] = None
     elif re.match(r"(?is)(set|unset)\b", rest):
         setting = re.match(r"(?is)set\b", rest) is not None
+        enabling = re.search(r"(?is)\bscheduler\s*=\s*'?enable", rest) is not None
+        if setting and re.search(r"(?is)\btarget_lag\s*=", rest) and (dynamic.get("scheduler") or "").upper() == "DISABLE" and not enabling:
+            lag = _option(rest, "target_lag") or ""
+            raise _error(f"SQL compilation error:\ninvalid property combination 'SCHEDULER'='DISABLE' and 'TARGET_LAG'="
+                         f"'{_text(lag) if lag.startswith(chr(39)) else lag}'", 1425, "22023")
         for key in ("target_lag", "warehouse", "initialization_warehouse", "refresh_mode", "scheduler", "comment", "data_retention_time_in_days"):
             if not re.search(r"(?is)\b" + key + r"\b", rest):
                 continue
@@ -704,6 +711,8 @@ def _alter(cursor, original, m: re.Match):  # noqa: ANN001, ANN202
             if value is not None:
                 value = _text(value) if value.startswith("'") else value.strip('"')
                 value = value if key == "target_lag" and value.upper() != "DOWNSTREAM" else value.upper()
+            if key == "scheduler" and value == "DISABLE":
+                dynamic["target_lag"] = None  # (no lag without the scheduler: SHOW gives '')
             if key == "refresh_mode":
                 dynamic["configured_refresh_mode"] = value or "AUTO"
                 dynamic["refresh_mode"] = "ADAPTIVE" if (value or "AUTO") == "AUTO" else value
@@ -822,7 +831,9 @@ def _linear(column: str) -> str:
 
 
 DYNAMIC_COLUMNS = f"""r.created_on, r.name, r.database_name, r.schema_name, coalesce({_linear('r.cluster_by')}, '') as cluster_by, r.rows, r.bytes,
-    r.owner, json_extract_string(r.dynamic, '$.target_lag') as target_lag, json_extract_string(r.dynamic, '$.refresh_mode') as refresh_mode,
+    r.owner, coalesce(json_extract_string(r.dynamic, '$.target_lag'),
+                      case when json_extract_string(r.dynamic, '$.scheduler') = 'DISABLE' then '' end) as target_lag,
+    json_extract_string(r.dynamic, '$.refresh_mode') as refresh_mode,
     null::varchar as refresh_mode_reason, json_extract_string(r.dynamic, '$.warehouse') as warehouse, coalesce(r.comment, '') as comment,
     r.text, case when r.cluster_by is null then 'OFF' else 'ON' end as automatic_clustering,
     json_extract_string(r.dynamic, '$.scheduling_state') as scheduling_state,

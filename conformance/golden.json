@@ -7899,6 +7899,36 @@
    ]
   ]
  },
+ "object_agg_by_group": {
+  "rows": [
+   [
+    "1",
+    {
+     "x": 1,
+     "y": 2
+    }
+   ],
+   [
+    "2",
+    {
+     "x": 3
+    }
+   ]
+  ]
+ },
+ "object_agg_duplicate_key": {
+  "error": "100103 (22000): Duplicate field key 'foo'"
+ },
+ "object_agg_skips_nulls": {
+  "rows": [
+   [
+    {
+     "a": 1,
+     "b": 5
+    }
+   ]
+  ]
+ },
  "object_agg_values": {
   "rows": [
    [
@@ -7987,6 +8017,9 @@
     }
    ]
   ]
+ },
+ "object_construct_duplicate_key": {
+  "error": "100103 (22000): Duplicate field key 'a'"
  },
  "object_delete_insert_pick": {
   "rows": [

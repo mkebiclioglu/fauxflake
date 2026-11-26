@@ -18,6 +18,15 @@ from . import account, catalog, constraints, jsondoc, sketches, xmldoc, zoned
 _NS = "_fs_global.main."
 _SCALE = r"coalesce(try_cast(nullif(regexp_extract(typeof(a), ',(\d+)\)', 1), '') as integer), 0)"
 
+def first_duplicate(values):  # noqa: ANN001, ANN201
+    seen = set()
+    for v in values or []:
+        if v in seen:
+            return v
+        seen.add(v)
+    return None
+
+
 def python_functions(duck) -> None:  # noqa: ANN001
     """What DuckDB has no function for and SQL cannot say: registered once, before the macros that call them."""
     import hashlib
@@ -37,6 +46,7 @@ def python_functions(duck) -> None:  # noqa: ANN001
 
     for name, fn, args, out, kind in (
             ("_fxpy_sha2", sha2, ["VARCHAR", "INTEGER"], "VARCHAR", None),
+            ("_fxpy_first_duplicate", first_duplicate, ["VARCHAR[]"], "VARCHAR", None),
             ("_fxpy_json_sorted", sorted_json, ["VARCHAR"], "VARCHAR", "arrow"),
             ("_fxpy_json_key", json_keys_of, ["VARCHAR"], "VARCHAR", "arrow"),
             ("_fxpy_java_double", jsondoc.java_double, ["DOUBLE"], "VARCHAR", None),
@@ -473,6 +483,9 @@ MACROS = zoned.MACROS + [
     f"create or replace macro {_NS}_fx_current_date() as today()",
     f"create or replace macro {_NS}_fx_current_timestamp() as get_current_timestamp()",
     f"create or replace macro {_NS}_fx_sysdate() as timezone('UTC', get_current_timestamp())",
+    # the first value of a list met before in it (OBJECT_AGG's duplicate key), or NULL (in Python: a lambda over an aggregate's
+    # list is an internal error of DuckDB's)
+    f"create or replace macro {_NS}_sf_first_duplicate(l) as _fxpy_first_duplicate(l)",
     f"create or replace macro {_NS}_fx_current_time() as get_current_time()",
     f"create or replace macro {_NS}_fx_localtime() as current_localtime()",
     f"create or replace macro {_NS}_fx_localtimestamp() as current_localtimestamp()",
@@ -932,6 +945,15 @@ VECTOR_FUNCTIONS = {exp.CosineDistance: "_sf_vector_cosine", exp.EuclideanDistan
 _VECTOR_AGGREGATES = {"VECTOR_AVG": "AVG", "VECTOR_SUM": "SUM", "VECTOR_MIN": "MIN", "VECTOR_MAX": "MAX"}
 GEO_KINDS = {"STRUCT(G VARCHAR, GEOGRAPHY INTEGER)": "geography", "STRUCT(G VARCHAR, GEOMETRY INTEGER)": "geometry"}
 VECTOR_KIND = re.compile(r"(FLOAT|INTEGER)\[(\d*)\]")  # a result column of this DuckDB type is a VECTOR (FLOAT[]: by its values)
+
+
+def _duplicate_key(key: exp.Expression) -> exp.Expression:
+    """Snowflake's error for an object given one key twice: 100103 "Duplicate field key 'k'"."""
+    text = exp.DPipe(this=exp.DPipe(this=exp.DPipe(this=exp.DPipe(
+        this=exp.Anonymous(this="chr", expressions=[exp.Literal.number(31)]),
+        expression=exp.Literal.string("fxerr:100103:22000:Duplicate field key '")), expression=key.copy()),
+        expression=exp.Literal.string("'")), expression=exp.Anonymous(this="chr", expressions=[exp.Literal.number(31)]))
+    return exp.cast(exp.Anonymous(this="error", expressions=[text]), "json")
 
 
 def _vector_type(node: exp.DataType) -> exp.DataType:
@@ -1661,6 +1683,10 @@ def _fix(node: exp.Expression) -> exp.Expression:
     if isinstance(node, exp.ToVariant) and not isinstance(node.this, exp.Null):
         node.set("this", _jv(node.this))
     if isinstance(node, exp.Struct) and node.expressions and all(isinstance(e, exp.PropertyEQ) for e in node.expressions):
+        names = [e.this.name for e in node.expressions]
+        twice = next((n for i, n in enumerate(names) if n in names[:i]), None)
+        if twice is not None:  # OBJECT_CONSTRUCT('a', 1, 'a', 2) is refused (measured: 100103)
+            return _duplicate_key(exp.Literal.string(twice))
         pairs = [x for e in node.expressions for x in (exp.Literal.string(e.this.name), e.expression)]
         return exp.func("OBJECT_CONSTRUCT", *pairs, dialect="snowflake")
     if isinstance(node, exp.Anonymous) and node.name.lower() == "to_object" and len(node.expressions) == 1:
@@ -1679,8 +1705,19 @@ def _fix(node: exp.Expression) -> exp.Expression:
         # each element as JSON Snowflake writes it (a timestamp's text). Not ARRAY_AGG(DISTINCT x) ... WITHIN GROUP
         # (ORDER BY x): DuckDB wants the same x in both
         node.set("this", _jv(node.this))
+    if isinstance(node, exp.ObjectAgg) and not isinstance(node.parent, (exp.Window, exp.WithinGroup, exp.Coalesce, exp.Case)) \
+            and node.this is not None and node.expression is not None:
+        # two rows with one key: Snowflake refuses the object (measured: 100103 "Duplicate field key 'foo'"), of the pairs it
+        # keeps (key and value not NULL)
+        kept = exp.and_(exp.Is(this=node.this.copy(), expression=exp.Null()).not_(),
+                        exp.Is(this=node.expression.copy(), expression=exp.Null()).not_())
+        keys = exp.Filter(this=exp.Anonymous(this="list", expressions=[exp.cast(node.this.copy(), "varchar")]), expression=exp.Where(this=kept))
+        twice = _fn("_sf_first_duplicate", keys)
+        return exp.Case(ifs=[exp.If(this=exp.Is(this=twice.copy(), expression=exp.Null()).not_(),
+                                    true=_duplicate_key(twice))],
+                        default=exp.Coalesce(this=node, expressions=[exp.ParseJSON(this=exp.Literal.string("{}"))]))
     if isinstance(node, (exp.ArrayAgg, exp.ObjectAgg)) or (isinstance(node, exp.WithinGroup) and isinstance(node.this, exp.ArrayAgg)):
-        if not isinstance(node.parent, (exp.Window, exp.WithinGroup)):
+        if not isinstance(node.parent, (exp.Window, exp.WithinGroup, exp.Case)):
             empty = "{}" if isinstance(node, exp.ObjectAgg) else "[]"  # no rows give an empty value, not NULL
             return exp.Coalesce(this=node, expressions=[exp.ParseJSON(this=exp.Literal.string(empty))])
     if isinstance(node, exp.Window) and (isinstance(node.this, exp.ArrayAgg) or (

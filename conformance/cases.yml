@@ -1250,3 +1250,7 @@
 - {id: double_limit_refused, sql: "select 1 as id\nlimit 1\nlimit 1"}
 - {id: date_functions_read_us_dates, sql: "select datediff(day, '09/01/2023', '09/12/2023'), datediff(day, '09/01/2023'::date, '09/12/2023'::date), dateadd(day, 1, '09/01/2023'), date_trunc('month', '09/15/2023'::date)"}
 - {id: date_functions_read_short_offsets, sql: "select datediff(day, '2023-09-01 10:00:00-0', '2023-09-12')"}
+- {id: object_agg_duplicate_key, sql: "select object_agg(key, value) from (select 'foo' as key, 1 as value union all select 'foo', 2)"}
+- {id: object_agg_skips_nulls, sql: "select object_agg(k, v) from (select column1 k, column2 v from values ('a', 1), ('b', null), (null, 3), ('b', 5))"}
+- {id: object_construct_duplicate_key, sql: "select object_construct('a', 1, 'a', 2)"}
+- {id: object_agg_by_group, sql: "select g, object_agg(k, v) from (select 1 g, 'x' k, 1 v union all select 1, 'y', 2 union all select 2, 'x', 3) group by g order by g"}
