@@ -933,6 +933,44 @@ def _geo_shape(op: str, args: list) -> exp.Expression:
     return exp.Anonymous(this="struct_update", expressions=[first.copy(), exp.PropertyEQ(this=exp.to_identifier("G"), expression=new)])
 
 
+def _h3_call(node: exp.Anonymous) -> exp.Expression:
+    """H3_*(...): geo.h3_call with its arguments as text, its answer typed as Snowflake types it."""
+    from . import geo
+
+    op, gives = geo.H3_FUNCTIONS[node.name.upper()]
+    args = list(node.expressions)[:3]
+
+    def text(e: exp.Expression) -> exp.Expression:
+        return exp.Case(ifs=[exp.If(this=exp.Like(this=exp.Anonymous(this="typeof", expressions=[e.copy()]), expression=exp.Literal.string("STRUCT%")),
+                                    true=exp.cast(exp.Anonymous(this="to_json", expressions=[e.copy()]), "varchar"))],
+                        default=exp.cast(e.copy(), "varchar"))
+
+    call = exp.Anonymous(this="_fxpy_h3", expressions=[exp.Literal.string(op), *[text(a) for a in args],
+                                                       *[exp.null() for _ in range(3 - len(args))]])
+    if gives == "same":  # (text in, text out: a cell written as text, or one an H3_*_STRING function gave)
+        first = args[0] if args else None
+        gives = "text" if (isinstance(first, exp.Literal) and first.is_string) or (
+            isinstance(first, exp.Anonymous) and first.name.upper().endswith("_STRING")) else "number"
+    if gives == "number":
+        return exp.cast(call, "bigint")
+    if gives == "text":
+        return exp.Anonymous(this="json_extract_string", expressions=[call, exp.Literal.string("$")])
+    if gives == "boolean":
+        return exp.cast(call, "boolean")
+    if gives == "geography":
+        # (struct_pack: a Struct node would be taken for OBJECT_CONSTRUCT by the passes after this one)
+        packed = exp.Anonymous(this="struct_pack", expressions=[exp.PropertyEQ(this=exp.to_identifier("G"), expression=call),
+                                                                exp.PropertyEQ(this=exp.to_identifier("GEOGRAPHY"), expression=exp.Literal.number(4326))])
+        return exp.Cast(this=packed, to=exp.DataType(this=exp.DataType.Type.USERDEFINED, kind=geo.GEOGRAPHY_TYPE))
+    return exp.cast(call, "json")
+
+
+def _h3_names() -> frozenset:
+    from . import geo
+
+    return frozenset(geo.H3_FUNCTIONS)
+
+
 def _geo_names() -> frozenset:
     from . import geo
 
@@ -940,6 +978,7 @@ def _geo_names() -> frozenset:
 
 
 _GEO_NAMES = _geo_names()
+_H3_NAMES = _h3_names()
 VECTOR_FUNCTIONS = {exp.CosineDistance: "_sf_vector_cosine", exp.EuclideanDistance: "_sf_vector_l2",
                     exp.DotProduct: "_sf_vector_inner", exp.ManhattanDistance: "_sf_vector_l1"}
 _VECTOR_AGGREGATES = {"VECTOR_AVG": "AVG", "VECTOR_SUM": "SUM", "VECTOR_MIN": "MIN", "VECTOR_MAX": "MAX"}
@@ -1478,6 +1517,8 @@ def _fix(node: exp.Expression) -> exp.Expression:
         if isinstance(node.this, exp.Null):
             return node
         return _fn("_sf_to_geography" if node.to.meta["fx_geo"] == "GEOGRAPHY" else "_sf_to_geometry", node.this)
+    if isinstance(node, exp.Anonymous) and node.name.upper() in _H3_NAMES:
+        return _h3_call(node)
     if isinstance(node, (exp.StPoint, exp.StDistance)) or (isinstance(node, exp.Anonymous) and node.name.upper() in _GEO_NAMES):
         from . import geo
 

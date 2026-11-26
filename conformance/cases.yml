@@ -1254,3 +1254,7 @@
 - {id: object_agg_skips_nulls, sql: "select object_agg(k, v) from (select column1 k, column2 v from values ('a', 1), ('b', null), (null, 3), ('b', 5))"}
 - {id: object_construct_duplicate_key, sql: "select object_construct('a', 1, 'a', 2)"}
 - {id: object_agg_by_group, sql: "select g, object_agg(k, v) from (select 1 g, 'x' k, 1 v union all select 1, 'y', 2 union all select 2, 'x', 3) group by g order by g"}
+- {id: h3_cells, sql: "select h3_latlng_to_cell(37.55, -122.35, 9), h3_latlng_to_cell_string(37.55, -122.35, 9), h3_point_to_cell(st_makepoint(-122.35, 37.55), 9), h3_cell_to_parent(h3_latlng_to_cell(37.55, -122.35, 9), 5), h3_int_to_string(617700174198734847), h3_get_resolution(617700174198734847)"}
+- {id: h3_text_cells, sql: "select h3_cell_to_parent('892830924cfffff', 5), h3_string_to_int('892830924cfffff'), h3_is_valid_cell(617700174198734847), h3_is_valid_cell(5), h3_grid_distance(617700174198734847, 617700174198472703), h3_is_pentagon(617700174198734847)"}
+- {id: h3_neighbours, sql: "select h3_grid_disk(617700174198734847, 1), h3_cell_to_children(599685776145383423, 6)"}
+- {id: h3_centre, sql: "select round(st_x(h3_cell_to_point(617700174198734847)), 12), round(st_y(h3_cell_to_point(617700174198734847)), 12), st_npoints(h3_cell_to_boundary(617700174198734847))"}

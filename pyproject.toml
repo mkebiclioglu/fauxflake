@@ -24,12 +24,14 @@ dependencies = [
 [project.optional-dependencies]
 # dbt Python models and Python procedures written against the Snowpark DataFrame API
 snowpark = ["snowflake-snowpark-python>=1.20", "pandas>=2"]
+# the H3_* functions (Uber's H3 library, as Snowflake uses it)
+geo = ["h3>=4"]
 
 [project.scripts]
 fauxflake = "fauxflake.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8", "snowflake-snowpark-python>=1.20", "pandas>=2"]
+dev = ["pytest>=8", "snowflake-snowpark-python>=1.20", "pandas>=2", "h3>=4"]
 
 [build-system]
 requires = ["hatchling"]

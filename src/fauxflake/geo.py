@@ -954,7 +954,8 @@ def register(duck, ns: str) -> None:  # noqa: ANN001
             ("_fxpy_geo_count", count, ["VARCHAR", "VARCHAR"], "BIGINT"),
             ("_fxpy_geo_shape", shape, ["VARCHAR", "VARCHAR", "VARCHAR", "DOUBLE"], "VARCHAR"),
             ("_fxpy_geo_collect", collect, ["VARCHAR[]"], "VARCHAR"),
-            ("_fxpy_haversine", haversine, ["DOUBLE", "DOUBLE", "DOUBLE", "DOUBLE"], "DOUBLE")):
+            ("_fxpy_haversine", haversine, ["DOUBLE", "DOUBLE", "DOUBLE", "DOUBLE"], "DOUBLE"),
+            ("_fxpy_h3", h3_call, ["VARCHAR", "VARCHAR", "VARCHAR", "VARCHAR"], "VARCHAR")):
         try:
             duck.create_function(name, fn, args, out, null_handling="special")
         except Exception:  # noqa: BLE001, S110 - registered already on this connection
@@ -1026,4 +1027,92 @@ NAMES = {
     "ST_POINTN": "_sf_st_pointn", "ST_ENVELOPE": "_sf_st_envelope", "ST_MAKELINE": "_sf_st_makeline",
     "ST_MAKEPOLYGON": "_sf_st_makepolygon", "ST_POLYGON": "_sf_st_makepolygon", "ST_COLLECT": "_sf_st_collect",
     "HAVERSINE": "_sf_haversine",
+}
+
+
+# ---------------------------------------------------------------- H3 (Uber's library, as Snowflake uses it)
+
+def _h3():  # noqa: ANN202
+    try:
+        import h3
+    except ImportError as e:
+        raise _raise("fauxflake: the H3 functions need the h3 package (pip install 'fauxflake[geo]')", 2140, "42601") from e
+    return h3
+
+
+def _cell(c) -> str | None:  # noqa: ANN001
+    """An H3 cell given as a number (handed over as its digits) or as text: its text."""
+    if c is None:
+        return None
+    c = str(c).strip()
+    return _h3().int_to_str(int(c)) if c.isdigit() else c.lower()
+
+
+def h3_call(op: str, a, b, c) -> str | None:  # noqa: ANN001, C901, PLR0911, PLR0912
+    """One H3 function, its arguments as text (a GEOGRAPHY as to_json of its struct): the answer as JSON text (a number, text,
+    an array, or a GEOGRAPHY's document), or NULL."""
+    h3 = _h3()
+    try:
+        if op in ("latlng_to_cell", "latlng_to_cell_string"):
+            if a is None or b is None or c is None:
+                return None
+            cell = h3.latlng_to_cell(float(a), float(b), int(c))
+            return json.dumps(cell if op.endswith("string") else h3.str_to_int(cell))
+        if op in ("point_to_cell", "point_to_cell_string"):
+            v = _value(a)
+            if v is None or b is None:
+                return None
+            if v[2]["type"] != "Point":
+                raise _raise(f"Type {v[2]['type']} is not supported as argument to H3_POINT_TO_CELL.", 100281)
+            lng, lat = (float(x) for x in v[2]["coordinates"][:2])
+            cell = h3.latlng_to_cell(lat, lng, int(b))
+            return json.dumps(cell if op.endswith("string") else h3.str_to_int(cell))
+        cell = _cell(a)
+        if cell is None:
+            return None
+        textual = not str(a).strip().isdigit()
+        out = (lambda x: x) if textual else h3.str_to_int
+        if op == "is_valid_cell":
+            return json.dumps(bool(h3.is_valid_cell(cell)))
+        if not h3.is_valid_cell(cell):
+            raise _raise(f"Invalid cell ID: {a}", 100426, "22023")
+        if op == "get_resolution":
+            return json.dumps(h3.get_resolution(cell))
+        if op == "is_pentagon":
+            return json.dumps(bool(h3.is_pentagon(cell)))
+        if op == "int_to_string":
+            return json.dumps(cell)
+        if op == "string_to_int":
+            return json.dumps(h3.str_to_int(cell))
+        if op == "cell_to_parent":
+            return json.dumps(out(h3.cell_to_parent(cell, int(b))))
+        if op in ("cell_to_children", "cell_to_children_string"):
+            kids = h3.cell_to_children(cell, int(b))
+            return json.dumps(kids if op.endswith("string") else [h3.str_to_int(k) for k in kids])
+        if op == "grid_disk":
+            return json.dumps([out(x) for x in h3.grid_disk(cell, int(b))])
+        if op == "grid_distance":
+            return json.dumps(h3.grid_distance(cell, _cell(b)))
+        if op == "cell_to_point":
+            lat, lng = h3.cell_to_latlng(cell)
+            return dumps({"type": "Point", "coordinates": [F(lng), F(lat)]})
+        if op == "cell_to_boundary":
+            ring = [[F(lng), F(lat)] for lat, lng in h3.cell_to_boundary(cell)]
+            return dumps({"type": "Polygon", "coordinates": [ring + [ring[0]]]})
+    except ValueError:
+        raise
+    except Exception as e:  # noqa: BLE001 - the library's own refusal of an argument
+        raise _raise(f"H3_{op.upper()}: {e}", 100426, "22023") from e
+    raise _raise(f"unknown H3 function {op}", 2140, "42601")
+
+
+H3_FUNCTIONS = {  # Snowflake's name -> (operation, what it gives back: a number, text, an array, a boolean, a geography)
+    "H3_LATLNG_TO_CELL": ("latlng_to_cell", "number"), "H3_LATLNG_TO_CELL_STRING": ("latlng_to_cell_string", "text"),
+    "H3_POINT_TO_CELL": ("point_to_cell", "number"), "H3_POINT_TO_CELL_STRING": ("point_to_cell_string", "text"),
+    "H3_CELL_TO_PARENT": ("cell_to_parent", "same"), "H3_CELL_TO_CHILDREN": ("cell_to_children", "array"),
+    "H3_CELL_TO_CHILDREN_STRING": ("cell_to_children_string", "array"), "H3_GET_RESOLUTION": ("get_resolution", "number"),
+    "H3_INT_TO_STRING": ("int_to_string", "text"), "H3_STRING_TO_INT": ("string_to_int", "number"),
+    "H3_GRID_DISK": ("grid_disk", "array"), "H3_GRID_DISTANCE": ("grid_distance", "number"),
+    "H3_IS_VALID_CELL": ("is_valid_cell", "boolean"), "H3_IS_PENTAGON": ("is_pentagon", "boolean"),
+    "H3_CELL_TO_POINT": ("cell_to_point", "geography"), "H3_CELL_TO_BOUNDARY": ("cell_to_boundary", "geography"),
 }
