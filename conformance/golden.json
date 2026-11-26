@@ -1107,6 +1107,14 @@
    ]
   ]
  },
+ "coalesce_skips_null_tz_window": {
+  "rows": [
+   [
+    "2021-01-01 00:00:00.000",
+    true
+   ]
+  ]
+ },
  "coalesce_variant_with_text": {
   "rows": [
    [
@@ -1752,6 +1760,21 @@
     "1",
     "-9",
     "1500"
+   ]
+  ]
+ },
+ "datediff_of_coalesce_with_tz": {
+  "rows": [
+   [
+    true
+   ]
+  ]
+ },
+ "datediff_of_zoned_branches": {
+  "rows": [
+   [
+    "2",
+    "7"
    ]
   ]
  },
@@ -10555,6 +10578,16 @@
    ]
   ]
  },
+ "try_cast_number_other_scale_refused": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
+ "try_cast_number_same_scale": {
+  "rows": [
+   [
+    "1.5"
+   ]
+  ]
+ },
  "try_cast_same_semi_kind": {
   "rows": [
    [
@@ -12333,6 +12366,15 @@
     "5",
     " 0.50",
     "007"
+   ]
+  ]
+ },
+ "zoned_clock_in_grouped_select": {
+  "rows": [
+   [
+    "1",
+    "2020-01-01 00:00:00.000",
+    true
    ]
   ]
  }

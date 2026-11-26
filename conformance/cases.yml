@@ -1287,3 +1287,9 @@
 - {id: grouped_window_alias_in_arithmetic, sql: "select k, sum(v) s, sum(s) over () tot, s / tot share from (select 1 k, 2 v union all select 2, 6) group by k order by k"}
 - {id: aggregate_alias_given_to_dateadd, sql: "select k, min(d) as m, dateadd(month, 1, m) n, date_trunc('quarter', m) q from (select 1 k, '2020-05-15 10:00'::timestamp_ntz d) group by k"}
 - {id: aggregate_alias_in_fiscal_quarter, sql: "select k, last_day(min(d)) as cm, last_day(dateadd('month', 1, date_trunc('quarter', dateadd('month', -1, cm)))) as fq from (select 1 k, '2020-05-15'::date d) group by 1"}
+- {id: datediff_of_coalesce_with_tz, sql: "select datediff('second', u, coalesce(lead(u) over (order by u), convert_timezone('UTC', current_timestamp()))) > 0 from (select '2020-01-01'::timestamp_ntz u)"}
+- {id: datediff_of_zoned_branches, sql: "select datediff('day', '2020-01-01'::timestamp_ntz, coalesce(null, '2020-01-03 10:00 +05:00'::timestamp_tz)), datediff('hour', iff(true, '2020-01-03 10:00 +05:00'::timestamp_tz, null), '2020-01-03 12:00'::timestamp_ntz)"}
+- {id: coalesce_skips_null_tz_window, sql: "select coalesce(lead(t) over (order by t), '2021-01-01 00:00 +02:00'::timestamp_tz), lead(t) over (order by t) is null from (select '2020-01-01 10:00 +05:00'::timestamp_tz t)"}
+- {id: zoned_clock_in_grouped_select, sql: "select k, max(v) m, cast(dateadd(year, 1, convert_timezone('UTC', current_timestamp())) as date) > '2020-01-01'::date from (select 1 k, '2020-01-01'::timestamp_ntz v) group by 1 having cast(max(v) as date) < cast(convert_timezone('UTC', current_timestamp()) as date)"}
+- {id: try_cast_number_same_scale, sql: "select try_cast(x as number(28,6)) from (select 1.5::number(28,6) x)"}
+- {id: try_cast_number_other_scale_refused, sql: "select try_cast(x as number(10,2)) from (select 1.5::number(28,6) x)"}

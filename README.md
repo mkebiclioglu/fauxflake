@@ -266,6 +266,8 @@ production weekly and opens a pull request with what moved.
 | --- | --- |
 | **SQL** | Snowflake's dialect and its answers: number scale and rounding, NULL ordering, implicit conversions, time zones, `QUALIFY`, `PIVOT`, `LATERAL FLATTEN`, `ASOF JOIN`, `CONNECT BY`, lateral column aliases, `GENERATOR`, `RESULT_SCAN`; unnamed columns are named as Snowflake names them (`COUNT(*)`, `A+1`) |
 | **Semi-structured data** | `VARIANT`, `OBJECT`, `ARRAY` and `MAP` with path access, `FLATTEN`, and the object, array and map functions |
+| **Vectors and geospatial** | `VECTOR(FLOAT, n)` and `VECTOR(INT, n)` with the `VECTOR_*` distance and aggregate functions; `GEOGRAPHY` and `GEOMETRY` from WKT, EWKT, GeoJSON and WKB with Snowflake's spherical (S2) and planar measures, predicates and constructors; the `H3_*` functions (`pip install "fauxflake[geo]"`) |
+| **Types as Snowflake describes them** | the `VARCHAR(n)` a `CREATE ... AS SELECT` or a view derives (`'initial'` is `VARCHAR(7)`, `a \|\| b` adds the lengths), collations kept through queries and shown by `DESCRIBE`, `SHOW COLUMNS` and `GET_DDL`, `ALTER COLUMN ... SET DATA TYPE` allowed and refused as Snowflake does |
 | **dbt** | tables, views, incremental models (`merge`, `delete+insert`, `append`), snapshots, seeds, ephemeral models, tests, hooks, packages, `persist_docs`, `grants`, dynamic tables, secure and materialized views |
 | **Python models** | Snowpark sends its SQL here, so a Python model runs like a SQL one (`pip install "fauxflake[snowpark]"`); models that only use `session.sql`, `session.table` and pandas need no extra |
 | **Functions** | SQL functions and SQL table functions become macros; Python functions run as written; JavaScript functions run in an embedded engine |
@@ -280,7 +282,10 @@ production weekly and opens a pull request with what moved.
 | **Tags** | `CREATE TAG` with allowed values, `SET TAG` and `UNSET TAG` on objects and columns, `SHOW TAGS`, `TAG_REFERENCES`, `TAG_REFERENCES_ALL_COLUMNS` and `SYSTEM$GET_TAG`, with inheritance from schema and database |
 | **The account** | `CREATE`, `ALTER` and `DROP` of warehouses, resource monitors, network policies and roles; a `GRANT` to a role the account lacks fails once its roles are described (`init` lists the ones the project grants to); `ALTER ACCOUNT SET`; `SHOW PARAMETERS` at every scope with Snowflake's defaults; every account-level `SHOW` with the columns a real account returns, listing what the spec's `account:` names and what the project created |
 | **Constraints** | `PRIMARY KEY`, `UNIQUE` and `FOREIGN KEY`, inline or added by `ALTER TABLE`, with `RELY`/`NORELY`, kept and never enforced (as on Snowflake: only `NOT NULL` is); `MODIFY`/`RENAME`/`DROP CONSTRAINT`; `SHOW PRIMARY`/`UNIQUE`/`IMPORTED`/`EXPORTED KEYS`; `INFORMATION_SCHEMA.TABLE_CONSTRAINTS`, `REFERENTIAL_CONSTRAINTS` and `TABLE_PRIVILEGES`; Snowflake's errors for each, as measured. Held for the run: a kept warehouse opened again has none |
-| **Accepted, with nothing to act on** | grants, comments, clustering keys, session settings |
+| **Tables and their metadata** | `SHOW TABLES / OBJECTS / VIEWS` with Snowflake's columns, `INFORMATION_SCHEMA.TABLES` with exact row counts, `GET_DDL`, comments, `CLONE`, `COPY GRANTS`, grants kept and shown (`SHOW GRANTS`, `TABLE_PRIVILEGES`); dynamic tables refreshed on create, on `ALTER ... REFRESH` and when their lag has passed |
+| **Sessions** | the parameters a client logs in with and `ALTER SESSION SET` / `UNSET` are kept and shown by `SHOW PARAMETERS`; `USE WAREHOUSE` |
+| **Staged files** | `SELECT $1, METADATA$FILENAME FROM @stage/path (FILE_FORMAT => ..., PATTERN => ...)`, as Snowpark's `session.read` uses it |
+| **Accepted, with nothing to act on** | clustering keys, warehouse sizes |
 
 When the emulator does not know a statement it fails at once with a message that starts with
 `fauxflake emulator:`. It does not hang and it does not pass silently.
@@ -369,6 +374,17 @@ from at-least-once loaders and out-of-order updates appear without being scripte
 - **External functions, and Java or Scala handlers, return NULL** with a warning: they call
   services or runtimes that are not here. A Python function whose packages are not installed
   does the same. Give them a stand-in under `udfs`.
+- **Cortex AI functions are not emulated.** `AI_COMPLETE`, `SNOWFLAKE.CORTEX.*` and the like call
+  Snowflake's models; a trial account cannot run them, so there is nothing measured to match. Give them a
+  stand-in under `udfs`.
+- **Geospatial overlays are missing**: `ST_BUFFER`, `ST_SIMPLIFY`, `ST_UNION_AGG`, `ST_INTERSECTION` and
+  `ST_DIFFERENCE` fail with a clear error; measures, predicates and constructors are there.
+- **`SYSTEM$TYPEOF` and `COLLATION()` are missing.** The first reports Snowflake's internal storage width,
+  which depends on the stored data; DuckDB does not expose an expression's collation to the second.
+- **A `CREATE ... AS SELECT` of a number literal is `NUMBER(38,0)`** where Snowflake derives the
+  precision (`1 as id` is `NUMBER(1,0)` there). Text lengths are derived as Snowflake derives them.
+- **Unknown roles and warehouses are accepted** (`USE ROLE nobody` succeeds) until the spec's `account:`
+  lists them; key-pair and OAuth logins are accepted without checking the key.
 - **It may accept SQL Snowflake refuses when it compiles.** Text given to `DATE_TRUNC`,
   `EXTRACT` and `LAST_DAY` is refused as on Snowflake; other type checks may be missing. A cheap
   stage on Snowflake closes this:

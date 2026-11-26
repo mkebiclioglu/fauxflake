@@ -33,9 +33,12 @@ _SPLIT_SQL = r"^(.*\d:\d\d(?::\d\d(?:\.\d*)?)?)\s*(Z|[+-]\d{1,2}(?::?\d\d)?)\s*$
 # arguments where they are written, and nested readings would otherwise grow exponentially
 MACROS = [
     f"create or replace macro {_NS}_tz_is(x) as typeof(x) = '{SHOWN}'",
-    f"create or replace macro {_NS}_tz_make(i, o) as struct_pack(\"I\" := i::timestamptz, \"O\" := o::bigint)",
-    f"""create or replace macro {_NS}_tz_zoned(zone, t) as list_transform([t::timestamptz],
-          lambda v: {_NS}_tz_make(v, ((epoch(timezone(zone, v)) - epoch(v)) / 60)::bigint))[1]""",
+    # (no instant: a NULL, not a struct of NULLs, which COALESCE and IS NULL would take for a value)
+    f"create or replace macro {_NS}_tz_make(i, o) as case when i is not null then struct_pack(\"I\" := i::timestamptz, \"O\" := o::bigint) end",
+    # (plain expressions, not `list_transform([x], lambda v: ...)`: in a SELECT with GROUP BY, DuckDB takes a lambda's
+    # `v.i` for a column that is not grouped)
+    f"""create or replace macro {_NS}_tz_zoned(zone, t) as {_NS}_tz_make(t::timestamptz,
+          ((epoch(timezone(zone, t::timestamptz)) - epoch(t::timestamptz)) / 60)::bigint)""",
     # an instant at the session's time zone (UTC unless ALTER SESSION SET TIMEZONE said otherwise)
     f"create or replace macro {_NS}_tz_local(t) as {_NS}_tz_zoned(current_setting('TimeZone'), t)",
     f"""create or replace macro {_NS}_tz_minutes(z) as case when z is null or z = '' or z = 'Z' then 0
@@ -62,15 +65,15 @@ MACROS = [
           else {_NS}_tz_local(try_cast(x as timestamptz)) end""",
     f"create or replace macro {_NS}_tz_instant(x) as {_NS}_tz_of(x).i",
     f"create or replace macro {_NS}_tz_instant_of(x) as try_cast(x as timestamptz)",
-    f"create or replace macro {_NS}_tz_wall_s(s) as list_transform([s], lambda v: timezone('UTC', v.i) + to_minutes(v.o::bigint))[1]",
+    f"create or replace macro {_NS}_tz_wall_s(s) as timezone('UTC', s.i) + to_minutes(s.o::bigint)",
     f"create or replace macro {_NS}_tz_wall(x) as {_NS}_tz_wall_s({_NS}_tz_of(x))",
-    f"create or replace macro {_NS}_tz_rewall_o(w, o) as list_transform([o], lambda v: {_NS}_tz_make(timezone('UTC', w::timestamp - to_minutes(v::bigint)), v))[1]",
+    f"create or replace macro {_NS}_tz_rewall_o(w, o) as {_NS}_tz_make(timezone('UTC', w::timestamp - to_minutes(o::bigint)), o)",
     f"""create or replace macro {_NS}_tz_sign(o) as case when o < 0 then '-' else '+' end
           || lpad((abs(o) // 60)::varchar, 2, '0')""",
     f"""create or replace macro {_NS}_tz_offset_text(o, colon) as case when o = 0 then 'Z'
           else {_NS}_tz_sign(o) || case when colon then ':' else '' end || lpad((abs(o) % 60)::varchar, 2, '0') end""",
-    f"""create or replace macro {_NS}_tz_text_s(s) as list_transform([s], lambda v: case when v is not null then
-          strftime(timezone('UTC', v.i) + to_minutes(v.o::bigint), '%Y-%m-%d %H:%M:%S.%g') || ' ' || {_NS}_tz_offset_text(v.o, false) end)[1]""",
+    f"""create or replace macro {_NS}_tz_text_s(s) as case when s is not null then
+          strftime(timezone('UTC', s.i) + to_minutes(s.o::bigint), '%Y-%m-%d %H:%M:%S.%g') || ' ' || {_NS}_tz_offset_text(s.o, false) end""",
     f"create or replace macro {_NS}_tz_text(x) as {_NS}_tz_text_s({_NS}_tz_of(x))",
     f"""create or replace macro {_NS}_tz_part_o(o, part) as case part
           when 'TZH:TZM' then {_NS}_tz_offset_text(o, true)
@@ -213,6 +216,8 @@ class _Pass:
             return "text"
         if isinstance(node, exp.Paren):
             return self.kind(node.this)
+        if isinstance(node, (exp.Coalesce, exp.If, exp.Case, exp.Greatest, exp.Least)) and any(self.tz(v) for v in self._values(node)):
+            return "tz"  # (fix makes every value of it a TIMESTAMP_TZ: `coalesce(lead(ts) over (...), convert_timezone(...))`)
         if isinstance(node, exp.Null):
             return "null"
         if isinstance(node, exp.Literal):

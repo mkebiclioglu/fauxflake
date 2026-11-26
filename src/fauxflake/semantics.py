@@ -573,7 +573,7 @@ MACROS = zoned.MACROS + [
     f"""create or replace macro {_NS}_sf_try_input(x, target) as case
           when typeof(x) in ('VARCHAR', '"NULL"') or (target = 'DATE' and typeof(x) = 'DATE')
             or (target = 'BOOLEAN' and typeof(x) = 'BOOLEAN') or (target = 'DOUBLE' and typeof(x) in ('DOUBLE', 'FLOAT'))
-            or (target = 'BLOB' and typeof(x) = 'BLOB')
+            or (target = 'BLOB' and typeof(x) = 'BLOB') or typeof(x) = target
             or (target = 'WHOLE' and typeof(x) in ('BIGINT', 'HUGEINT', 'SMALLINT', 'DECIMAL(38,0)')) then x
           else error('Function TRY_CAST cannot be used with arguments of type ' || typeof(x)) end""",
     f"create or replace macro {_NS}_sf_negate(x) as -x",
@@ -1481,6 +1481,9 @@ def _try_target(node: exp.Expression) -> str | None:
         kind = node.to.this
         if _whole(node.to):
             return "WHOLE"
+        sized = [p.this.name for p in node.to.expressions if isinstance(p, exp.DataTypeParam)]
+        if kind in (exp.DataType.Type.DECIMAL, exp.DataType.Type.BIGDECIMAL) and len(sized) == 2:
+            return f"DECIMAL({sized[0]},{sized[1]})"  # (a NUMBER of exactly this precision and scale passes, measured)
         return {exp.DataType.Type.DATE: "DATE", exp.DataType.Type.BOOLEAN: "BOOLEAN", exp.DataType.Type.DOUBLE: "DOUBLE",
                 exp.DataType.Type.FLOAT: "DOUBLE", exp.DataType.Type.BINARY: "BLOB", exp.DataType.Type.VARBINARY: "BLOB"}.get(kind, "OTHER")
     if not node.args.get("safe"):
