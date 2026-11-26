@@ -119,3 +119,38 @@ def test_show_objects_pages_and_starts_with(run):
         run(f"create or replace table p{i} (a int)")
     names = [r[1] for r in run("show terse objects in schema analytics.ci starts with 'P' limit 2 from 'P1'")]
     assert names == ["P2", "P3"]
+
+
+def test_grants_as_snowflake_keeps_them(run):
+    role = run("select current_role()")[0][0]
+    run("grant select on table base to role public")
+    run("grant select, insert on base to role analyst")
+    shown = [(r["privilege"], r["grantee_name"], r["grant_option"]) for r in run.named("show grants on table base")]
+    assert shown == [("OWNERSHIP", role, "true"), ("SELECT", "ANALYST", "false"), ("INSERT", "ANALYST", "false"), ("SELECT", "PUBLIC", "false")][:1] + \
+        sorted(shown[1:], key=lambda r: (r[1], r[0]))  # (owner first, then by grantee and privilege)
+    assert [r[1] for r in shown[1:]] == ["ANALYST", "ANALYST", "PUBLIC"] and [r[0] for r in shown[1:3]] == ["INSERT", "SELECT"]
+    assert run("revoke insert on table base from role analyst") == [("Statement executed successfully. 1 objects affected.",)]
+    run("create or replace table base (id int, v varchar) copy grants")
+    assert [(r["privilege"], r["grantee_name"]) for r in run.named("show grants on table base")][1:] == [("SELECT", "ANALYST"), ("SELECT", "PUBLIC")]
+    run("create or replace table base (id int, v varchar)")
+    assert [r["privilege"] for r in run.named("show grants on table base")] == ["OWNERSHIP"]
+    run("create or replace view v as select 1 x")
+    run("grant all privileges on view v to role public")
+    assert len(run("select * from information_schema.table_privileges where table_name = 'V' and grantee = 'PUBLIC'")) == 13
+    with pytest.raises(Exception, match="unexpected 'on'"):
+        run("grant fake_privilege on table base to role public")
+    with pytest.raises(Exception, match="does not exist or not authorized"):
+        run("grant select on table nosuch to role public")
+
+
+def test_the_role_a_client_logs_in_with_is_the_sessions():
+    import snowflake.connector
+
+    with emulator.serve() as emu:
+        emu.ensure_database("ANALYTICS", "CI")
+        conn = snowflake.connector.connect(**emu.connect_kwargs(database="ANALYTICS", schema="CI"), role="TRANSFORMER")
+        cur = conn.cursor()
+        assert cur.execute("select current_role()").fetchall() == [("TRANSFORMER",)]
+        cur.execute("create table t (a int)")
+        assert cur.execute("select table_owner from information_schema.tables where table_name = 'T'").fetchall() == [("TRANSFORMER",)]
+        conn.close()

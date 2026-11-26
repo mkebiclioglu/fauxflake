@@ -5503,6 +5503,80 @@
    ]
   ]
  },
+ "geo_centroid": {
+  "rows": [
+   [
+    {
+     "coordinates": [
+      0.9999999999999296,
+      1.000050645587494
+     ],
+     "type": "Point"
+    },
+    "3",
+    "9q8vxgg2w77dvnqjgwn2",
+    "9q8vx"
+   ]
+  ]
+ },
+ "geo_collect": {
+  "rows": [
+   [
+    {
+     "coordinates": [
+      [
+       0.0,
+       0.0
+      ],
+      [
+       1.0,
+       1.0
+      ]
+     ],
+     "type": "MultiPoint"
+    }
+   ]
+  ]
+ },
+ "geo_collection": {
+  "rows": [
+   [
+    {
+     "geometries": [
+      {
+       "coordinates": [
+        1,
+        2
+       ],
+       "type": "Point"
+      },
+      {
+       "coordinates": [
+        [
+         0,
+         0
+        ],
+        [
+         1,
+         1
+        ]
+       ],
+       "type": "LineString"
+      }
+     ],
+     "type": "GeometryCollection"
+    },
+    {
+     "coordinates": [
+      1,
+      2,
+      3
+     ],
+     "type": "Point"
+    }
+   ]
+  ]
+ },
  "geo_distance": {
   "rows": [
    [
@@ -5514,6 +5588,246 @@
     "1"
    ]
   ]
+ },
+ "geo_distance_shapes": {
+  "rows": [
+   [
+    "111195.1011775",
+    "628519.1549911"
+   ]
+  ]
+ },
+ "geo_from_text": {
+  "rows": [
+   [
+    {
+     "coordinates": [
+      1.5,
+      2
+     ],
+     "type": "Point"
+    },
+    {
+     "coordinates": [
+      [
+       [
+        0,
+        0
+       ],
+       [
+        1,
+        0
+       ],
+       [
+        1,
+        1
+       ],
+       [
+        0,
+        1
+       ],
+       [
+        0,
+        0
+       ]
+      ]
+     ],
+     "type": "Polygon"
+    },
+    {
+     "coordinates": [
+      [
+       0,
+       0
+      ],
+      [
+       1,
+       1
+      ]
+     ],
+     "type": "MultiPoint"
+    },
+    {
+     "coordinates": [
+      1.1,
+      2
+     ],
+     "type": "Point"
+    }
+   ]
+  ]
+ },
+ "geo_geometry": {
+  "rows": [
+   [
+    {
+     "coordinates": [
+      1820.12,
+      890.56
+     ],
+     "type": "Point"
+    },
+    "5",
+    "4",
+    "3857",
+    "SRID=3857;POINT(1 2)"
+   ]
+  ]
+ },
+ "geo_invalid_pair": {
+  "error": "100205 (P0000): GeoJSON::Point: Invalid Lng/Lat pair: '200,100'."
+ },
+ "geo_kinds": {
+  "rows": [
+   [
+    null,
+    "4326",
+    "0",
+    true
+   ]
+  ]
+ },
+ "geo_lines": {
+  "rows": [
+   [
+    {
+     "coordinates": [
+      [
+       0.0,
+       0.0
+      ],
+      [
+       1.0,
+       1.0
+      ]
+     ],
+     "type": "LineString"
+    },
+    {
+     "coordinates": [
+      [
+       [
+        0,
+        0
+       ],
+       [
+        1,
+        0
+       ],
+       [
+        1,
+        1
+       ],
+       [
+        0,
+        0
+       ]
+      ]
+     ],
+     "type": "Polygon"
+    },
+    "0.7853220051762",
+    "1.414213562373"
+   ]
+  ]
+ },
+ "geo_measures": {
+  "rows": [
+   [
+    "12364036567.08",
+    "157249.6280925",
+    "444763.4687276"
+   ]
+  ]
+ },
+ "geo_point": {
+  "rows": [
+   [
+    {
+     "coordinates": [
+      -122.35,
+      37.55
+     ],
+     "type": "Point"
+    },
+    {
+     "coordinates": [
+      1.5,
+      2.0
+     ],
+     "type": "Point"
+    },
+    "-122.35",
+    "37.55"
+   ]
+  ]
+ },
+ "geo_points_of_a_line": {
+  "rows": [
+   [
+    {
+     "coordinates": [
+      0.0,
+      0.0
+     ],
+     "type": "Point"
+    },
+    {
+     "coordinates": [
+      1.0,
+      1.0
+     ],
+     "type": "Point"
+    },
+    {
+     "coordinates": [
+      0.0,
+      0.0
+     ],
+     "type": "Point"
+    }
+   ]
+  ]
+ },
+ "geo_predicates": {
+  "rows": [
+   [
+    true,
+    true,
+    true,
+    true
+   ]
+  ]
+ },
+ "geo_st_distance": {
+  "rows": [
+   [
+    "4133344.721205",
+    "4133.338233466"
+   ]
+  ]
+ },
+ "geo_text_out": {
+  "rows": [
+   [
+    "POINT(-122.35 37.55)",
+    "LINESTRING(0 0,1 1)",
+    {
+     "coordinates": [
+      1,
+      2
+     ],
+     "type": "Point"
+    },
+    "SRID=4326;POINT(1 2)"
+   ]
+  ]
+ },
+ "geo_unparsable": {
+  "error": "100256 (P0000): Error parsing Geo input: unknown keyword \"nonsense\", pos 9nonsense. Did not recognize valid GeoJSON, (E)"
+ },
+ "geo_x_of_a_line": {
+  "error": "100281 (P0000): Type LineString is not supported as argument to ST_X."
  },
  "get_and_compare": {
   "rows": [

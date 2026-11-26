@@ -51,12 +51,18 @@ _VIEWS = {
           made as CREATED, altered as LAST_ALTERED
           from {LIVE} where kind = 'FOREIGN KEY' and database_name = {{db}}""",
     # the role that made a table owns it (the emulator's tables are all made by the session's role)
-    "TABLE_PRIVILEGES": f"""select {_NS}._sf_current_role() as GRANTOR, {_NS}._sf_current_role() as GRANTEE, 'ROLE' as GRANTED_TO,
-          database_name as TABLE_CATALOG, schema_name as TABLE_SCHEMA, table_name as TABLE_NAME, 'OWNERSHIP' as PRIVILEGE_TYPE,
-          'YES' as IS_GRANTABLE, 'NO' as WITH_HIERARCHY, to_timestamp(0)::timestamptz as CREATED
+    # the owner's OWNERSHIP of each table and view, then what was granted on it (relations.py keeps both)
+    "TABLE_PRIVILEGES": f"""select coalesce(r.owner, {_NS}._sf_current_role()) as GRANTOR, coalesce(r.owner, {_NS}._sf_current_role()) as GRANTEE,
+          'ROLE' as GRANTED_TO, o.database_name as TABLE_CATALOG, o.schema_name as TABLE_SCHEMA, o.table_name as TABLE_NAME,
+          'OWNERSHIP' as PRIVILEGE_TYPE, 'YES' as IS_GRANTABLE, 'NO' as WITH_HIERARCHY, coalesce(r.created_on, {_NS}._fx_started()) as CREATED
           from (select database_name, schema_name, table_name from duckdb_tables() where not internal
-                union all select database_name, schema_name, view_name from duckdb_views() where not internal)
-          where database_name = {{db}} and schema_name not ilike '_fs%' and schema_name <> 'information_schema'""",
+                union all select database_name, schema_name, view_name from duckdb_views() where not internal) o
+          left join {_NS}._fx_relations r on r.database_name = o.database_name and r.schema_name = o.schema_name and r.name = o.table_name
+          where o.database_name = {{db}} and o.schema_name not ilike '_fs%' and o.schema_name <> 'information_schema'
+          union all
+          select g.granted_by, g.grantee, 'ROLE', g.database_name, g.schema_name, g.name, g.privilege,
+                 case when g.grant_option then 'YES' else 'NO' end, 'NO', g.created_on
+          from {_NS}._fx_grants g where g.database_name = {{db}}""",
 }
 
 

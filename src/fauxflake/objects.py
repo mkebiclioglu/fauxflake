@@ -268,11 +268,14 @@ def _parse_callable(sql: str) -> dict | None:
     if not m:
         return None
     close = _close_paren(sql, m.end() - 1)
-    args = []
+    args, defaults = [], {}
     for part in split_top(sql[m.end():close]):
         words = part.split(None, 1)
-        kind = re.split(r"(?i)\s+default\s+|\s*:=", words[1])[0].strip() if len(words) > 1 else "VARCHAR"
+        pieces = re.split(r"(?i)\s+default\s+|\s*:=", words[1], maxsplit=1) if len(words) > 1 else ["VARCHAR"]
+        kind = pieces[0].strip()
         args.append((_unquote(words[0]), kind))
+        if len(pieces) > 1:
+            defaults[_unquote(words[0])] = pieces[1].strip()  # (an argument a call may leave out: DEFAULT <expression>)
     rest = sql[close + 1:]
     body = _BODY.search(rest)
     options = rest[:body.start()] if body else rest
@@ -289,7 +292,8 @@ def _parse_callable(sql: str) -> dict | None:
         "kind": m.group("kind").lower(), "name": bare(m.group("name")), "args": args, "body": text,
         "table": kind.lower().startswith("table"), "returns": "VARCHAR" if kind.lower().startswith("table") else kind,
         "language": (language.group(1).lower() if language else "sql"),
-        "handler": handler.group(1) if handler else None,
+        "handler": handler.group(1) if handler else None, "defaults": defaults,
+        "aggregate": "aggregate" in m.group("mods").lower(),
         "external": "external" in m.group("mods").lower() or bool(re.search(r"(?i)\bapi_integration\b", options)),
         "options": options,
     }
@@ -363,8 +367,30 @@ def _register_native(cursor, state: State, defn: dict) -> str:  # noqa: ANN001
     registered once, as a dispatcher. `CREATE OR REPLACE` only swaps the handler behind it."""
     kinds = [duck_type(k) for _, k in defn["args"]]
     out_kind = duck_type(defn["returns"])
-    signature = zlib.crc32("|".join([*kinds, out_kind]).encode()) % 100000
+    signature = zlib.crc32("|".join([*kinds, out_kind, "agg" if defn.get("aggregate") else ""]).encode()) % 100000
     name = f"_udfx_{defn['name'].lower()}_{len(kinds)}_{signature}"
+    if defn.get("aggregate") and defn["language"] == "python":
+        # an aggregate function: a class Snowflake makes one of per group, hands each row to (`accumulate`) and asks for the
+        # answer (`finish`); here it is handed the group's rows at once (see _define_function: list() of the arguments)
+        handler = _python_handler(defn)
+        many = len(kinds) > 1
+
+        def call(rows):  # noqa: ANN001, ANN202
+            state_ = handler()
+            for row in rows or []:
+                values = [row[f"a{i}"] for i in range(len(kinds))] if many else [row]
+                state_.accumulate(*[_convert_in(v, k) for v, k in zip(values, kinds)])
+            return _convert_out(state_.finish(), out_kind)
+
+        registered = name in state.handlers
+        state.handlers[name] = call
+        if not registered:
+            dispatch = eval("lambda rows: handlers[name](rows)", {"handlers": state.handlers, "name": name})  # noqa: S307
+            given = ("STRUCT(" + ", ".join(f"a{i} {k}" for i, k in enumerate(kinds)) + ")[]") if many else f"{kinds[0]}[]"
+            (state.root or cursor._duck_conn).create_function(name, dispatch, [given], out_kind, null_handling="special", side_effects=True)
+            state.dispatchers[name] = dispatch
+            state.native.append(name)
+        return name
     if defn["language"] == "python":
         handler = _python_handler(defn)
 
@@ -417,13 +443,20 @@ def _define_function(cursor, state: State, defn: dict) -> None:  # noqa: ANN001
                   "to run the real code, or give the function a stand-in under `udfs:` in the spec.", file=sys.stderr)
             native = None
         passed = ", ".join(f'to_json("{a}")' if duck_type(k) == "JSON" else f'cast("{a}" as {duck_type(k)})' for a, k in args)
+        if defn.get("aggregate") and native:  # the group's rows, as one list (of structs, for more than one argument)
+            passed = f"list({passed})" if len(args) == 1 else \
+                "list({" + ", ".join(f"'a{i}': {v}" for i, v in enumerate(passed.split(", "))) + "})"
         defn["duck"] = f"{native}({passed})" if native else ("null::json" if duck_type(defn["returns"]) == "JSON" else "null")
     overloads = state.functions.setdefault(name, {})
     if overloads and next(iter(overloads.values()))["table"] != defn["table"]:
         overloads.clear()
     overloads[len(args)] = defn
     macro = ("_udtf_" if defn["table"] else "_udf_") + name
-    bodies = ", ".join(f"({_params(d['args'])}) as " + (f"table ({d['duck']})" if d["table"] else f"({d['duck']})") for d in overloads.values())
+    def params(d: dict) -> str:  # the macro's parameters: one with a DEFAULT may be left out of a call (`name := value`)
+        given = d.get("defaults") or {}
+        return ", ".join(f'"{a}"' + (f" := {_transpile_expression(cursor, given[a])}" if a in given else "") for a, _ in d["args"])
+
+    bodies = ", ".join(f"({params(d)}) as " + (f"table ({d['duck']})" if d["table"] else f"({d['duck']})") for d in overloads.values())
     cursor._duck_conn.execute(f"create or replace macro _fs_global.main.{macro}{bodies}")
     (semantics.UDTFS if defn["table"] else semantics.UDFS)[name] = macro
     (semantics.UDFS if defn["table"] else semantics.UDTFS).pop(name, None)

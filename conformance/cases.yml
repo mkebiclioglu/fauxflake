@@ -1225,3 +1225,20 @@
 - {id: vector_sum_in_32_bits, sql: "select vector_sum(v), vector_avg(v) from (select [0.1, 1e8]::vector(float,2) v from table(generator(rowcount=>10)))"}
 - {id: vector_avg_in_double, sql: "select vector_avg(v) from (select [1, 0.1]::vector(float,2) v union all select [2, 0.2]::vector(float,2) union all select [4, 0.4]::vector(float,2))"}
 - {id: vector_aggregate_of_nothing, sql: "select vector_sum(v), vector_avg(v) from (select [1,2,3]::vector(int,3) v where 1 = 0)"}
+- {id: geo_point, sql: "select st_makepoint(-122.35, 37.55), st_point(1.5, 2), st_x(st_makepoint(-122.35, 37.55)), st_y(st_makepoint(-122.35, 37.55))"}
+- {id: geo_from_text, sql: "select to_geography('POINT(1.50 2.0)'), to_geography('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))'), to_geography('MULTIPOINT((0 0),(1 1))'), to_geography('{\"type\":\"Point\",\"coordinates\":[1.10,2]}')"}
+- {id: geo_collection, sql: "select to_geography('GEOMETRYCOLLECTION(POINT(1 2), LINESTRING(0 0, 1 1))'), to_geography('POINT Z(1 2 3)')"}
+- {id: geo_st_distance, sql: "select st_distance(st_makepoint(-122.35, 37.55), st_makepoint(-73.98, 40.75)), haversine(37.55, -122.35, 40.75, -73.98)"}
+- {id: geo_distance_shapes, sql: "select st_distance(to_geography('LINESTRING(0 0, 10 0)'), to_geography('POINT(5 1)')), st_distance(to_geography('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))'), to_geography('POINT(5 5)'))"}
+- {id: geo_measures, sql: "select st_area(to_geography('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))')), st_length(to_geography('LINESTRING(0 0, 1 1)')), st_perimeter(to_geography('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))'))"}
+- {id: geo_predicates, sql: "select st_contains(to_geography('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))'), st_makepoint(1, 1)), st_intersects(to_geography('LINESTRING(0 0, 2 2)'), to_geography('LINESTRING(0 2, 2 0)')), st_dwithin(st_makepoint(0,0), st_makepoint(0, 0.001), 200), st_within(st_makepoint(1,1), to_geography('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))'))"}
+- {id: geo_text_out, sql: "select st_astext(to_geography('POINT(-122.35 37.55)')), st_aswkt(to_geography('LINESTRING(0 0, 1 1)')), st_asgeojson(to_geography('POINT(1 2)')), st_asewkt(to_geography('POINT(1 2)'))"}
+- {id: geo_centroid, sql: "select st_centroid(to_geography('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))')), st_npoints(to_geography('LINESTRING(0 0, 1 1, 2 2)')), st_geohash(st_makepoint(-122.35, 37.55)), st_geohash(st_makepoint(-122.35, 37.55), 5)"}
+- {id: geo_kinds, sql: "select try_to_geography('nonsense'), st_srid(to_geography('POINT(1 2)')), st_dimension(to_geography('POINT(1 2)')), st_isvalid(to_geography('POINT(1 2)'))"}
+- {id: geo_lines, sql: "select st_makeline(st_makepoint(0,0), st_makepoint(1,1)), st_makepolygon(to_geography('LINESTRING(0 0, 1 0, 1 1, 0 0)')), st_azimuth(st_makepoint(0,0), st_makepoint(1,1)), st_hausdorffdistance(st_makepoint(0,0), st_makepoint(1,1))"}
+- {id: geo_points_of_a_line, sql: "select st_startpoint(to_geography('LINESTRING(0 0, 1 1)')), st_endpoint(to_geography('LINESTRING(0 0, 1 1)')), st_pointn(to_geography('LINESTRING(0 0, 1 1)'), 1)"}
+- {id: geo_collect, sql: "select st_collect(g) from (select st_makepoint(0, 0) g union all select st_makepoint(1, 1))"}
+- {id: geo_geometry, sql: "select to_geometry('POINT(1820.12 890.56)'), st_distance(to_geometry('POINT(0 0)'), to_geometry('POINT(3 4)')), st_area(to_geometry('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))')), st_srid(to_geometry('POINT(1 2)', 3857)), st_asewkt(to_geometry('SRID=3857;POINT(1 2)'))"}
+- {id: geo_invalid_pair, sql: "select to_geography('POINT(200 100)')"}
+- {id: geo_unparsable, sql: "select to_geography('nonsense')"}
+- {id: geo_x_of_a_line, sql: "select st_x(to_geography('LINESTRING(0 0, 1 1)'))"}

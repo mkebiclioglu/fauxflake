@@ -95,6 +95,9 @@ def python_functions(duck) -> None:  # noqa: ANN001
                  "(v, k, iv) as _fxpy_encrypt_raw(v, k, iv, null, null)::json, "
                  "(v, k, iv, aad) as _fxpy_encrypt_raw(v, k, iv, aad, null)::json, "
                  "(v, k, iv, aad, m) as _fxpy_encrypt_raw(v, k, iv, aad, m)::json")
+    from . import geo
+
+    geo.register(duck, _NS)  # GEOGRAPHY and GEOMETRY (geo.py)
     for name, lenient in (("decrypt_raw", "false"), ("try_decrypt_raw", "true")):
         duck.execute(f"create or replace macro {_NS}_sf_{name} (v, k, iv) as _fxpy_decrypt_raw(v, k, iv, null, null, null, {lenient}), "
                      f"(v, k, iv, aad) as _fxpy_decrypt_raw(v, k, iv, aad, null, null, {lenient}), "
@@ -898,9 +901,33 @@ MACROS += [
           list_transform(range(1, len(list_filter(l, lambda v: v is not null)[1]) + 1), lambda i:
             list_avg(list_transform(list_filter(l, lambda v: v is not null), lambda v: v[i]::double))) end""",
 ]
+def _geo_shape(op: str, args: list) -> exp.Expression:
+    """struct_update(x, G := <the new document>): of x's own kind (see geo.SHAPES)."""
+    def doc(e: exp.Expression) -> exp.Expression:
+        return exp.cast(exp.Anonymous(this="to_json", expressions=[e.copy()]), "varchar")
+
+    first = args[0]
+    if op == "collect":
+        new = exp.Anonymous(this="_fxpy_geo_collect", expressions=[exp.Anonymous(this="list", expressions=[doc(first)])])
+        first = exp.Anonymous(this="any_value", expressions=[first.copy()])
+    else:
+        other = doc(args[1]) if op == "makeline" and len(args) > 1 else exp.null()
+        extra = exp.cast(args[1].copy(), "double") if op == "pointn" and len(args) > 1 else exp.null()
+        new = exp.Anonymous(this="_fxpy_geo_shape", expressions=[exp.Literal.string(op), doc(first), other, extra])
+    return exp.Anonymous(this="struct_update", expressions=[first.copy(), exp.PropertyEQ(this=exp.to_identifier("G"), expression=new)])
+
+
+def _geo_names() -> frozenset:
+    from . import geo
+
+    return frozenset(geo.NAMES)
+
+
+_GEO_NAMES = _geo_names()
 VECTOR_FUNCTIONS = {exp.CosineDistance: "_sf_vector_cosine", exp.EuclideanDistance: "_sf_vector_l2",
                     exp.DotProduct: "_sf_vector_inner", exp.ManhattanDistance: "_sf_vector_l1"}
 _VECTOR_AGGREGATES = {"VECTOR_AVG": "AVG", "VECTOR_SUM": "SUM", "VECTOR_MIN": "MIN", "VECTOR_MAX": "MAX"}
+GEO_KINDS = {"STRUCT(G VARCHAR, GEOGRAPHY INTEGER)": "geography", "STRUCT(G VARCHAR, GEOMETRY INTEGER)": "geometry"}
 VECTOR_KIND = re.compile(r"(FLOAT|INTEGER)\[(\d*)\]")  # a result column of this DuckDB type is a VECTOR (FLOAT[]: by its values)
 
 
@@ -1412,6 +1439,26 @@ def _fix(node: exp.Expression) -> exp.Expression:
             return node
         checked = _fn("_sf_vector_in", _fn("_sf_doc", node.this), exp.Literal.number(n), exp.Literal.string(kind))
         return exp.Cast(this=checked, to=node.to)
+    if isinstance(node, exp.DataType) and node.this in (exp.DataType.Type.GEOGRAPHY, exp.DataType.Type.GEOMETRY):
+        from . import geo
+
+        kind = "GEOGRAPHY" if node.this == exp.DataType.Type.GEOGRAPHY else "GEOMETRY"
+        built = exp.DataType(this=exp.DataType.Type.USERDEFINED, kind=geo.GEOGRAPHY_TYPE if kind == "GEOGRAPHY" else geo.GEOMETRY_TYPE)
+        built.meta["fx_geo"] = kind
+        return built
+    if isinstance(node, exp.Cast) and node.to.meta.get("fx_geo"):  # x::geography is TO_GEOGRAPHY(x)
+        if isinstance(node.this, exp.Null):
+            return node
+        return _fn("_sf_to_geography" if node.to.meta["fx_geo"] == "GEOGRAPHY" else "_sf_to_geometry", node.this)
+    if isinstance(node, (exp.StPoint, exp.StDistance)) or (isinstance(node, exp.Anonymous) and node.name.upper() in _GEO_NAMES):
+        from . import geo
+
+        name = "ST_POINT" if isinstance(node, exp.StPoint) else "ST_DISTANCE" if isinstance(node, exp.StDistance) else node.name.upper()
+        args = [node.this, node.expression] if isinstance(node, (exp.StPoint, exp.StDistance)) else list(node.expressions)
+        args = [a for a in args if a is not None]
+        if name in geo.SHAPES and args:
+            return _geo_shape(geo.SHAPES[name], args)
+        return _fn(geo.NAMES[name], *args)
     if type(node) in VECTOR_FUNCTIONS:
         return _fn(VECTOR_FUNCTIONS[type(node)], node.this, node.expression)
     if isinstance(node, exp.Anonymous) and node.name.upper() in _VECTOR_AGGREGATES and len(node.expressions) == 1:
@@ -2551,7 +2598,8 @@ def coerce_result(cursor) -> None:  # noqa: ANN001
     casts, changed = [], False
     for i, (name, kind, *_rest) in enumerate(cursor._duck_conn.description):
         kind, alias = str(kind).upper(), '"' + name.replace('"', '""') + '"'
-        if kind in _SUPPORTED or kind.startswith("DECIMAL") or (VECTOR_KIND.fullmatch(kind) and not kind.endswith("[]")):
+        if kind in _SUPPORTED or kind.startswith("DECIMAL") or (VECTOR_KIND.fullmatch(kind) and not kind.endswith("[]")) \
+                or kind in GEO_KINDS:
             casts.append(f"_c{i} as {alias}")
             continue
         changed = True

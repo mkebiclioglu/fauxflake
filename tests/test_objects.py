@@ -844,6 +844,7 @@ def test_a_grant_names_a_role_the_account_has_once_its_roles_are_described(emu):
 
     emu.ensure_database("ANALYTICS", "CI")
     cur = emu._fs.connect(database="ANALYTICS", schema="CI").cursor()
+    cur.execute("create table t (a int)")  # (a grant on a table that is not there is refused, as in Snowflake)
     cur.execute("grant select on table t to role reporter")  # a fresh emulator takes any role, as production has them
     account.load(emu, {"roles": [{"name": "transformer"}]})
     cur.execute("grant select on table t to role transformer")
@@ -959,3 +960,34 @@ def test_a_transaction_across_databases_rolls_back_whole(run):
         assert run("select count(*) from other.ci.u") == [(2,)]  # (its own writes, before it ends)
         run(end)
         assert (run("select count(*) from t"), run("select count(*) from other.ci.u")) == rows
+
+
+def test_function_arguments_with_defaults(run):
+    # measured on Snowflake: price_for_xlarge() = 200, (5) = 10, (5, 3) = 15; the Python one 8 and 2
+    run("create or replace function price_for_xlarge(price number default 100, mult number default 2) returns number as $$ price * mult $$")
+    assert run("select price_for_xlarge(), price_for_xlarge(5), price_for_xlarge(5, 3)") == [(200, 10, 15)]
+    run("create or replace function pyd(x number default 7) returns number language python runtime_version = '3.11' handler = 'f' "
+        "as $$\ndef f(x):\n    return x + 1\n$$")
+    assert run("select pyd(), pyd(1)") == [(8, 2)]
+
+
+def test_python_aggregate_function(run):
+    # Snowflake's handler class: accumulate each row, finish with the answer (measured: 14; by group 5 and 9; weighted 210)
+    run("""create or replace aggregate function sum_squared(value number) returns number language python runtime_version = '3.11'
+           handler = 'SumSquared' as $$
+class SumSquared:
+    def __init__(self):
+        self._partial_sum = 0
+    @property
+    def aggregate_state(self):
+        return self._partial_sum
+    def accumulate(self, input_value):
+        self._partial_sum += input_value * input_value
+    def merge(self, other_partial_sum):
+        self._partial_sum += other_partial_sum
+    def finish(self):
+        return self._partial_sum
+$$""")
+    assert run("select sum_squared(column1) from values (1), (2), (3)") == [(14,)]
+    assert run("select column2, sum_squared(column1) from values (1, 'a'), (2, 'a'), (3, 'b') group by column2 order by 1") == \
+        [("a", 5), ("b", 9)]

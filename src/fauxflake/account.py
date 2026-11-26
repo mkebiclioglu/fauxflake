@@ -588,10 +588,20 @@ def _like(pattern: str) -> re.Pattern:
 
 
 def _session_warehouse(cursor) -> str | None:  # noqa: ANN001
-    """The session's warehouse: CURRENT_WAREHOUSE() is LOCAL here (the dbt profile fauxflake writes names it)."""
-    from . import semantics
+    """The session's warehouse: the one it logged in with or last USEd (LOCAL in the profile fauxflake writes)."""
+    return getattr(cursor._conn, "_fx_warehouse", None) or "LOCAL"
 
-    return semantics.SESSION.get("CurrentWarehouse", "LOCAL")
+
+def warehouses_known(duck) -> bool:  # noqa: ANN001
+    """Whether the account's warehouses are described (the spec's `account: warehouses:`, or parity's mirror): only then is
+    USE of one nobody made refused. A fresh emulator takes any, as the production account has the ones a project names."""
+    return _mirrored(duck) or duck.execute(f"select count(*) from {ACCOUNT} where kind = 'warehouses'").fetchone()[0] > 0
+
+
+def use_warehouse(cursor, name: str) -> None:  # noqa: ANN001
+    if warehouses_known(cursor._duck_conn) and _get(cursor._duck_conn, "warehouses", name) is None:
+        raise _error("SQL compilation error:\nObject does not exist, or operation cannot be performed.", errno=2043, sqlstate="02000")
+    cursor._conn._fx_warehouse = name
 
 
 def rows_of(cursor, kind: str) -> list[dict]:  # noqa: ANN001

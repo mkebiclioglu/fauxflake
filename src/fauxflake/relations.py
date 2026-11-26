@@ -44,6 +44,7 @@ _STRING = r"'(?:[^'\\]|''|\\.)*'|\$\$.*?\$\$"  # (a quote doubled, or escaped as
 
 
 def ensure(duck) -> None:  # noqa: ANN001
+    ensure_grants(duck)
     WAITING.clear()
     SCHEDULED.clear()
     duck.execute(f"create table if not exists {TABLE} ({COLUMNS})")
@@ -299,6 +300,8 @@ def _note(cursor, duck, text: str, verb: str) -> None:  # noqa: ANN001, C901
                 values[k] = source.get(k)
         if kind not in ("VIEW", "MATERIALIZED VIEW"):
             values["row_count"] = _count(duck, fq)
+        if not re.search(r"(?is)\bcopy\s+grants\b", options):
+            _grants_follow(duck, fq, dropped=True)  # (made again: the old one's grants went with it)
         SCHEDULED.pop(tuple(fq), None)
         WAITING.discard(tuple(fq))
         _upsert(duck, fq, **values)
@@ -318,6 +321,7 @@ def _note(cursor, duck, text: str, verb: str) -> None:  # noqa: ANN001, C901
         if m:
             fq = qualified(cursor, m.group("name"))
             duck.execute(f"delete from {TABLE} where database_name = ? and schema_name = ? and name = ?", list(fq))
+            _grants_follow(duck, fq, dropped=True)
             SCHEDULED.pop(tuple(fq), None)
             WAITING.discard(tuple(fq))
         return
@@ -331,6 +335,7 @@ def _note(cursor, duck, text: str, verb: str) -> None:  # noqa: ANN001, C901
             to = qualified(cursor, renamed.group(1))
             duck.execute(f"update {TABLE} set database_name = ?, schema_name = ?, name = ?, last_ddl = ? "
                          "where database_name = ? and schema_name = ? and name = ?", [*to, at, *fq])
+            _grants_follow(duck, fq, to=to)
             return
         swapped = re.match(r"(?is)swap\s+with\s+(" + _NAME + r")\s*$", rest)
         if swapped:
@@ -426,6 +431,10 @@ def intercept(cursor, command, original):  # noqa: ANN001, ANN201
     text = _command(command)
     head = re.match(_LEAD + r"(\w+)", text)
     word = head.group(1).lower() if head else ""
+    if word in ("grant", "revoke") or (word == "show" and re.match(_LEAD + r"show\s+grants\s+on\b", text)):
+        done = grants_intercept(cursor, command, original)
+        if done is not None:
+            return done
     if word == "create" and (m := _CREATE_SPECIAL.match(text)):
         return _create(cursor, original, m, text)
     if word == "alter" and (m := _ALTER_SPECIAL.match(text)):
@@ -673,6 +682,10 @@ def _alter(cursor, original, m: re.Match):  # noqa: ANN001, ANN202
         return _status(original, cursor, "Statement executed successfully.")
     elif re.match(r"(?is)swap\s+with\s+", rest):
         raise _error("SQL compilation error:\nSWAP WITH is not supported for dynamic tables.", 2032, "42601")
+    elif re.match(r"(?is)set\s+immutable\s+where\b", rest):
+        dynamic["immutable_where"] = _immutable_where(rest)
+    elif re.match(r"(?is)unset\s+immutable\s+where\b", rest):
+        dynamic["immutable_where"] = None
     elif re.match(r"(?is)(set|unset)\b", rest):
         setting = re.match(r"(?is)set\b", rest) is not None
         for key in ("target_lag", "warehouse", "initialization_warehouse", "refresh_mode", "scheduler", "comment", "data_retention_time_in_days"):
@@ -975,3 +988,147 @@ def _get_ddl(cursor, original, m: re.Match):  # noqa: ANN001, ANN202
     alias = m.group("alias") or f"GET_DDL('{m.group('kind').upper()}', '{m.group('name')}'" + (f", {m.group('full').upper()}" if m.group("full") else "") + ")"
     alias = alias.strip('"') if alias.startswith('"') else alias.upper()
     return original(cursor, "select " + _quoted(ddl).replace("\\", "\\\\") + ' as "' + alias.replace('"', '""') + '"')
+
+
+# ---------------------------------------------------------------- grants on tables and views
+
+GRANTS = "_fs_global.main._fx_grants"
+# what ALL grants (measured): on a view also VIEW EXPANDED QUERY PROFILE
+_ALL_TABLE = ["APPLY COMMENT", "APPLYBUDGET", "DELETE", "DELETE ERROR TABLE", "EVOLVE SCHEMA", "INSERT", "REBUILD", "REFERENCES", "SELECT",
+              "SELECT ERROR TABLE", "TRUNCATE", "UPDATE"]
+_OBJECT = r"(?:(?P<kind>table|view|dynamic\s+table|materialized\s+view|external\s+table|iceberg\s+table|interactive\s+table)\s+)?"
+_GRANT = re.compile(_LEAD + r"grant\s+(?P<privs>.+?)\s+on\s+" + _OBJECT + r"(?P<name>" + _NAME + r")\s+to\s+(?P<grantees>.+?)"
+                    r"(?P<option>\s+with\s+grant\s+option)?\s*;?\s*$")
+_REVOKE = re.compile(_LEAD + r"revoke\s+(?P<grant_option>grant\s+option\s+for\s+)?(?P<privs>.+?)\s+on\s+" + _OBJECT + r"(?P<name>" + _NAME
+                     + r")\s+from\s+(?P<grantees>.+?)(?:\s+(?:cascade|restrict))?\s*;?\s*$")
+_SHOW_GRANTS = re.compile(_LEAD + r"show\s+grants\s+on\s+" + _OBJECT + r"(?P<name>" + _NAME + r")\s*;?\s*$")
+_NOT_RELATIONS = re.compile(r"(?i)^(?:all|future)\s+\w+\s+in\s|^(?:schema|database|warehouse|function|procedure|integration|stage|"
+                            r"file\s+format|sequence|stream|task|pipe|role|user|account|share|tag|masking|row\s+access)\b")
+
+
+def ensure_grants(duck) -> None:  # noqa: ANN001
+    duck.execute(f"create table if not exists {GRANTS} (database_name varchar, schema_name varchar, name varchar, privilege varchar, "
+                 "grantee varchar, grant_option boolean, granted_by varchar, created_on timestamptz)")
+
+
+def _relation_kind(duck, fq) -> str | None:  # noqa: ANN001
+    """TABLE, VIEW or DYNAMIC_TABLE as SHOW GRANTS names it, or None when nothing has that name."""
+    reg = _row(duck, fq) or {}
+    if reg.get("kind") == "DYNAMIC TABLE":
+        return "DYNAMIC_TABLE"
+    if duck.execute("select count(*) from duckdb_views() where database_name = ? and schema_name = ? and view_name = ?", list(fq)).fetchone()[0]:
+        return "VIEW"
+    if duck.execute("select count(*) from duckdb_tables() where database_name = ? and schema_name = ? and table_name = ?", list(fq)).fetchone()[0]:
+        return "TABLE"
+    return None
+
+
+_KNOWN = {*_ALL_TABLE, "VIEW EXPANDED QUERY PROFILE", "OWNERSHIP", "ALL", "ALL PRIVILEGES"}
+
+
+def _privileges(text: str, kind: str) -> list[str]:
+    words = [re.sub(r"\s+", " ", p.strip()).upper() for p in text.split(",") if p.strip()]
+    out = []
+    for w in words:
+        if w in ("ALL", "ALL PRIVILEGES"):
+            out += _ALL_TABLE + (["VIEW EXPANDED QUERY PROFILE"] if kind == "VIEW" else [])
+        else:
+            out.append(w)
+    return list(dict.fromkeys(out))
+
+
+def _grantees(text: str) -> list[str] | None:
+    """The roles a GRANT names; None when it names something else (a share, a database role, a user)."""
+    out = []
+    for part in text.split(","):
+        m = re.match(r'(?is)^\s*(?:role\s+)?("(?:[^"]|"")+"|[\w$]+)\s*$', part)
+        if not m or re.match(r"(?is)^\s*(share|database\s+role|application|user)\b", part):
+            return None
+        out.append(_unquote(m.group(1)))
+    return out
+
+
+def grants_intercept(cursor, command, original):  # noqa: ANN001, ANN201, C901
+    """GRANT / REVOKE of privileges on a table or view, and SHOW GRANTS ON one: kept as Snowflake keeps them."""
+    if not isinstance(command, str):
+        return None
+    text = _command(command)
+    duck = cursor._duck_conn
+    if (m := _SHOW_GRANTS.match(text)) is not None:
+        fq = qualified(cursor, m.group("name"))
+        kind = _relation_kind(duck, fq)
+        if kind is None:
+            return None
+        reg = _row(duck, fq) or {}
+        owner, made = reg.get("owner") or _role(duck), reg.get("created_on") or now()
+        rows = [(made, "OWNERSHIP", kind, ".".join(fq), "ROLE", owner, "true", owner, "ROLE")]
+        rows += [(r[0], r[1], kind, ".".join(fq), "ROLE", r[2], "true" if r[3] else "false", r[4], "ROLE") for r in duck.execute(
+            f"select created_on, privilege, grantee, grant_option, granted_by from {GRANTS} where database_name = ? and schema_name = ? "
+            "and name = ? order by grantee, privilege", list(fq)).fetchall()]
+        names = ["created_on", "privilege", "granted_on", "name", "granted_to", "grantee_name", "grant_option", "granted_by", "granted_by_role_type"]
+        from . import scripting
+
+        selects = ["select " + ", ".join(f'{_literal(v, n, scripting)} as "{n}"' for n, v in zip(names, row)) for row in rows]
+        return original(cursor, " union all ".join(selects))
+    grant, revoke = _GRANT.match(text), _REVOKE.match(text)
+    m = grant or revoke
+    if m is None or _NOT_RELATIONS.match(text[m.start("name") - len(m.group("kind") or "") - 1:].lstrip()) \
+            or _NOT_RELATIONS.match(m.group("name")):
+        return None
+    grantees = _grantees(m.group("grantees"))
+    if grantees is None:
+        return None
+    fq = qualified(cursor, m.group("name"))
+    kind = _relation_kind(duck, fq)
+    if kind is None:
+        written = m.group("name").strip()
+        shown = written.upper() if not written.startswith('"') else written.strip('"')
+        raise _error(f"SQL compilation error:\n{'View' if (m.group('kind') or '').lower() == 'view' else 'Table'} '{shown}' does not exist or "
+                     "not authorized.", 2003, "42S02")
+    from . import account
+
+    if account.roles_known(duck):
+        for role in grantees:
+            if not account._role_exists(cursor, role):
+                raise _error(f"SQL compilation error:\nRole '{role}' does not exist or not authorized.", 2003, "02000")
+    privileges = _privileges(m.group("privs"), kind)
+    unknown = [p for p in (re.sub(r"\s+", " ", w.strip()).upper() for w in m.group("privs").split(",")) if p and p not in _KNOWN]
+    if unknown:
+        # a word that is no privilege: Snowflake's parser stops at what follows it (measured: `grant fake_privilege on t ...`
+        # is "unexpected 'on'" at the position of ON)
+        at_on = re.search(r"(?i)\s(on)\s", text[:m.start("name")])
+        position = at_on.start(1) - text.rfind("\n", 0, at_on.start(1)) - 1 if at_on else 0
+        raise _error(f"SQL compilation error:\nsyntax error line 1 at position {position} unexpected 'on'.", 1003, "42000")
+    at, granter = now(), _role(duck)
+    affected = 0
+    for role in grantees:
+        for p in privileges:
+            where = [*fq, p, role]
+            held = duck.execute(f"select grant_option from {GRANTS} where database_name = ? and schema_name = ? and name = ? and privilege = ? "
+                                "and grantee = ?", where).fetchone()
+            if grant:
+                if held is None:
+                    duck.execute(f"insert into {GRANTS} values (?, ?, ?, ?, ?, ?, ?, ?)", [*where, bool(m.group("option")), granter, at])
+                elif m.group("option") and not held[0]:
+                    duck.execute(f"update {GRANTS} set grant_option = true where database_name = ? and schema_name = ? and name = ? "
+                                 "and privilege = ? and grantee = ?", where)
+            elif held is not None:
+                affected += 1
+                if m.group("grant_option"):
+                    duck.execute(f"update {GRANTS} set grant_option = false where database_name = ? and schema_name = ? and name = ? "
+                                 "and privilege = ? and grantee = ?", where)
+                else:
+                    duck.execute(f"delete from {GRANTS} where database_name = ? and schema_name = ? and name = ? and privilege = ? "
+                                 "and grantee = ?", where)
+    if revoke:
+        return _status(original, cursor, f"Statement executed successfully. {affected} objects affected.")
+    return _status(original, cursor, "Statement executed successfully.")
+
+
+def _grants_follow(duck, fq, *, dropped: bool = False, to=None) -> None:  # noqa: ANN001
+    """A relation made again without COPY GRANTS, or dropped, loses its grants; one renamed keeps them."""
+    if to is not None:
+        duck.execute(f"update {GRANTS} set database_name = ?, schema_name = ?, name = ? where database_name = ? and schema_name = ? and name = ?",
+                     [*to, *fq])
+    elif dropped:
+        duck.execute(f"delete from {GRANTS} where database_name = ? and schema_name = ? and name = ?", list(fq))

@@ -264,6 +264,20 @@ _ZONE_SET = re.compile(r"(?is)^\s*alter\s+session\s+(?:set\s+.*?\btimezone\s*=\s
 _ZONES: dict[int, str] = {}  # DuckDB connection -> the TimeZone it was last set to
 
 
+_USE_WAREHOUSE = re.compile(r'(?is)^(?:\s|--[^\n]*\n|/\*.*?\*/)*use\s+warehouse\s+("(?:[^"]|"")+"|[\w$]+)\s*;?\s*(?:/\*.*\*/\s*)?$')
+
+
+def _session_warehouse(cursor, command, original):  # noqa: ANN001, ANN202
+    """USE WAREHOUSE: the session's, which CURRENT_WAREHOUSE() gives (dbt switches to a model's `snowflake_warehouse` so).
+    Returns the reply to a USE, None otherwise."""
+    m = _USE_WAREHOUSE.match(command) if isinstance(command, str) else None
+    if m:
+        name = m.group(1)
+        account.use_warehouse(cursor, name[1:-1].replace('""', '"') if name.startswith('"') else name.upper())
+    semantics.SESSION["CurrentWarehouse"] = getattr(cursor._conn, "_fx_warehouse", None) or "LOCAL"
+    return original(cursor, "select 'Statement executed successfully.' as \"status\"") if m else None
+
+
 def _session_zone(cursor, command) -> None:  # noqa: ANN001
     """ALTER SESSION SET TIMEZONE: the session's clock, for TIMESTAMP_LTZ and for a TIMESTAMP_TZ made without an offset.
     Kept on the connection and given to DuckDB before each of its statements."""
@@ -286,6 +300,19 @@ def _session_zone(cursor, command) -> None:  # noqa: ANN001
             _ZONES[id(cursor._duck_conn)] = zone
         except Exception:  # noqa: BLE001, S110
             pass
+
+
+def _geo_out(table):  # noqa: ANN001, ANN202
+    """A GEOGRAPHY or GEOMETRY (geo.py: a struct holding the document) as Snowflake sends one: GeoJSON text."""
+    import pyarrow as pa
+
+    from . import geo
+
+    for i, field in enumerate(table.schema):
+        if pa.types.is_struct(field.type) and {f.name for f in field.type} in ({"G", "GEOGRAPHY"}, {"G", "GEOMETRY"}):
+            shown = pa.array([None if v is None or v.get("G") is None else geo.shown(v["G"]) for v in table.column(i).to_pylist()], pa.string())
+            table = table.set_column(i, pa.field(field.name, pa.string()), shown)
+    return table
 
 
 def _local_out(table):  # noqa: ANN001, ANN202
@@ -892,9 +919,13 @@ def _vectors_described(describe):  # noqa: ANN001, ANN202
     def described_with_vectors(described):  # noqa: ANN001, ANN202
         vectors = {i: semantics.VECTOR_KIND.fullmatch(str(row[1]).upper()) for i, row in enumerate(described)}
         vectors = {i: m for i, m in vectors.items() if m and m[2]}
-        if not vectors:
+        geos = {i: semantics.GEO_KINDS[str(row[1]).upper()] for i, row in enumerate(described) if str(row[1]).upper() in semantics.GEO_KINDS}
+        if not vectors and not geos:
             return describe(described)
-        info = describe([(row[0], "BLOB", *row[2:]) if i in vectors else row for i, row in enumerate(described)])
+        info = describe([(row[0], "BLOB" if i in vectors else "VARCHAR", *row[2:]) if i in vectors or i in geos else row
+                         for i, row in enumerate(described)])
+        for i, kind in geos.items():  # (sent as GeoJSON text: see _geo_out)
+            info[i].update(type=kind, byteLength=None, length=None)
         for i, m in vectors.items():
             element = {"type": "real", "precision": None, "scale": None} if m[1] == "FLOAT" else \
                 {"type": "fixed", "precision": 38, "scale": 0}
@@ -990,6 +1021,9 @@ def _patch_fakesnow() -> None:
             self._fauxflake_qualify = False
             command = objects.session_functions(self, command)
             handled = _query_tag(self, command, original)
+            if handled is not None:
+                return handled
+            handled = _session_warehouse(self, command, original)
             if handled is not None:
                 return handled
             handled = _transaction(self, command, original)
@@ -1098,6 +1132,17 @@ def _patch_fakesnow() -> None:
                     body["data"].setdefault("masterToken", body["data"]["token"])
                 except Exception:  # noqa: BLE001 - a refused login: as it is
                     return response
+                warehouse = request.query_params.get("warehouse")
+                session = server.sessions.get(body["data"].get("token")) if warehouse else None
+                if session is not None:  # (the warehouse the client logs in with: CURRENT_WAREHOUSE() until it USEs another)
+                    session._fx_warehouse = warehouse.strip('"') if warehouse.startswith('"') else warehouse.upper()
+                role = request.query_params.get("roleName")
+                if role and server.shared_fs is not None:
+                    # the role the client logs in with is the session's (dbt's profile names one): CURRENT_ROLE(), the owner
+                    # of what it makes, the grantor of what it grants
+                    with contextlib.suppress(Exception):
+                        objects.set_role(server.shared_fs.duck_conn, role.strip('"') if role.startswith('"') else role)
+                        body["data"].setdefault("sessionInfo", {})["roleName"] = role.strip('"').upper()
                 return JSONResponse(body, status_code=response.status_code)
 
             server.app.router.routes[i] = Route(route.path, login_request, methods=list(route.methods or ["POST"]))
@@ -1135,7 +1180,16 @@ def _patch_fakesnow() -> None:
     upstream_to_sf = server.to_sf
 
     def to_sf(table, rowtype):  # noqa: ANN001, ANN202
-        return upstream_to_sf(_local_out(_zoned_out(table)), rowtype)
+        done = upstream_to_sf(_geo_out(_local_out(_zoned_out(table))), rowtype)
+        if any(c.get("type") in ("geography", "geometry") for c in rowtype):
+            # the column is described as GEOGRAPHY / GEOMETRY; its values travel as text, as Snowflake sends GeoJSON (the
+            # connector reads Arrow by `logicalType`, and has no reader of its own for these)
+            import pyarrow as pa
+
+            fields = [f.with_metadata({**(f.metadata or {}), b"logicalType": b"TEXT"}) if c.get("type") in ("geography", "geometry") else f
+                      for f, c in zip(done.schema, rowtype)]
+            done = pa.Table.from_arrays(done.columns, schema=pa.schema(fields))
+        return done
 
     server.to_sf = to_sf
 
@@ -1225,7 +1279,9 @@ def _patch_fakesnow() -> None:
     if "'VECTOR'" not in info.SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW:
         info.SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW = info.SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW.replace(
             "when columns.data_type='BLOB' then 'BINARY'",
-            "when columns.data_type='BLOB' then 'BINARY' when regexp_full_match(columns.data_type, '(FLOAT|INTEGER)\\[\\d+\\]') then 'VECTOR'")
+            "when columns.data_type='BLOB' then 'BINARY' when regexp_full_match(columns.data_type, '(FLOAT|INTEGER)\\[\\d+\\]') then 'VECTOR' "
+            "when columns.data_type = 'STRUCT(G VARCHAR, GEOGRAPHY INTEGER)' then 'GEOGRAPHY' "
+            "when columns.data_type = 'STRUCT(G VARCHAR, GEOMETRY INTEGER)' then 'GEOMETRY'")
 
     # the columns Snowflake's views have beyond those: precision of times, and the rest as Snowflake
     # reports them for an ordinary column
