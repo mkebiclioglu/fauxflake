@@ -46,6 +46,7 @@ def python_functions(duck) -> None:  # noqa: ANN001
 
     for name, fn, args, out, kind in (
             ("_fxpy_sha2", sha2, ["VARCHAR", "INTEGER"], "VARCHAR", None),
+            ("_fxpy_collation_spec", collation_spec, ["VARCHAR", "VARCHAR"], "VARCHAR", None),
             ("_fxpy_first_duplicate", first_duplicate, ["VARCHAR[]"], "VARCHAR", None),
             ("_fxpy_json_sorted", sorted_json, ["VARCHAR"], "VARCHAR", "arrow"),
             ("_fxpy_json_key", json_keys_of, ["VARCHAR"], "VARCHAR", "arrow"),
@@ -598,6 +599,8 @@ MACROS = zoned.MACROS + [
     # the text behind the base64, as UTF-8; a VARIANT string is read without its JSON quotes
     f"create or replace macro {_NS}_sf_try_base64(x) as try(decode(from_base64({_NS}_sf_text(x))))",
     f"create or replace macro {_NS}_sf_base64(x) as decode(from_base64({_NS}_sf_text(x)))",
+    # what BASE64_ENCODE / HEX_ENCODE read: a BINARY's bytes, text's UTF-8 (DuckDB casts text to BLOB reading \\x escapes)
+    f"create or replace macro {_NS}_sf_bytes(x) as case when typeof(x) = 'BLOB' then x::blob else encode(x::varchar) end",
     f"create or replace macro {_NS}_sf_array_distinct(l) as list_filter(l, lambda x, i: list_position(l, x) = i)",
     f"create or replace macro {_NS}_sf_jarowinkler(a, b) as round(jaro_winkler_similarity(upper(a), upper(b)) * 100)::bigint",
     f"""create or replace macro {_NS}_sf_object_insert
@@ -1402,11 +1405,41 @@ _MAPS = {"MAP_KEYS": "", "MAP_SIZE": "", "MAP_CONTAINS_KEY": "", "MAP_DELETE": "
          "MAP_PICK": "OBJECT_PICK"}
 
 
+COLLATIONS: dict[str, str] = {}  # a DuckDB collation -> the Snowflake spec last written as it (see _collation)
+
+
 def _collation(spec: str) -> str | None:
-    """A Snowflake collation spec ('en-ci', 'en-ci-ai') as DuckDB's NOCASE / NOACCENT."""
-    parts = spec.lower().replace("_", "-").split("-")
-    names = [name for flag, name in (("ci", "NOCASE"), ("ai", "NOACCENT")) if flag in parts]
-    return ".".join(names) or None
+    """A Snowflake collation spec ('en-ci', 'en-ci-ai') as DuckDB's NOCASE / NOACCENT; a spec that changes neither (`en`,
+    `utf8`) as NFC, so the column still carries one. DuckDB keeps a column's collation through CTAS and expressions as
+    Snowflake keeps the spec; DESCRIBE and the information schema give the spec back (collation_spec)."""
+    text = spec.strip().lower()  # (Snowflake keeps a spec in lower case: COLLATION(COLLATE(x, 'EN-CI')) is 'en-ci')
+    if text in ("", "binary"):
+        return None
+    parts = text.lower().replace("_", "-").split("-")
+    names = [name for flag, name in (("ci", "nocase"), ("ai", "noaccent")) if flag in parts] or ["nfc"]
+    duck = ".".join(names)
+    # each spec its own DuckDB collation: 'en-ci' and 'en-ci-rtrim' both NOCASE, told apart by NFC steps that change
+    # nothing more (the spec's case aside, as Snowflake compares them)
+    while duck in COLLATIONS and COLLATIONS[duck].lower() != text.lower():
+        duck += ".nfc"
+    COLLATIONS.setdefault(duck, text)
+    return duck
+
+
+def collation_spec(table_sql: str | None, column: str | None) -> str | None:
+    """The Snowflake spec of a column's collation, read from DuckDB's CREATE TABLE text of its table."""
+    if not table_sql or column is None:
+        return None
+    quoted = '"' + column.replace('"', '""') + '"'
+    found = re.search(r"[(,]\s*(?:" + re.escape(quoted) + "|" + re.escape(column) + r")\s+VARCHAR(?:\(\d+\))?\s+COLLATE\s+([\w.]+)",
+                      table_sql, re.I)
+    if not found:
+        return None
+    duck = found[1].lower()
+    if duck in COLLATIONS:
+        return COLLATIONS[duck]
+    parts = duck.split(".")
+    return "en" + ("-ci" if "nocase" in parts else "") + ("-ai" if "noaccent" in parts else "")
 
 
 _TRY_SAME = {"DATE": ("DATE",), "BOOLEAN": ("BOOLEAN",), "DOUBLE": ("DOUBLE", "FLOAT"), "BLOB": ("BLOB",)}
@@ -1639,6 +1672,10 @@ def _fix(node: exp.Expression) -> exp.Expression:
         if name is None:
             return node.this
         node.set("expression", exp.var(name))
+        return node
+    if isinstance(node, exp.AlterColumn) and isinstance(node.args.get("collate"), exp.Literal):
+        name = _collation(node.args["collate"].name)
+        node.set("collate", exp.var(name) if name else None)
         return node
     if isinstance(node, exp.CollateColumnConstraint) and isinstance(node.this, (exp.Literal, exp.Var, exp.Identifier)):
         node.set("this", exp.var(_collation(node.this.name) or "BINARY"))
@@ -2661,6 +2698,13 @@ def _format_chosen_at_run_time(node: exp.Expression) -> exp.Expression | None:
 
 def rewrite(node: exp.Expression) -> exp.Expression:
     """Apply the fixes bottom-up, so nested cases (a ratio of averages) all get rewritten."""
+    if isinstance(node, exp.Create) and str(node.args.get("kind") or "").upper() == "TABLE" and isinstance(node.expression, exp.Select):
+        for projection in node.expression.selects:  # CREATE TABLE AS SELECT NULL AS z: a VARCHAR column (measured)
+            if isinstance(projection, exp.Alias) and isinstance(projection.this, exp.Null):
+                projection.set("this", exp.cast(exp.null(), "varchar"))
+    if isinstance(node, (exp.ToBase64, exp.Base64Encode)) and not _is(node.this, "_sf_bytes"):
+        node.set("this", _fn("_sf_bytes", rewrite(node.this)))
+        return node
     if isinstance(node, exp.HashAgg) or (isinstance(node, exp.Anonymous) and node.name.upper() == "HASH"):
         return _hash(node)
     _text_beside_variant_branches(node)

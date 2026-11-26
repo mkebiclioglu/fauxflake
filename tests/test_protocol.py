@@ -71,3 +71,28 @@ def test_result_types_as_snowflake_describes_them():
         conn.close()
     assert seen == expected
     assert (shown.hour, str(shown.tzinfo)) == (12, "America/New_York")
+
+
+def test_session_parameters_set_at_login_and_by_alter_session():
+    """SHOW PARAMETERS IN SESSION gives back what the client logged in with (dbt sends S3_STAGE_VPCE_DNS_NAME so) and what
+    ALTER SESSION set, at level SESSION; UNSET puts the default back (measured)."""
+    import snowflake.connector
+
+    from fauxflake.emulator import serve
+
+    with serve() as emu:
+        emu.ensure_database("P", "PUBLIC")
+        kwargs = emu.connect_kwargs(database="P", schema="PUBLIC")
+        kwargs["session_parameters"] = {**kwargs.get("session_parameters", {}), "S3_STAGE_VPCE_DNS_NAME": "vpce-x.s3.us-east-1.vpce.amazonaws.com"}
+        conn = snowflake.connector.connect(**kwargs)
+        cur = conn.cursor()
+
+        def shown(key):  # noqa: ANN001, ANN202
+            return cur.execute(f"show parameters like '{key}' in session").fetchall()[0][1:4:2]
+
+        assert shown("S3_STAGE_VPCE_DNS_NAME") == ("vpce-x.s3.us-east-1.vpce.amazonaws.com", "SESSION")
+        cur.execute("alter session set ROWS_PER_RESULTSET = 5")
+        assert shown("ROWS_PER_RESULTSET") == ("5", "SESSION")
+        cur.execute("alter session unset ROWS_PER_RESULTSET")
+        assert shown("ROWS_PER_RESULTSET") == ("0", "")
+        conn.close()

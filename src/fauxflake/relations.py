@@ -450,6 +450,8 @@ def intercept(cursor, command, original):  # noqa: ANN001, ANN201
             return done
     if word == "alter" and (m := _ALTER_SPECIAL.match(text)):
         return _alter(cursor, original, m)
+    if word == "alter" and (m := _ALTER_TYPE.match(text)):
+        _check_type_change(cursor, m)
     if word == "show" and (m := _SHOW.match(text)):
         return _show(cursor, original, m)
     if word == "select" and (m := _GET_DDL.match(text)):
@@ -465,6 +467,72 @@ def intercept(cursor, command, original):  # noqa: ANN001, ANN201
     if word in ("select", "with") and "dynamic" not in text.lower():
         uninitialized(cursor, text)
     return None
+
+
+_ALTER_TYPE = re.compile(_LEAD + r"alter\s+table\s+(?:if\s+exists\s+)?(?P<name>" + _NAME + r")\s+(?:alter|modify)\s+(?:column\s+)?"
+                         r"(?P<column>\"(?:[^\"]|\"\")+\"|[\w$]+)\s+(?:set\s+data\s+)?type\s+(?P<type>[\w ]+?(?:\(\s*\d+\s*(?:,\s*\d+\s*)?\))?)"
+                         r"(?:\s+collate\s+'(?P<collate>[^']*)')?\s*;?\s*$")
+
+
+def _snowflake_type(text: str) -> str:
+    """A type as DESCRIBE writes it: VARCHAR(16777216), NUMBER(38,0), TIMESTAMP_NTZ(9)."""
+    import sqlglot
+    from sqlglot import exp
+
+    dtype = sqlglot.parse_one(f"cast(null as {text})", read="snowflake").to
+    T = exp.DataType.Type
+    params = [int(p.this.name) for p in dtype.expressions if isinstance(p, exp.DataTypeParam) and p.this.is_int]
+    if dtype.this in (T.VARCHAR, T.CHAR, T.TEXT, T.NVARCHAR, T.NCHAR):
+        return f"VARCHAR({params[0] if params and dtype.this != T.CHAR else (params[0] if params else 1) if dtype.this == T.CHAR else 16777216})"
+    if dtype.this in (T.DECIMAL, T.BIGDECIMAL):
+        return f"NUMBER({params[0] if params else 38},{params[1] if len(params) > 1 else 0})"
+    if dtype.this in (T.INT, T.BIGINT, T.SMALLINT, T.TINYINT):
+        return "NUMBER(38,0)"
+    if dtype.this in (T.FLOAT, T.DOUBLE):
+        return "FLOAT"
+    named = {T.TIMESTAMP: "TIMESTAMP_NTZ(9)", T.TIMESTAMPNTZ: "TIMESTAMP_NTZ(9)", T.TIMESTAMPLTZ: "TIMESTAMP_LTZ(9)",
+             T.TIMESTAMPTZ: "TIMESTAMP_TZ(9)", T.TIME: "TIME(9)"}
+    return named.get(dtype.this, dtype.sql("snowflake").upper())
+
+
+def _check_type_change(cursor, m) -> None:  # noqa: ANN001, C901
+    """ALTER TABLE ... ALTER COLUMN c SET DATA TYPE t [COLLATE 'spec'], refused as Snowflake refuses it (measured
+    2026-11-26): another kind of type (002108), a shorter VARCHAR (040050), another scale (040052), another collation
+    (040053, the spec's case aside)."""
+    fq = qualified(cursor, m.group("name"))
+    column = m.group("column")
+    column = column[1:-1].replace('""', '"') if column.startswith('"') else column.upper()
+    cur = cursor._conn.cursor()
+    try:
+        described = {row[0]: row[1] for row in cur.execute(f"describe table {_sql_name(fq)}").fetchall()}
+    except Exception:  # noqa: BLE001 - a table that is not there is the statement's own error to give
+        return
+    finally:
+        cur.close()
+    if column not in described:
+        return
+    try:
+        new = _snowflake_type(m.group("type"))
+    except Exception:  # noqa: BLE001
+        return
+    found = re.fullmatch(r"(.*?)(?: COLLATE '([^']*)')?", described[column])
+    old, old_spec = found[1], found[2]
+    new_spec = m.group("collate")
+    kind = lambda t: re.sub(r"\(.*", "", t)  # noqa: E731
+    shown = column.upper() if re.fullmatch(r"[A-Z_][A-Z0-9_$]*", column) else f'"{column}"'
+    if kind(old) != kind(new):
+        raise _error(f"SQL compilation error: cannot change column {shown} from type {old} to {new}", 2108, "22000")
+    if (old_spec or "").lower() != (new_spec or "").lower():
+        written = lambda t, spec: f"\"{t}{f' COLLATE {chr(39)}{spec}{chr(39)}' if spec else ''}\""  # noqa: E731
+        raise _error(f"SQL compilation error: cannot change column {shown} from type {written(old, old_spec)} to "
+                     f"{written(new, new_spec)} because they have incompatible collations.", 40053, "22000")
+    sizes = lambda t: [int(x) for x in re.findall(r"\d+", t)]  # noqa: E731
+    if kind(old) == "VARCHAR" and sizes(new)[0] < sizes(old)[0]:
+        raise _error(f"SQL compilation error: cannot change column {shown} from type {old} to {new} because reducing the "
+                     "byte-length of a varchar is not supported.", 40050, "22000")
+    if kind(old) == "NUMBER" and sizes(new)[1] != sizes(old)[1]:
+        raise _error(f"SQL compilation error: cannot change column {shown} from type {old} to {new} because changing the "
+                     "scale of a number is not supported.", 40052, "22000")
 
 
 WAITING: set[tuple[str, str, str]] = set()  # dynamic tables made ON_SCHEDULE and not yet refreshed

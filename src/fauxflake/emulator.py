@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import gzip
 import json
 import logging
 import os
@@ -28,7 +29,7 @@ from typing import Iterator
 import duckdb
 from sqlglot import exp
 
-from . import account, constraints, history, objects, relations, semantics, zoned
+from . import account, constraints, history, lengths, objects, relations, semantics, zoned
 
 # Statements the emulator cannot run as-is, rewritten before they are parsed.
 # Every entry is a known difference from Snowflake: keep the list short and
@@ -440,6 +441,35 @@ _TAG_SHOWN = re.compile(_LEADING + r"show\s+parameters\s+like\s+'query_tag'\s+in
 _ESCAPES = {"\\": "\\", "'": "'", '"': '"', "n": "\n", "t": "\t", "r": "\r", "0": "\0"}
 
 
+_SESSION_SET = re.compile(r"(?is)^\s*alter\s+session\s+set\s+(.+?)\s*;?\s*$")
+_SESSION_UNSET = re.compile(r"(?is)^\s*alter\s+session\s+unset\s+(.+?)\s*;?\s*$")
+_SETTING = re.compile(r"""(?is)\s*([\w$]+)\s*=\s*('(?:[^'\\]|''|\\.)*'|"[^"]*"|[^,\s]+)\s*(?:,|$)""")
+
+
+def session_value(value) -> str:  # noqa: ANN001
+    """A parameter's value as SHOW PARAMETERS gives it: text without its quotes, TRUE as true."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    text = str(value).strip()
+    if len(text) >= 2 and text[0] == text[-1] == "'":
+        return re.sub(r"''|\\(.)", lambda e: "'" if e.group(0) == "''" else _ESCAPES.get(e.group(1), e.group(1)), text[1:-1])
+    return text.lower() if text.lower() in ("true", "false") else text
+
+
+def _session_parameters(cursor, command) -> None:  # noqa: ANN001
+    """ALTER SESSION SET / UNSET: the values SHOW PARAMETERS ... IN SESSION gives back at level SESSION (measured). The
+    statement itself still runs: TIMEZONE and the rest act through their own handlers."""
+    if not isinstance(command, str):
+        return
+    params = cursor._conn.__dict__.setdefault("_fx_session_params", {})
+    if (m := _SESSION_SET.match(command)) is not None:
+        for key, value in _SETTING.findall(m.group(1)):
+            params[key.upper()] = session_value(value)
+    elif (m := _SESSION_UNSET.match(command)) is not None:
+        for key in re.split(r"\s*,\s*", m.group(1)):
+            params.pop(key.strip().upper(), None)
+
+
 def _query_tag(cursor, command: str, original):  # noqa: ANN001, ANN202
     """The session's QUERY_TAG, kept as Snowflake keeps it: `show parameters` reads it back (dbt and projects nest
     the tag they find in their own), and one longer than 2000 characters is refused. None for any other statement."""
@@ -556,6 +586,11 @@ def _describe_semi_types(duck) -> None:  # noqa: ANN001
 
     duck.execute(f"create or replace table {_SEMI_TABLE} (c varchar, s varchar, t varchar, col varchar, kind varchar)")
     view = info_schema.SQL_CREATE_GLOBAL_INFORMATION_SCHEMA_COLUMNS_VIEW
+    # a column's collation as its Snowflake spec (semantics.collation_spec: a Python function, so the view is made again
+    # here, once it is registered)
+    view = view.replace("COLLATION_NAME, IS_IDENTITY", "case when columns.data_type = 'VARCHAR' then _fxpy_collation_spec("
+                        "(select t.sql from duckdb_tables() t where t.database_name = columns.table_catalog and t.schema_name = "
+                        "columns.table_schema and t.table_name = columns.table_name), columns.column_name) end as COLLATION_NAME, IS_IDENTITY")
     typed = view.replace("when columns.data_type='JSON' then 'VARIANT'", "when columns.data_type='JSON' then coalesce(fxk.kind, 'VARIANT')")
     joined = typed.replace("where schema_name != '_fs_information_schema'",
                            f"LEFT JOIN {_SEMI_TABLE} fxk ON fxk.c = columns.table_catalog AND fxk.s = columns.table_schema "
@@ -949,6 +984,15 @@ def _patch_information_schema() -> None:
                             """CASE WHEN is_nullable = 'YES' THEN 'true' ELSE 'NOT_NULL' END as "null?",""")
         view = view.replace('"nullable":true', '"nullable":' + "' || CASE WHEN is_nullable = 'YES' THEN 'true' ELSE 'false' END || '")
         view = view.replace('NULL as "schema_evolution_record"', 'NULL as "schema_evolution_record", NULL as "write_default"')
+        # (a VARCHAR's byteLength is four bytes a character, at most 128 MB, as Snowflake reports it)
+        bytes_case = '''CASE
+                WHEN character_maximum_length = 16777216 THEN 16777216
+                ELSE coalesce(character_maximum_length*4,16777216)
+            END'''
+        assert bytes_case in view
+        view = view.replace(bytes_case, "least(coalesce(character_maximum_length, 16777216) * 4, 134217728)")
+        assert ',"fixed":false}' in view
+        view = view.replace(',"fixed":false}\'', ',"fixed":false\' || coalesce(\',"collation":"\' || collation_name || \'"\', \'\') || \'}\'')
         _show.SQL_CREATE_VIEW_SHOW_COLUMNS = view
 
 
@@ -1064,6 +1108,7 @@ def _patch_fakesnow() -> None:
             handled = _query_tag(self, command, original)
             if handled is not None:
                 return handled
+            _session_parameters(self, command)
             handled = _session_warehouse(self, command, original)
             if handled is not None:
                 return handled
@@ -1089,6 +1134,7 @@ def _patch_fakesnow() -> None:
                     objects.note_secure_view(self, command)
                     _note_stats(self, command, truncated)
                     relations.note(self, command)
+                    lengths.note(self, command)
                     _note_empty_lookup(self, command)
                     return done
                 except ProgrammingError as e:
@@ -1117,6 +1163,7 @@ def _patch_fakesnow() -> None:
             objects.note_secure_view(self, command)
             _note_stats(self, command, truncated)
             relations.note(self, command)
+            lengths.note(self, command)
             return done
         except ProgrammingError as e:
             if "_fx_refused_conversion" in str(e.msg):  # (the check of what a TRY_ function is given, in a window)
@@ -1206,6 +1253,14 @@ def _patch_fakesnow() -> None:
                 session = server.sessions.get(body["data"].get("token")) if warehouse else None
                 if session is not None:  # (the warehouse the client logs in with: CURRENT_WAREHOUSE() until it USEs another)
                     session._fx_warehouse = warehouse.strip('"') if warehouse.startswith('"') else warehouse.upper()
+                if session is None:
+                    session = server.sessions.get(body["data"].get("token"))
+                with contextlib.suppress(Exception):  # the parameters the client logs in with are the session's (SHOW PARAMETERS)
+                    sent = json.loads(gzip.decompress(await request.body()) if request.headers.get("Content-Encoding") == "gzip"
+                                      else await request.body())["data"].get("SESSION_PARAMETERS") or {}
+                    if session is not None:
+                        session.__dict__.setdefault("_fx_session_params", {}).update(
+                            {k.upper(): session_value(v) for k, v in sent.items() if not k.upper().startswith("FAKESNOW") and k != "nop_regexes"})
                 role = request.query_params.get("roleName")
                 if role and server.shared_fs is not None:
                     # the role the client logs in with is the session's (dbt's profile names one): CURRENT_ROLE(), the owner
@@ -1449,6 +1504,11 @@ def _patch_fakesnow() -> None:
             assert old in template, old
             template = template.replace(old, new)
         upstream.SQL_DESCRIBE_TABLE = Template(template)
+    if "COLLATE" not in upstream.SQL_DESCRIBE_TABLE.template:  # (a column's collation, as Snowflake writes it)
+        text = "WHEN data_type = 'TEXT' THEN 'VARCHAR(' || coalesce(character_maximum_length,16777216)  || ')'"
+        assert text in upstream.SQL_DESCRIBE_TABLE.template
+        upstream.SQL_DESCRIBE_TABLE = Template(upstream.SQL_DESCRIBE_TABLE.template.replace(
+            text, text + " || coalesce(' COLLATE ''' || collation_name || '''', '')"))
     if "VECTOR(" not in upstream.SQL_DESCRIBE_TABLE.template:
         upstream.SQL_DESCRIBE_TABLE = Template(upstream.SQL_DESCRIBE_TABLE.template.replace(
             "        ELSE data_type END AS \"type\",",
