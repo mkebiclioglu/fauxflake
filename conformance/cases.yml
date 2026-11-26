@@ -1242,3 +1242,9 @@
 - {id: geo_invalid_pair, sql: "select to_geography('POINT(200 100)')"}
 - {id: geo_unparsable, sql: "select to_geography('nonsense')"}
 - {id: geo_x_of_a_line, sql: "select st_x(to_geography('LINESTRING(0 0, 1 1)'))"}
+- {id: ts_text_one_digit_offset, sql: "select '2025-01-01 01:25:00-0'::timestamp_tz, to_timestamp_tz('2025-01-02 13:47:00-0'), '2025-01-01 01:25:00+5:30'::timestamp_tz, '2025-01-01 01:25:00-0'::timestamp_ntz"}
+- {id: ts_text_us_dates, sql: "select '09/01/2023'::date, '9/1/2023'::date, '09/01/2023'::timestamp, '09/01/2023 13:45:10'::timestamp"}
+- {id: ts_text_digits_cast, sql: "select '1735689600'::timestamp, '2023-09-01 10:00:00'::timestamp"}
+- {id: date_text_day_first_refused, sql: "select '13/01/2023'::date"}
+- {id: ts_text_refused, sql: "select 'nope'::timestamp"}
+- {id: double_limit_refused, sql: "select 1 as id\nlimit 1\nlimit 1"}

@@ -27,7 +27,7 @@ STRUCT = "STRUCT(I TIMESTAMPTZ, O BIGINT)"
 SHOWN = "STRUCT(I TIMESTAMP WITH TIME ZONE, O BIGINT)"  # (as typeof() and DESCRIBE name it)
 
 # a text that ends in an offset, after a time of day: its wall clock and the offset (+05:30, -0330, +05, Z)
-_SPLIT_SQL = r"^(.*\d:\d\d(?::\d\d(?:\.\d*)?)?)\s*(Z|[+-]\d\d(?::?\d\d)?)\s*$"
+_SPLIT_SQL = r"^(.*\d:\d\d(?::\d\d(?:\.\d*)?)?)\s*(Z|[+-]\d{1,2}(?::?\d\d)?)\s*$"  # (measured: -0, +5 and +5:30 are offsets)
 
 # Each macro reads its argument once (through a one-element list when it needs it twice): DuckDB expands a macro's
 # arguments where they are written, and nested readings would otherwise grow exponentially
@@ -39,8 +39,8 @@ MACROS = [
     # an instant at the session's time zone (UTC unless ALTER SESSION SET TIMEZONE said otherwise)
     f"create or replace macro {_NS}_tz_local(t) as {_NS}_tz_zoned(current_setting('TimeZone'), t)",
     f"""create or replace macro {_NS}_tz_minutes(z) as case when z is null or z = '' or z = 'Z' then 0
-          else (case when z[1] = '-' then -1 else 1 end) * (try_cast(regexp_replace(z, '[^0-9]', '', 'g')[1:2] as integer) * 60
-            + coalesce(try_cast(nullif(regexp_replace(z, '[^0-9]', '', 'g')[3:4], '') as integer), 0)) end""",
+          else (case when z[1] = '-' then -1 else 1 end) * (try_cast(regexp_extract(z, '^[+-]([0-9]{{1,2}})', 1) as integer) * 60
+            + coalesce(try_cast(nullif(regexp_extract(z, '^[+-][0-9]{{1,2}}:?([0-9][0-9])$', 1), '') as integer), 0)) end""",
     f"""create or replace macro {_NS}_tz_parse(s) as list_transform([regexp_extract(s::varchar, '{_SPLIT_SQL}', ['w', 'z'])],
           lambda p: case when p.z = '' and s is not null
             then {_NS}_tz_local(timezone(current_setting('TimeZone'), cast(s::varchar as timestamp)))

@@ -1541,6 +1541,9 @@
    ]
   ]
  },
+ "date_text_day_first_refused": {
+  "error": "100040 (22007): Date '13/01/2023' is not recognized"
+ },
  "date_to_text": {
   "rows": [
    [
@@ -1838,6 +1841,9 @@
     "4.73"
    ]
   ]
+ },
+ "double_limit_refused": {
+  "error": "001003 (42000): SQL compilation error:"
  },
  "duplicate_cte_names": {
   "rows": [
@@ -10347,6 +10353,37 @@
   "rows": [
    [
     "7"
+   ]
+  ]
+ },
+ "ts_text_digits_cast": {
+  "rows": [
+   [
+    "2025-01-01 00:00:00.000",
+    "2023-09-01 10:00:00.000"
+   ]
+  ]
+ },
+ "ts_text_one_digit_offset": {
+  "rows": [
+   [
+    "2025-01-01 01:25:00.000",
+    "2025-01-02 13:47:00.000",
+    "2025-01-01 01:25:00.000",
+    "2025-01-01 01:25:00.000"
+   ]
+  ]
+ },
+ "ts_text_refused": {
+  "error": "100035 (22007): Timestamp 'nope' is not recognized"
+ },
+ "ts_text_us_dates": {
+  "rows": [
+   [
+    "2023-09-01",
+    "2023-09-01",
+    "2023-09-01 00:00:00.000",
+    "2023-09-01 13:45:10.000"
    ]
   ]
  },

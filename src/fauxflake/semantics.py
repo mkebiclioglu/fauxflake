@@ -700,6 +700,8 @@ MACROS = zoned.MACROS + [
           try_strptime(x::varchar, ['%m/%d/%Y %H:%M:%S', '%m/%d/%Y %H:%M', '%m/%d/%Y', '%d-%b-%Y %H:%M:%S', '%d-%b-%Y']),
           timezone('UTC', {_NS}_sf_epoch(x)))""",
     f"""create or replace macro {_NS}_sf_try_date(x) as coalesce(try_cast(x as date), {_NS}_sf_try_timestamp(x)::date)""",
+    f"""create or replace macro {_NS}_sf_cast_ntz(x) as case when typeof(x) <> 'VARCHAR' then try_cast(x as timestamp) else
+          coalesce(try_cast({_NS}_tz_wall_in(x) as timestamp), {_NS}_sf_try_timestamp(x), cast(x::varchar as timestamp)) end""",
     f"""create or replace macro {_NS}_sf_to_date(x) as coalesce({_NS}_sf_try_date(x), cast(x::varchar as date))""",
     f"""create or replace macro {_NS}_sf_try_time(x) as coalesce(
           case when regexp_matches(x::varchar, '^[[:space:]]*[0-9]{{1,2}}:[0-9]{{2}}') then try_cast(x::varchar as time) end,
@@ -1553,6 +1555,11 @@ def _fix(node: exp.Expression) -> exp.Expression:
         if to.is_type("timestamp", "timestampntz", "timestampltz", "timestamptz") and (_is(inner, "_sf_int") or (
                 isinstance(inner, exp.Cast) and inner.to.is_type("int", "bigint", "decimal", "double", "float"))):
             return exp.Cast(this=_fn("_sf_seconds", inner), to=to)  # x::number::timestamp: seconds since 1970
+        if to.is_type("timestamp", "timestampntz") and not to.expressions and isinstance(inner, exp.Literal) and inner.is_string:
+            # text read as Snowflake reads it (AUTO): an offset is dropped from the wall clock (`...01:25:00-0`), US dates
+            # (`09/01/2023`) and digits (seconds since 1970) are times (a column goes through _fs_to_timestamp, which reads
+            # text the same way)
+            return _fn("_sf_cast_ntz", inner)
         if to.is_type("boolean") and not isinstance(inner, (*_VARIANT_ACCESS, exp.Boolean, exp.Null)):
             return _fn("_sf_bool", inner)
         if to.is_type("date") and not isinstance(inner, (*_VARIANT_ACCESS, exp.Null, exp.Cast, exp.Anonymous)) \

@@ -52,19 +52,11 @@ REWRITES: list[tuple[re.Pattern[str], str, str]] = [
         "session parameters are empty",
     ),
     (
-        # dbt reads existing grants before applying `grants:` / `copy_grants`: there are none locally
-        re.compile(r"(?s)^(?:\s|--[^\n]*\n|/\*.*?\*/)*show\s+grants\s+on\s.*$", re.IGNORECASE),
-        """select null as "created_on", null as "privilege", null as "granted_on", null as "name", null as "granted_to", """
-        """null as "grantee_name", null as "grant_option", null as "granted_by" where false""",
-        "no grants exist locally",
-    ),
-    (
-        # A dynamic table is a query Snowflake keeps fresh by itself. Locally it is a table that
-        # every run rebuilds: the lag, warehouse and refresh settings have nothing to act on.
-        re.compile(r"(?s)\bcreate\s+(?:or\s+replace\s+)?(?:transient\s+)?dynamic\s+table\s+(?:if\s+not\s+exists\s+)?(\S+)\s.*?\bas\s*(?=\(|select\b|with\b)",
-                   re.IGNORECASE),
-        r"create or replace table \1 as ",
-        "dynamic table -> table",
+        # COPY TAGS keeps the tags of the relation a CREATE OR REPLACE replaces: they are kept here by name (objects.py)
+        # whether the clause is there or not, and sqlglot does not read it
+        re.compile(r"(?is)^((?:\s|--[^\n]*\n|/\*.*?\*/)*create\b(?:(?!\bas\b).)*?)\bcopy\s+tags\b"),
+        r"\1",
+        "COPY TAGS: tags are kept by name",
     ),
     (re.compile(r"\bdrop\s+dynamic\s+table\b", re.IGNORECASE), "drop table", "dynamic table -> table"),
     (re.compile(r"\balter\s+dynamic\s+table\s+(\S+)\s+(rename|swap)\b", re.IGNORECASE), r"alter table \1 \2", "dynamic table -> table"),
@@ -114,6 +106,8 @@ _NO_SUCH_COLUMN = re.compile(r'Binder Error: (?:Values list "[^"]*" does not hav
 _NOT_DATA_ERRORS = ("Binder Error", "Parser Error", "Catalog Error", "does not exist", "syntax error", "Not implemented",
                     "SQL compilation error", "INTERRUPT", "Interrupt", "timed out", "Duplicate row detected", _TWO_DATABASES)
 # DuckDB's word for text that is no number, and Snowflake's (fakesnow answers 100035, Snowflake's for a timestamp)
+_NOT_A_TIME = re.compile(r'invalid (date|timestamp) field format: "([^"]*)"')
+_MANY_CLAUSES = re.compile(r"Found multiple '(\w+)' clauses\. Line (\d+), Col: (\d+)")
 _NOT_A_NUMBER = re.compile(r"Could not convert string (['\"])(.*?)\1 to (?:U?(?:TINY|SMALL|BIG|HUGE)?INT(?:EGER|8|16|32|64|128)?|DECIMAL[^ ]*|DOUBLE|FLOAT)\b", re.S)
 
 
@@ -276,6 +270,48 @@ def _session_warehouse(cursor, command, original):  # noqa: ANN001, ANN202
         account.use_warehouse(cursor, name[1:-1].replace('""', '"') if name.startswith('"') else name.upper())
     semantics.SESSION["CurrentWarehouse"] = getattr(cursor._conn, "_fx_warehouse", None) or "LOCAL"
     return original(cursor, "select 'Statement executed successfully.' as \"status\"") if m else None
+
+
+_STATS_VERB = re.compile(r"(?is)^(?:\s|--[^\n]*\n|/\*.*?\*/)*(insert|update|delete|merge|truncate|create)\b")
+_CTAS = re.compile(r'(?is)^(?:\s|--[^\n]*\n|/\*.*?\*/)*create\s+(?:or\s+replace\s+)?(?:(?:local|global|transient|temporary|temp)\s+)*table\s+'
+                   r'(?:if\s+not\s+exists\s+)?((?:"(?:[^"]|"")+"|[\w$]+)(?:\.(?:"(?:[^"]|"")+"|[\w$]+)){0,2})(?:(?!\bas\b).)*\bas\b')
+_TRUNCATE = re.compile(r'(?is)^(?:\s|--[^\n]*\n|/\*.*?\*/)*truncate\s+(?:table\s+)?(?:if\s+exists\s+)?((?:"(?:[^"]|"")+"|[\w$]+)(?:\.(?:"(?:[^"]|"")+"|[\w$]+)){0,2})')
+
+
+def _rows_now(cursor, name: str) -> int:  # noqa: ANN001
+    try:
+        return cursor._duck_conn.execute(f"select count(*) from {relations._sql_name(relations.qualified(cursor, name))}").fetchone()[0]
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _note_stats(cursor, command, truncated: int | None) -> None:  # noqa: ANN001
+    """What a DML statement did, as Snowflake reports it with the result (dbt reads rows_inserted and the like from it;
+    measured: an INSERT, UPDATE, DELETE, MERGE, a CREATE TABLE AS (its rows inserted) and a TRUNCATE (its rows deleted))."""
+    conn = cursor._conn
+    conn._fx_stats = None
+    m = _STATS_VERB.match(command) if isinstance(command, str) else None
+    if not m:
+        return
+    verb = m.group(1).lower()
+    stats = {"numRowsInserted": 0, "numRowsUpdated": 0, "numRowsDeleted": 0, "numDmlDuplicates": 0}
+    if verb == "create":
+        made = _CTAS.match(command)
+        if not made:
+            return
+        stats["numRowsInserted"] = _rows_now(cursor, made.group(1))
+    elif verb == "truncate":
+        stats["numRowsDeleted"] = truncated or 0
+    else:
+        table = getattr(cursor, "_arrow_table", None)
+        if table is None or table.num_rows == 0:
+            return
+        for name in table.column_names:
+            key = {"number of rows inserted": "numRowsInserted", "number of rows updated": "numRowsUpdated",
+                   "number of rows deleted": "numRowsDeleted"}.get(name.lower())
+            if key:
+                stats[key] += sum(int(v or 0) for v in table.column(name).to_pylist())
+    conn._fx_stats = stats
 
 
 def _session_zone(cursor, command) -> None:  # noqa: ANN001
@@ -833,6 +869,9 @@ CREATE OR REPLACE MACRO ${catalog}._fs_to_timestamp(val, scale) AS (
                 WHEN abs(try_cast(trim(val::VARCHAR) AS HUGEINT)) < 31536000000000 THEN try_cast(trim(val::VARCHAR) AS HUGEINT) * 1000
                 WHEN abs(try_cast(trim(val::VARCHAR) AS HUGEINT)) < 31536000000000000 THEN try_cast(trim(val::VARCHAR) AS HUGEINT)
                 ELSE try_cast(trim(val::VARCHAR) AS HUGEINT) // 1000 END)::BIGINT)
+        -- other text as Snowflake's AUTO reads it: an offset is dropped from the wall clock, US dates are dates
+        WHEN typeof(val) = 'VARCHAR' THEN coalesce(try_cast(_fs_global.main._tz_wall_in(val) AS TIMESTAMP),
+            try_strptime(trim(val::VARCHAR), ['%m/%d/%Y %H:%M:%S', '%m/%d/%Y %H:%M', '%m/%d/%Y']), CAST(val AS TIMESTAMP))
         ELSE CAST(val AS TIMESTAMP)
     END
 );
@@ -1035,6 +1074,8 @@ def _patch_fakesnow() -> None:
                 objects.remember(self)
                 return handled
             temporary = _temporary(self, command)
+            cut = _TRUNCATE.match(command) if isinstance(command, str) else None
+            truncated = _rows_now(self, cut.group(1)) if cut else None
             for _ in range(8):
                 try:
                     done = original(self, rewrite(command), *args, **kwargs)
@@ -1044,6 +1085,7 @@ def _patch_fakesnow() -> None:
                     objects.consume_streams(self, command)
                     objects.remember(self)
                     objects.note_secure_view(self, command)
+                    _note_stats(self, command, truncated)
                     relations.note(self, command)
                     _note_empty_lookup(self, command)
                     return done
@@ -1071,6 +1113,7 @@ def _patch_fakesnow() -> None:
             objects.consume_streams(self, command)
             objects.remember(self)
             objects.note_secure_view(self, command)
+            _note_stats(self, command, truncated)
             relations.note(self, command)
             return done
         except ProgrammingError as e:
@@ -1088,6 +1131,17 @@ def _patch_fakesnow() -> None:
                 self._sqlstate = "22018"
                 # (DuckDB's words kept after Snowflake's: the fitter reads the value and the type from them)
                 raise ProgrammingError(msg=f"Numeric value '{text[2]}' is not recognized\n{e.msg}", errno=100038, sqlstate="22018") from e
+            when = _NOT_A_TIME.search(str(e.msg)) if e.errno == 100035 else None
+            if when:  # Snowflake's words (measured: a date is 100040, a timestamp 100035), DuckDB's after them for the fitter
+                self._sqlstate = "22007"
+                kind = "Date" if when[1] == "date" else "Timestamp"
+                raise ProgrammingError(msg=f"{kind} '{when[2]}' is not recognized\n{e.msg}", errno=100040 if kind == "Date" else 100035,
+                                       sqlstate="22007") from e
+            many = _MANY_CLAUSES.search(str(e.msg)) if e.errno == 1003 else None
+            if many:  # Snowflake's parser stops at the second keyword: its line and 0-based position
+                self._sqlstate = "42000"
+                raise ProgrammingError(msg=f"SQL compilation error:\nsyntax error line {many[2]} at position "
+                                           f"{max(0, int(many[3]) - len(many[1]))} unexpected '{many[1].lower()}'.", errno=1003, sqlstate="42000") from e
             raise
         except Exception as e:  # noqa: BLE001
             tried = re.search(r"Function TRY_CAST cannot be used with arguments of type [^'\n]*", str(e))
@@ -1225,6 +1279,22 @@ def _patch_fakesnow() -> None:
     in_flight: dict[tuple[str, str], asyncio.Future] = {}
     handle = server.query_request
 
+    def _with_stats(request, response):  # noqa: ANN001, ANN202
+        """A DML statement's counts, in the reply as Snowflake gives them (`stats`: the connector's cursor.stats)."""
+        try:
+            conn = server.sessions.get(server.to_token(request))
+            stats = getattr(conn, "_fx_stats", None)
+            if not stats:
+                return response
+            body = json.loads(response.body)
+            if not body.get("success") or not isinstance(body.get("data"), dict):
+                return response
+            body["data"]["stats"] = stats
+            conn._fx_stats = None
+            return JSONResponse(body, status_code=response.status_code)
+        except Exception:  # noqa: BLE001 - the reply as it was
+            return response
+
     async def query_request(request):  # noqa: ANN001, ANN202
         request_id = request.query_params.get("requestId")
         key = (request.headers.get("Authorization", ""), request_id or "")
@@ -1237,6 +1307,7 @@ def _patch_fakesnow() -> None:
         future = in_flight[key] = loop.create_future()
         try:
             response = await handle(request)
+            response = _with_stats(request, response)
         except server.ServerError:
             raise
         except Exception as e:  # noqa: BLE001
