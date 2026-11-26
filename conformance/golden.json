@@ -847,12 +847,38 @@
    ]
   ]
  },
+ "case_json_path_beside_text": {
+  "rows": [
+   [
+    "instagram_business"
+   ]
+  ]
+ },
  "case_null": {
   "rows": [
    [
     "2",
     "2",
     "2"
+   ]
+  ]
+ },
+ "case_number_variant_beside_text": {
+  "rows": [
+   [
+    "5",
+    "a"
+   ]
+  ]
+ },
+ "case_variant_beside_text": {
+  "rows": [
+   [
+    "x",
+    "lit",
+    {
+     "a": 1
+    }
    ]
   ]
  },
@@ -6671,6 +6697,15 @@
     "0",
     null,
     "3"
+   ]
+  ]
+ },
+ "iff_nvl_variant_beside_text": {
+  "rows": [
+   [
+    "x",
+    "y",
+    "w"
    ]
   ]
  },

@@ -1335,6 +1335,44 @@ def _operand(node: exp.Expression) -> exp.Expression:
 
 
 _VARIANT_ACCESS = (exp.JSONExtract, exp.Bracket)
+
+
+def _variant_like(e: exp.Expression) -> bool:
+    return isinstance(e, (*_VARIANT_ACCESS, exp.ParseJSON)) or (isinstance(e, exp.Cast) and e.to.is_type("variant")) \
+        or (isinstance(e, exp.Anonymous) and e.name.upper() in ("TRY_PARSE_JSON", "PARSE_JSON", "TO_VARIANT", "GET", "GET_PATH"))
+
+
+def _text_like(e: exp.Expression) -> bool:
+    return (isinstance(e, exp.Literal) and e.is_string) or (isinstance(e, (exp.Cast, exp.TryCast)) and e.to.is_type("varchar", "text", "char")) \
+        or isinstance(e, (exp.Concat, exp.DPipe, exp.Upper, exp.Lower, exp.Trim, exp.Substring))
+
+
+def _text_beside_variant_branches(node: exp.Expression) -> None:
+    """CASE / IFF / NVL / NVL2 / COALESCE of a VARIANT and text is text in Snowflake (measured: `case when ... then
+    parse_json('"x"') else cast(null as varchar) end` is the VARCHAR x, without quotes; with 'lit' beside it, 'lit'): the
+    VARIANT branches give their value as text. DuckDB would make the text JSON, or quote the value."""
+    if isinstance(node, exp.Case):
+        slots = [(i, "true") for i in node.args.get("ifs") or []] + ([(node, "default")] if node.args.get("default") is not None else [])
+    elif isinstance(node, (exp.If, exp.Nvl2)):
+        slots = [(node, "true")] + ([(node, "false")] if node.args.get("false") is not None else [])
+    elif isinstance(node, exp.Coalesce):
+        slots = [(node, "this")] + [(node, ("expressions", k)) for k in range(len(node.expressions))]
+    else:
+        return
+
+    def get(owner, key):  # noqa: ANN001, ANN202
+        return owner.expressions[key[1]] if isinstance(key, tuple) else owner.args.get(key)
+
+    values = [get(o, k) for o, k in slots]
+    if not any(v is not None and _text_like(v) for v in values) or not any(v is not None and _variant_like(v) for v in values):
+        return
+    for (owner, key), value in zip(slots, values):
+        if value is not None and _variant_like(value):
+            wrapped = exp.Anonymous(this=_NS + "_sf_text", expressions=[value.copy()])
+            if isinstance(key, tuple):
+                owner.expressions[key[1]].replace(wrapped)
+            else:
+                owner.set(key, wrapped)
 _STRING_FUNCTIONS = (exp.Right, exp.Left, exp.Substring, exp.Upper, exp.Lower, exp.Trim, exp.Length, exp.RegexpReplace,
                      exp.RegexpExtract, exp.RegexpLike, exp.SplitPart, exp.Split, exp.StartsWith, exp.EndsWith, exp.Contains,
                      exp.Initcap, exp.Pad, exp.StrPosition, exp.Concat, exp.ConcatWs, exp.DPipe, exp.Reverse, exp.Repeat,
@@ -2603,6 +2641,7 @@ def _format_chosen_at_run_time(node: exp.Expression) -> exp.Expression | None:
 
 def rewrite(node: exp.Expression) -> exp.Expression:
     """Apply the fixes bottom-up, so nested cases (a ratio of averages) all get rewritten."""
+    _text_beside_variant_branches(node)
     if isinstance(node, exp.TryCast) and (
             (node.to.is_type("object", "map") and (isinstance(node.this, exp.Struct) or (
                 isinstance(node.this, exp.Anonymous) and node.this.name.upper() == "OBJECT_CONSTRUCT")))

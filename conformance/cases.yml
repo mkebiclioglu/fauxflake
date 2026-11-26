@@ -1260,3 +1260,7 @@
 - {id: h3_centre, sql: "select round(st_x(h3_cell_to_point(617700174198734847)), 12), round(st_y(h3_cell_to_point(617700174198734847)), 12), st_npoints(h3_cell_to_boundary(617700174198734847))"}
 - {id: try_cast_same_semi_kind, sql: "select try_cast({'Alberta':'Edmonton','Manitoba':'Winnipeg'} as object), try_cast(['a','b','c'] as array), try_cast([1,2,3] as array)"}
 - {id: try_cast_variant_to_object_refused, sql: "select try_cast(parse_json('{\"a\":1}') as object)"}
+- {id: case_variant_beside_text, sql: "select case when true then parse_json('\"x\"') else cast(null as varchar) end, case when false then parse_json('\"x\"') else 'lit' end, case when true then parse_json('{\"a\":1}') else cast(null as varchar) end"}
+- {id: iff_nvl_variant_beside_text, sql: "select iff(true, parse_json('\"x\"'), cast(null as varchar)), nvl(parse_json('\"y\"'), 'z'), nvl2(1, parse_json('\"w\"'), 'q')"}
+- {id: case_number_variant_beside_text, sql: "select case when true then parse_json('5') else 'a' end, case when true then 'a' else parse_json('5') end"}
+- {id: case_json_path_beside_text, sql: "select case when e in ('a') then try_parse_json(m)['schema'] else cast(null as varchar) end from (select 'a' e, '{\"schema\": \"instagram_business\"}' m)"}
