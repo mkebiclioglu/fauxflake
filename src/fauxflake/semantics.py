@@ -2603,6 +2603,14 @@ def _format_chosen_at_run_time(node: exp.Expression) -> exp.Expression | None:
 
 def rewrite(node: exp.Expression) -> exp.Expression:
     """Apply the fixes bottom-up, so nested cases (a ratio of averages) all get rewritten."""
+    if isinstance(node, exp.TryCast) and (
+            (node.to.is_type("object", "map") and (isinstance(node.this, exp.Struct) or (
+                isinstance(node.this, exp.Anonymous) and node.this.name.upper() == "OBJECT_CONSTRUCT")))
+            or (node.to.is_type("array") and (isinstance(node.this, exp.Array) or (
+                isinstance(node.this, exp.Anonymous) and node.this.name.upper() == "ARRAY_CONSTRUCT")))):
+        # TRY_CAST of an OBJECT to OBJECT, an ARRAY to ARRAY: the value itself (measured; a VARIANT is refused; dbt's unit
+        # tests write their fixtures so)
+        return rewrite(node.this)
     if isinstance(node, (exp.TsOrDsToDate, exp.StrToTime, exp.StrToDate, exp.TsOrDsToTimestamp)):
         chosen = _format_chosen_at_run_time(node)
         if chosen is not None:

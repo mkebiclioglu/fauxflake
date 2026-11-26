@@ -10337,6 +10337,29 @@
    ]
   ]
  },
+ "try_cast_same_semi_kind": {
+  "rows": [
+   [
+    {
+     "Alberta": "Edmonton",
+     "Manitoba": "Winnipeg"
+    },
+    [
+     "a",
+     "b",
+     "c"
+    ],
+    [
+     1,
+     2,
+     3
+    ]
+   ]
+  ]
+ },
+ "try_cast_variant_to_object_refused": {
+  "error": "001065 (22023): SQL compilation error:"
+ },
  "try_input_1": {
   "rows": [
    [

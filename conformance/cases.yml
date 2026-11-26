@@ -1258,3 +1258,5 @@
 - {id: h3_text_cells, sql: "select h3_cell_to_parent('892830924cfffff', 5), h3_string_to_int('892830924cfffff'), h3_is_valid_cell(617700174198734847), h3_is_valid_cell(5), h3_grid_distance(617700174198734847, 617700174198472703), h3_is_pentagon(617700174198734847)"}
 - {id: h3_neighbours, sql: "select h3_grid_disk(617700174198734847, 1), h3_cell_to_children(599685776145383423, 6)"}
 - {id: h3_centre, sql: "select round(st_x(h3_cell_to_point(617700174198734847)), 12), round(st_y(h3_cell_to_point(617700174198734847)), 12), st_npoints(h3_cell_to_boundary(617700174198734847))"}
+- {id: try_cast_same_semi_kind, sql: "select try_cast({'Alberta':'Edmonton','Manitoba':'Winnipeg'} as object), try_cast(['a','b','c'] as array), try_cast([1,2,3] as array)"}
+- {id: try_cast_variant_to_object_refused, sql: "select try_cast(parse_json('{\"a\":1}') as object)"}
