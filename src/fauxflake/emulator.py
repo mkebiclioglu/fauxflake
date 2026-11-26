@@ -1127,6 +1127,10 @@ def _patch_fakesnow() -> None:
                 self._sqlstate = "42S02"
                 raise ProgrammingError(msg=f"{e.raw_msg or e.msg}\nObject does not exist or not authorized.",
                                        errno=2003, sqlstate="42S02") from e
+            said = re.search(r"\x1ffxerr:(\d+):(\w+):(.*?)\x1f", str(e.msg), re.S)
+            if said:  # an error of Snowflake's, raised by one of the emulator's functions through a failing cast
+                self._sqlstate = said[2]
+                raise ProgrammingError(msg=said[3], errno=int(said[1]), sqlstate=said[2]) from e
             text = _NOT_A_NUMBER.search(str(e.msg)) if e.errno == 100035 else None
             if text:
                 self._sqlstate = "22018"

@@ -1609,6 +1609,14 @@
    ]
   ]
  },
+ "date_trunc_in_a_window_order": {
+  "rows": [
+   [
+    "2020-03-04",
+    "1"
+   ]
+  ]
+ },
  "date_trunc_units": {
   "rows": [
    [

@@ -1264,3 +1264,4 @@
 - {id: iff_nvl_variant_beside_text, sql: "select iff(true, parse_json('\"x\"'), cast(null as varchar)), nvl(parse_json('\"y\"'), 'z'), nvl2(1, parse_json('\"w\"'), 'q')"}
 - {id: case_number_variant_beside_text, sql: "select case when true then parse_json('5') else 'a' end, case when true then 'a' else parse_json('5') end"}
 - {id: case_json_path_beside_text, sql: "select case when e in ('a') then try_parse_json(m)['schema'] else cast(null as varchar) end from (select 'a' e, '{\"schema\": \"instagram_business\"}' m)"}
+- {id: date_trunc_in_a_window_order, sql: "select d, row_number() over (order by date_trunc('year', d)) from (select '2020-03-04'::date d)"}

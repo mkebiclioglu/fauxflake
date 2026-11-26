@@ -387,8 +387,10 @@ MACROS = zoned.MACROS + [
     # A date or time in a VARIANT keeps its type: its text, with the character at the type's place (TIMESTAMP_TZ 1,
     # _LTZ 2, _NTZ 3, DATE 4, TIME 5) written as a JSON escape. Every reader decodes it to the same text; TYPEOF reads it
     # DATE_TRUNC, EXTRACT (YEAR, HOUR, DAYOFWEEK, ...) and LAST_DAY refuse text, as Snowflake does when it compiles
+    # (raised by a failing cast, which leaves the expression non-volatile: error() would keep it out of a window's ORDER BY)
     f"""create or replace macro {_NS}_sf_not_text(x, f) as case when typeof(x) = 'VARCHAR'
-          then error('SQL compilation error: Function ' || f || ' does not support VARCHAR argument type') else x end""",
+          then cast(chr(31) || 'fxerr:2016:22000:SQL compilation error: Function ' || f || ' does not support VARCHAR argument type'
+                    || chr(31) as date) else x end""",
     # an instant as text in the session's time zone: DuckDB's +00 / -08 / +05:30 written as Snowflake does (Z, -0800, +0530)
     f"""create or replace macro {_NS}_sf_ltz_text(t) as regexp_replace(regexp_replace(regexp_replace(
           strftime(t, '%Y-%m-%d %H:%M:%S.%g %z'), ' ([+-]\\d\\d)$', ' \\100'), ' ([+-]\\d\\d):(\\d\\d)$', ' \\1\\2'), ' \\+0000$', ' Z')""",
