@@ -1702,6 +1702,8 @@ def _patch_fakesnow() -> None:
             if getattr(self._conn, "_fauxflake_undo", None) is not None:
                 _undo_copy(self, tree)
             try:
+                if os.environ.get("FAUXFLAKE_MEMORY_LOG"):  # (the memory log names the statement a thread runs)
+                    RUNNING[threading.get_ident()] = tree.sql(dialect="duckdb")[:20000] if isinstance(tree, exp.Expression) else str(tree)[:20000]
                 original_execute(self, tree, params)
                 if merging:
                     _refuse_nondeterministic_merge(self, merging, "merge_candidates")
@@ -1978,14 +1980,35 @@ def _spill_directory(duck: duckdb.DuckDBPyConnection) -> str:
     return path
 
 
+RUNNING: dict[int, str] = {}  # thread -> the statement it last ran (for FAUXFLAKE_MEMORY_LOG)
+
+
 def _log_memory(duck, path: str) -> None:  # noqa: ANN001
     """Append DuckDB's own accounting (duckdb_memory(), by tag) and the process's resident size to `path`."""
     import resource
 
     probe = duck.cursor()
+    import faulthandler
+
+    def resident() -> int:  # the current resident size in MB (Linux /proc; elsewhere the peak)
+        try:
+            return int(open("/proc/self/statm").read().split()[1]) * os.sysconf("SC_PAGE_SIZE") // 1048576
+        except Exception:  # noqa: BLE001
+            return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1048576
+    last, dumped = [resident()], [0.0]
 
     def loop() -> None:
         while True:
+            now = resident()
+            high = int(os.environ.get("FAUXFLAKE_MEMORY_LOG_STACKS_MB", "8000"))
+            if (now - last[0] > 2048 or now > high) and time.monotonic() - dumped[0] > 20:  # what every thread is doing
+                dumped[0] = time.monotonic()
+                with open(path + ".stacks", "a") as out:
+                    out.write(f"=== {time.strftime('%H:%M:%S')} {last[0]}MB -> {now}MB\n")
+                    faulthandler.dump_traceback(file=out, all_threads=True)
+                    for ident, sql in list(RUNNING.items()):
+                        out.write(f"--- thread {ident:#x} runs ({len(sql)} chars): {sql}\n")
+            last[0] = now
             try:
                 rows = probe.execute("select tag, memory_usage_bytes // 1048576, temporary_storage_bytes // 1048576 "
                                      "from duckdb_memory() where memory_usage_bytes > 50 * 1048576 or temporary_storage_bytes > 0 "
@@ -1997,7 +2020,7 @@ def _log_memory(duck, path: str) -> None:  # noqa: ANN001
             except Exception as e:  # noqa: BLE001
                 with open(path, "a") as out:
                     out.write(f"{time.strftime('%H:%M:%S')} probe failed: {e}\n")
-            time.sleep(10)
+            time.sleep(10 if os.environ.get("FAUXFLAKE_MEMORY_LOG_FAST") is None else 2)
 
     threading.Thread(target=loop, name="fauxflake-memory-log", daemon=True).start()
 
