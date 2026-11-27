@@ -2467,6 +2467,18 @@ class Fitter:
         self.dirty |= changed
         return changed
 
+    def made_up_text_parsed(self, sql_key: str, message: str) -> bool:
+        """`Error parsing JSON: unknown keyword "context_feature_skus_3bb8..."`: Snowflake's message names no column, but
+        the made-up value names the one it was made for. The model (or a view it reads) parses it, so it holds
+        documents: arrays where the SQL makes an array of it (`parse_json(...)::array`, `array_size`), else objects."""
+        m = re.search(r'Error parsing JSON: unknown keyword "(?P<col>[a-z][a-z0-9_]*)_[0-9a-f]{12}"', message)
+        if not m:
+            return False
+        name = m.group("col").upper()
+        code = self.sql_of.get(sql_key, "").lower()
+        as_array = bool(re.search(rf"{name.lower()}\b[^;]{{0,80}}?\)\s*::\s*array|array_size\(", code))
+        return self.retype_column(sql_key, name, "ARRAY" if as_array else "VARIANT", direct=True, made_up=True)
+
     def text_to_a_time_function(self, sql_key: str, message: str) -> bool:
         """`Function DATE_TRUNC does not support VARCHAR argument type`: Snowflake refuses text given to DATE_TRUNC,
         EXTRACT, DATE_PART or LAST_DAY when it compiles, and the message names no column. Every column the model gives
@@ -2830,7 +2842,7 @@ class Fitter:
         if self.runaway(sql_key, message) or self.looked_for(sql_key) or self.jinja_columns(sql_key, message) \
                 or self.ambiguous_column(sql_key, message) or self.aggregate_out_of_place(sql_key, message):
             return True
-        if self.text_to_a_time_function(sql_key, message):
+        if self.text_to_a_time_function(sql_key, message) or self.made_up_text_parsed(sql_key, message):
             return True
         if self.udf_input(sql_key, message) or self.pivot_values(sql_key, message) or self.pivoted_upstream(sql_key, message) \
                 or self.missing_column(sql_key, message) or self.missing_relation(sql_key, message) \

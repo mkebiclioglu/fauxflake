@@ -1042,3 +1042,15 @@ def test_text_given_to_date_trunc_makes_every_such_column_a_time_at_once():
     f.retype_column = lambda uid, name, hint, *a, **k: asked.append((uid, name, hint)) or True
     assert f._learn("m", "002016 (22000): SQL compilation error: Function DATE_TRUNC does not support VARCHAR argument type")
     assert sorted(asked) == [("m", "DUE", "TIMESTAMP"), ("m", "RECEIVED_AT", "TIMESTAMP"), ("m", "SENT_AT", "TIMESTAMP")]
+
+
+def test_made_up_text_a_model_parses_as_json_becomes_documents():
+    f = fitter(sql_of={"m": "select count_if(array_size(feature_skus) > 0) from stg"})
+    asked = []
+    f.retype_column = lambda uid, name, hint, *a, **k: asked.append((name, hint, k)) or True
+    assert f._learn("m", '100069 (22P02): Error parsing JSON: unknown keyword "context_feature_skus_c249c3fdd2c9", pos 34')
+    assert asked == [("CONTEXT_FEATURE_SKUS", "ARRAY", {"direct": True, "made_up": True})]
+    f.sql_of = {"m": "select parse_json(payload):kind from t"}
+    asked.clear()
+    assert f._learn("m", 'Error parsing JSON: unknown keyword "payload_0123456789ab", pos 1')
+    assert asked[0][:2] == ("PAYLOAD", "VARIANT")
