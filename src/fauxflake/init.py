@@ -3627,7 +3627,7 @@ def _fit(project, path: Path, database: str, emu, manifest: dict, analysis: Anal
     # columns), and the tests that fail on the data as it is are reported. FAUXFLAKE_FIT_TESTS=1 also learns from them
     fitter.models_only = not os.environ.get("FAUXFLAKE_FIT_TESTS")
     summary = {} if os.environ.get("FAUXFLAKE_FIT_NO_BUILD") else fitter.learn_from_build(
-        project, analysis, rounds=30 if os.environ.get("FAUXFLAKE_FIT_TESTS") else 8)
+        project, analysis, rounds=30 if os.environ.get("FAUXFLAKE_FIT_TESTS") else 16)
     # a function the project creates itself (in a hook) needs no placeholder
     state = emu._fs.results_cache.get(objects._KEY)
     created = set(state.functions) if state else set()

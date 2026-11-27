@@ -504,12 +504,17 @@ def why(spec_path, project_dir, db_path, every, unique, models):
 @click.option("--force", is_flag=True, help="Overwrite an existing spec.")
 @click.option("--fit/--no-fit", default=True, show_default=True,
               help="Try the spec out (run the models, build the project) and learn from what fails.")
-def init(spec_path, project_dir, database, force, fit):
+@click.option("--fit-tests", is_flag=True,
+              help="Also fit the data to the tests that fail on it (unique keys, accepted values, singular tests); by default they are reported.")
+def init(spec_path, project_dir, database, force, fit, fit_tests):
     """Write a spec from the dbt project itself, then fit it until the project builds.
     Needs no Snowflake access."""
     from pathlib import Path
 
     import os
+
+    if fit_tests:
+        os.environ["FAUXFLAKE_FIT_TESTS"] = "1"
 
     from .dbt import DbtProject, emulator_output
     from .emulator import serve
@@ -539,7 +544,9 @@ def init(spec_path, project_dir, database, force, fit):
 @main.command()
 @click.option("--spec", "spec_path", default="fauxflake.yml", show_default=True)
 @click.option("--project-dir", default=".", show_default=True)
-def fit(spec_path, project_dir):
+@click.option("--fit-tests", is_flag=True,
+              help="Also fit the data to the tests that fail on it (unique keys, accepted values, singular tests); by default they are reported.")
+def fit(spec_path, project_dir, fit_tests):
     """Bring the spec up to date with the project. Keeps what you edited.
 
     New sources and columns the models read are added, then the project is run on generated
@@ -559,6 +566,8 @@ def fit(spec_path, project_dir):
 
     from .init import production_target
 
+    if fit_tests:
+        os.environ["FAUXFLAKE_FIT_TESTS"] = "1"
     database = Spec.load(path).dbt.get("database", "ANALYTICS")  # also takes the target the spec records
     if not os.environ.get("FAUXFLAKE_TARGET") and production_target(project_dir):
         os.environ["FAUXFLAKE_TARGET"] = production_target(project_dir)  # the same target `init` fitted

@@ -3787,6 +3787,10 @@ class Fitter:
             else:
                 selected = ["--select", *[f"{name}+" for name in sorted(again)], *sorted(changed)]
             fresh = not selected
+            if n_round == rounds - 1 and not fresh:
+                # the last round is a full build on a fresh warehouse whatever is left: a partial round leaves out what
+                # it defers to that build, and reads tables earlier rounds left behind
+                selected, fresh = [], True
         self.recheck_expected(project)
         if not self.spec["dbt"].get("expected_failures"):
             self.spec["dbt"].pop("expected_failures", None)

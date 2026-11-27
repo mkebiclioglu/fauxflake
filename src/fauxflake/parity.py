@@ -11,6 +11,7 @@ import contextlib
 import json
 import re
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -882,13 +883,16 @@ def run(conn, wh: Warehouse, local: DbtProject, remote: DbtProject, start: datet
             built_here = (here, datetime.now(timezone.utc).replace(tzinfo=None))
             mine = outcomes(local)
             began = conn.cursor().execute("select sysdate()").fetchone()[0]
+            started_there = time.monotonic()
             with remote_session(renamed), _environment(remote_env):
                 remote.invoke(["build", *full, *chosen, *extra], schema=remote_schema, quiet=True)
+            took_there = time.monotonic() - started_there
             ended = conn.cursor().execute("select sysdate()").fetchone()[0]
             theirs = outcomes(remote)
         finally:
             os.environ.pop("FAUXFLAKE_TESTS_DO_NOT_BLOCK", None)
-        log(f"{now:%Y-%m-%d}  built on both engines")
+        took_here = (built_here[1] - built_here[0]).total_seconds()
+        log(f"{now:%Y-%m-%d}  built on both engines (dbt build: {took_here:.1f}s here, {took_there:.1f}s on Snowflake)")
         built = {uid for uid in mine if mine[uid][0] == "success" and theirs.get(uid, ("",))[0] == "success"}
         from . import emulator
 
