@@ -1059,7 +1059,29 @@ def _once(statement: str) -> str:
 
 # (_sf_list and the float-keeping readers name their argument up to eight times: ARRAY_SIZE(ARRAY_DISTINCT(ARRAY_CAT(...,
 # ARRAY_CAT(...)))) over three columns took Mattermost's spined model past 30 GB to bind)
-_READ_ONCE = ("_sf_text", "_sf_element", "_sf_object_keys", "_sf_typeof", "_sf_jv", "_sf_list", "_sf_floats", "_sf_get", "_sf_get_text",
+def _once_overloads(statement: str) -> str:
+    """_once for a macro of several signatures (`(o, k, v) as ..., (o, k, v, f) as ...`): each body reads its arguments once."""
+    m = re.match(r"(?s)(create or replace macro \S+?)\s*\n(\s*\(.*)$", statement)
+    if m is None:
+        return statement
+    parts = re.split(r",\n(?=\s*\([^()]*\) as )", m.group(2))
+    out = []
+    for part in parts:
+        sig = re.match(r"(?s)\s*\(([^()]*)\) as (.*)$", part)
+        if sig is None:
+            return statement
+        names = [a.strip().split()[0] for a in sig.group(1).split(",") if a.strip()]
+        body = sig.group(2)
+        for name in reversed(names):
+            body = f"list_extract(list_transform([{name}], lambda {name}: {body}), 1)"
+        out.append(f"          ({sig.group(1)}) as {body}")
+    return m.group(1) + "\n" + ",\n".join(out)
+
+
+# overloaded macros that name an argument several times and nest through lateral aliases (GitLab's GCP billing source
+# inserts into an object five times in a row, each insert reading the one before)
+_READ_ONCE_OVERLOADED = ("_sf_object_insert", "_sf_array_sort")
+_READ_ONCE = ("_sf_num_text", "_sf_int", "_sf_text", "_sf_element", "_sf_object_keys", "_sf_typeof", "_sf_jv", "_sf_list", "_sf_floats", "_sf_get", "_sf_get_text",
               "_sf_scalar_text", "_sf_json_doc", "_sf_array_distinct", "_sf_vector_in", "_sf_vector_reduce", "_sf_vector_avg", "_sf_vector_pair",
               "_sf_vector_cosine", "_sf_vector_l2", "_sf_vector_inner", "_sf_vector_l1")
 _AGGREGATES = re.compile(r"(?i)\b(sum|count|min|max|avg|list|array_agg|string_agg|bit_xor|bit_or|bit_and|first|last|any_value|approx_\w+|"
@@ -1083,6 +1105,7 @@ def _mentions_twice(statement: str) -> bool:
 # every macro reads each argument once: DuckDB writes an argument out at each mention, so a macro nested in itself (or
 # in another that names its argument twice) grows exponentially as it binds, outside DuckDB's memory limit
 MACROS = [_once(m) if re.match(r"create or replace macro \S*\.(" + "|".join(_READ_ONCE) + r")\(", m) else m for m in MACROS]
+MACROS = [_once_overloads(m) if re.match(r"create or replace macro \S*\.(" + "|".join(_READ_ONCE_OVERLOADED) + r")\s*\n", m) else m for m in MACROS]
 
 _RENAMED = {  # Snowflake function -> macro, same arguments
     "width_bucket": "_sf_width_bucket",
@@ -2593,9 +2616,22 @@ def _number_texts(transformed: exp.Expression) -> None:
             continue
         if isinstance(arg, exp.Literal) and not re.fullmatch(r"\s*[+-]?[0-9]*\.?[0-9]*[eE]?\s*", arg.name):
             continue  # text that is not a number of this kind: as it is
-        fixed = _fn("_sf_num_text", arg.copy())
-        cast.replace(exp.Case(ifs=[exp.If(this=exp.Not(this=exp.Is(this=fixed.copy(), expression=exp.Null())),
-                                          true=cast.__class__(this=fixed, to=cast.to.copy()))], default=cast.copy()))
+        once = not isinstance(arg, (exp.Column, exp.Literal)) and not arg.find(exp.AggFunc, exp.Window, exp.Select) \
+            and not (isinstance(arg, exp.Column) and arg.name == "_fx_n")
+        source = exp.column("_fx_n") if once else arg  # (read once: the text is named three times, and an alias
+        fixed = _fn("_sf_num_text", source.copy())    # chain or nested VARIANT reads grew with each mention)
+        case = exp.Case(ifs=[exp.If(this=exp.Not(this=exp.Is(this=fixed.copy(), expression=exp.Null())),
+                                    true=cast.__class__(this=fixed, to=cast.to.copy()))],
+                        default=cast.__class__(this=source.copy(), to=cast.to.copy()))
+        if once:  # (built, not parsed back from SQL: `v -> '$.d' -> '$[1]'` reads back grouped the other way)
+            template = sqlglot.parse_one("list_extract(list_transform([_fx_arg], lambda _fx_n: _fx_body), 1)", read="duckdb")
+            for col in list(template.find_all(exp.Column)):
+                if col.name == "_fx_arg":
+                    col.replace(arg.copy())
+                elif col.name == "_fx_body":
+                    col.replace(case)
+            case = template
+        cast.replace(case)
 
 
 def _undefined_in_arrays(transformed: exp.Expression) -> None:

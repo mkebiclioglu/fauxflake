@@ -7898,6 +7898,32 @@
    ]
   ]
  },
+ "number_cast_of_aggregate_and_window": {
+  "rows": [
+   [
+    "1",
+    "5",
+    "5",
+    "5"
+   ],
+   [
+    "1",
+    "6",
+    "6",
+    "5"
+   ]
+  ]
+ },
+ "number_cast_of_variant_reads_once": {
+  "rows": [
+   [
+    "7",
+    "1.26",
+    "3",
+    null
+   ]
+  ]
+ },
  "number_cast_to_timestamp": {
   "rows": [
    [
@@ -8365,6 +8391,22 @@
      "x": 1,
      "y": 2
     }
+   ]
+  ]
+ },
+ "object_insert_chain_then_cast": {
+  "rows": [
+   [
+    {
+     "credits": [
+      1,
+      2,
+      3
+     ],
+     "x": 1
+    },
+    "1",
+    "1"
    ]
   ]
  },
