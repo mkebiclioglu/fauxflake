@@ -3491,6 +3491,38 @@ def offsets_as_written(transformed: exp.Expression, message: str) -> exp.Express
     return transformed if changed else None
 
 
+def _stars_written_out(select: exp.Select, conn) -> bool:  # noqa: ANN001
+    """`base.*, case ... end as offer_type_wip, ...`: before the select is split into levels, each `t.*` (and a lone
+    `*` over one relation) becomes the columns it stands for, so the helper columns of the levels stay hidden. False
+    when a star cannot be written out (EXCLUDE/REPLACE, `*` over a join, a relation that binds only in its place)."""
+    stars = [p for p in select.expressions if isinstance(p, exp.Star) or (isinstance(p, exp.Column) and isinstance(p.this, exp.Star))]
+    if not stars:
+        return True
+    out: list[exp.Expression] = []
+    for p in select.expressions:
+        if p not in stars:
+            out.append(p)
+            continue
+        star = p if isinstance(p, exp.Star) else p.this
+        if any(star.args.get(k) for k in ("except_", "replace", "rename", "ilike")):
+            return False
+        table = p.table if isinstance(p, exp.Column) else ""
+        if not table and select.args.get("joins"):
+            return False
+        probe = exp.Select(expressions=[p.copy()])
+        probe.set("from_", select.args["from_"].copy())
+        if select.args.get("joins"):
+            probe.set("joins", [j.copy() for j in select.args["joins"]])
+        try:
+            names = [row[0] for row in conn.execute("describe " + _cte_prefix(select) + probe.sql(dialect="duckdb")).fetchall()]
+        except Exception:  # noqa: BLE001 - binds only in its context
+            return False
+        out += [exp.column(n, table=exp.to_identifier(table, quoted=p.args["table"].quoted) if table else None, quoted=True)
+                for n in names]
+    select.set("expressions", out)
+    return True
+
+
 def shared_aliases(transformed: exp.Expression, conn, limit: int = 20_000) -> exp.Expression:  # noqa: ANN001
     """`a + 1 AS b, b * 2 AS c, b + c AS d`: Snowflake computes each column once. DuckDB writes every
     reference out again, so a long chain of columns built on each other (scores made of weights
@@ -3513,6 +3545,12 @@ def shared_aliases(transformed: exp.Expression, conn, limit: int = 20_000) -> ex
             size[i] = sum(1 for _ in projection.walk()) + sum(size[j] for j in refs[i])
         if max(size) < limit:
             continue
+        if not _stars_written_out(select, conn):
+            continue
+        index = {}
+        for i, projection in enumerate(select.expressions):
+            if isinstance(projection, exp.Alias):
+                index.setdefault(projection.alias.upper(), i)
         outside = [select.args[k] for k in ("qualify", "order") if select.args.get(k) is not None]
         if any(p.find(exp.Star, exp.Select) for p in [*select.expressions, *outside]):
             continue  # a star would show the helper columns; a subquery reads the tables by their names

@@ -586,3 +586,22 @@ def test_flatten_numbers_each_element_by_its_place_over_a_large_table(emu):
     cur.execute("select count(*), count_if(value::int <> id * 10 + index), count_if(path <> '[' || index || ']') "
                 "from big, lateral flatten(input => arr)")
     assert cur.fetchone() == (900000, 0, 0)
+
+
+def test_a_chain_of_aliases_beside_a_star_is_computed_once(emu):
+    import time
+
+    emu.ensure_database("ANALYTICS", "CI")
+    cur = emu._fs.connect(database="ANALYTICS", schema="CI").cursor()
+    cur.execute("create or replace table tp as select 'Web Form' as kind, 'gitlab.com/x/ebook' as url, 'Event' as channel, 1 as id")
+    cur.execute("create or replace table cp as select 1 as cid, 'Survey' as type")
+    # GitLab's prep_crm_touchpoint: base.*, a long CASE, a CASE that names it six times, one that names that ten times
+    wip = "case " + " ".join(f"when kind = 'k{i}' or lower(url) like '%p{i}%' then 'v{i}'" for i in range(30)) + " else 'Online Content' end"
+    offer = "case " + " ".join(f"when wip = 'Online Content' and url like '%w{i}%' then 'o{i}'" for i in range(6)) + " else wip end"
+    grouped = "case " + " ".join(f"when offer = 'g{i}' or channel = 'c{i}' then 'G{i}'" for i in range(10)) + " else 'Other' end"
+    started = time.monotonic()
+    cur.execute(f"select tp.*, {wip} as wip, {offer} as offer, {grouped} as grouped from tp left join cp on tp.id = cp.cid")
+    names = [d[0] for d in cur.description]
+    assert names == ["KIND", "URL", "CHANNEL", "ID", "WIP", "OFFER", "GROUPED"]
+    assert cur.fetchall() == [("Web Form", "gitlab.com/x/ebook", "Event", 1, "Online Content", "Online Content", "Other")]
+    assert time.monotonic() - started < 20
