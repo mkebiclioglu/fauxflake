@@ -2467,6 +2467,36 @@ class Fitter:
         self.dirty |= changed
         return changed
 
+    def hash_beside_numbers_in_a_union(self, sql_key: str, message: str) -> bool:
+        """`Could not convert string '5685...2ab6c' to INT64`, in a model that reads a `union_relations` model:
+        dbt_utils casts each column to the type the first table gives it, and a column one stacked table generates as
+        hashes (an id) was made up as numbers in its sister tables. Stacked tables share a shape: the column is text
+        in every one of them, made as the table that knew it was."""
+        if not re.search(r"Could not convert string '[0-9a-f]{32}' to (?:INT\d*|DOUBLE|FLOAT|DECIMAL|BIGINT)", message):
+            return False
+        reads = {_fq(self.nodes[a]["relation_name"]) for a in [sql_key, *self._ancestors(sql_key)]
+                 if (self.nodes.get(a) or {}).get("relation_name")}
+        changed = False
+        for fq, members in self.unions.items():
+            if fq not in reads:
+                continue
+            held = [t for t in members if t in self.tables]
+            names = {c for t in held for c in (self.tables[t].get("columns") or {})}
+            for name in sorted(names):
+                gens = {t: self.tables[t]["columns"].get(name) for t in held if (self.tables[t].get("columns") or {}).get(name)}
+                hashed = next((g for g in gens.values() if g.get("gen") == "hash_id"), None)
+                made_up = [t for t, g in gens.items() if g.get("gen") in ("dist", "sequence")
+                           and str(g.get("type", "BIGINT")).upper() in ("BIGINT", "DOUBLE", "INTEGER") and not g.get("ref")]
+                if hashed is None or not made_up:
+                    continue
+                for t in made_up:
+                    self.tables[t]["columns"][name] = copy.deepcopy(hashed)
+                    self.retyped.add(t)
+                changed = True
+                self.learned.append(f"{fq}: {name} holds hashes in one of the tables it unions and made-up numbers in "
+                                    f"{len(made_up)} others; generated as hashes in all of them.")
+        return changed
+
     def made_up_text_parsed(self, sql_key: str, message: str) -> bool:
         """`Error parsing JSON: unknown keyword "context_feature_skus_3bb8..."`: Snowflake's message names no column, but
         the made-up value names the one it was made for. The model (or a view it reads) parses it, so it holds
@@ -2842,7 +2872,8 @@ class Fitter:
         if self.runaway(sql_key, message) or self.looked_for(sql_key) or self.jinja_columns(sql_key, message) \
                 or self.ambiguous_column(sql_key, message) or self.aggregate_out_of_place(sql_key, message):
             return True
-        if self.text_to_a_time_function(sql_key, message) or self.made_up_text_parsed(sql_key, message):
+        if self.text_to_a_time_function(sql_key, message) or self.made_up_text_parsed(sql_key, message) \
+                or self.hash_beside_numbers_in_a_union(sql_key, message):
             return True
         if self.udf_input(sql_key, message) or self.pivot_values(sql_key, message) or self.pivoted_upstream(sql_key, message) \
                 or self.missing_column(sql_key, message) or self.missing_relation(sql_key, message) \

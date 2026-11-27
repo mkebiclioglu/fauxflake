@@ -1054,3 +1054,16 @@ def test_made_up_text_a_model_parses_as_json_becomes_documents():
     asked.clear()
     assert f._learn("m", 'Error parsing JSON: unknown keyword "payload_0123456789ab", pos 1')
     assert asked[0][:2] == ("PAYLOAD", "VARIANT")
+
+
+def test_a_hash_beside_made_up_numbers_in_stacked_tables_makes_them_all_hashes():
+    # Mattermost's base_mattermost2__tracks: union_relations casts ID to the first table's NUMBER; SERVER's ids are hashes
+    f = fitter(nodes={"model.p.agg": {"relation_name": "ANALYTICS.CI.AGG"}, "model.p.tracks": {"relation_name": "ANALYTICS.CI.TRACKS"}},
+               tables={"RAW.M.A": {"columns": {"ID": {"gen": "dist", "type": "BIGINT", "p": [0, 1], "v": [1, 1000]}}},
+                       "RAW.M.B": {"columns": {"ID": {"gen": "sequence"}}},
+                       "RAW.M.SERVER": {"columns": {"ID": {"gen": "hash_id"}}}})
+    f.unions = {"ANALYTICS.CI.TRACKS": ["RAW.M.A", "RAW.M.B", "RAW.M.SERVER"]}
+    f._ancestors = lambda uid: {"model.p.tracks"}
+    assert f._learn("model.p.agg", "Conversion Error: Could not convert string '56854494788f30d5fef7149e03d2ab6c' to INT64 "
+                                   "when casting from source column x")
+    assert all(f.tables[t]["columns"]["ID"] == {"gen": "hash_id"} for t in ("RAW.M.A", "RAW.M.B", "RAW.M.SERVER"))
