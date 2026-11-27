@@ -3523,6 +3523,28 @@ def _stars_written_out(select: exp.Select, conn) -> bool:  # noqa: ANN001
     return True
 
 
+MACRO_NODES, MACRO_COPIES = 40, 4  # about what an emulator macro's body adds, and how often it names an argument
+
+
+def _emulator_macro(node: exp.Expression) -> bool:
+    """`_FS_GLOBAL.MAIN._SF_EQ(a, b)`: a call of one of the emulator's macros, which DuckDB writes out where it is used."""
+    if isinstance(node, exp.Anonymous):  # as the emulator builds it, `this` names the macro in full
+        return isinstance(node.this, str) and node.this.lower().startswith("_fs_global.")
+    return isinstance(node, exp.Dot) and isinstance(node.expression, exp.Anonymous) \
+        and node.this.sql(dialect="duckdb").upper().startswith("_FS_GLOBAL")
+
+
+def _macro_copies(column: exp.Expression, within: exp.Expression) -> int:
+    """How many times DuckDB writes `column` out where it stands: a macro names its argument several times
+    (`_SF_EQ` reads each side in every branch of its CASE), and a macro inside a macro multiplies that."""
+    copies, node = 1, column.parent
+    while node is not None and node is not within.parent:
+        if _emulator_macro(node):
+            copies *= MACRO_COPIES
+        node = node.parent
+    return copies
+
+
 def shared_aliases(transformed: exp.Expression, conn, limit: int = 20_000) -> exp.Expression:  # noqa: ANN001
     """`a + 1 AS b, b * 2 AS c, b + c AS d`: Snowflake computes each column once. DuckDB writes every
     reference out again, so a long chain of columns built on each other (scores made of weights
@@ -3535,14 +3557,16 @@ def shared_aliases(transformed: exp.Expression, conn, limit: int = 20_000) -> ex
         index: dict[str, int] = {}
         refs: list = []
         for i, projection in enumerate(select.expressions):  # every use counts: each one is written out again
-            refs.append([index[c.name.upper()] for c in projection.find_all(exp.Column) if not c.table and c.name.upper() in index])
+            refs.append([(index[c.name.upper()], _macro_copies(c, projection)) for c in projection.find_all(exp.Column)
+                         if not c.table and c.name.upper() in index])
             if isinstance(projection, exp.Alias):
                 index.setdefault(projection.alias.upper(), i)
         if not any(refs):
             continue
         size = [0] * len(select.expressions)
         for i, projection in enumerate(select.expressions):
-            size[i] = sum(1 for _ in projection.walk()) + sum(size[j] for j in refs[i])
+            size[i] = sum(MACRO_NODES if _emulator_macro(n) else 1 for n in projection.walk()) \
+                + sum(copies * size[j] for j, copies in refs[i])
         if max(size) < limit:
             continue
         if not _stars_written_out(select, conn):

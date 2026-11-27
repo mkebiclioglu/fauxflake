@@ -605,3 +605,30 @@ def test_a_chain_of_aliases_beside_a_star_is_computed_once(emu):
     assert names == ["KIND", "URL", "CHANNEL", "ID", "WIP", "OFFER", "GROUPED"]
     assert cur.fetchall() == [("Web Form", "gitlab.com/x/ebook", "Event", 1, "Online Content", "Online Content", "Other")]
     assert time.monotonic() - started < 20
+
+
+def test_a_chain_of_aliases_compared_through_macros_beside_a_cte_star_is_computed_once(emu):
+    import time
+
+    emu.ensure_database("ANALYTICS", "CI")
+    cur = emu._fs.connect(database="ANALYTICS", schema="CI").cursor()
+    cur.execute("create or replace table tp as select 'Web Form' as kind, 'gitlab.com/x/ebook.html' as url, 'Event' as channel, 1 as cid, 'FALSE' as deleted")
+    cur.execute("create or replace table mapping as select 'gitlab.com/x/ebook' as mapped_url, 'eBook' as content_type")
+    cur.execute("create or replace table cp as select 1 as id, 'Survey' as type")
+    # GitLab's prep_crm_touchpoint as it reaches the chain: base.* over a DISTINCT CTE that joins on its own alias, and
+    # comparisons of the chain's columns the emulator makes through its macros (each names its argument several times)
+    wip = "case " + " ".join(f"when kind = 'k{i}' or url_clean like '%p{i}%' then 'v{i}'" for i in range(12)) + " else 'Online Content' end"
+    offer = "case when content_type is not null then content_type " \
+        + " ".join(f"when wip = 'Online Content' and url_clean like '%w{i}%' then 'o{i}'" for i in range(6)) + " else wip end"
+    grouped = "case " + " ".join(f"when channel = 'c{i}' or offer = 'g{i}' then 'G{i}'" for i in range(10)) + " else 'Other' end"
+    started = time.monotonic()
+    cur.execute(f"""with source as (select * from tp where deleted = 'FALSE'),
+        base as (select distinct source.*, lower(url) as url_prep, replace(url_prep, '.html', '') as url_clean, content_type, cp.type
+                 from source left join mapping on url_clean = mapped_url left join cp on source.cid = cp.id),
+        final as (select base.*, {wip} as wip, {offer} as offer, {grouped} as grouped from base)
+        select * from final""")
+    rows = cur.fetchall()
+    assert [d[0] for d in cur.description][-3:] == ["WIP", "OFFER", "GROUPED"]
+    assert rows == [("Web Form", "gitlab.com/x/ebook.html", "Event", 1, "FALSE", "gitlab.com/x/ebook.html", "gitlab.com/x/ebook",
+                     "eBook", "Survey", "Online Content", "eBook", "Other")]
+    assert time.monotonic() - started < 20
