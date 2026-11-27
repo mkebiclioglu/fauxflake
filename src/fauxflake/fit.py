@@ -2467,6 +2467,28 @@ class Fitter:
         self.dirty |= changed
         return changed
 
+    def text_to_a_time_function(self, sql_key: str, message: str) -> bool:
+        """`Function DATE_TRUNC does not support VARCHAR argument type`: Snowflake refuses text given to DATE_TRUNC,
+        EXTRACT, DATE_PART or LAST_DAY when it compiles, and the message names no column. Every column the model gives
+        to one of them holds times; those generated as text become times, all at once."""
+        m = re.search(r"Function (?:DATE_TRUNC|EXTRACT|LAST_DAY|DATE_PART)\w* does not support VARCHAR", message)
+        tree = self.tree(sql_key) if m else None
+        if tree is None:
+            return False
+        from .semantics import _EXTRACTS
+
+        names: list[str] = []
+        for node in tree.find_all(exp.TimestampTrunc, exp.DateTrunc, exp.Extract, exp.LastDay, *_EXTRACTS):
+            arg = node.args.get("expression" if isinstance(node, exp.Extract) else "this")
+            while isinstance(arg, exp.Paren):
+                arg = arg.this
+            if isinstance(arg, exp.Column) and not isinstance(arg.this, exp.Star) and arg.name.upper() not in names:
+                names.append(arg.name.upper())
+        changed = False
+        for name in names:
+            changed = self.retype_column(sql_key, name, "TIMESTAMP") or changed
+        return changed
+
     def ambiguous_column(self, sql_key: str, message: str) -> bool:
         """Two joined tables both have a column the model reads without saying from which. In the real
         warehouse only one has it: the one the model also names it with (`opp.end_date`). The other
@@ -2807,6 +2829,8 @@ class Fitter:
             return True
         if self.runaway(sql_key, message) or self.looked_for(sql_key) or self.jinja_columns(sql_key, message) \
                 or self.ambiguous_column(sql_key, message) or self.aggregate_out_of_place(sql_key, message):
+            return True
+        if self.text_to_a_time_function(sql_key, message):
             return True
         if self.udf_input(sql_key, message) or self.pivot_values(sql_key, message) or self.pivoted_upstream(sql_key, message) \
                 or self.missing_column(sql_key, message) or self.missing_relation(sql_key, message) \

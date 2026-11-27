@@ -1526,3 +1526,20 @@ def test_dbt_first_runs_its_commands_before_each_build(tmp_path, monkeypatch):
     assert project.invoke(["build"]) and ran == ["seed", "build"]
     ran.clear()
     assert project.invoke(["test"]) and ran == ["test"]
+
+
+def test_a_bare_column_beside_a_join_with_a_cte_that_writes_its_columns_out_is_the_sources():
+    from fauxflake.init import SourceUse, scan_model
+
+    # Mattermost's server_fact: the CTE gives server_id, max_time and max_date; everything else is the source's
+    sources = {"RAW.T.ACTIVITY": SourceUse()}
+    out = scan_model("""
+        with max_time as (select user_id as server_id, max(timestamp) as max_time, max(timestamp::date) as max_date
+                          from raw.t.activity group by 1),
+        activity as (select user_id, public_channels, public_channels_deleted, context_ip, max_time
+                     from raw.t.activity s1 join max_time s2 on s1.user_id = s2.server_id and s1.timestamp = s2.max_time)
+        select user_id, public_channels - public_channels_deleted as channels, context_ip, max_time from activity""", sources)
+    columns = sources["RAW.T.ACTIVITY"].columns
+    assert {"PUBLIC_CHANNELS", "PUBLIC_CHANNELS_DELETED", "CONTEXT_IP", "USER_ID", "TIMESTAMP"} <= set(columns)
+    assert "MAX_TIME" not in columns and "MAX_DATE" not in columns  # the CTE's own
+    assert out["CONTEXT_IP"] == ("RAW.T.ACTIVITY", "CONTEXT_IP")

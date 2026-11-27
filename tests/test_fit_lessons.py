@@ -1033,3 +1033,12 @@ def test_a_lesson_about_a_column_keeps_the_rules_about_its_rows():
     tables["RAW.T.SERVER"]["columns"]["INSTALLATION"].pop("template")
     assert f.learn_from_test(test, places)
     assert tables["RAW.T.SERVER"]["columns"]["INSTALLATION"]["null_unless"] == rule
+
+
+def test_text_given_to_date_trunc_makes_every_such_column_a_time_at_once():
+    f = fitter(trees={"m": parse("select date_trunc('hour', received_at) h, extract(day from (sent_at)), last_day(d.due), "
+                                 "date_trunc('day', received_at) from t join d on true")})
+    asked = []
+    f.retype_column = lambda uid, name, hint, *a, **k: asked.append((uid, name, hint)) or True
+    assert f._learn("m", "002016 (22000): SQL compilation error: Function DATE_TRUNC does not support VARCHAR argument type")
+    assert sorted(asked) == [("m", "DUE", "TIMESTAMP"), ("m", "RECEIVED_AT", "TIMESTAMP"), ("m", "SENT_AT", "TIMESTAMP")]

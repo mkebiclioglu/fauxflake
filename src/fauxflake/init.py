@@ -474,6 +474,23 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
         others = {a.upper() for a in selected} - set(direct) - laterals
         only = next(iter(direct.values())) if len(direct) == 1 and not renames and not others else None
 
+        def names_given(src) -> set[str] | None:  # noqa: ANN001
+            """Every name a CTE or subquery gives (None when a `*` leaves some unsaid)."""
+            inner = getattr(src, "expression", None)
+            while isinstance(inner, exp.SetOperation):
+                inner = inner.this
+            if not isinstance(inner, exp.Select) or any(isinstance(p, exp.Star) or (
+                    isinstance(p, exp.Column) and isinstance(p.this, exp.Star)) for p in inner.expressions):
+                return None
+            return {p.alias_or_name.upper() for p in inner.expressions}
+
+        # `from source s1 join max_time s2 on ...` and an unqualified `public_channels`: next to one source read whole,
+        # relations whose every column is known (CTEs and subqueries that write theirs out), a name none of them
+        # gives is the source's
+        closed = {a.upper(): names_given(src) for a, src in selected.items() if a.upper() not in direct and a.upper() not in laterals}
+        sole = next(iter(direct)) if len(direct) == 1 and closed and all(v is not None for v in closed.values()) else None
+        given_beside = set().union(*closed.values()) if sole else set()
+
         # `metadata$filename as _filename, split(_filename, '/')`: the second use is the alias, not a column
         aliases = {p.alias.upper(): p.this for p in select.expressions if isinstance(p, exp.Alias)
                    and not any(c.name.upper() == p.alias.upper() for c in p.this.find_all(exp.Column))}
@@ -502,7 +519,12 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 return through_star(next(iter(renames.values())), col.name.upper())
             if not table:  # next to a join: the one relation known to write a column of that name
                 having = [r for r in renames.values() if col.name.upper() in r and col.name.upper() != _PATHS]
-                return having[0][col.name.upper()] if len(having) == 1 else None
+                if len(having) == 1:
+                    return having[0][col.name.upper()]
+                if not having and sole and col.name.upper() not in given_beside:
+                    if col.name.upper() in explicit.get(sole, ()):
+                        return explicit[sole][col.name.upper()]
+                    return None if col.name.upper() in added.get(sole, ()) else (direct[sole], col.name.upper())
             return None
 
         def through_star(known: dict, name: str):  # noqa: ANN202
@@ -688,7 +710,7 @@ def scan_model(sql: str, sources: dict[str, SourceUse],
                 # an unqualified column next to a join: the one relation known to write it (were it also a
                 # column of a table read whole beside it, the SQL would not say which it meant)
                 having = [a for a in plain if name in path_maps.get(a, ()) or name in renames.get(a, ())]
-                owner = having[0] if len(having) == 1 else ""
+                owner = having[0] if len(having) == 1 else sole if not having and sole and name not in given_beside else ""
             if name in path_maps.get(owner, ()):
                 return path_maps[owner][name]
             hit = resolve(node)
