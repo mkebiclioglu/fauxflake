@@ -1452,6 +1452,14 @@
    ]
   ]
  },
+ "cte_column_list_over_repeated_names": {
+  "rows": [
+   [
+    "1",
+    "1"
+   ]
+  ]
+ },
  "cte_reuse": {
   "rows": [
    [
@@ -1851,6 +1859,24 @@
    [
     "2",
     "only"
+   ]
+  ]
+ },
+ "distinct_variant_beside_constant_number": {
+  "rows": [
+   [
+    "x",
+    "0",
+    [
+     "x"
+    ]
+   ],
+   [
+    "y",
+    "0",
+    [
+     "y"
+    ]
    ]
   ]
  },
@@ -8932,6 +8958,50 @@
    [
     "15",
     "5"
+   ]
+  ]
+ },
+ "recursive_cte_column_list_over_repeated_names": {
+  "rows": [
+   [
+    "a",
+    "a"
+   ],
+   [
+    "a",
+    "b"
+   ],
+   [
+    "b",
+    "b"
+   ]
+  ]
+ },
+ "recursive_distinct_variant_beside_constant": {
+  "rows": [
+   [
+    "x",
+    "0",
+    [
+     "x"
+    ]
+   ],
+   [
+    "x",
+    "1",
+    [
+     "x",
+     "z"
+    ]
+   ],
+   [
+    "x",
+    "2",
+    [
+     "x",
+     "z",
+     "z"
+    ]
    ]
   ]
  },

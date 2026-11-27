@@ -1301,3 +1301,7 @@
 - {id: number_cast_of_variant_reads_once, sql: "select v:a[0]::int a, v:b::number(10,2) b, (v:c::varchar || '')::int c, try_cast(v:d::varchar as int) d from (select parse_json('{\"a\":[\"7\"],\"b\":\"1.256\",\"c\":\" 3e \",\"d\":\"x\"}') v)"}
 - {id: number_cast_of_aggregate_and_window, sql: "select k, max(t)::int m, (max(t) || '')::int m2, sum(n) over (partition by k)::int w from (select 1 k, '5' t, 2 n union all select 1, '6', 3) group by k, n order by 1, 2"}
 - {id: object_insert_chain_then_cast, sql: "select object_insert(object_insert(v, 'x', 1), 'credits', array_sort(v:credits), true) a, a:credits[0]::int c0, a:x::int x from (select parse_json('{\"credits\":[3,1,2]}') v)"}
+- {id: distinct_variant_beside_constant_number, sql: "select distinct column1 as k, 0 as d, array_construct(column1) as p from values ('x'), ('x'), ('y') order by 1"}
+- {id: recursive_distinct_variant_beside_constant, sql: "with recursive r (k, d, p) as (select distinct column1, 0, array_construct(column1) from values ('x'), ('x') union all select r.k, r.d + 1, array_append(r.p, 'z') from r where r.d < 2) select * from r order by d"}
+- {id: cte_column_list_over_repeated_names, sql: "with r (x, y) as (select 1 a, 1 a) select x, y from r"}
+- {id: recursive_cte_column_list_over_repeated_names, sql: "with recursive r (pid, cid) as (select distinct column1, column1 from values ('a', null), ('b', 'a') union all select r.pid, v.column1 from (select * from values ('a', null), ('b', 'a')) v inner join r on r.cid = v.column2) select * from r order by 1, 2"}

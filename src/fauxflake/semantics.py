@@ -3821,6 +3821,12 @@ def misnamed_column(transformed: exp.Expression, conn, probe: bool = True) -> st
         flatten = ["SEQ", "KEY", "PATH", "INDEX", "VALUE", "THIS"]
         if isinstance(source, Scope):
             inner = source.expression
+            cte = inner.parent  # (`WITH r (a, b) AS (...)`: the list names the columns, whatever the select calls them;
+            while isinstance(cte, exp.SetOperation):  # a recursive CTE's own name, inside it, is its anchor's scope)
+                cte = cte.parent
+            listed = cte.args.get("alias") if isinstance(cte, exp.CTE) else None
+            if isinstance(listed, exp.TableAlias) and listed.columns:
+                return [target(c) for c in listed.columns]
             call = inner.this if isinstance(inner, exp.Table) else None
             if isinstance(call, exp.Func) and re.search("flatten|explode", call.name if isinstance(call, exp.Anonymous) else call.sql_name(), re.I):
                 return flatten
@@ -5325,8 +5331,12 @@ def variants_by_value(transformed: exp.Expression, conn) -> exp.Expression:  # n
             # DISTINCT over a VARIANT: a GROUP BY of every column, the VARIANT by its value
             items = [e.this if isinstance(e, exp.Alias) else e for e in distinct_items]
             select.set("distinct", None)
-            select.set("group", exp.Group(expressions=[_fn("_sf_json_key", i.copy()) if e in listed else i.copy()
-                                                       for e, i in zip(distinct_items, items)]))
+            # (a constant number item, `0 AS distance`, would read as a GROUP BY position: it is cast)
+            positional = lambda i: (isinstance(i, exp.Literal) and i.is_int) or (  # noqa: E731
+                isinstance(i, exp.Neg) and isinstance(i.this, exp.Literal) and i.this.is_int)
+            select.set("group", exp.Group(expressions=[
+                _fn("_sf_json_key", i.copy()) if e in listed else exp.cast(i.copy(), "BIGINT") if positional(i) else i.copy()
+                for e, i in zip(distinct_items, items)]))
             keyed = [(None, i) for e, i in zip(distinct_items, items) if e in listed]
         elif keyed:
             for g, r in keyed:
