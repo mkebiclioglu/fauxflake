@@ -37,7 +37,7 @@ from sqlglot import exp
 
 from . import emulator
 from .init import address_emails, follow_categories, guess, periods_have_length, unique_together, within_bounds
-from .spec import quoted
+from .spec import column_name, quoted
 
 Log = Callable[[str], None]
 
@@ -450,6 +450,8 @@ class Fitter:
         columns = self.tables[table].setdefault("columns", {})
         if col in columns or _WRITTEN_BY_DBT.match(col):
             return False  # (there already, or what dbt_utils.union_relations writes itself: never a source's column)
+        if any(column_name(c).upper() == col.upper() for c in columns):
+            return False  # ("Employee_ID" is there, quoted in its case: DuckDB cannot hold EMPLOYEE_ID beside it)
         columns[col] = guess(col, None)
         self.emu.duck.execute(f'alter table {quoted(table)} add column if not exists "{col}" {duck_type(columns[col])}')
         self.learned.append(f"{table}.{col}: read by a model, added.")

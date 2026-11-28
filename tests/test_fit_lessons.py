@@ -1208,3 +1208,16 @@ def test_a_document_field_made_up_as_text_and_parsed_as_json_holds_json_text():
     fields = tables["RAW.Y.PI"]["columns"]["JSONTEXT"]["fields"]
     assert fields["[].monthly_estimated_targets~json"] == {"gen": "object", "fields": {}}
     assert not f.made_up_text_parsed("m", message)
+
+
+def test_a_table_holds_a_name_in_one_case_only():
+    # GitLab's comp_band_deviation_snapshots reads "Employee_ID"; another model reads employee_id unquoted
+    from fauxflake.spec import Spec
+
+    tables = {"RAW.S.BANDS": {"columns": {'"Employee_ID"': {"gen": "template", "template": "e_{hex}"}}}}
+    f = fitter(tables=tables)
+    f.emu = type("E", (), {"duck": type("D", (), {"execute": lambda self, *a: self})()})()
+    assert not f.add_column("RAW.S.BANDS", "EMPLOYEE_ID")
+    spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "tables": {"RAW.S.BANDS": {"columns": {
+        "ID": {"gen": "sequence"}, "EMPLOYEE_ID": {"gen": "dist"}, '"Employee_ID"': {"gen": "template", "template": "e_{hex}"}}}}}, ".")
+    assert list(spec.tables["RAW.S.BANDS"].columns) == ["ID", "Employee_ID"]

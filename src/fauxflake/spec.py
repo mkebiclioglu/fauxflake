@@ -151,6 +151,18 @@ def column_name(key: str) -> str:
     return key[1:-1] if len(key) > 2 and key.startswith('"') and key.endswith('"') else key.upper()
 
 
+def _one_per_name(columns: dict[str, dict]) -> dict[str, dict]:
+    """DuckDB names columns in any case, so a table holds "Employee_ID" or EMPLOYEE_ID, not both (Snowflake could):
+    the one a model quotes in its case is kept."""
+    kept: dict[str, str] = {}
+    for name in columns:
+        other = kept.get(name.upper())
+        if other is None or (other == other.upper() and name != name.upper()):
+            kept[name.upper()] = name
+    chosen = set(kept.values())
+    return {name: d for name, d in columns.items() if name in chosen}
+
+
 def quoted(name: str) -> str:
     return ".".join('"' + part.replace('"', '""') + '"' for part in name.split("."))
 
@@ -194,7 +206,7 @@ class Spec:
             name = name.upper()
             if name.count(".") != 2:
                 raise ValueError(f"table {name!r} must be DATABASE.SCHEMA.TABLE")
-            cols = {column_name(c): dict(d or {}) for c, d in (t.get("columns") or {}).items()}
+            cols = _one_per_name({column_name(c): dict(d or {}) for c, d in (t.get("columns") or {}).items()})
             tables[name] = Table(name=name, raw=t, columns=cols)
         spec = cls(seed=int(raw.get("seed", 1)), start=_date(raw["start"]), tables=tables,
                    dbt=raw.get("dbt") or {}, path=Path(path),
