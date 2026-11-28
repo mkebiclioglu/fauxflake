@@ -298,7 +298,7 @@ def duck_type(gen: dict) -> str:
     if gen.get("type"):
         return str(gen["type"])
     kind = gen["gen"]
-    if kind in ("time_offset", "loaded_at", "event_time", "updated_at"):
+    if kind in ("time_offset", "loaded_at", "event_time", "updated_at", "valid_to"):
         return "TIMESTAMP"
     if kind in ("object", "array"):
         return "JSON"
@@ -1376,6 +1376,12 @@ class Fitter:
         """Keep the spec loadable whatever was learned: a reference needs a parent with a key."""
         if os.environ.get("FAUXFLAKE_FIT_WATCH"):
             self._watch(self.__dict__.get("_last_watched") or self._watched(), "something other than an error's lesson (seen at repair)")
+        from .init import chain_versions
+
+        for table, spec in self.tables.items():  # (a spec made before snapshot sources were generated as versions)
+            if chain_versions(spec.get("columns") or {}):
+                self.retyped.add(table)
+                self.learned.append(f"{table}: a dbt snapshot kept as a source; each version is valid until the next.")
         keyed = {t for t, spec in self.tables.items()
                  if any(d.get("gen") in ("sequence", "hash_id") for d in (spec.get("columns") or {}).values())}
         for table, spec in self.tables.items():

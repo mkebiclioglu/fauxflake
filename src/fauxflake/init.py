@@ -1947,6 +1947,20 @@ def address_emails(tables: dict) -> list[tuple[str, str]]:
     return changed
 
 
+def chain_versions(columns: dict) -> bool:
+    """A dbt snapshot kept as a source (DBT_VALID_FROM, DBT_VALID_TO) whose key repeats: the rows are versions of
+    things, each valid until the next version starts, the latest still valid. Drawn on their own, most rows would be
+    valid forever, and a model that joins each version to the days it was valid would get every day for all of them.
+    DBT_VALID_TO, while still what its name suggested, becomes the start of the next version. True when changed."""
+    if "DBT_VALID_FROM" not in columns or columns.get("DBT_VALID_TO") != guess("DBT_VALID_TO", None):
+        return False
+    key = next((c for c, d in columns.items() if d.get("gen") in ("sequence", "hash_id")), None)
+    if key is None or not columns[key].get("of"):
+        return False  # (a key no two rows share: each row a thing of its own, with nothing after it)
+    columns["DBT_VALID_TO"] = {"gen": "valid_to", "from": "DBT_VALID_FROM", "by": key}
+    return True
+
+
 def guess(column: str, hint: str | None) -> dict:
     """A generator for a column we know only by name and (maybe) a cast."""
     c, h = column.upper(), (hint or "").upper()
@@ -3263,6 +3277,8 @@ def analyse(manifest: dict, database: str) -> Analysis:
     if (start, history) != (date(2025, 1, 1), None):
         notes.append(f"the SQL compares with dates between {min(d for _, d in dates)} and {max(d for _, d in dates)}: "
                      f"the generated history starts {start}" + (f" and spans {history} days." if history else "."))
+    for table in tables.values():  # (dbt snapshots kept as sources: versions, each valid until the next)
+        chain_versions(table.get("columns") or {})
     analysis = Analysis({"seed": 42, "start": start.isoformat(), **({"history": history} if history else {}),
                          **({"recent": RECENT, "older": older} if older else {}),
                          **({"least_rows": least} if least else {}),

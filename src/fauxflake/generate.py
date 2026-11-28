@@ -409,6 +409,10 @@ class TableSQL:
             sizes = self.grain()
             stride = math.prod(list(sizes.values())[:list(sizes).index(col)])
             expr = self.key_expr(self.t, f"((_n // {stride}) % {sizes[col]})::bigint")
+        elif gen in ("sequence", "hash_id") and d.get("of") and self.base == "g" and "." not in col \
+                and any(c.get("gen") == "valid_to" and c.get("by") == col for c in self.t.columns.values()):
+            # a dbt snapshot kept as a source: its rows are versions of a few things (what refers to it picks one)
+            expr = self.key_expr(self.t, f"(g % {int(d['of'])})")
         elif gen in ("sequence", "hash_id"):
             expr = self.key_expr(self.t, "g")
         elif gen == "link":
@@ -616,6 +620,8 @@ class TableSQL:
                 expr = f"(case ({self.expr(str(d['of']), other)})::varchar {arms} else {rest} end)"
         elif gen == "constant":
             expr = lit(d.get("value"))
+        elif gen == "valid_to":
+            expr = "NULL::timestamp"  # (the next version's start: written once the table holds the rows, see _chain_versions)
         else:
             raise ValueError(f"{self.t.name}.{col}: unknown gen {gen!r}")
         if gen in ("event_time", "time_offset") and self.base == "g" and (self.grain_time() or ("", ""))[0] == col \
@@ -821,6 +827,7 @@ class Warehouse:
             counts[t.name] = self.cur.execute(f"{verb} {select}", params).fetchone()[0]
             if t.raw.get("mode") == "upsert":
                 self._keep_latest(t)
+            self._chain_versions(t)
         if self.now is None:
             for name, rel in self.spec.existing.items():
                 db, schema, _ = name.split(".")
@@ -836,6 +843,19 @@ class Warehouse:
         if self.freeze_clock:
             emulator.FROZEN_NOW = until
         return counts
+
+    def _chain_versions(self, t: Table) -> None:
+        """A dbt snapshot kept as a source: each version of a thing is valid until the next one starts, and only the
+        latest is still valid (`gen: valid_to`). Written again as rows arrive, as a snapshot closes the version before."""
+        for col, d in t.columns.items():
+            if d.get("gen") != "valid_to":
+                continue
+            start, key = str(d.get("from") or "DBT_VALID_FROM"), str(d.get("by") or t.key[0])
+            kind = d.get("type") or "timestamp"
+            self.cur.execute(f"""
+                update {t.sql} as x set "{col}" = n.nxt::{kind} from (
+                  select rowid as r, lead("{start}") over (partition by "{key}" order by "{start}", rowid) as nxt from {t.sql}) n
+                where x.rowid = n.r""")
 
     def _keep_latest(self, t: Table) -> None:
         """An upsert-style source holds one row per key: the newest version that has arrived."""

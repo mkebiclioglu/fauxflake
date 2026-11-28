@@ -620,3 +620,27 @@ def test_a_value_that_goes_by_another_column_holds_what_each_case_says(tmp_path)
             count_if("FIELD" = 'amount' and try_cast("OLDVALUE" as bigint) is not null), count_if("FIELD" = 'stagename' and "OLDVALUE" like 'oldvalue\\_%' escape '\\')
             from "RAW"."T"."HISTORY" """).fetchone()
         assert rows == dates + amounts + texts and min(dates, amounts, texts) > 50
+
+
+def test_a_snapshot_kept_as_a_source_holds_versions_each_valid_until_the_next():
+    # GitLab's prep_crm_account_daily_snapshot joins each account version to the days it was valid: drawn on their own,
+    # 80% of the versions were valid forever and the join ran out of memory
+    from fauxflake.init import chain_versions, guess
+    from fauxflake.spec import Spec
+
+    columns = {"ID": {"gen": "hash_id", "of": 5}, "DBT_VALID_FROM": guess("DBT_VALID_FROM", None),
+               "DBT_VALID_TO": guess("DBT_VALID_TO", None)}
+    assert chain_versions(columns) and columns["DBT_VALID_TO"] == {"gen": "valid_to", "from": "DBT_VALID_FROM", "by": "ID"}
+    assert not chain_versions({"ID": {"gen": "sequence"}, "DBT_VALID_FROM": guess("DBT_VALID_FROM", None),
+                               "DBT_VALID_TO": guess("DBT_VALID_TO", None)})  # (a key no two rows share: nothing after a row)
+    spec = Spec.from_raw({"seed": 42, "start": "2025-01-01", "tables": {"RAW.SNAPSHOTS.ACCOUNTS": {
+        "volume": {"rows_per_day": 20, "weekly": [1] * 7}, "lateness": {"p": [0, 1], "seconds": [0, 1]}, "columns": columns}}}, ".")
+    with serve() as emu:
+        house = Warehouse(emu, spec, 1.0)
+        house.advance_to(datetime(2025, 1, 10))
+        house.advance_to(datetime(2025, 1, 20))  # (a version that arrives later closes the one before it)
+        cur = emu.cursor()
+        current, keys = cur.execute("select count(*) filter (where DBT_VALID_TO is null), count(distinct ID) from RAW.SNAPSHOTS.ACCOUNTS").fetchone()
+        gaps = cur.execute("""select count(*) from (select DBT_VALID_TO, lead(DBT_VALID_FROM) over (partition by ID order by DBT_VALID_FROM) as nxt
+                              from RAW.SNAPSHOTS.ACCOUNTS) where DBT_VALID_TO is distinct from nxt""").fetchone()[0]
+    assert current == keys == 5 and gaps == 0
