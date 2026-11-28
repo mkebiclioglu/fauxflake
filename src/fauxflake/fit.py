@@ -423,6 +423,17 @@ class Fitter:
             if not (stars and named) and not (listed and len(named) > len(listed)):
                 continue
             for owner in self.real_tables(select, ctes):
+                if owner not in self.tables:
+                    # `d.date_actual as snapshot_date, base.*` with base a model that is a `select *` of a source: the
+                    # source behind it, when it has the column only because the fitter added it (a reader asked)
+                    behind, seen = owner, set()
+                    while behind and behind not in self.tables and behind not in seen and len(seen) < 6:
+                        seen.add(behind)
+                        behind = self.passthrough(behind)
+                    if not behind or behind not in self.tables \
+                            or f"{behind}.{col}: read by a model, added." not in self.learned:
+                        continue
+                    owner = behind
                 columns = (self.tables.get(owner) or {}).get("columns") or {}
                 if col in columns:
                     del columns[col]
@@ -2597,7 +2608,55 @@ class Fitter:
         name = m.group("col").upper()
         code = self.sql_of.get(sql_key, "").lower()
         as_array = bool(re.search(rf"{name.lower()}\b[^;]{{0,80}}?\)\s*::\s*array|array_size\(", code))
-        return self.retype_column(sql_key, name, "ARRAY" if as_array else "VARIANT", direct=True, made_up=True)
+        if self.retype_column(sql_key, name, "ARRAY" if as_array else "VARIANT", direct=True, made_up=True):
+            return True
+        # a field of a document (`[].monthly_estimated_targets` of a YAML file loaded as JSON): its value is JSON text
+        changed = False
+        for table in self.sources_of(sql_key):
+            for column, held in (self.tables[table].get("columns") or {}).items():
+                fields = held.get("fields") if held.get("gen") == "object" else None
+                for path, field in list((fields or {}).items()):
+                    last = re.split(r"[.\[\]~]+", path.rstrip("[]"))[-1] if path else ""
+                    if last != name.lower() or field.get("template") != f"{name.lower()}_{{hex}}" \
+                            or any(other.startswith((path + "~", path + ".", path + "[")) for other in fields):
+                        continue
+                    fields[path + ("~json[]" if as_array else "~json")] = \
+                        dict(field) if as_array else {"gen": "object", "fields": {}}
+                    self.retyped.add(table)
+                    self.learned.append(f"{table}.{column}: {path} parsed as JSON, generated as JSON text.")
+                    changed = True
+        if changed:
+            self.dirty = True
+        return changed
+
+    def divided_by_zero(self, sql_key: str, message: str) -> bool:
+        """`payment_applied / total_billed`: Snowflake refuses a division by zero, naming nothing. The numbers each
+        divisor is made of (through the models before it) are generated above zero, as the amounts billed are."""
+        tree = self.tree(sql_key) if re.search(r"\bDivision by zero\b", message) else None
+        if tree is None:
+            return False
+        names = list(dict.fromkeys(c.name.upper() for div in tree.find_all(exp.Div) for c in div.expression.find_all(exp.Column)
+                                   if not isinstance(c.this, exp.Star)))
+        made = {a.alias.upper(): a.this for a in tree.find_all(exp.Alias)}
+        for name in list(names):  # (`sum(invoice.amount) as total_billed` in a CTE: the amounts it adds up)
+            for c in (made[name].find_all(exp.Column) if name in made else ()):
+                if not isinstance(c.this, exp.Star) and c.name.upper() not in names:
+                    names.append(c.name.upper())
+        changed = False
+        for table in self.sources_of(sql_key):
+            columns = self.tables[table].get("columns") or {}
+            for name in dict.fromkeys(n for name in names for n in [name, *self.origins(sql_key, name)]):
+                d = columns.get(name)
+                if not d or d.get("gen") != "dist" or not d.get("v") or min(d["v"]) > 0:
+                    continue
+                low = min((v for v in d["v"] if v > 0), default=1)
+                d["v"] = [v if v > 0 else round(low / 10, 6) or 1 for v in d["v"]]
+                self.retyped.add(table)
+                self.learned.append(f"{table}.{name}: divided by, generated above zero.")
+                changed = True
+        if changed:
+            self.dirty = True
+        return changed
 
     def made_up_text_read_as_a_document(self, sql_key: str, message: str) -> bool:
         """`OBJECT_KEYS(stage.value['groups'])` on a field made up as text: Snowflake refuses the cast (`Failed to cast
@@ -3009,7 +3068,7 @@ class Fitter:
         if self.text_to_a_time_function(sql_key, message) or self.made_up_text_parsed(sql_key, message) \
                 or self.hash_beside_numbers_in_a_union(sql_key, message) or self.time_added_as_an_amount(sql_key, message) \
                 or self.parsed_as_url(sql_key, message) or self.hash_beside_a_column_in_a_coalesce(sql_key, message) \
-                or self.made_up_text_read_as_a_document(sql_key, message):
+                or self.made_up_text_read_as_a_document(sql_key, message) or self.divided_by_zero(sql_key, message):
             return True
         if self.udf_input(sql_key, message) or self.pivot_values(sql_key, message) or self.pivoted_upstream(sql_key, message) \
                 or self.missing_column(sql_key, message) or self.missing_relation(sql_key, message) \

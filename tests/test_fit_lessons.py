@@ -1150,3 +1150,55 @@ def test_a_document_field_made_up_as_text_and_read_as_an_object_becomes_one():
     assert fields["stages[].groups"] == {"gen": "object", "fields": {}}
     assert fields["other.groups"]["gen"] == "template"  # (one with keys under it: they say what it holds)
     assert not f.made_up_text_read_as_a_document("m", '100071 (22000): Failed to cast variant value "groups_80272ae923bf" to OBJECT')
+
+
+class _Duck:
+    def execute(self, *a):
+        return self
+
+
+def test_a_column_written_beside_a_star_of_a_model_is_taken_from_the_source_it_was_added_to():
+    # GitLab's mart_available_to_renew_snapshot_model: d.date_actual as snapshot_date, base.* (base: a model that is a
+    # `select *` of the snapshot source); a reader had asked for snapshot_date before the model built, so the fitter
+    # added it to the source, and Snowflake refuses the column twice
+    tree = parse("""with base as (select * from "PROD".prep.renew_base), dates as (select * from "PROD".common.dim_date)
+        select dates.date_id as snapshot_id, dates.date_actual as snapshot_date, base.* from base join dates on true""")
+    tables = {"LOAD.SNAPSHOTS.RENEW": {"columns": {"ARR": {"gen": "dist"}, "SNAPSHOT_DATE": {"gen": "time_offset"}}}}
+    f = fitter(trees={"m": tree}, tables=tables, learned=["LOAD.SNAPSHOTS.RENEW.SNAPSHOT_DATE: read by a model, added."])
+    f.passthrough = lambda fq: {"PROD.PREP.RENEW_BASE": "LOAD.SNAPSHOTS.RENEW"}.get(fq)
+    f.emu = type("E", (), {"duck": _Duck()})()
+    assert f.doubled_by_a_star("m", "002025 (42S21): SQL compilation error:\nduplicate column name 'SNAPSHOT_DATE'")
+    assert list(tables["LOAD.SNAPSHOTS.RENEW"]["columns"]) == ["ARR"]
+    # a column the source had of its own is left to it
+    tables["LOAD.SNAPSHOTS.RENEW"]["columns"]["SNAPSHOT_ID"] = {"gen": "dist"}
+    assert not f.doubled_by_a_star("m", "duplicate column name 'SNAPSHOT_ID'")
+
+
+def test_the_numbers_a_model_divides_by_are_generated_above_zero():
+    # GitLab's mart_collections_monthly: payment_applied / total_billed with sum(fct_invoice.amount) as total_billed
+    tree = parse("""with billed as (select month, sum(invoice.amount) as total_billed from "RAW".z.invoice group by 1)
+        select round((p.applied / billed.total_billed) * 100, 2) as pct from "RAW".z.payments p join billed using (month)""")
+    shared = [0, 0, 10, 1000]
+    tables = {"RAW.Z.INVOICE": {"columns": {"AMOUNT": {"gen": "dist", "p": [0, 0.3, 0.9, 1], "v": shared}}},
+              "RAW.Z.PAYMENTS": {"columns": {"APPLIED": {"gen": "dist", "p": [0, 1], "v": shared}}}}
+    f = fitter(trees={"m": tree}, tables=tables)
+    f.sources_of, f.origins = (lambda uid: ["RAW.Z.INVOICE", "RAW.Z.PAYMENTS"]), (lambda uid, name, depth=0, strict=False: [name])
+    assert f.divided_by_zero("m", "100051 (22012): Division by zero")
+    assert tables["RAW.Z.INVOICE"]["columns"]["AMOUNT"]["v"] == [1, 1, 10, 1000]
+    assert tables["RAW.Z.PAYMENTS"]["columns"]["APPLIED"]["v"] == [0, 0, 10, 1000]  # (divided, not dividing by: as it was)
+    assert not f.divided_by_zero("m", "100051 (22012): Division by zero")
+
+
+def test_a_document_field_made_up_as_text_and_parsed_as_json_holds_json_text():
+    # GitLab's fct_performance_indicator_targets: FLATTEN(PARSE_JSON(pi_monthly_estimated_targets)) of a YAML file's field
+    tables = {"RAW.Y.PI": {"columns": {"JSONTEXT": {"gen": "object", "fields": {
+        "[].monthly_estimated_targets": {"gen": "template", "template": "monthly_estimated_targets_{hex}"},
+        "[].name": {"gen": "template", "template": "name_{hex}"}}}}}}
+    f = fitter(tables=tables, sql_of={"m": "select parse_json(pi_monthly_estimated_targets) from x"})
+    f.sources_of = lambda uid: ["RAW.Y.PI"]
+    f.retype_column = lambda *a, **k: False  # (no column of that name: a field)
+    message = 'Error parsing JSON: unknown keyword "monthly_estimated_targets_9ac8e4564813", pos 39'
+    assert f.made_up_text_parsed("m", message)
+    fields = tables["RAW.Y.PI"]["columns"]["JSONTEXT"]["fields"]
+    assert fields["[].monthly_estimated_targets~json"] == {"gen": "object", "fields": {}}
+    assert not f.made_up_text_parsed("m", message)
