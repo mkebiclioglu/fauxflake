@@ -33,6 +33,7 @@ from sqlglot.optimizer.scope import traverse_scope
 
 from . import catalog
 from .generate import named_values
+from .spec import column_name
 
 LOADED_AT = ["_LOADED_AT", "_FIVETRAN_SYNCED", "_AIRBYTE_EXTRACTED_AT", "_SDC_BATCHED_AT", "_ETL_LOADED_AT",
              "LOADED_AT", "_INGESTED_AT", "INGESTED_AT", "_PARTITIONTIME"]
@@ -3598,6 +3599,7 @@ def update_spec(project, path: Path, database: str, emu, log=print) -> list[str]
     spec = yaml.safe_load(text)
     provide_env(project)
     manifest = project.compile()
+    seeded_sources(project, manifest, emu)  # as `init` does: the seeds' hooks (and the run's own) create what they create
     analysis = analyse(manifest, database)
     added: list[str] = []
     tables = spec.setdefault("tables", {})
@@ -3607,8 +3609,10 @@ def update_spec(project, path: Path, database: str, emu, log=print) -> list[str]
             added.append(name)
             continue
         columns = tables[name].setdefault("columns", {})
+        held = {column_name(c).upper() for c in columns}  # (`"Employee_ID"`, which a model quotes, is EMPLOYEE_ID read)
         for col, gen in table["columns"].items():
-            if col not in columns and gen.get("gen") != "loaded_at":  # no model reads that one: it stays out if it was taken out
+            if col not in columns and column_name(col).upper() not in held and gen.get("gen") != "loaded_at":
+                # (one no model reads stays out if it was taken out)
                 columns[col] = gen
                 added.append(f"{name}.{col}")
     if analysis.spec["dbt"].get("role"):

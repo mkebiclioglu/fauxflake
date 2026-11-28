@@ -1563,3 +1563,24 @@ def test_a_bare_column_beside_a_join_with_a_cte_that_writes_its_columns_out_is_t
     assert {"PUBLIC_CHANNELS", "PUBLIC_CHANNELS_DELETED", "CONTEXT_IP", "USER_ID", "TIMESTAMP"} <= set(columns)
     assert "MAX_TIME" not in columns and "MAX_DATE" not in columns  # the CTE's own
     assert out["CONTEXT_IP"] == ("RAW.T.ACTIVITY", "CONTEXT_IP")
+
+
+def test_fit_on_a_spec_does_not_add_a_column_it_holds_in_its_case_again(tmp_path, monkeypatch):
+    # GitLab: the spec holds "Employee_ID", the static read gives EMPLOYEE_ID; DuckDB would hold only one of them
+    from types import SimpleNamespace
+
+    import yaml
+
+    from fauxflake import init
+
+    path = tmp_path / "fauxflake.yml"
+    path.write_text(yaml.safe_dump({"seed": 1, "start": "2025-01-01", "dbt": {}, "tables": {"RAW.S.T": {"columns": {
+        '"Employee_ID"': {"gen": "fk", "ref": "RAW.S.W", "type": "VARCHAR"}}}}}))
+    read = {"RAW.S.T": {"columns": {"EMPLOYEE_ID": {"gen": "sequence"}, "NAME": {"gen": "template", "template": "name_{hex}"}}}}
+    project = SimpleNamespace(compile=lambda: {"nodes": {}, "sources": {}})
+    for name, value in {"provide_env": lambda p: {}, "seeded_sources": lambda *a: set(), "unknown_functions": lambda *a: {},
+                        "_fit": lambda *a: [], "analyse": lambda m, d: SimpleNamespace(spec={"tables": read, "dbt": {}})}.items():
+        monkeypatch.setattr(init, name, value)
+    init.update_spec(project, path, "ANALYTICS", emu=None)
+    columns = yaml.safe_load(path.read_text())["tables"]["RAW.S.T"]["columns"]
+    assert list(columns) == ['"Employee_ID"', "NAME"] and columns['"Employee_ID"']["type"] == "VARCHAR"
