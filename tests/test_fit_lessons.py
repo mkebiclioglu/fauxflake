@@ -1250,3 +1250,20 @@ def test_a_made_up_value_of_a_quoted_column_read_as_a_number_retypes_that_column
     columns = tables["RAW.D.SOV"]["columns"]
     assert columns['"Desktop_Readership"']["gen"] in ("dist", "sequence") and columns['"Brand"']["gen"] == "template"
     assert "DESKTOP_READERSHIP" not in columns
+
+
+def test_a_reference_to_hashes_cast_to_a_number_makes_its_key_numbers():
+    # GitLab's greenhouse_offer_custom_fields_source: offer_id::NUMBER, OFFER_ID referring to OFFERS.ID made up as hashes
+    tree = parse('select offer_id::number as offer_id, user_id::number as user_id, try_cast(note as number) as n, '
+                 'custom_field::varchar as f from "RAW".g.offer_custom_fields')
+    tables = {"RAW.G.OFFERS": {"columns": {"ID": {"gen": "hash_id"}}},
+              "RAW.G.OFFER_CUSTOM_FIELDS": {"columns": {"OFFER_ID": {"gen": "fk", "ref": "RAW.G.OFFERS"},
+                                                        "USER_ID": {"gen": "dist", "type": "BIGINT"},
+                                                        "NOTE": {"gen": "hash_id"}, "CUSTOM_FIELD": {"gen": "hash_id"}}}}
+    f = fitter(trees={"m": tree}, tables=tables)
+    f.sources_of = lambda uid: ["RAW.G.OFFER_CUSTOM_FIELDS"]
+    retyped = []
+    f.retype_column = lambda uid, name, hint, *a, **k: retyped.append((name, hint)) or True
+    assert f.hash_cast_to_a_number("m", "100038 (22018): Numeric value '44b400e563c40755629a35d838b2987d' is not recognized")
+    assert retyped == [("OFFER_ID", "BIGINT")]  # (TRY_CAST fails no build; a cast to text is no number)
+    assert not f.hash_cast_to_a_number("m", "Numeric value 'abc' is not recognized")

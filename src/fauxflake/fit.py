@@ -2593,6 +2593,38 @@ class Fitter:
             changed = self.retype_column(sql_key, name, "TEXT") or changed
         return changed
 
+    def hash_cast_to_a_number(self, sql_key: str, message: str) -> bool:
+        """`offer_id::NUMBER`, where OFFER_ID refers to a key made up as hashes: Snowflake names only the hash. The
+        columns the model casts to a number that are generated as hashes, or refer to a key that is, hold numbers."""
+        if not re.search(r"(?:Numeric value|Could not convert string) ['\"][0-9a-f]{32}['\"]", message):
+            return False
+        tree = self.tree(sql_key)
+        if tree is None:
+            return False
+        numbers = ("decimal", "int", "bigint", "smallint", "tinyint", "double", "float")
+        cast = []
+        for c in tree.find_all(exp.Cast):
+            inner = c.this.unnest() if isinstance(c.this, exp.Paren) else c.this
+            if isinstance(c, exp.TryCast) or not c.to.is_type(*numbers) or not isinstance(inner, exp.Column) \
+                    or isinstance(inner.this, exp.Star) or inner.name.upper() in cast:
+                continue
+            cast.append(inner.name.upper())
+
+        def hashes(gen: dict) -> bool:
+            if gen.get("gen") == "hash_id":
+                return not _text_ids(gen)
+            if gen.get("gen") == "fk":
+                parent = self.tables.get(str(gen.get("ref", "")).upper(), {}).get("columns") or {}
+                return any(d.get("gen") == "hash_id" and not _text_ids(d) for d in parent.values())
+            return False
+        held = {name for table in self.sources_of(sql_key) for name, gen in (self.tables[table].get("columns") or {}).items()
+                if hashes(gen)}
+        changed = False
+        for name in cast:
+            if name in held:
+                changed = self.retype_column(sql_key, name, "BIGINT", direct=True) or changed
+        return changed
+
     def hash_beside_numbers_in_a_union(self, sql_key: str, message: str) -> bool:
         """`Could not convert string '5685...2ab6c' to INT64`, in a model that reads a `union_relations` model:
         dbt_utils casts each column to the type the first table gives it, and a column one stacked table generates as
@@ -3093,7 +3125,7 @@ class Fitter:
         if self.text_to_a_time_function(sql_key, message) or self.made_up_text_parsed(sql_key, message) \
                 or self.hash_beside_numbers_in_a_union(sql_key, message) or self.time_added_as_an_amount(sql_key, message) \
                 or self.parsed_as_url(sql_key, message) or self.hash_beside_a_column_in_a_coalesce(sql_key, message) \
-                or self.made_up_text_read_as_a_document(sql_key, message) or self.divided_by_zero(sql_key, message):
+                or self.hash_cast_to_a_number(sql_key, message) or self.made_up_text_read_as_a_document(sql_key, message) or self.divided_by_zero(sql_key, message):
             return True
         if self.udf_input(sql_key, message) or self.pivot_values(sql_key, message) or self.pivoted_upstream(sql_key, message) \
                 or self.missing_column(sql_key, message) or self.missing_relation(sql_key, message) \

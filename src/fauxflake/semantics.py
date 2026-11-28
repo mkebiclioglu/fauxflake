@@ -2483,7 +2483,8 @@ def reads_window_aliases(tree: exp.Expression) -> bool:
 
 
 def lateral_aliases(sql: str) -> set[str]:
-    """The SELECT aliases a statement reads again in the same SELECT (`last_value(d) over () as l, date_trunc('month', l)`)."""
+    """The SELECT aliases a statement reads again in the same SELECT (`last_value(d) over () as l, date_trunc('month', l)`),
+    also in its WHERE, QUALIFY or HAVING (`current_date() as report_date ... where date_trunc('month', report_date) = ...`)."""
     try:
         tree = sqlglot.parse_one(sql, read="snowflake")
     except Exception:  # noqa: BLE001
@@ -2491,7 +2492,7 @@ def lateral_aliases(sql: str) -> set[str]:
     out: set[str] = set()
     for select in tree.find_all(exp.Select):
         named = {p.alias.upper(): p for p in select.expressions if isinstance(p, exp.Alias) and not _self_named(p)}
-        for proj in select.expressions:
+        for proj in [*select.expressions, *[select.args[k] for k in ("where", "qualify", "having") if select.args.get(k)]]:
             for col in proj.find_all(exp.Column):
                 owner = named.get(col.name.upper())
                 if owner is not None and owner is not proj and not col.table and col.find_ancestor(exp.Select) is select:

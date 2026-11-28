@@ -657,3 +657,13 @@ def test_an_alias_built_on_a_window_does_not_stand_for_the_column_the_window_rea
     cur.execute("""select min(valid_from) over (partition by country, grp)::date as first_file_date,
         iff(grp = 1, least('2020-03-24', first_file_date), first_file_date) as valid_from from geo""")
     assert cur.fetchall() == [(datetime(2020, 2, 1).date(), datetime(2020, 2, 1).date())] * 2
+
+
+def test_a_select_alias_given_to_date_trunc_in_where_is_read_as_its_expression(emu):
+    # GitLab's pump_disaster_relief_fund: `current_date() as report_date ... where date_trunc('month', report_date) = ...`
+    emu.ensure_database("ANALYTICS", "CI")
+    cur = emu._fs.connect(database="ANALYTICS", schema="CI").cursor()
+    cur.execute("create or replace table hires as select current_date() as event_date union all select '2020-01-15'::date")
+    cur.execute("select current_date() as report_date, event_date from hires "
+                "where date_trunc('month', dateadd('month', -1, report_date)) < date_trunc('month', event_date) order by 2")
+    assert [r[1] for r in cur.fetchall()] == [datetime.now().date()]
