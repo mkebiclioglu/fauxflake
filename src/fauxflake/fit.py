@@ -69,7 +69,8 @@ _NO_FUNCTION = re.compile(r"No function matches the given name and argument type
 _TEMPORAL = {"epoch", "epoch_ms", "date_part", "datepart", "extract", "year", "month", "day", "hour", "minute", "second",
              "dayofweek", "dayofyear", "week", "quarter", "last_day", "dayname", "monthname"}
 # `invalid type [_FS_GLOBAL.MAIN._SF_INT(UPDATED)] for parameter 'TO_NUMBER'` (semantics.refused_conversions): the column
-_REFUSED_TYPE = re.compile(r"invalid type \[(?:[\w$.]*\()*(?:\w+\.)*(?P<col>\"[^\"]+\"|[A-Za-z_][\w$]*)\)*\] for parameter '(?P<fn>\w+)'")
+_REFUSED_TYPE = re.compile(r"invalid type \[(?:[\w$.]*\()*(?:\w+\.)*(?P<col>\"[^\"]+\"|[A-Za-z_][\w$]*)(?: AS [\w ]+(?:\([\d, ]+\))?)?\)*\] "
+                           r"for parameter '(?P<fn>\w+)'")
 _NUMERIC = {"abs", "round", "floor", "ceil", "sqrt", "ln", "log", "exp", "power", "sign"}
 _NOT_STRUCT = re.compile(r"""Cannot extract field '(?P<field>[^']+)' from expression "(?P<col>[^"]+)" because it is not a struct""")
 _HINTS = {"INT8": "BIGINT", "INT16": "BIGINT", "INT32": "BIGINT", "INT64": "BIGINT", "INT128": "BIGINT", "UINT8": "BIGINT",
@@ -1707,6 +1708,28 @@ class Fitter:
             return True
         return False
 
+    def cased_column(self, candidates: set[str], col: str, written: str) -> bool:
+        """`"Date_Added"::date`: a quoted name is that name in its case, so the source's column DATE_ADDED is not it.
+        The one source that has the column in upper case gets it in the case the model writes, in its place."""
+        having = [c for c in sorted(candidates) if c in self.tables and col in (self.tables[c].get("columns") or {})]
+        if len(having) != 1 or written in self.tables[having[0]]["columns"]:
+            if len(candidates) == 1 and next(iter(candidates)) in self.tables and not having:
+                return self.add_column(next(iter(candidates)), written)
+            return False
+        table = self.tables[having[0]]
+
+        def renamed(value):  # noqa: ANN001, ANN202 - and where its sister columns name it (follows, keyed_by, ...)
+            if isinstance(value, dict):
+                return {k: renamed(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [renamed(v) for v in value]
+            return written if value == col else value
+        table["columns"] = {(written if name == col else name): renamed(spec) for name, spec in table["columns"].items()}
+        self.retyped.add(having[0])
+        self.learned.append(f'{having[0]}.{written}: read as "{written}", a quoted name in its case; renamed from {col}.')
+        self.dirty = True
+        return True
+
     def missing_column(self, sql_key: str, message: str) -> bool:
         m = next((m for m in (p.search(message) for p in _MISSING) if m), None)
         t = self.tree(sql_key) if m else None
@@ -1755,6 +1778,9 @@ class Fitter:
         if not candidates:
             candidates = self.real_tables(t, ctes)
         candidates = {c for c in candidates if self.blameable(c)}
+        written = m.group("col").split(".")[-1].strip('"')
+        if f"'\"{written}\"'" in message and written != written.upper() and self.cased_column(candidates, col, written):
+            return True
         if len(candidates) > 1:
             # several sources could own it: the one already known to have a column of that name
             # cannot be the one missing it
@@ -2531,6 +2557,25 @@ class Fitter:
             changed = self.retype_column(sql_key, name, "TIMESTAMP") or changed
         return changed
 
+    def time_added_as_an_amount(self, sql_key: str, message: str) -> bool:
+        """`DATEADD('s', _uploaded_at, '1970-01-01')`: an amount to add is a number, and Snowflake refuses a time there
+        when it compiles, naming no column. Every column the model adds as an amount holds numbers, epoch seconds when
+        generated as times; all of them at once."""
+        tree = self.tree(sql_key) if "Invalid argument types for function 'DATEADD'" in message else None
+        if tree is None:
+            return False
+        names: list[str] = []
+        for node in tree.find_all(exp.DateAdd, exp.TimestampAdd, exp.TsOrDsAdd, exp.DateSub):
+            arg = node.args.get("expression")
+            while isinstance(arg, (exp.Paren, exp.Cast, exp.TryCast)):
+                arg = arg.this
+            if isinstance(arg, exp.Column) and not isinstance(arg.this, exp.Star) and arg.name.upper() not in names:
+                names.append(arg.name.upper())
+        changed = False
+        for name in names:
+            changed = self.retype_column(sql_key, name, "EPOCH") or changed
+        return changed
+
     def ambiguous_column(self, sql_key: str, message: str) -> bool:
         """Two joined tables both have a column the model reads without saying from which. In the real
         warehouse only one has it: the one the model also names it with (`opp.end_date`). The other
@@ -2873,7 +2918,7 @@ class Fitter:
                 or self.ambiguous_column(sql_key, message) or self.aggregate_out_of_place(sql_key, message):
             return True
         if self.text_to_a_time_function(sql_key, message) or self.made_up_text_parsed(sql_key, message) \
-                or self.hash_beside_numbers_in_a_union(sql_key, message):
+                or self.hash_beside_numbers_in_a_union(sql_key, message) or self.time_added_as_an_amount(sql_key, message):
             return True
         if self.udf_input(sql_key, message) or self.pivot_values(sql_key, message) or self.pivoted_upstream(sql_key, message) \
                 or self.missing_column(sql_key, message) or self.missing_relation(sql_key, message) \

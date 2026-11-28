@@ -42,6 +42,23 @@ def test_a_timestamp_tz_keeps_its_offset(cur):
     assert cur.fetchall() == [(1,)]
 
 
+def test_text_with_an_offset_is_written_into_zoned_columns_by_update_and_merge(cur):
+    # GitLab's missing_member_column post-hook: MERGE ... '9999-01-01 00:00:00.000 +0000' into every timestamp column
+    cur.execute("create or replace table written (id varchar, l timestamp_ltz, t timestamp_tz, n timestamp_ntz)")
+    cur.execute("create or replace temporary table incoming as select 'a' as id, '2020-01-01 00:00:00.000 +0300' as v")
+    cur.execute("insert into written (id, l) select id, v from incoming")
+    cur.execute("update written set t = '9999-01-01 00:00:00.000 +0000'")
+    cur.execute("update written set t = current_timestamp() where id = 'none'")
+    cur.execute("update written set l = incoming.v, n = incoming.v from incoming where written.id = incoming.id")
+    cur.execute("""merge into written using (select distinct 'b' as id, '9999-01-01 00:00:00.000 +0000' as v) s on written.id = s.id
+        when matched then update set l = s.v, t = s.v when not matched then insert (id, l, t, n) values (s.id, s.v, s.v, s.v)""")
+    cur.execute("merge into written using incoming s on written.id = s.id when matched then update set t = s.v")
+    cur.execute("select id, l, t::varchar, n from written order by id")
+    assert cur.fetchall() == [
+        ("a", datetime(2019, 12, 31, 21, tzinfo=timezone.utc), "2020-01-01 00:00:00.000 +0300", datetime(2020, 1, 1)),
+        ("b", datetime(9999, 1, 1, tzinfo=timezone.utc), "9999-01-01 00:00:00.000 Z", datetime(9999, 1, 1))]  # (as Snowflake shows +0000)
+
+
 def test_the_session_time_zone(cur):
     """Measured on Snowflake with ALTER SESSION SET TIMEZONE = 'America/Los_Angeles' (2026-11-23)."""
     cur.execute("alter session set timezone = 'America/Los_Angeles'")

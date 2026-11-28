@@ -1067,3 +1067,44 @@ def test_a_hash_beside_made_up_numbers_in_stacked_tables_makes_them_all_hashes()
     assert f._learn("model.p.agg", "Conversion Error: Could not convert string '56854494788f30d5fef7149e03d2ab6c' to INT64 "
                                    "when casting from source column x")
     assert all(f.tables[t]["columns"]["ID"] == {"gen": "hash_id"} for t in ("RAW.M.A", "RAW.M.B", "RAW.M.SERVER"))
+
+
+def test_a_quoted_name_in_mixed_case_renames_the_column_it_was_generated_as():
+    # GitLab's sheetload models: `select * from source` then `"Date_Added"::date`; the static read gave DATE_ADDED
+    tree = parse("""with source as (select * from "RAW".sheetload.abm)
+        select "Date_Added"::date as added_date, "Site Luid" as site, "Account_ID" as account_id from source""")
+    tables = {"RAW.SHEETLOAD.ABM": {"columns": {"DATE_ADDED": {"gen": "time_offset", "type": "DATE"},
+                                                "SITE LUID": {"gen": "template", "template": "site luid_{hex}"},
+                                                "ACCOUNT_NAME": {"gen": "template", "follows": "DATE_ADDED"}}}}
+    f = fitter(trees={"m": tree}, tables=tables, existing={}, pending={}, unions={})
+    f.add_column = lambda table, col: tables[table]["columns"].setdefault(col, {}) is not None
+    assert f.missing_column("m", "SQL compilation error: error line 2 at position 15\ninvalid identifier '\"Date_Added\"'")
+    assert f.missing_column("m", "SQL compilation error: error line 2 at position 52\ninvalid identifier '\"Site Luid\"'")
+    columns = tables["RAW.SHEETLOAD.ABM"]["columns"]
+    assert list(columns) == ["Date_Added", "Site Luid", "ACCOUNT_NAME"]
+    assert columns["Date_Added"] == {"gen": "time_offset", "type": "DATE"} and columns["ACCOUNT_NAME"]["follows"] == "Date_Added"
+    # one the source lacks in any case is added in the case the model writes
+    assert f.missing_column("m", "SQL compilation error: error line 2 at position 80\ninvalid identifier '\"Account_ID\"'")
+    assert "Account_ID" in columns and "ACCOUNT_ID" not in columns
+
+
+def test_a_column_added_to_a_time_as_an_amount_holds_epoch_numbers():
+    # GitLab's customers_db_license_versions_source: Snowflake refuses a time as DATEADD's amount, naming no column
+    tree = parse("""select dateadd('s', _uploaded_at, '1970-01-01')::timestamp as uploaded, dateadd(day, n::int, d) as later,
+        dateadd(day, 1, created_at) as next_day from "RAW".c.versions""")
+    f = fitter(trees={"m": tree})
+    retyped = []
+    f.retype_column = lambda uid, name, hint, *a, **k: retyped.append((name, hint)) or True
+    assert f.time_added_as_an_amount("m", "SQL compilation error:\nInvalid argument types for function 'DATEADD'")
+    assert sorted(retyped) == [("N", "EPOCH"), ("_UPLOADED_AT", "EPOCH")]
+    assert not f.time_added_as_an_amount("m", "SQL compilation error:\nInvalid argument types for function 'CONVERT_TIMEZONE'")
+
+
+def test_a_refused_number_conversion_names_its_column_also_in_a_cast():
+    from fauxflake.fit import _REFUSED_TYPE
+
+    for message, col, fn in [("invalid type [CAST(\"_UPDATED_AT\" AS DECIMAL(38, 0))] for parameter 'TO_NUMBER'", '"_UPDATED_AT"', "TO_NUMBER"),
+                             ("invalid type [CAST(_UPDATED_AT AS DOUBLE)] for parameter 'TO_DOUBLE'", "_UPDATED_AT", "TO_DOUBLE"),
+                             ("invalid type [UPDATED] for parameter 'TO_NUMBER'", "UPDATED", "TO_NUMBER")]:
+        m = _REFUSED_TYPE.search(message)
+        assert (m.group("col"), m.group("fn")) == (col, fn)

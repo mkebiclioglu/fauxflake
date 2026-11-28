@@ -795,6 +795,26 @@ def test_a_snapshots_config_names_columns_of_the_source_it_selects_whole():
     assert "UNIQUE_KEY" in columns and columns["DATE_LAST_MODIFIED_GMT"]["gen"] in ("time_offset", "updated_at", "event_time")
 
 
+def test_the_columns_dbt_writes_into_a_snapshot_are_not_its_sources():
+    from fauxflake.init import build_spec
+
+    # GitLab's sfdc_user_snapshots: `select * from source`, and models read dbt_valid_from/dbt_scd_id of the snapshot
+    manifest = {
+        "sources": {"source.p.n.user": {"database": "RAW", "schema": "SF", "name": "user", "identifier": "user", "columns": {}}},
+        "nodes": {
+            "snapshot.p.user_snapshots": {
+                "resource_type": "snapshot", "depends_on": {"nodes": []}, "relation_name": "A.SNAPSHOTS.USER_SNAPSHOTS",
+                "config": {"strategy": "timestamp", "unique_key": "id", "updated_at": "systemmodstamp"},
+                "compiled_code": "select * from raw.sf.user"},
+            "model.p.users": {
+                "resource_type": "model", "depends_on": {"nodes": ["snapshot.p.user_snapshots"]}, "relation_name": "A.B.USERS",
+                "compiled_code": "select id, name, dbt_scd_id, dbt_valid_from, dbt_valid_to from a.snapshots.user_snapshots"}},
+    }
+    columns = build_spec(manifest, "A")[0]["tables"]["RAW.SF.USER"]["columns"]
+    assert {"ID", "NAME", "SYSTEMMODSTAMP"} <= set(columns)
+    assert not any(c.startswith("DBT_") for c in columns)
+
+
 def test_the_columns_of_one_coalesce_share_what_is_known_of_one():
     from fauxflake.init import build_spec
 

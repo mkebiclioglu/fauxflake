@@ -131,6 +131,7 @@ _DATE_LITERAL = re.compile(r"(\d{4})-(\d{2})-(\d{2})(?:[ T]00:00:00(?:\.0+)?)?")
 CONTEXT = {"CURRENT_ACCOUNT": "FAUXFLAKE", "CURRENT_ACCOUNT_NAME": "FAUXFLAKE", "CURRENT_ORGANIZATION_NAME": "FAUXFLAKE",
            "CURRENT_REGION": "LOCAL", "CURRENT_WAREHOUSE": "LOCAL"}
 _PATHS = "\0paths"  # in a model's outputs: {column: (source, source column, path inside its document)}
+SNAPSHOT_COLUMNS = ("DBT_SCD_ID", "DBT_UPDATED_AT", "DBT_VALID_FROM", "DBT_VALID_TO", "DBT_IS_DELETED")  # dbt writes them
 _ANY = "\0any:"  # in a model's outputs: _ANY + column -> the source columns a COALESCE takes the value from, in order
 _KEYED = "\0key:"  # in a model's outputs: _KEYED + column -> the parts of a surrogate key of several columns, in order
 _LATEST = "\0latest"  # in a CTE's outputs: the one place its rows are the latest of (`qualify row_number() over (partition by x) = 1`)
@@ -2376,6 +2377,10 @@ def analyse(manifest: dict, database: str) -> Analysis:
             scan(parent)
         if node.get("compiled_code"):
             outputs[uid] = scan_model(node["compiled_code"], uses, by_relation, links, joins, dates, lookups, coalesced)
+        if node["resource_type"] == "snapshot" and "*" in outputs[uid]:
+            # dbt writes the snapshot's own columns: a model that reads dbt_valid_from reads none of the source's
+            star = outputs[uid]["*"]
+            outputs[uid]["*"] = (star[0], "|".join(sorted({*filter(None, star[1].split("|")), *SNAPSHOT_COLUMNS})))
         if node["resource_type"] == "snapshot" and "*" in outputs[uid] and outputs[uid]["*"][0] in uses:
             # `select * from source` with `unique_key='id', updated_at='modified'` in the snapshot's config: dbt reads
             # those columns of the source, though the snapshot's SQL does not name them

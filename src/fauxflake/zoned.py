@@ -586,21 +586,31 @@ class _Pass:
             out = exp.DPipe(this=out, expression=p, safe=True)
         return out
 
+    def written(self, kind: str | None, value: exp.Expression) -> exp.Expression:
+        """A value written into a column of that Snowflake type: a TIMESTAMP_TZ made one, text into a TIMESTAMP_LTZ read
+        as Snowflake reads it (with an offset such as +0000, or in the session's zone without one)."""
+        if kind == "TIMESTAMP_TZ":
+            return self.to_tz(value)
+        if kind == "TIMESTAMP_LTZ" and self.kind(value) in ("text", "json", "unknown"):  # (by its type when it binds)
+            return _fn("_tz_instant", value)
+        return value
+
     def writes(self, node: exp.Expression) -> None:
-        """INSERT, UPDATE and MERGE into a TIMESTAMP_TZ column: the value made one."""
+        """INSERT, UPDATE and MERGE into a TIMESTAMP_TZ column: the value made one (and text into a TIMESTAMP_LTZ)."""
         if isinstance(node, exp.Insert) and isinstance(node.this, (exp.Table, exp.Schema)):
             table = node.this if isinstance(node.this, exp.Table) else node.this.this
             columns = self.columns_of(table)
             named = [c.name.upper() for c in node.this.expressions] if isinstance(node.this, exp.Schema) else [c for c, _ in columns]
             kinds = dict(columns)
-            zoned = [i for i, c in enumerate(named) if kinds.get(c) == "TIMESTAMP_TZ"]
+            zoned = [i for i, c in enumerate(named) if kinds.get(c) in ("TIMESTAMP_TZ", "TIMESTAMP_LTZ")]
             if not zoned:
                 return
             source = node.expression
             if isinstance(source, exp.Values):
                 for row in source.expressions:
                     if isinstance(row, exp.Tuple):
-                        row.set("expressions", [self.to_tz(e) if i in zoned else e for i, e in enumerate(row.expressions)])
+                        row.set("expressions", [self.written(kinds.get(named[i]), e) if i in zoned else e
+                                                for i, e in enumerate(row.expressions)])
                 return
             selects = [source] if isinstance(source, exp.Select) else [
                 s for s in source.find_all(exp.Select) if s.parent is source or isinstance(s.parent, exp.SetOperation)] \
@@ -613,23 +623,23 @@ class _Pass:
                         item = select.expressions[i]
                         target = item.this if isinstance(item, exp.Alias) else item
                         if not self.tz(target):
-                            target.replace(self.to_tz(target.copy()))
+                            target.replace(self.written(kinds.get(named[i]), target.copy()))
         if isinstance(node, exp.Update) and isinstance(node.this, exp.Table):
             kinds = dict(self.columns_of(node.this))
             for eq in node.expressions:
-                if isinstance(eq, exp.EQ) and isinstance(eq.this, exp.Column) and kinds.get(eq.this.name.upper()) == "TIMESTAMP_TZ":
-                    eq.set("expression", self.to_tz(eq.expression))
+                if isinstance(eq, exp.EQ) and isinstance(eq.this, exp.Column):
+                    eq.set("expression", self.written(kinds.get(eq.this.name.upper()), eq.expression))
         if isinstance(node, exp.Merge) and isinstance(node.this, exp.Table):
             kinds = dict(self.columns_of(node.this))
             for when in node.find_all(exp.When):
                 then = when.args.get("then")
                 if isinstance(then, exp.Update):
                     for eq in then.expressions:
-                        if isinstance(eq, exp.EQ) and isinstance(eq.this, exp.Column) and kinds.get(eq.this.name.upper()) == "TIMESTAMP_TZ":
-                            eq.set("expression", self.to_tz(eq.expression))
+                        if isinstance(eq, exp.EQ) and isinstance(eq.this, exp.Column):
+                            eq.set("expression", self.written(kinds.get(eq.this.name.upper()), eq.expression))
                 if isinstance(then, exp.Insert) and isinstance(then.this, exp.Tuple) and isinstance(then.expression, exp.Tuple):
                     names = [c.name.upper() for c in then.this.expressions]
-                    then.expression.set("expressions", [self.to_tz(v) if kinds.get(n) == "TIMESTAMP_TZ" else v
+                    then.expression.set("expressions", [self.written(kinds.get(n), v)
                                                         for n, v in zip(names, then.expression.expressions)])
 
     def unions(self, node: exp.Expression) -> None:
@@ -691,7 +701,8 @@ def rewrite(expression: exp.Expression, conn, database: str | None, schema: str 
         catalog, stored = {}, False
     from . import semantics
     local = semantics.SESSION_ZONE[0].upper() not in ("UTC", "ETC/UTC", "GMT", "Z")
-    if not stored and not _mentions_tz(expression) and not (local and _mentions_ltz(expression)):
+    if not stored and not _mentions_tz(expression) and not (local and _mentions_ltz(expression)) \
+            and not _writes_instants(expression, catalog):
         return expression
     db, sch = (database.upper() if database else None), (schema.upper() if schema else None)
     if db and sch and catalog:  # a table found elsewhere (a temporary one) is read where the statement names it
@@ -704,7 +715,19 @@ def rewrite(expression: exp.Expression, conn, database: str | None, schema: str 
     step = _Pass(types, catalog, database.upper() if database else None, schema.upper() if schema else None)
     step.writes(expression)
     step.unions(expression)
-    return _grouped(_bottom_up(expression, step.fix))
+    # `UPDATE t SET tz = ...`: the column set is a name, not a value to read
+    assigned = {id(n) for update in expression.find_all(exp.Update) for eq in update.expressions
+                if isinstance(eq, exp.EQ) and isinstance(eq.this, exp.Column) for n in (eq, eq.this)}
+    return _grouped(_bottom_up(expression, lambda node: node if id(node) in assigned else step.fix(node)))
+
+
+def _writes_instants(expression: exp.Expression, catalog: dict) -> bool:
+    """An INSERT, UPDATE or MERGE into a table with a TIMESTAMP_LTZ column: text written there is read the way
+    Snowflake reads it (`'9999-01-01 00:00:00.000 +0000'`, which DuckDB's own conversion refuses)."""
+    if not isinstance(expression, (exp.Insert, exp.Update, exp.Merge)):
+        return False
+    return any(kind == "TIMESTAMP_LTZ" for schemas in catalog.values() for tables in schemas.values()
+               for columns in tables.values() for kind in columns.values())
 
 
 def _bottom_up(node: exp.Expression, fn) -> exp.Expression:  # noqa: ANN001
