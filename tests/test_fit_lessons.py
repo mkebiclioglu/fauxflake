@@ -1135,3 +1135,18 @@ def test_a_column_that_falls_back_to_a_hash_holds_text():
         "m", 'Conversion Error: Could not convert string "6bb61e3b7bce0931da574d19d1d82c88" to DECIMAL(38,5)')
     assert sorted(retyped) == [("CHARGE_ID", "TEXT"), ("PRODUCT_ID", "TEXT")]
     assert not f.hash_beside_a_column_in_a_coalesce("m", "Could not convert string 'abc' to DOUBLE")
+
+
+def test_a_document_field_made_up_as_text_and_read_as_an_object_becomes_one():
+    # GitLab's dim_ping_metric: FLATTEN(INPUT => OBJECT_KEYS(stage_json.value['groups'])) over stages[].groups
+    tables = {"RAW.Y.STAGES": {"columns": {"JSONTEXT": {"gen": "object", "fields": {
+        "stages[].groups": {"gen": "template", "template": "groups_{hex}"},
+        "stages[].section": {"gen": "template", "template": "section_{hex}"},
+        "other.groups": {"gen": "template", "template": "groups_{hex}"}, "other.groups.name": {"gen": "template", "template": "name_{hex}"}}}}}}
+    f = fitter(tables=tables)
+    f.sources_of = lambda uid: ["RAW.Y.STAGES"]
+    assert f.made_up_text_read_as_a_document("m", '100071 (22000): Failed to cast variant value "groups_80272ae923bf" to OBJECT')
+    fields = tables["RAW.Y.STAGES"]["columns"]["JSONTEXT"]["fields"]
+    assert fields["stages[].groups"] == {"gen": "object", "fields": {}}
+    assert fields["other.groups"]["gen"] == "template"  # (one with keys under it: they say what it holds)
+    assert not f.made_up_text_read_as_a_document("m", '100071 (22000): Failed to cast variant value "groups_80272ae923bf" to OBJECT')

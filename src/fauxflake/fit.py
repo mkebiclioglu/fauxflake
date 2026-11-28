@@ -2599,6 +2599,31 @@ class Fitter:
         as_array = bool(re.search(rf"{name.lower()}\b[^;]{{0,80}}?\)\s*::\s*array|array_size\(", code))
         return self.retype_column(sql_key, name, "ARRAY" if as_array else "VARIANT", direct=True, made_up=True)
 
+    def made_up_text_read_as_a_document(self, sql_key: str, message: str) -> bool:
+        """`OBJECT_KEYS(stage.value['groups'])` on a field made up as text: Snowflake refuses the cast (`Failed to cast
+        variant value "groups_80272ae923bf" to OBJECT`), naming the made-up value, which names the field it was made for.
+        That field of the documents the model reads is an object (an array) instead."""
+        m = re.search(r'Failed to cast variant value "(?P<name>[a-z][a-z0-9_]*)_[0-9a-f]{12}" to (?P<kind>OBJECT|ARRAY)', message)
+        if not m:
+            return False
+        name, made = m.group("name"), {"gen": "object", "fields": {}} if m.group("kind") == "OBJECT" else {"gen": "array"}
+        changed = False
+        for table in self.sources_of(sql_key):
+            for column, held in (self.tables[table].get("columns") or {}).items():
+                fields = held.get("fields") if held.get("gen") == "object" else None
+                for path, field in list((fields or {}).items()):
+                    last = re.split(r"[.\[\]~]+", path.rstrip("[]"))[-1] if path else ""
+                    if last != name or field.get("gen") != "template" or field.get("template") != f"{name}_{{hex}}" \
+                            or any(other.startswith((path + ".", path + "[", path + "~")) for other in fields):
+                        continue
+                    fields[path] = copy.deepcopy(made)
+                    self.retyped.add(table)
+                    self.learned.append(f"{table}.{column}: {path} read as an {m.group('kind').lower()}, generated as one.")
+                    changed = True
+        if changed:
+            self.dirty = True
+        return changed
+
     def text_to_a_time_function(self, sql_key: str, message: str) -> bool:
         """`Function DATE_TRUNC does not support VARCHAR argument type`: Snowflake refuses text given to DATE_TRUNC,
         EXTRACT, DATE_PART or LAST_DAY when it compiles, and the message names no column. Every column the model gives
@@ -2983,7 +3008,8 @@ class Fitter:
             return True
         if self.text_to_a_time_function(sql_key, message) or self.made_up_text_parsed(sql_key, message) \
                 or self.hash_beside_numbers_in_a_union(sql_key, message) or self.time_added_as_an_amount(sql_key, message) \
-                or self.parsed_as_url(sql_key, message) or self.hash_beside_a_column_in_a_coalesce(sql_key, message):
+                or self.parsed_as_url(sql_key, message) or self.hash_beside_a_column_in_a_coalesce(sql_key, message) \
+                or self.made_up_text_read_as_a_document(sql_key, message):
             return True
         if self.udf_input(sql_key, message) or self.pivot_values(sql_key, message) or self.pivoted_upstream(sql_key, message) \
                 or self.missing_column(sql_key, message) or self.missing_relation(sql_key, message) \
