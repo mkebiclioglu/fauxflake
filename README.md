@@ -93,7 +93,7 @@ access to their data:
 | [dbt-snowflake-monitoring](https://github.com/get-select/dbt-snowflake-monitoring) (its integration project) | 28 | 13 tables, 214 columns | 28/28 | 3/5 |
 | [Mattermost](https://github.com/mattermost/mattermost-data-warehouse), legacy `snowflake-dbt` | 249 | 646 tables, 3,342 columns | 249/249 | 17/18 |
 | [Mattermost](https://github.com/mattermost/mattermost-data-warehouse), `mattermost-analytics` | 274 | 563 tables, 7,994 columns | 274/274 | 449/460 |
-| [GitLab analytics](https://gitlab.com/gitlab-data/analytics) | 2,912 | 1,095 tables, 18,482 columns | 2,545/3,046, see below | 3,380/5,036 |
+| [GitLab analytics](https://gitlab.com/gitlab-data/analytics) | 2,912 | 1,095 tables, 18,482 columns | 2,612/3,046, see below | 3,505/5,036 |
 | [Flipside NEAR](https://github.com/FlipsideCrypto/near-models-archive) | 64 | 7 tables, 38 columns | 17 or 18 of 64, see below | 52 or 53 of 469 |
 
 <sub>Measured on 0.5.0 from an empty spec, `fauxflake init` and nothing else. Failing tests state facts about
@@ -101,8 +101,8 @@ production data (row counts, values that must appear, freshness) and are listed 
 `--fit-tests` fits the data to them. Flipside's models nest each model's query tag inside the next one's; past 2,000
 characters Snowflake refuses the tag, and so does the emulator. Which model reaches that first depends on the order
 threads run them; the rest are its dependants. GitLab's project is the size of a large company's warehouse: its spec
-was made by `init` and then `fauxflake fit` (about an hour per build round on a 64 GB machine), and these are its
-numbers after the second build round, with each round still building more.</sub>
+was made by `init` and then `fauxflake fit`, which take about an hour per build round on a 64 GB machine. The 9
+models that still fail are listed by `fit`; the rest are their dependants.</sub>
 
 `fauxflake parity` then built each project on the emulator and on a real Snowflake account from the same generated
 rows and compared every model:
