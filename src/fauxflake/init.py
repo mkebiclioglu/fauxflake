@@ -3643,16 +3643,14 @@ def _fit(project, path: Path, database: str, emu, manifest: dict, analysis: Anal
     project.invoke(["seed"], silent=True)
     failures = fitter.learn_from_models(manifest, database)
     for _ in range(3):
-        if not failures and all(n.get("compiled_code") for n in models):
+        # (the models that inspect the warehouse are left to the build: compiling again does not run them here)
+        if not failures and all(n.get("compiled_code") for n in models if n["unique_id"] not in fitter.deferred):
             break
         # models whose Jinja inspects the warehouse (dbt_utils.star, union_relations, get_column_values)
         # compile differently, or only at all, once the relations they look at exist: they do now
         before, known = len(failures), len(fitter.learned)
-        seen = {n["unique_id"]: n.get("compiled_code") for n in models}
         manifest = project.compile()
         models = [n for n in manifest["nodes"].values() if n["resource_type"] == "model"]
-        if not failures and seen == {n["unique_id"]: n.get("compiled_code") for n in models}:
-            break  # nothing failed and the project compiles as before: running it again teaches nothing
         failures = fitter.learn_from_models(manifest, database)
         if len(failures) > before * 0.9 and (len(fitter.learned) == known or before - len(failures) < 3):
             break  # compiling again changes little now: the build takes it from here

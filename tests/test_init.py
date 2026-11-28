@@ -1586,8 +1586,9 @@ def test_fit_on_a_spec_does_not_add_a_column_it_holds_in_its_case_again(tmp_path
     assert list(columns) == ['"Employee_ID"', "NAME"] and columns['"Employee_ID"']["type"] == "VARCHAR"
 
 
-def test_the_fit_stops_compiling_again_once_nothing_fails_and_the_sql_stays_the_same(tmp_path, monkeypatch):
-    # GitLab: models that inspect the warehouse never compile here, and each pass over its 2,205 others took 18 minutes
+def test_the_fit_stops_compiling_again_once_nothing_fails_but_the_models_left_to_the_build(tmp_path, monkeypatch):
+    # GitLab: its 805 models that inspect the warehouse are left to the build, and each pass over its 2,205 others took
+    # 18 minutes; the SQL of 13 of those holds `run_started_at`, so it is never the same twice
     from types import SimpleNamespace
 
     from fauxflake import fit, init
@@ -1597,7 +1598,7 @@ def test_the_fit_stops_compiling_again_once_nothing_fails_and_the_sql_stays_the_
 
     class Fitter:
         def __init__(self, *a, **k):
-            self.learned, self.spec = [], {}
+            self.learned, self.spec, self.deferred = [], {}, {"model.p.b"}
 
         def learn_from_models(self, manifest, database):
             runs.append(len(runs))
@@ -1608,7 +1609,9 @@ def test_the_fit_stops_compiling_again_once_nothing_fails_and_the_sql_stays_the_
     monkeypatch.setattr(fit, "Fitter", Fitter)
     nodes = {"model.p.a": {"unique_id": "model.p.a", "resource_type": "model", "compiled_code": "select 1"},
              "model.p.b": {"unique_id": "model.p.b", "resource_type": "model"}}  # (inspects the warehouse)
-    project = SimpleNamespace(compile=lambda: {"nodes": nodes}, invoke=lambda *a, **k: None)
+    stamp = iter(range(10))
+    project_nodes = lambda: {**nodes, "model.p.a": {**nodes["model.p.a"], "compiled_code": f"select {next(stamp)}"}}
+    project = SimpleNamespace(compile=lambda: {"nodes": project_nodes()}, invoke=lambda *a, **k: None)
     emu = SimpleNamespace(_fs=SimpleNamespace(results_cache={}))
     init._fit(project, tmp_path / "fauxflake.yml", "ANALYTICS", emu, {"nodes": nodes}, SimpleNamespace(bounds={}), print)
     assert len(runs) == 2  # the first run, then one after compiling again to retry the model that failed
