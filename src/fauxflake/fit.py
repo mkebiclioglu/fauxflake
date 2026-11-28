@@ -1204,6 +1204,42 @@ class Fitter:
         self.dirty |= changed
         return changed
 
+    def parsed_as_url(self, uid: str, message: str) -> bool:
+        """`PARSE_URL(landing_page)['parameters']['utm_campaign']`: Snowflake refuses text without a scheme (`Error
+        parsing URL: scheme not specified`), naming no column. Each column the model parses holds web addresses, with
+        the query parameters the model reads."""
+        tree = self.tree(uid) if "Error parsing URL" in message else None
+        if tree is None:
+            return False
+        url = getattr(exp, "ParseUrl", None)
+        changed = False
+        for call in tree.find_all(*([url] if url else []), exp.Anonymous):
+            if isinstance(call, exp.Anonymous) and call.name.upper() != "PARSE_URL":
+                continue
+            arg = (call.expressions[0] if isinstance(call, exp.Anonymous) and call.expressions else call.this)
+            arg = arg.unnest() if isinstance(arg, exp.Expression) else None
+            if not isinstance(arg, exp.Column):
+                continue
+            params = sorted({b.expressions[0].name for c in tree.find_all(url or exp.Anonymous) if c.this == call.this
+                             for b in [c.parent.parent] if isinstance(c.parent, exp.Bracket) and isinstance(b, exp.Bracket)
+                             and c.parent.expressions and c.parent.expressions[0].name.lower() == "parameters"
+                             and b.expressions and isinstance(b.expressions[0], exp.Literal)})
+            query = "&".join(f"{p}={p.lower()}_{{hex}}" for p in params)
+            for table, name in [(t, n) for t in self.sources_of(uid) for n in self.origins(uid, arg.name.upper())]:
+                columns = self.tables[table].get("columns") or {}
+                if name not in columns or str(columns[name].get("template", "")).startswith("https://"):
+                    continue
+                if columns[name].get("gen") in ("sequence", "hash_id"):
+                    self._unkey(table)
+                columns[name] = {"gen": "template",
+                                 "template": f"https://www.example.com/{name.lower()}/{{hex}}" + (f"?{query}" if query else "")}
+                self.retyped.add(table)
+                self.learned.append(f"{table}.{name}: read with PARSE_URL, generated as web addresses.")
+                changed = True
+        if changed:
+            self.dirty = True
+        return changed
+
     def parsed_as_ip(self, uid: str) -> bool:
         """PARSE_IP(col, 'inet') on a column that was not generated as addresses."""
         tree = self.tree(uid)
@@ -2493,12 +2529,40 @@ class Fitter:
         self.dirty |= changed
         return changed
 
+    def hash_beside_a_column_in_a_coalesce(self, sql_key: str, message: str) -> bool:
+        """`COALESCE(charge.quote_rate_plan_charge_id, MD5(-1))`: the column falls back to a hash, so it holds text (an
+        id); made up as numbers, Snowflake would convert the hash to one and fail, naming only the hash."""
+        if not re.search(r"Could not convert string ['\"][0-9a-f]{32}['\"] to (?:INT\d*|DOUBLE|FLOAT|DECIMAL|BIGINT)", message):
+            return False
+        tree = self.tree(sql_key)
+        if tree is None:
+            return False
+
+        def hashed(e: exp.Expression) -> bool:
+            return any(isinstance(n, (exp.MD5, exp.MD5Digest, exp.SHA, exp.SHA2)) or (isinstance(n, exp.Anonymous)
+                       and n.name.upper() in ("MD5", "MD5_HEX", "SHA1", "SHA1_HEX", "SHA2", "SHA2_HEX"))
+                       or (isinstance(n, exp.Literal) and n.is_string and re.fullmatch(r"[0-9a-f]{32}", n.name))
+                       for n in e.walk())
+        names: list[str] = []
+        for call in tree.find_all(exp.Coalesce, exp.Nvl2):
+            values = [call.this, *call.expressions]
+            if not any(hashed(v) for v in values):
+                continue
+            for v in values:
+                v = v.unnest()
+                if isinstance(v, exp.Column) and not isinstance(v.this, exp.Star) and v.name.upper() not in names:
+                    names.append(v.name.upper())
+        changed = False
+        for name in names:
+            changed = self.retype_column(sql_key, name, "TEXT") or changed
+        return changed
+
     def hash_beside_numbers_in_a_union(self, sql_key: str, message: str) -> bool:
         """`Could not convert string '5685...2ab6c' to INT64`, in a model that reads a `union_relations` model:
         dbt_utils casts each column to the type the first table gives it, and a column one stacked table generates as
         hashes (an id) was made up as numbers in its sister tables. Stacked tables share a shape: the column is text
         in every one of them, made as the table that knew it was."""
-        if not re.search(r"Could not convert string '[0-9a-f]{32}' to (?:INT\d*|DOUBLE|FLOAT|DECIMAL|BIGINT)", message):
+        if not re.search(r"Could not convert string ['\"][0-9a-f]{32}['\"] to (?:INT\d*|DOUBLE|FLOAT|DECIMAL|BIGINT)", message):
             return False
         reads = {_fq(self.nodes[a]["relation_name"]) for a in [sql_key, *self._ancestors(sql_key)]
                  if (self.nodes.get(a) or {}).get("relation_name")}
@@ -2918,7 +2982,8 @@ class Fitter:
                 or self.ambiguous_column(sql_key, message) or self.aggregate_out_of_place(sql_key, message):
             return True
         if self.text_to_a_time_function(sql_key, message) or self.made_up_text_parsed(sql_key, message) \
-                or self.hash_beside_numbers_in_a_union(sql_key, message) or self.time_added_as_an_amount(sql_key, message):
+                or self.hash_beside_numbers_in_a_union(sql_key, message) or self.time_added_as_an_amount(sql_key, message) \
+                or self.parsed_as_url(sql_key, message) or self.hash_beside_a_column_in_a_coalesce(sql_key, message):
             return True
         if self.udf_input(sql_key, message) or self.pivot_values(sql_key, message) or self.pivoted_upstream(sql_key, message) \
                 or self.missing_column(sql_key, message) or self.missing_relation(sql_key, message) \

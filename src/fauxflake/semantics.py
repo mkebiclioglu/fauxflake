@@ -450,7 +450,7 @@ MACROS = zoned.MACROS + [
     # DuckDB returns a full-precision double, and NULL on zero. The failing cast raises without
     # making the expression volatile, so `a / b as r, r * 2` can still reuse the alias.
     f"""create or replace macro {_NS}_sf_div(a, b) as case
-          when b = 0 and a is not null then cast('Division by zero' as double)
+          when b = 0 and a is not null then cast(chr(31) || 'fxerr:100051:22012:Division by zero' || chr(31) as double)
           when typeof(a) in ('DOUBLE', 'FLOAT', 'VARCHAR') or typeof(b) in ('DOUBLE', 'FLOAT', 'VARCHAR') then a::double / b::double
           else round(a::double / b::double, greatest({_SCALE}, least({_SCALE} + 6, 12))) end""",
     # DATE_TRUNC keeps the input type. DuckDB turns a DATE into a TIMESTAMP.
@@ -2411,8 +2411,11 @@ def layer_windows(tree: exp.Expression, everywhere: bool = False) -> exp.Express
             hidden = {name: f"_la_{i}_{name}" for i, name in enumerate(sorted(nested))}
             # the windows move one level down, where the other aliases of this SELECT do not exist:
             # write those out (`a || b as k, lag(k) over (...) as prev, count_if(k != prev) over (...)`)
+            # (not one built on a window being moved, `min(valid_from) over (...) as first, iff(.., first, ..) as valid_from`:
+            # inside that window the name cannot be the alias, which reads the window, so it is the source's column)
             plain = {p.alias.lower(): p.this for p in select.expressions if isinstance(p, exp.Alias) and not p.find(exp.Window)
-                     and not (isinstance(p.this, exp.Column) and p.this.name.lower() == p.alias.lower())}
+                     and not (isinstance(p.this, exp.Column) and p.this.name.lower() == p.alias.lower())
+                     and not any(not c.table and c.name.lower() in windowed for c in p.this.find_all(exp.Column))}
 
             def moved(expression: exp.Expression) -> exp.Expression:
                 out = expression.copy()
@@ -5382,6 +5385,13 @@ def variants_by_value(transformed: exp.Expression, conn) -> exp.Expression:  # n
             continue
         is_json = iter(k == "JSON" for k in kinds)
         keyed = [(g, r) for (g, r), j in zip(grouped, is_json) if j]
+        # an item grouped by its position or alias as a whole (`up[0]::number` beside `up`, GROUP BY 1, 2, 3): it is a
+        # key of the group as written, so the VARIANT inside it is not made one of the group's values
+        names = {e.alias.upper(): i for i, e in enumerate(select.expressions) if isinstance(e, exp.Alias)}
+        whole = {int(g.name) - 1 if isinstance(g, exp.Literal) else names[g.name.upper()]
+                 for g, r in grouped if (g, r) not in keyed and (
+                     (isinstance(g, exp.Literal) and g.is_int and 0 < int(g.name) <= len(select.expressions))
+                     or (isinstance(g, exp.Column) and not g.table and g.name.upper() in names))}
         listed = [e for e, j in zip(distinct_items, is_json) if j]
         for p, j in zip(partitions, is_json):
             if j:
@@ -5414,6 +5424,8 @@ def variants_by_value(transformed: exp.Expression, conn) -> exp.Expression:  # n
             return node
 
         for i, item in enumerate(list(select.expressions)):
+            if i in whole:
+                continue
             name = item.alias_or_name if not isinstance(item, exp.Alias) else None
             changed = item.transform(one_of, copy=True)
             if name and changed is not item and not isinstance(item, exp.Alias) and changed != item:

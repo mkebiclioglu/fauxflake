@@ -1108,3 +1108,30 @@ def test_a_refused_number_conversion_names_its_column_also_in_a_cast():
                              ("invalid type [UPDATED] for parameter 'TO_NUMBER'", "UPDATED", "TO_NUMBER")]:
         m = _REFUSED_TYPE.search(message)
         assert (m.group("col"), m.group("fn")) == (col, fn)
+
+
+def test_a_column_parsed_as_a_url_is_generated_as_web_addresses_with_the_parameters_read():
+    # GitLab's dim_crm_touchpoint: PARSE_URL(bizible_landing_page_raw)['parameters']['utm_campaign']
+    tree = parse("""select parse_url(page)['parameters']['utm_campaign']::varchar as campaign,
+        parse_url(page)['parameters']['utm_medium']::varchar as medium, parse_url(page)['host']::varchar as host from "RAW".b.tp""")
+    tables = {"RAW.B.TP": {"columns": {"PAGE": {"gen": "template", "template": "page_{hex}"}}}}
+    f = fitter(trees={"m": tree}, tables=tables)
+    f.sources_of, f.origins = (lambda uid: ["RAW.B.TP"]), (lambda uid, name, depth=0, strict=False: [name])
+    assert not f.parsed_as_url("m", "Numeric value 'x' is not recognized")
+    assert f.parsed_as_url("m", "100139 (22000): Error parsing URL: scheme not specified")
+    assert tables["RAW.B.TP"]["columns"]["PAGE"] == {
+        "gen": "template", "template": "https://www.example.com/page/{hex}?utm_campaign=utm_campaign_{hex}&utm_medium=utm_medium_{hex}"}
+    assert not f.parsed_as_url("m", "100139 (22000): Error parsing URL: scheme not specified")  # (learned once)
+
+
+def test_a_column_that_falls_back_to_a_hash_holds_text():
+    # GitLab's fct_quote_item: COALESCE(rate_plan_charge.zqu_quote_rate_plan_charge_id, MD5(-1)) in a surrogate key
+    tree = parse("""select md5(coalesce(c.charge_id, md5(-1)) || ifnull(c.product_id, md5(-1))) as k, coalesce(c.n, 0) as n
+        from "RAW".q.charges c""")
+    f = fitter(trees={"m": tree})
+    retyped = []
+    f.retype_column = lambda uid, name, hint, *a, **k: retyped.append((name, hint)) or True
+    assert f.hash_beside_a_column_in_a_coalesce(
+        "m", 'Conversion Error: Could not convert string "6bb61e3b7bce0931da574d19d1d82c88" to DECIMAL(38,5)')
+    assert sorted(retyped) == [("CHARGE_ID", "TEXT"), ("PRODUCT_ID", "TEXT")]
+    assert not f.hash_beside_a_column_in_a_coalesce("m", "Could not convert string 'abc' to DOUBLE")

@@ -516,9 +516,30 @@ class _Pass:
         if not keyed:
             return
 
+        def aggregated(node: exp.Expression) -> bool:
+            """Inside an aggregate of the group. A window runs after the grouping: its PARTITION BY, ORDER BY and
+            the arguments of a function it applies (`object_agg(...) over (partition by ts)`) read the group's values."""
+            parent = node.parent
+            while parent is not None and parent is not select:
+                if isinstance(parent, exp.AggFunc) and not isinstance(parent.parent, exp.Window) \
+                        and not (isinstance(parent.parent, exp.Filter) and isinstance(parent.parent.parent, exp.Window)):
+                    return True
+                parent = parent.parent
+            return False
+
+        def window_key(node: exp.Expression) -> bool:
+            """In a window's PARTITION BY or ORDER BY, where TIMESTAMP_TZ values compare by their instant."""
+            child, parent = node, node.parent
+            while parent is not None and parent is not select:
+                if isinstance(parent, exp.Window) and child.arg_key in ("partition_by", "order"):
+                    return True
+                child, parent = parent, parent.parent
+            return False
+
         def one_of(node: exp.Expression) -> exp.Expression:
-            if any(node == k for k in keyed) and not node.find_ancestor(exp.AggFunc, exp.Window):
-                return exp.Anonymous(this="any_value", expressions=[node.copy()])
+            if any(node == k for k in keyed) and not aggregated(node):
+                value = exp.Anonymous(this="any_value", expressions=[node.copy()])
+                return _field(value, "i") if window_key(node) else value
             return node
 
         for i, item in enumerate(list(select.expressions)):

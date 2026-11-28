@@ -1,3 +1,4 @@
+from datetime import datetime
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -632,3 +633,27 @@ def test_a_chain_of_aliases_compared_through_macros_beside_a_cte_star_is_compute
     assert rows == [("Web Form", "gitlab.com/x/ebook.html", "Event", 1, "FALSE", "gitlab.com/x/ebook.html", "gitlab.com/x/ebook",
                      "eBook", "Survey", "Online Content", "eBook", "Other")]
     assert time.monotonic() - started < 20
+
+
+def test_an_item_grouped_as_a_whole_beside_the_variant_it_reads_is_not_an_aggregate(emu):
+    # GitLab's gitlab_dotcom_namespace_lineage_scd: GROUP BY 1..7 over upstream_lineage and upstream_lineage[0]::NUMBER
+    emu.ensure_database("ANALYTICS", "CI")
+    cur = emu._fs.connect(database="ANALYTICS", schema="CI").cursor()
+    cur.execute("create or replace table lineage as select 1 as id, to_array(7) as up, to_array('2024-01-01'::timestamp) as f "
+                "union all select 1, parse_json('[7.0]'), to_array('2024-01-02'::timestamp)")
+    cur.execute("""select id, up, up[0]::number as ultimate, array_size(up) as depth, max(fl.value::timestamp) as latest
+        from lineage, lateral flatten(input => f) fl group by 1, 2, 3, 4""")
+    assert cur.fetchall() == [(1, "[7]", 7, 1, datetime(2024, 1, 2))]  # (7 and 7.0 are one value, as in Snowflake)
+    cur.execute("select id, up[0]::number as ultimate, count(*) from lineage group by id, up, ultimate")
+    assert cur.fetchall() == [(1, 7, 2)]
+
+
+def test_an_alias_built_on_a_window_does_not_stand_for_the_column_the_window_reads(emu):
+    # GitLab's prep_geozone: min(valid_from) over (...) as first_file_date, iff(..., first_file_date, ...) as valid_from
+    emu.ensure_database("ANALYTICS", "CI")
+    cur = emu._fs.connect(database="ANALYTICS", schema="CI").cursor()
+    cur.execute("create or replace table geo as select 'US' as country, 1 as grp, '2020-05-01'::timestamp as valid_from "
+                "union all select 'US', 1, '2020-02-01'::timestamp")
+    cur.execute("""select min(valid_from) over (partition by country, grp)::date as first_file_date,
+        iff(grp = 1, least('2020-03-24', first_file_date), first_file_date) as valid_from from geo""")
+    assert cur.fetchall() == [(datetime(2020, 2, 1).date(), datetime(2020, 2, 1).date())] * 2

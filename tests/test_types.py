@@ -1,4 +1,5 @@
 """What the client is told a column holds: the type codes and Python values Snowflake's connector gives."""
+import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -57,6 +58,20 @@ def test_text_with_an_offset_is_written_into_zoned_columns_by_update_and_merge(c
     assert cur.fetchall() == [
         ("a", datetime(2019, 12, 31, 21, tzinfo=timezone.utc), "2020-01-01 00:00:00.000 +0300", datetime(2020, 1, 1)),
         ("b", datetime(9999, 1, 1, tzinfo=timezone.utc), "9999-01-01 00:00:00.000 Z", datetime(9999, 1, 1))]  # (as Snowflake shows +0000)
+
+
+def test_a_window_in_a_select_grouped_by_a_timestamp_tz_reads_the_groups_value(cur):
+    # GitLab's ga360_session: GROUP BY visit_start_time beside object_agg(...) over (partition by visit_start_time)
+    cur.execute("create or replace table visits (id int, started timestamp_tz, k varchar, v varchar)")
+    cur.execute("insert into visits values (1, '2024-01-01 12:00:00 +0200', 'a', 'x'), (1, '2024-01-01 10:00:00 Z', 'b', 'y'), "
+                "(2, '2024-01-02 00:00:00 +0000', 'a', 'z')")
+    cur.execute("""select id, started::varchar, count(*), rank() over (order by started desc),
+        sum(count(*)) over (partition by started), object_agg(k, v::variant) over (partition by id, started)
+        from visits group by id, started, k, v order by 1, 2 limit 2""")
+    rows = cur.fetchall()
+    # (a group of each row: one shows its +0200, the other its Z; the two are one instant, and rank and partition alike)
+    assert {r[:5] for r in rows} == {(1, "2024-01-01 12:00:00.000 +0200", 1, 2, 2), (1, "2024-01-01 10:00:00.000 Z", 1, 2, 2)}
+    assert all(json.loads(r[5]) == {"a": "x", "b": "y"} for r in rows)
 
 
 def test_the_session_time_zone(cur):
