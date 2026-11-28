@@ -1,6 +1,6 @@
 [project]
 name = "fauxflake"
-version = "0.4.0"
+version = "0.5.0"
 description = "Run dbt-snowflake CI on synthetic, statistically shaped data, locally on DuckDB."
 readme = "README.md"
 license = "MIT"
