@@ -663,10 +663,54 @@ class _Pass:
                     then.expression.set("expressions", [self.written(kinds.get(n), v)
                                                         for n, v in zip(names, then.expression.expressions)])
 
-    def unions(self, node: exp.Expression) -> None:
-        """A UNION whose column is a TIMESTAMP_TZ in one branch: the other branches' values made one too."""
+    def star_unions(self, branches: list[exp.Select], conn) -> bool:  # noqa: ANN001
+        """`select * from snapshot union select *, null::timestamp_tz as created_at from changes`: the columns of each
+        branch, its stars written out by what DuckDB describes, line up by position; where one branch holds a
+        TIMESTAMP_TZ, the others' values are made one (a column of a star through `* REPLACE (...)`)."""
+        lined: list[list[tuple[str, exp.Expression | None, exp.Expression | None, bool]]] = []
+        for branch in branches:
+            out: list[tuple[str, exp.Expression | None, exp.Expression | None, bool]] = []
+            for item in branch.expressions:
+                if _starred(item):
+                    described = _star_columns(branch, item, conn)
+                    if described is None:
+                        return False
+                    out += [(name, None, item, zoned) for name, zoned in described]
+                else:
+                    value = item.this if isinstance(item, exp.Alias) else item
+                    out.append((item.alias_or_name, value, None, self.tz(value)))
+            lined.append(out)
+        if len({len(columns) for columns in lined}) != 1:
+            return False
+        changed = False
+        for i in range(len(lined[0])):
+            if not any(columns[i][3] for columns in lined):
+                continue
+            for name, value, star, zoned in (columns[i] for columns in lined):
+                if zoned:
+                    continue
+                if value is not None:
+                    if not isinstance(value, exp.Null):
+                        value.replace(self.to_tz(value.copy()))
+                        changed = True
+                    continue
+                inner = star if isinstance(star, exp.Star) else star.this
+                column = exp.column(exp.to_identifier(name, quoted=True),
+                                    table=star.args.get("table").copy() if isinstance(star, exp.Column) and star.args.get("table") else None)
+                inner.set("replace", [*(inner.args.get("replace") or []),
+                                      exp.alias_(self.to_tz(column), exp.to_identifier(name, quoted=True))])
+                changed = True
+        return changed
+
+    def unions(self, node: exp.Expression, conn=None) -> bool:  # noqa: ANN001
+        """A UNION whose column is a TIMESTAMP_TZ in one branch: the other branches' values made one too. True when a
+        UNION with a `*` in a branch was changed."""
+        starred = False
         for union in node.find_all(exp.SetOperation):
             branches = [s for s in (union.left, union.right) if isinstance(s, exp.Select)]
+            if len(branches) >= 2 and conn is not None and any(any(_starred(e) for e in b.expressions) for b in branches):
+                starred = self.star_unions(branches, conn) or starred
+                continue
             if len(branches) < 2 or any(any(isinstance(e, exp.Star) for e in b.expressions) for b in branches):
                 continue
             for i in range(min(len(b.expressions) for b in branches)):
@@ -675,6 +719,7 @@ class _Pass:
                     for v in values:
                         if not self.tz(v) and not isinstance(v, exp.Null):
                             v.replace(self.to_tz(v.copy()))
+        return starred
 
 
 def _annotated(expression: exp.Expression, catalog: dict, database: str | None, schema: str | None) -> dict[int, exp.DataType]:
@@ -689,6 +734,9 @@ def _annotated(expression: exp.Expression, catalog: dict, database: str | None, 
         if alias is None or not alias.columns:
             values.set("alias", exp.TableAlias(this=exp.to_identifier(alias.name if alias is not None else "_fx_values"),
                                                columns=[exp.to_identifier(f"COLUMN{i + 1}") for i in range(width)]))
+    for call in list(copy.find_all(exp.Anonymous)):  # (the values the rewrite made a TIMESTAMP_TZ, typed as one)
+        if _own(call) in _MAKERS:
+            call.replace(exp.Cast(this=call.copy(), to=exp.DataType.build("TIMESTAMPTZ")))
     kw = {"catalog": database, "db": schema} if database else {}
     try:
         copy = qualify(copy, schema=catalog or None, dialect="snowflake", validate_qualify_columns=False,
@@ -713,6 +761,28 @@ def _annotated(expression: exp.Expression, catalog: dict, database: str | None, 
     return {n.meta["fx"]: n.type for n in copy.walk() if "fx" in n.meta and n.type is not None}
 
 
+def _starred(e: exp.Expression) -> bool:
+    return isinstance(e, exp.Star) or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star))
+
+
+def _star_columns(branch: exp.Select, star: exp.Expression, conn) -> list[tuple[str, bool]] | None:  # noqa: ANN001
+    """The columns a `*` of a UNION branch stands for, and whether each holds a TIMESTAMP_TZ (None: cannot be told)."""
+    from .semantics import _cte_prefix
+
+    probe = exp.Select(expressions=[star.copy()])
+    if branch.args.get("from_") is None:
+        return None
+    probe.set("from_", branch.args["from_"].copy())
+    for key in ("joins", "laterals"):
+        if branch.args.get(key):
+            probe.set(key, [j.copy() for j in branch.args[key]])
+    try:
+        rows = conn.execute("describe " + _cte_prefix(branch) + probe.sql(dialect="duckdb")).fetchall()
+    except Exception:  # noqa: BLE001 - binds only in its place
+        return None
+    return [(str(r[0]), str(r[1]).upper() == SHOWN.upper()) for r in rows]
+
+
 def rewrite(expression: exp.Expression, conn, database: str | None, schema: str | None) -> exp.Expression:  # noqa: ANN001
     """The statement with its TIMESTAMP_TZ values held as (instant, offset) and read the way Snowflake reads them."""
     names = {t.name for t in expression.find_all(exp.Table) if t.name}
@@ -735,7 +805,8 @@ def rewrite(expression: exp.Expression, conn, database: str | None, schema: str 
     types = _annotated(expression, catalog, db, sch)
     step = _Pass(types, catalog, database.upper() if database else None, schema.upper() if schema else None)
     step.writes(expression)
-    step.unions(expression)
+    if step.unions(expression, conn):  # (a branch's values made TIMESTAMP_TZs: what reads the UNION is typed again)
+        step.types = _annotated(expression, catalog, db, sch)
     # `UPDATE t SET tz = ...`: the column set is a name, not a value to read
     assigned = {id(n) for update in expression.find_all(exp.Update) for eq in update.expressions
                 if isinstance(eq, exp.EQ) and isinstance(eq.this, exp.Column) for n in (eq, eq.this)}

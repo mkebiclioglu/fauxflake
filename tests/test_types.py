@@ -74,6 +74,15 @@ def test_a_window_in_a_select_grouped_by_a_timestamp_tz_reads_the_groups_value(c
     assert all(json.loads(r[5]) == {"a": "x", "b": "y"} for r in rows)
 
 
+def test_a_union_of_stars_with_a_timestamp_tz_in_one_branch_makes_the_others_one(cur):
+    # GitLab's sfdc_opportunity_field_historical: select * from snapshot union select *, null::timestamp_tz as created_at ...
+    cur.execute("create or replace table snap as select 1 as id, '2024-01-01'::date as created_at, '2024-01-02'::timestamp as valid_from")
+    cur.execute("create or replace table changes as select 2 as id")
+    cur.execute("""with u as (select * from snap union select *, null::timestamp_tz as created_at, null::timestamp_tz as valid_from
+        from changes) select id, created_at::varchar, valid_from::varchar from u order by id""")
+    assert cur.fetchall() == [(1, "2024-01-01 00:00:00.000 Z", "2024-01-02 00:00:00.000 Z"), (2, None, None)]
+
+
 def test_the_session_time_zone(cur):
     """Measured on Snowflake with ALTER SESSION SET TIMEZONE = 'America/Los_Angeles' (2026-11-23)."""
     cur.execute("alter session set timezone = 'America/Los_Angeles'")
