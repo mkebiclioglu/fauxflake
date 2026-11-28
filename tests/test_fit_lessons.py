@@ -1081,11 +1081,17 @@ def test_a_quoted_name_in_mixed_case_renames_the_column_it_was_generated_as():
     assert f.missing_column("m", "SQL compilation error: error line 2 at position 15\ninvalid identifier '\"Date_Added\"'")
     assert f.missing_column("m", "SQL compilation error: error line 2 at position 52\ninvalid identifier '\"Site Luid\"'")
     columns = tables["RAW.SHEETLOAD.ABM"]["columns"]
-    assert list(columns) == ["Date_Added", "Site Luid", "ACCOUNT_NAME"]
-    assert columns["Date_Added"] == {"gen": "time_offset", "type": "DATE"} and columns["ACCOUNT_NAME"]["follows"] == "Date_Added"
+    assert list(columns) == ['"Date_Added"', '"Site Luid"', "ACCOUNT_NAME"]  # (in double quotes: the spec keeps the case)
+    assert columns['"Date_Added"'] == {"gen": "time_offset", "type": "DATE"} and columns["ACCOUNT_NAME"]["follows"] == "Date_Added"
     # one the source lacks in any case is added in the case the model writes
     assert f.missing_column("m", "SQL compilation error: error line 2 at position 80\ninvalid identifier '\"Account_ID\"'")
-    assert "Account_ID" in columns and "ACCOUNT_ID" not in columns
+    assert '"Account_ID"' in columns and "ACCOUNT_ID" not in columns
+    # and a spec read back keeps those names in their case, the rest in upper case
+    from fauxflake.spec import Spec
+
+    spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "tables": {"RAW.SHEETLOAD.ABM": {
+        "columns": {"ID": {"gen": "sequence"}, **columns}}}}, ".")
+    assert list(spec.tables["RAW.SHEETLOAD.ABM"].columns) == ["ID", "Date_Added", "Site Luid", "ACCOUNT_NAME", "Account_ID"]
 
 
 def test_a_column_added_to_a_time_as_an_amount_holds_epoch_numbers():

@@ -144,6 +144,13 @@ class Table:
         return done
 
 
+def column_name(key: str) -> str:
+    """A column as the spec names it: upper case, as Snowflake stores an unquoted name, or, written in double quotes
+    (`'"Date_Added"'`), that name in its case, as a model that quotes it reads it."""
+    key = str(key)
+    return key[1:-1] if len(key) > 2 and key.startswith('"') and key.endswith('"') else key.upper()
+
+
 def quoted(name: str) -> str:
     return ".".join('"' + part.replace('"', '""') + '"' for part in name.split("."))
 
@@ -187,7 +194,7 @@ class Spec:
             name = name.upper()
             if name.count(".") != 2:
                 raise ValueError(f"table {name!r} must be DATABASE.SCHEMA.TABLE")
-            cols = {c.upper(): dict(d or {}) for c, d in (t.get("columns") or {}).items()}
+            cols = {column_name(c): dict(d or {}) for c, d in (t.get("columns") or {}).items()}
             tables[name] = Table(name=name, raw=t, columns=cols)
         spec = cls(seed=int(raw.get("seed", 1)), start=_date(raw["start"]), tables=tables,
                    dbt=raw.get("dbt") or {}, path=Path(path),

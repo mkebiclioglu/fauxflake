@@ -1758,10 +1758,16 @@ class Fitter:
     def cased_column(self, candidates: set[str], col: str, written: str) -> bool:
         """`"Date_Added"::date`: a quoted name is that name in its case, so the source's column DATE_ADDED is not it.
         The one source that has the column in upper case gets it in the case the model writes, in its place."""
+        key = f'"{written}"'  # (in the spec, a name in double quotes keeps its case)
         having = [c for c in sorted(candidates) if c in self.tables and col in (self.tables[c].get("columns") or {})]
-        if len(having) != 1 or written in self.tables[having[0]]["columns"]:
-            if len(candidates) == 1 and next(iter(candidates)) in self.tables and not having:
-                return self.add_column(next(iter(candidates)), written)
+        if len(having) != 1 or key in self.tables[having[0]]["columns"]:
+            only = next(iter(candidates)) if len(candidates) == 1 else None
+            if only in self.tables and not having and key not in (self.tables[only].get("columns") or {}):
+                self.tables[only].setdefault("columns", {})[key] = guess(written, None)
+                self.retyped.add(only)
+                self.learned.append(f'{only}."{written}": read by a model in its case, added.')
+                self.dirty = True
+                return True
             return False
         table = self.tables[having[0]]
 
@@ -1771,7 +1777,7 @@ class Fitter:
             if isinstance(value, list):
                 return [renamed(v) for v in value]
             return written if value == col else value
-        table["columns"] = {(written if name == col else name): renamed(spec) for name, spec in table["columns"].items()}
+        table["columns"] = {(key if name == col else name): renamed(spec) for name, spec in table["columns"].items()}
         self.retyped.add(having[0])
         self.learned.append(f'{having[0]}.{written}: read as "{written}", a quoted name in its case; renamed from {col}.')
         self.dirty = True
