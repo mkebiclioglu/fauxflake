@@ -1584,3 +1584,31 @@ def test_fit_on_a_spec_does_not_add_a_column_it_holds_in_its_case_again(tmp_path
     init.update_spec(project, path, "ANALYTICS", emu=None)
     columns = yaml.safe_load(path.read_text())["tables"]["RAW.S.T"]["columns"]
     assert list(columns) == ['"Employee_ID"', "NAME"] and columns['"Employee_ID"']["type"] == "VARCHAR"
+
+
+def test_the_fit_stops_compiling_again_once_nothing_fails_and_the_sql_stays_the_same(tmp_path, monkeypatch):
+    # GitLab: models that inspect the warehouse never compile here, and each pass over its 2,205 others took 18 minutes
+    from types import SimpleNamespace
+
+    from fauxflake import fit, init
+
+    monkeypatch.setenv("FAUXFLAKE_FIT_NO_BUILD", "1")
+    runs = []
+
+    class Fitter:
+        def __init__(self, *a, **k):
+            self.learned, self.spec = [], {}
+
+        def learn_from_models(self, manifest, database):
+            runs.append(len(runs))
+            return ["model.p.a"] if len(runs) == 1 else []
+
+        generate = drop_models = save = lambda self, *a: None
+
+    monkeypatch.setattr(fit, "Fitter", Fitter)
+    nodes = {"model.p.a": {"unique_id": "model.p.a", "resource_type": "model", "compiled_code": "select 1"},
+             "model.p.b": {"unique_id": "model.p.b", "resource_type": "model"}}  # (inspects the warehouse)
+    project = SimpleNamespace(compile=lambda: {"nodes": nodes}, invoke=lambda *a, **k: None)
+    emu = SimpleNamespace(_fs=SimpleNamespace(results_cache={}))
+    init._fit(project, tmp_path / "fauxflake.yml", "ANALYTICS", emu, {"nodes": nodes}, SimpleNamespace(bounds={}), print)
+    assert len(runs) == 2  # the first run, then one after compiling again to retry the model that failed
