@@ -695,10 +695,13 @@ class _Pass:
                         changed = True
                     continue
                 inner = star if isinstance(star, exp.Star) else star.this
-                column = exp.column(exp.to_identifier(name, quoted=True),
+                # (a plain name as DuckDB describes it, `created_at`, is the CREATED_AT Snowflake reads: written so, not
+                # quoted, which in Snowflake would be another column)
+                quote = not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", name)
+                column = exp.column(exp.to_identifier(name, quoted=quote),
                                     table=star.args.get("table").copy() if isinstance(star, exp.Column) and star.args.get("table") else None)
                 inner.set("replace", [*(inner.args.get("replace") or []),
-                                      exp.alias_(self.to_tz(column), exp.to_identifier(name, quoted=True))])
+                                      exp.alias_(self.to_tz(column), exp.to_identifier(name, quoted=quote))])
                 changed = True
         return changed
 

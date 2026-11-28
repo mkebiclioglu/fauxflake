@@ -408,7 +408,9 @@ class Fitter:
     def doubled_by_a_star(self, sql_key: str, message: str) -> bool:
         """`select o.id as sfid, o.* from source o`, refused (`duplicate column name 'SFID'`): the model writes the
         column out itself, so the source behind the star must not have one. Take it out of the generated table."""
-        m = re.search(r"duplicate column name '\"?([^'\"]+)\"?'", message)
+        # (`ambiguous column name 'VALID_FROM'`: a later CTE reads the name a select gives twice, `"VALID_FROM", min(...) as
+        # valid_from`, from a source whose columns a macro wrote out)
+        m = re.search(r"(?:duplicate|ambiguous) column name '\"?([^'\"]+)\"?'", message)
         t = self.tree(sql_key) if m else None
         if t is None:
             return False
@@ -430,8 +432,11 @@ class Fitter:
                     while behind and behind not in self.tables and behind not in seen and len(seen) < 6:
                         seen.add(behind)
                         behind = self.passthrough(behind)
-                    if not behind or behind not in self.tables \
-                            or f"{behind}.{col}: read by a model, added." not in self.learned:
+                    # (or made up from its name alone, in an earlier run: nothing measured it, and Snowflake would refuse
+                    # the model if the source had it)
+                    held = ((self.tables.get(behind) or {}).get("columns") or {}).get(col) if behind else None
+                    if not behind or behind not in self.tables or (f"{behind}.{col}: read by a model, added." not in self.learned
+                                                                   and held != guess(col, None)):
                         continue
                     owner = behind
                 columns = (self.tables.get(owner) or {}).get("columns") or {}
@@ -2260,6 +2265,10 @@ class Fitter:
             holder = (m.groupdict().get("table") or "").upper()
             tree = self.tree(sql_key)
             sources = self.sources_of(sql_key)
+            if not holder and tree is not None:
+                # (`invalid identifier 'SCREEN'`, of `stages_pivoted.screen`: the relation is the one the SQL names it of)
+                holder = next((c.table.upper() for c in tree.find_all(exp.Column)
+                               if c.table and c.name.upper() == m.group("col").upper()), "")
             if not prefix and not suffix:
                 # no prefix to tell the pivoted columns by: they are what the model reads from the CTE that
                 # pivots (`stages_pivoted.application_review`) and that CTE does not otherwise select
@@ -2550,7 +2559,10 @@ class Fitter:
             macros[uid] = macro.get("macro_sql") or ""
             pile += macro.get("depends_on", {}).get("macros", [])
         tested = [c for text in macros.values() for c in re.findall(r"'([A-Z][A-Z0-9_]*)'\s+(?:not\s+)?in\s+[\w.\[\]]*column", text)]
-        wanted = [c for c in dict.fromkeys([*tested, *self.columns_children_read(sql_key)]) if not _WRITTEN_BY_DBT.match(c)]
+        # (what the models downstream read of it, but not a name its own SQL gives, `id::number as member_id`)
+        given = set(re.findall(r"\bAS\s+([A-Z_][A-Z0-9_$]*)", code))
+        read = [c for c in self.columns_children_read(sql_key) if c.upper() not in given]
+        wanted = [c for c in dict.fromkeys([*tested, *read]) if not _WRITTEN_BY_DBT.match(c)]
         changed = False
         for table in tables:
             columns = self.tables[table].setdefault("columns", {})

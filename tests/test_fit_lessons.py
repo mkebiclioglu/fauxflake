@@ -749,6 +749,17 @@ def test_pivoted_values_add_up_over_rounds():
     assert set(tables["RAW.T.STAGES"]["columns"]["STAGE"]["values"]) == {"screen", "offer"}
 
 
+def test_a_pivoted_value_named_in_snowflakes_words_without_its_relation_is_learned():
+    # GitLab's greenhouse_stage_intermediate: `invalid identifier 'SCREEN'`, of `stages_pivoted.screen`
+    raw = "with p as (select id, {{ dbt_utils.pivot('stage', dbt_utils.get_column_values(ref('stages'), 'stage')) }} from x) select p.screen from p"
+    tables = {"RAW.T.STAGES": {"columns": {"STAGE": {"gen": "categorical", "values": {"name_1": 0.5, "name_2": 0.5}}}}}
+    f = fitter(trees={"m": parse('with p as (select id, max(1) as name_1 from x) select p.screen from p')}, sql_of={"m": "x"},
+               nodes={"m": {"raw_code": raw}}, tables=tables)
+    f.sources_of = lambda uid: ["RAW.T.STAGES"]
+    f.origins = lambda uid, column, **k: ["STAGE"]
+    assert f.pivot_values("m", "SQL compilation error: error line 9 at position 4\ninvalid identifier 'SCREEN'")
+    assert set(tables["RAW.T.STAGES"]["columns"]["STAGE"]["values"]) == {"name_1", "name_2", "screen"}
+
 def test_numbers_are_followed_back_through_the_models_before():
     """One made-up value fails as a number; every source column the models use as numbers is learned with it."""
     stage = parse("select id, amount__c as amount, probability, stage_name as stage, closed_on, owner_id, "
@@ -1180,6 +1191,43 @@ def test_a_column_written_beside_a_star_of_a_model_is_taken_from_the_source_it_w
     tables["LOAD.SNAPSHOTS.RENEW"]["columns"]["SNAPSHOT_ID"] = {"gen": "dist"}
     assert not f.doubled_by_a_star("m", "duplicate column name 'SNAPSHOT_ID'")
 
+
+
+def test_a_column_written_beside_a_star_that_an_earlier_run_made_up_from_its_name_is_taken_out_too():
+    # the same model on `fauxflake fit`: the column was added in an earlier run, so this run learned nothing of it
+    from fauxflake.init import guess
+
+    tree = parse("""with base as (select * from "PROD".prep.renew_base), dates as (select * from "PROD".common.dim_date)
+        select dates.date_actual as snapshot_date, base.* from base join dates on true""")
+    tables = {"LOAD.SNAPSHOTS.RENEW": {"columns": {"ARR": {"gen": "dist"}, "SNAPSHOT_DATE": guess("SNAPSHOT_DATE", None)}}}
+    f = fitter(trees={"m": tree}, tables=tables)
+    f.passthrough = lambda fq: {"PROD.PREP.RENEW_BASE": "LOAD.SNAPSHOTS.RENEW"}.get(fq)
+    f.emu = type("E", (), {"duck": _Duck()})()
+    assert f.doubled_by_a_star("m", "duplicate column name 'SNAPSHOT_DATE'")
+    assert list(tables["LOAD.SNAPSHOTS.RENEW"]["columns"]) == ["ARR"]
+
+
+def test_a_source_column_a_macro_writes_out_beside_an_alias_of_its_name_is_taken_out_when_read_ambiguously():
+    # GitLab's SCD sources: distinct_source lists the source's columns, then `min(dateadd(...)) as valid_from`; the
+    # source had been given VALID_FROM, which the next CTE reads as an ambiguous name
+    tree = parse("""with distinct_source as (select "ID", "VALID_FROM", min(dateadd('sec', _uploaded_at, '1970-01-01')) as valid_from
+        from "LOAD".tap.members group by "ID", "VALID_FROM"), renamed as (select id as member_id, valid_from from distinct_source)
+        select * from renamed""")
+    tables = {"LOAD.TAP.MEMBERS": {"columns": {"ID": {"gen": "sequence"}, "VALID_FROM": {"gen": "template", "template": "valid_from_{hex}"}}}}
+    f = fitter(trees={"m": tree}, tables=tables)
+    f.emu = type("E", (), {"duck": _Duck()})()
+    assert f.doubled_by_a_star("m", "002028 (42601): SQL compilation error: ambiguous column name 'VALID_FROM'")
+    assert list(tables["LOAD.TAP.MEMBERS"]["columns"]) == ["ID"]
+
+
+def test_sql_written_from_a_tables_columns_does_not_give_it_the_names_the_model_makes():
+    # GitLab's SCD sources: the models after it read MEMBER_ID, which the model makes (`id::number as member_id`)
+    f = fitter(tables={"RAW.T.MEMBERS": {"columns": {}}},
+               sql_of={"m": 'select id::number as member_id, from "RAW".t.members group by'},
+               nodes={"m": {"name": "m", "depends_on": {"macros": []}}})
+    f.columns_children_read = lambda uid: ["MEMBER_ID", "ACCESS_LEVEL"]
+    assert f.jinja_columns("m", "Parser Error: syntax error at or near 'from'")
+    assert list(f.tables["RAW.T.MEMBERS"]["columns"]) == ["ACCESS_LEVEL"]
 
 def test_the_numbers_a_model_divides_by_are_generated_above_zero():
     # GitLab's mart_collections_monthly: payment_applied / total_billed with sum(fct_invoice.amount) as total_billed

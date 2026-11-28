@@ -2455,7 +2455,41 @@ def layer_windows(tree: exp.Expression, everywhere: bool = False) -> exp.Express
             changed = True
         if not changed:
             break
+    if everywhere:
+        for select in list(tree.find_all(exp.Select)):
+            _layer_window_arguments(select)
     return tree
+
+
+def _layer_window_arguments(select: exp.Select) -> bool:
+    """`qualify ts < date_trunc('day', max(ts) over ())`: a window given straight to an overloaded macro, which DuckDB
+    cannot type when it picks the overload. Computed a level below, over the same rows (the WHERE goes with it), it is
+    a column of a known type."""
+    source = select.args.get("from_")
+    if source is None or any(select.args.get(k) for k in ("group", "joins", "laterals")) or isinstance(source.this, exp.Unnest):
+        return False
+    own = {p.alias.lower() for p in select.expressions if isinstance(p, exp.Alias) and not _self_named(p)}
+    windows = [w for w in select.find_all(exp.Window) if w.find_ancestor(exp.Select) is select
+               and isinstance(w.parent, exp.Func) and not isinstance(w.parent, exp.Window) and w.find_ancestor(exp.Window) is None
+               and not any(not c.table and c.name.lower() in own for c in w.find_all(exp.Column))]
+    if not windows:
+        return False
+    named = source.this.alias_or_name
+    inner = exp.select("*", *[exp.alias_(w.copy(), f"_lw_{i}") for i, w in enumerate(windows)])
+    inner.set("from_", source.copy())
+    if select.args.get("where"):
+        inner.set("where", select.args.pop("where"))
+    for i, w in enumerate(windows):
+        w.replace(exp.column(f"_lw_{i}", table=named) if named else exp.column(f"_lw_{i}"))
+    for star in [p for p in select.expressions if isinstance(p, exp.Star)]:
+        star.set("except_", [*(star.args.get("except_") or []), *[exp.column(f"_lw_{i}") for i in range(len(windows))]])
+    select.set("from_", exp.From(this=inner.subquery(named or "_lw")))
+    qualify = select.args.get("qualify")
+    if qualify is not None and not any(w.find_ancestor(exp.Select) is select for w in select.find_all(exp.Window)):
+        # (no window left at this level: what QUALIFY keeps is what WHERE keeps, and DuckDB wants a window beside QUALIFY)
+        select.set("qualify", None)
+        select.set("where", exp.Where(this=qualify.this))
+    return True
 
 
 def _self_named(projection: exp.Alias) -> bool:
@@ -3924,7 +3958,10 @@ def misnamed_column(transformed: exp.Expression, conn, probe: bool = True) -> st
 
     for scope in scopes:
         sources: dict[str, list[str] | None] = {}
-        for name, (_node, source) in scope.selected_sources.items():
+        for name, (node, source) in scope.selected_sources.items():
+            if isinstance(node, exp.Expression) and node.args.get("pivots"):
+                sources[name.upper()] = None  # (a PIVOT or UNPIVOT makes columns of its own: not told here)
+                continue
             try:
                 sources[name.upper()] = known(source)
             except Exception:  # noqa: BLE001 - a relation that cannot be looked up is not checked

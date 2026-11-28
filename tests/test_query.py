@@ -667,3 +667,48 @@ def test_a_select_alias_given_to_date_trunc_in_where_is_read_as_its_expression(e
     cur.execute("select current_date() as report_date, event_date from hires "
                 "where date_trunc('month', dateadd('month', -1, report_date)) < date_trunc('month', event_date) order by 2")
     assert [r[1] for r in cur.fetchall()] == [datetime.now().date()]
+
+
+def test_a_union_of_a_star_beside_a_timestamp_tz_reads_its_plain_names_as_snowflake_does(emu):
+    # GitLab's sfdc_opportunity_field_historical: the star's CREATED_AT made a TIMESTAMP_TZ was written `"created_at"`,
+    # which Snowflake reads as another column
+    emu.ensure_database("ANALYTICS", "CI")
+    cur = emu._fs.connect(database="ANALYTICS", schema="CI").cursor()
+    cur.execute("create or replace table snaps as select 1 as opportunity_id, '10' as amount, "
+                "'2025-01-02 03:04:05'::timestamp_ltz as createddate")
+    cur.execute("create or replace table hist as select 1 as opportunity_id, '2024-06-01'::timestamp_ltz as valid_to, "
+                "'amount' as opportunity_field, '5' as old_value")
+    cur.execute("""create or replace table out as
+        with first_snapshot as (select opportunity_id, current_timestamp() as valid_to, amount, createddate as created_at from snaps),
+        unioned as (
+          select * from first_snapshot
+          union
+          select *, null::timestamp_tz as created_at from hist pivot(max(old_value) for opportunity_field in ('amount')))
+        select amount, first_value(created_at) ignore nulls over (partition by opportunity_id order by valid_to) as created_date
+        from unioned""")
+    cur.execute("select amount, created_date::timestamp_ntz::varchar from out order by amount")
+    assert cur.fetchall() == [("10", "2025-01-02 03:04:05.000"), ("5", "2025-01-02 03:04:05.000")]
+
+
+def test_a_window_given_to_date_trunc_in_qualify_is_computed_a_level_below(emu):
+    # GitLab's wk_rpt_dbt_model_efficiency: `qualify ... and ts < date_trunc('day', max(ts) over ())`
+    emu.ensure_database("ANALYTICS", "CI")
+    cur = emu._fs.connect(database="ANALYTICS", schema="CI").cursor()
+    cur.execute("create or replace table runs as select '2025-01-01 10:00:00'::timestamp as ts, 1 as r "
+                "union all select '2025-01-01 12:00:00', 1 union all select '2025-01-03 10:00:00', 2")
+    cur.execute("select ts, r from runs where r > 0 qualify row_number() over (partition by date_trunc('day', ts), r order by ts desc) = 1 "
+                "and ts < date_trunc('day', max(ts) over ())")
+    assert [str(row[0]) for row in cur.fetchall()] == ["2025-01-01 12:00:00"]
+    cur.execute("select ts from runs qualify ts < date_trunc('day', max(ts) over ()) order by 1")
+    assert [str(row[0]) for row in cur.fetchall()] == ["2025-01-01 10:00:00", "2025-01-01 12:00:00"]
+
+
+def test_the_name_column_of_an_unpivot_is_read_also_where_another_table_has_it_in_mixed_case(emu):
+    # GitLab's hire_replan_xf: `unpivot (headcount for month in (...))`, `month::date`; another table's "Month" made the
+    # emulator check the names, and it did not know the column the UNPIVOT makes
+    emu.ensure_database("ANALYTICS", "CI")
+    cur = emu._fs.connect(database="ANALYTICS", schema="CI").cursor()
+    cur.execute('create or replace table targets as select 1 as "Month"')
+    cur.execute('create or replace table replan as select \'Sales\' as department, \'3\' as "2020-04-30", \'4\' as "2020-05-31"')
+    cur.execute('select month::date as d, headcount from replan unpivot (headcount for month in ("2020-04-30", "2020-05-31")) order by 1')
+    assert [(str(d), h) for d, h in cur.fetchall()] == [("2020-04-30", "3"), ("2020-05-31", "4")]
