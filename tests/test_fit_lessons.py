@@ -1079,7 +1079,8 @@ def test_a_quoted_name_in_mixed_case_renames_the_column_it_was_generated_as():
     f = fitter(trees={"m": tree}, tables=tables, existing={}, pending={}, unions={})
     f.add_column = lambda table, col: tables[table]["columns"].setdefault(col, {}) is not None
     assert f.missing_column("m", "SQL compilation error: error line 2 at position 15\ninvalid identifier '\"Date_Added\"'")
-    assert f.missing_column("m", "SQL compilation error: error line 2 at position 52\ninvalid identifier '\"Site Luid\"'")
+    # the source's other columns the model quotes in their case are renamed with it, not one pass each
+    assert f.learned[-1].startswith('RAW.SHEETLOAD.ABM.Site Luid: read as "Site Luid"')
     columns = tables["RAW.SHEETLOAD.ABM"]["columns"]
     assert list(columns) == ['"Date_Added"', '"Site Luid"', "ACCOUNT_NAME"]  # (in double quotes: the spec keeps the case)
     assert columns['"Date_Added"'] == {"gen": "time_offset", "type": "DATE"} and columns["ACCOUNT_NAME"]["follows"] == "Date_Added"
@@ -1221,3 +1222,31 @@ def test_a_table_holds_a_name_in_one_case_only():
     spec = Spec.from_raw({"seed": 1, "start": "2025-01-01", "tables": {"RAW.S.BANDS": {"columns": {
         "ID": {"gen": "sequence"}, "EMPLOYEE_ID": {"gen": "dist"}, '"Employee_ID"': {"gen": "template", "template": "e_{hex}"}}}}}, ".")
     assert list(spec.tables["RAW.S.BANDS"].columns) == ["ID", "Employee_ID"]
+
+
+def test_a_quoted_name_read_through_a_model_that_passes_its_source_on_renames_the_sources_column():
+    # GitLab's sheetload_hire_replan: `"Departments"` of a model that is `select *` of the sheet
+    tree = parse('select "Departments" as department, "Size (bytes)" as size from "PREP".sheetload.hire_replan_source')
+    tables = {"RAW.SHEETLOAD.HIRE_REPLAN": {"columns": {"DEPARTMENTS": {"gen": "template", "template": "departments_{hex}"},
+                                                        "SIZE (BYTES)": {"gen": "template", "template": "size (bytes)_{hex}"}}}}
+    f = fitter(trees={"m": tree}, tables=tables, existing={}, pending={}, unions={})
+    f.passthrough = lambda fq: "RAW.SHEETLOAD.HIRE_REPLAN" if fq == "PREP.SHEETLOAD.HIRE_REPLAN_SOURCE" else None
+    f._union_members = f._is_snapshot = f.lists_columns = lambda fq: False
+    assert f.missing_column("m", "SQL compilation error: error line 1 at position 7\ninvalid identifier '\"Departments\"'")
+    assert list(tables["RAW.SHEETLOAD.HIRE_REPLAN"]["columns"]) == ['"Departments"', '"Size (bytes)"']
+    # and a name in double quotes may hold any character but a quote: one the source lacks is added
+    tables["RAW.SHEETLOAD.HIRE_REPLAN"]["columns"] = {}
+    assert f.missing_column("m", "SQL compilation error: error line 1 at position 40\ninvalid identifier '\"Size (bytes)\"'")
+    assert '"Size (bytes)"' in tables["RAW.SHEETLOAD.HIRE_REPLAN"]["columns"]
+
+
+def test_a_made_up_value_of_a_quoted_column_read_as_a_number_retypes_that_column():
+    # GitLab's driveload_marketing_press_sov_source: REPLACE("Desktop_Readership", ',')::NUMBER
+    tables = {"RAW.D.SOV": {"columns": {'"Desktop_Readership"': {"gen": "template", "template": "desktop_readership_{hex}"},
+                                        '"Brand"': {"gen": "template", "template": "brand_{hex}"}}}}
+    f = fitter(tables=tables, bounds={})
+    f.sources_of = lambda uid: ["RAW.D.SOV"]
+    assert f.retype_column("m", "DESKTOP_READERSHIP", "BIGINT", direct=True, made_up=True)
+    columns = tables["RAW.D.SOV"]["columns"]
+    assert columns['"Desktop_Readership"']["gen"] in ("dist", "sequence") and columns['"Brand"']["gen"] == "template"
+    assert "DESKTOP_READERSHIP" not in columns

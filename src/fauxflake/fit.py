@@ -1025,15 +1025,17 @@ class Fitter:
             [name, *self.origins(uid, name, strict=hint in ("DAY", "TEXT", "VARIANT", "BIGINT", "DOUBLE"))]))
         for table, name in [(t, n) for t in tables for n in names]:
             columns = self.tables[table].get("columns") or {}
+            if name not in columns:  # a name the spec keeps in its case (`"Desktop_Readership"`)
+                name = next((c for c in columns if c.startswith('"') and column_name(c).upper() == name.upper()), name)
             if name not in columns:  # "Sum of Open Opportunities" is sum_of_open_opportunities in generated text
-                flat = re.sub(r"\W+", "_", name).strip("_")
-                name = next((c for c in columns if re.sub(r"\W+", "_", c).strip("_") == flat), name)
+                flat = re.sub(r"\W+", "_", name).strip("_").upper()
+                name = next((c for c in columns if re.sub(r"\W+", "_", column_name(c)).strip("_").upper() == flat), name)
             gen = columns.get(name)
             if gen is None:
                 continue
             kind = gen.get("gen")
             if direct and made_up and not (kind == "template" and not gen.get("format")
-                                           and (gen.get("template") == f"{name.lower()}_{{hex}}" or gen.get("templates"))):
+                                           and (gen.get("template") == f"{column_name(name).lower()}_{{hex}}" or gen.get("templates"))):
                 continue  # the value that failed is made-up text (`version_3fa2...`): this column makes something else by now
             numeric = hint in ("BIGINT", "DOUBLE")
             fresh = None
@@ -1081,7 +1083,7 @@ class Fitter:
                         continue
                     # the key it refers to is text the SQL takes apart or names (`1.2.3`), and this column is read as
                     # a number: it does not hold that key. A number of its own
-                    columns[name] = guess(name, hint) if guess(name, hint).get("gen") == "dist" else \
+                    columns[name] = guess(column_name(name), hint) if guess(column_name(name), hint).get("gen") == "dist" else \
                         {"gen": "dist", "type": "BIGINT" if hint == "BIGINT" else "DOUBLE", "p": [0, 1], "v": [1, 1000]}
                     self.retyped.add(table)
                     self.learned.append(f"{table}.{name}: read as a number, but {gen['ref']}.{key} which it was taken to refer to "
@@ -1176,7 +1178,7 @@ class Fitter:
                     continue  # a year and a month (`%Y%m`) the models complete with a day before casting: it stays that
                 fresh = {"gen": "time_offset", **({"type": "DATE"} if hint == "DATE" else {}), "p": [0, 0.5, 1], "seconds": [0, 86400, 604800]}
             else:
-                fresh = guess(name, hint)
+                fresh = guess(column_name(name), hint)
                 if fresh["gen"] in _FREE:
                     continue
             if numeric and (table, name) in kept_text and fresh.get("gen") not in _FREE:
@@ -1757,10 +1759,18 @@ class Fitter:
             return True
         return False
 
-    def cased_column(self, candidates: set[str], col: str, written: str) -> bool:
+    def cased_column(self, candidates: set[str], col: str, written: str, tree: exp.Expression | None = None) -> bool:
         """`"Date_Added"::date`: a quoted name is that name in its case, so the source's column DATE_ADDED is not it.
-        The one source that has the column in upper case gets it in the case the model writes, in its place."""
+        The one source that has the column in upper case gets it in the case the model writes, in its place, and so
+        do the source's other columns the model quotes in a case of their own (a sheet's columns come one by one)."""
         key = f'"{written}"'  # (in the spec, a name in double quotes keeps its case)
+
+        def source(fq, depth=0):  # noqa: ANN001, ANN202 - a model that is a `select *` of a source passes the name on
+            if fq in self.tables or depth > 8:
+                return fq
+            parent = self.passthrough(fq)
+            return source(parent, depth + 1) if parent else fq
+        candidates = {source(c) for c in candidates}
         having = [c for c in sorted(candidates) if c in self.tables and col in (self.tables[c].get("columns") or {})]
         if len(having) != 1 or key in self.tables[having[0]]["columns"]:
             only = next(iter(candidates)) if len(candidates) == 1 else None
@@ -1772,16 +1782,22 @@ class Fitter:
                 return True
             return False
         table = self.tables[having[0]]
+        names = {col: written}
+        for ident in tree.find_all(exp.Identifier) if tree is not None else ():
+            other = ident.name
+            if ident.quoted and other != other.upper() and other.upper() in table["columns"] and f'"{other}"' not in table["columns"]:
+                names.setdefault(other.upper(), other)
 
         def renamed(value):  # noqa: ANN001, ANN202 - and where its sister columns name it (follows, keyed_by, ...)
             if isinstance(value, dict):
                 return {k: renamed(v) for k, v in value.items()}
             if isinstance(value, list):
                 return [renamed(v) for v in value]
-            return written if value == col else value
-        table["columns"] = {(key if name == col else name): renamed(spec) for name, spec in table["columns"].items()}
+            return names.get(value, value) if isinstance(value, str) else value
+        table["columns"] = {(f'"{names[name]}"' if name in names else name): renamed(spec) for name, spec in table["columns"].items()}
         self.retyped.add(having[0])
-        self.learned.append(f'{having[0]}.{written}: read as "{written}", a quoted name in its case; renamed from {col}.')
+        for upper, cased in names.items():
+            self.learned.append(f'{having[0]}.{cased}: read as "{cased}", a quoted name in its case; renamed from {upper}.')
         self.dirty = True
         return True
 
@@ -1792,8 +1808,9 @@ class Fitter:
             return False
         ctes = {c.alias.upper(): c.this for c in t.find_all(exp.CTE)}
         col = m.group("col").upper().split(".")[-1].strip('"')
-        if not re.fullmatch(r"[\w$ ]+", col):
-            return False
+        if not re.fullmatch(r"[\w$ ]+", col) and not (f"'\"{m.group('col').split('.')[-1].strip(chr(34))}\"'" in message
+                                                    and re.fullmatch(r'[^"\n]+', col)):
+            return False  # (in double quotes a name can hold anything: a sheet's `"Size (bytes)"`)
         candidates: set[str] = set()
         alias = (m.groupdict().get("table") or "").upper()
         if alias:
@@ -1834,7 +1851,7 @@ class Fitter:
             candidates = self.real_tables(t, ctes)
         candidates = {c for c in candidates if self.blameable(c)}
         written = m.group("col").split(".")[-1].strip('"')
-        if f"'\"{written}\"'" in message and written != written.upper() and self.cased_column(candidates, col, written):
+        if f"'\"{written}\"'" in message and written != written.upper() and self.cased_column(candidates, col, written, t):
             return True
         if len(candidates) > 1:
             # several sources could own it: the one already known to have a column of that name
@@ -3246,10 +3263,11 @@ class Fitter:
                             beside = _numeric_columns(self.tree(sql_key), (token.rsplit("_", 1)[0],))
                             for table in self.sources_of(sql_key):
                                 columns = self.tables[table].get("columns") or {}
-                                for name in sorted(beside & set(columns)):
+                                for name in sorted(c for c in columns if column_name(c).upper() in {b.upper() for b in beside}):
                                     gen = columns[name]
-                                    if gen.get("gen") == "template" and gen.get("template") == f"{name.lower()}_{{hex}}" and not gen.get("templates"):
-                                        columns[name] = guess(name, hint)
+                                    if gen.get("gen") == "template" and gen.get("template") == f"{column_name(name).lower()}_{{hex}}" \
+                                            and not gen.get("templates"):
+                                        columns[name] = guess(column_name(name), hint)
                                         self.retyped.add(table)
                                         self.learned.append(f"{table}.{name}: used as {hint} beside the column that failed, retyped.")
                         return True
